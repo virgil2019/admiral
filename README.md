@@ -4,6 +4,8 @@ A Go daemon that bridges a single Telegram chat to a single `oh-my-codex`
 (omx) team via `omx team api`. Mac-local MVP. Long-polling only, whitelist
 by TG user id, 1 bot : 1 team.
 
+Repo location: `/Users/georgehuang/Program/george/admiral` (repo root — `go run ./cmd/omx-bridge` from here).
+
 ## Prerequisites
 
 - Go 1.22+
