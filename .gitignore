@@ -1,0 +1,6 @@
+/bridge.db
+/*.db
+/bin/
+/omx-bridge
+*.log
+.DS_Store

@@ -1,0 +1,23 @@
+bot_token: "123456:ABC-your-tg-bot-token"
+allowed_tg_user_ids: [111222333]
+
+session:
+  tg_chat_id: 111222333
+  team_name: "vibe"
+  cwd: "/Users/georgehuang/Program/vibe-project"
+  omx_bin_path: "/usr/local/bin/omx"
+
+storage:
+  sqlite_path: "~/.local/share/omx-bridge/bridge.db"
+
+telegram:
+  long_poll_timeout_s: 50
+  api_base: "https://api.telegram.org"
+
+event_stream:
+  await_timeout_ms: 30000
+  idle_backoff_ms: 2000
+
+logging:
+  level: "info"
+  file: "~/.local/share/omx-bridge/bridge.log"
