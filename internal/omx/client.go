@@ -99,11 +99,31 @@ const (
 	LaunchPty    LaunchMode = "pty"
 )
 
-// Launch shells out `omx launch <team>`. In "pty" mode, ptyCommand (e.g.
-// ["/usr/bin/script","-q","/dev/null"]) is prepended to the argv so omx
-// sees a TTY. In "direct" mode, no wrapper is used — if omx exits with a
-// TTY-required error, ErrLaunchNeedsTTY is returned.
-func (c *Client) Launch(ctx context.Context, mode LaunchMode, ptyCommand []string) error {
+// LaunchSpec describes how to spawn an omx team via `omx team N:agent "<task>"`.
+type LaunchSpec struct {
+	WorkerCount int
+	AgentType   string
+	Task        string
+}
+
+// OmxCommandArgs returns the exact argv that would be passed to the omx
+// binary (excluding the binary itself). Exposed for testing.
+func (s LaunchSpec) OmxCommandArgs() []string {
+	return []string{"team", fmt.Sprintf("%d:%s", s.WorkerCount, s.AgentType), s.Task}
+}
+
+// Launch shells out `omx team <N>:<agent> "<task>"`. In "pty" mode,
+// ptyCommand (e.g. ["/usr/bin/script","-q","/dev/null"]) is prepended to
+// the argv so omx sees a TTY; combined stdout+stderr is captured via the
+// script wrapper since script(1) redirects child stderr into the pty. In
+// "direct" mode, no wrapper is used — if omx exits with a TTY-required
+// error, ErrLaunchNeedsTTY is returned.
+func (c *Client) Launch(ctx context.Context, mode LaunchMode, ptyCommand []string, spec LaunchSpec) error {
+	if spec.WorkerCount <= 0 || spec.AgentType == "" || strings.TrimSpace(spec.Task) == "" {
+		return fmt.Errorf("launch spec incomplete: %+v", spec)
+	}
+	omxArgs := spec.OmxCommandArgs()
+
 	var cmd *exec.Cmd
 	switch mode {
 	case LaunchPty:
@@ -111,22 +131,29 @@ func (c *Client) Launch(ctx context.Context, mode LaunchMode, ptyCommand []strin
 			return fmt.Errorf("pty launch: pty_command is empty")
 		}
 		args := append([]string{}, ptyCommand[1:]...)
-		args = append(args, c.BinPath, "launch", c.TeamName)
+		args = append(args, c.BinPath)
+		args = append(args, omxArgs...)
 		cmd = exec.CommandContext(ctx, ptyCommand[0], args...)
 	case LaunchDirect:
-		cmd = exec.CommandContext(ctx, c.BinPath, "launch", c.TeamName)
+		cmd = exec.CommandContext(ctx, c.BinPath, omxArgs...)
 	default:
 		return fmt.Errorf("unknown launch mode %q", mode)
 	}
 	cmd.Dir = c.CWD
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+
+	// script(1) redirects child stderr into the pty, so Cmd.Stderr alone is
+	// empty under pty mode. Capture combined output and use it for the error
+	// message regardless of mode.
+	var combined bytes.Buffer
+	cmd.Stdout = &combined
+	cmd.Stderr = &combined
+
 	if err := cmd.Run(); err != nil {
-		tail := trimTail(stderr.Bytes())
+		tail := trimTail(combined.Bytes())
 		if strings.Contains(tail, "stdin is not a terminal") {
 			return ErrLaunchNeedsTTY
 		}
-		return fmt.Errorf("launch failed: %w (stderr=%s)", err, tail)
+		return fmt.Errorf("launch failed: %w (output=%s)", err, tail)
 	}
 	return nil
 }

@@ -1,4 +1,4 @@
-# omx-bridge v0.1
+# omx-bridge v0.1.1
 
 A Go daemon that bridges a single Telegram chat to a single `oh-my-codex`
 (omx) team via `omx team api`. Mac-local MVP. Long-polling only, whitelist
@@ -10,7 +10,7 @@ Repo location: `/Users/georgehuang/Program/george/admiral` (repo root — `go ru
 
 - Go 1.22+
 - `omx` CLI in PATH (or absolute path via `session.omx_bin_path`)
-- `/usr/bin/script` (used to provide a PTY for `omx launch` — ships on macOS)
+- `/usr/bin/script` (used to provide a PTY for `omx team` — ships on macOS)
 - A Telegram bot token (BotFather → `/newbot`)
 
 ## Setup
@@ -25,7 +25,15 @@ Repo location: `/Users/georgehuang/Program/george/admiral` (repo root — `go ru
 3. Get your TG user id (message [@userinfobot](https://t.me/userinfobot)) and
    put it into `allowed_tg_user_ids`. Also fill `session.tg_chat_id` — for a
    1:1 DM chat, this is the same as your user id.
-4. Fill `session.team_name`, `session.cwd`, `session.omx_bin_path`.
+4. Fill `session.cwd`, `session.omx_bin_path`, and the `launch` block:
+   - `launch.worker_count` — N worker panes (e.g. 3).
+   - `launch.agent_type` — `codex` | `claude` | `gemini`.
+   - `launch.bootstrap_task` — free-form task string. The omx team name is
+     **derived** from this via omx's sanitize rule (lowercase, non-alnum
+     collapsed to `-`, trimmed, max 30 chars).
+   - `session.team_name` — MUST equal `sanitize(launch.bootstrap_task)` or
+     the bridge refuses to boot. Example: `bootstrap_task: "vibe bridge
+     session"` ⇒ `team_name: "vibe-bridge-session"`.
 
 ## Run
 
@@ -50,12 +58,26 @@ go run ./cmd/omx-bridge --config /path/to/config.yaml
 | `/whoami` | Print identity |
 | plain text | Forwarded to team leader as a mailbox message |
 
+## Team launch semantics
+
+`/start` invokes the real omx team-spawn verb:
+```
+<omx_bin_path> team <worker_count>:<agent_type> "<bootstrap_task>"
+```
+The team identifier is derived by omx from the task string (sanitize
+rule: lowercase, collapse non-alnum runs to `-`, trim, max 30 chars), and
+the bridge enforces that `session.team_name` equals that sanitized form.
+After launch the bridge polls `omx team api get-summary` for up to 60s to
+confirm the team is up before replying "Team <name> is up." in TG.
+
 ## Launch modes (config: `launch.mode`)
 
 - **`pty`** (default on macOS). The bridge prepends `launch.pty_command`
-  (default `/usr/bin/script -q /dev/null`) to `omx launch <team>` so omx
-  sees a real terminal. Logs a `WARN launch.mode=pty using_script_wrapper`
-  line on every `/start`.
+  (default `/usr/bin/script -q /dev/null`) to the omx argv so omx sees a
+  real terminal. Logs a `WARN launch.mode=pty using_script_wrapper` line
+  on every `/start`. Combined stdout+stderr is captured and surfaced in
+  launch-failure messages (under `pty`, `script(1)` redirects child
+  stderr into the pty, so a stderr-only pipe is always empty).
 - **`direct`** (default elsewhere). No wrapper. If omx exits with the
   "stdin is not a terminal" error, the bridge replies with instructions to
   either flip `launch.mode: pty` or pre-launch from a terminal, and keeps

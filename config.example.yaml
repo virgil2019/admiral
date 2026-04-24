@@ -3,7 +3,9 @@ allowed_tg_user_ids: [111222333]
 
 session:
   tg_chat_id: 111222333
-  team_name: "vibe"
+  # MUST equal sanitize(launch.bootstrap_task). For the example below,
+  # "vibe bridge session" sanitizes to "vibe-bridge-session".
+  team_name: "vibe-bridge-session"
   cwd: "/Users/georgehuang/Program/vibe-project"
   omx_bin_path: "/usr/local/bin/omx"
 
@@ -12,8 +14,17 @@ launch:
   # Use "direct" if you pre-launched the team from a real terminal and want
   # the bridge to fail loudly instead of wrapping omx in `script`.
   mode: "pty"
-  # Only used when mode=pty. Prepended to `omx launch <team>`.
+  # Only used when mode=pty. Prepended to the omx argv.
   pty_command: ["/usr/bin/script", "-q", "/dev/null"]
+  # The N in "omx team N:agent-type". Worker panes spawned.
+  worker_count: 3
+  # codex | claude | gemini
+  agent_type: "codex"
+  # Free-form task description passed to omx team launch. The team name is
+  # DERIVED from this via omx's sanitize rule (lowercase, non-alnum
+  # collapsed to "-", trimmed, max 30 chars). session.team_name MUST equal
+  # that derived form or the bridge refuses to boot.
+  bootstrap_task: "vibe bridge session"
 
 storage:
   sqlite_path: "~/.local/share/omx-bridge/bridge.db"

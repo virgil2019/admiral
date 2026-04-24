@@ -235,12 +235,18 @@ func (b *Bridge) cmdStart(ctx context.Context) {
 			"pty_command", b.cfg.Launch.PtyCommand,
 			"team", b.cfg.Session.TeamName)
 	}
-	err = b.omx.Launch(ctx, mode, b.cfg.Launch.PtyCommand)
+	spec := omx.LaunchSpec{
+		WorkerCount: b.cfg.Launch.WorkerCount,
+		AgentType:   b.cfg.Launch.AgentType,
+		Task:        b.cfg.Launch.BootstrapTask,
+	}
+	err = b.omx.Launch(ctx, mode, b.cfg.Launch.PtyCommand, spec)
 	if err != nil {
 		if errors.Is(err, omx.ErrLaunchNeedsTTY) {
-			_, _ = b.bot.SendToSession(
-				"Launch failed: omx requires a TTY. Set launch.mode: pty in config, " +
-					"or run \"omx launch " + b.cfg.Session.TeamName + "\" from a terminal on the Mac yourself, then use /status here.")
+			_, _ = b.bot.SendToSession(fmt.Sprintf(
+				"Launch failed: omx requires a TTY. Set launch.mode: pty in config, "+
+					"or run `omx team %d:%s %q` from a terminal on the Mac yourself, then use /status here.",
+				spec.WorkerCount, spec.AgentType, spec.Task))
 			b.logger.Error("launch_needs_tty_direct_mode")
 			return
 		}
@@ -248,7 +254,26 @@ func (b *Bridge) cmdStart(ctx context.Context) {
 		_, _ = b.bot.SendToSession(fmt.Sprintf("Launch failed: %s", shortErr(err)))
 		return
 	}
-	_, _ = b.bot.SendToSession(fmt.Sprintf("Team %s is up.", b.cfg.Session.TeamName))
+
+	// Poll get-summary until team is up (bounded 60s). omx team-launch
+	// returns once tmux panes are spawned; state may lag a second or two.
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		env, err := b.omx.GetSummary(ctx)
+		if err == nil && env.OK {
+			_, _ = b.bot.SendToSession(fmt.Sprintf("Team %s is up.", b.cfg.Session.TeamName))
+			b.startEventLoop(ctx)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+	_, _ = b.bot.SendToSession(fmt.Sprintf(
+		"Team %s launch returned OK but get-summary did not confirm within 60s — check `omx team status %s` on the Mac.",
+		b.cfg.Session.TeamName, b.cfg.Session.TeamName))
 	b.startEventLoop(ctx)
 }
 
