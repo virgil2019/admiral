@@ -75,6 +75,11 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// WAL avoids SQLITE_BUSY between concurrent cursor + messages writes
+	// (event-push goroutine + inbound long-poll goroutine both write).
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
+		return nil, fmt.Errorf("set WAL: %w", err)
+	}
 	if _, err := db.Exec(migration0001); err != nil {
 		return nil, fmt.Errorf("apply migration: %w", err)
 	}

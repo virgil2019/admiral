@@ -4,9 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/georgehuang/omx-bridge/internal/bridge"
@@ -27,7 +29,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(cfg.Logging.Level)}))
+	logger := newLogger(cfg.Logging)
 
 	db, err := store.Open(cfg.Storage.SQLitePath)
 	if err != nil {
@@ -72,4 +74,22 @@ func parseLevel(lvl string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// newLogger builds a slog logger writing to stderr and, if logging.file is
+// set in config, tees to that file too. File open errors are logged via
+// stderr-only and swallowed (we don't want a bad log path to kill the daemon).
+func newLogger(c config.Logging) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: parseLevel(c.Level)}
+	var w io.Writer = os.Stderr
+	if c.File != "" {
+		if err := os.MkdirAll(filepath.Dir(c.File), 0o755); err == nil {
+			if f, err := os.OpenFile(c.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+				w = io.MultiWriter(os.Stderr, f)
+			} else {
+				fmt.Fprintf(os.Stderr, "log file open failed (stderr-only): %v\n", err)
+			}
+		}
+	}
+	return slog.New(slog.NewTextHandler(w, opts))
 }

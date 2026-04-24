@@ -3,12 +3,28 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/georgehuang/omx-bridge/internal/tg"
 )
 
-// startEventLoop launches a goroutine that long-polls `await-event` and pushes
-// filtered events to TG. Idempotent — if already running, returns quickly.
+// routeOutcome describes how the event-loop should treat a single event
+// after routeEvent handled it. Separating "advance cursor" from "pushed"
+// lets us hold the cursor on transient push failures (per spec §4.2) while
+// still advancing past events that were intentionally suppressed.
+type routeOutcome int
+
+const (
+	// routeAdvance means the event has reached a terminal outcome (pushed
+	// successfully, or explicitly suppressed). Cursor should advance.
+	routeAdvance routeOutcome = iota
+	// routeHold means the event needed a push that failed transiently. The
+	// cursor must NOT advance so the next await-event re-delivers it.
+	routeHold
+)
+
 func (b *Bridge) startEventLoop(parent context.Context) {
 	b.eventMu.Lock()
 	defer b.eventMu.Unlock()
@@ -76,14 +92,11 @@ func (b *Bridge) runEventLoop(ctx context.Context) {
 		case "timeout":
 			continue
 		case "event":
-			if pushed := b.routeEvent(ctx, payload.Event); pushed {
-				if payload.Cursor != "" {
-					_ = b.db.SetCursor(b.cfg.Session.TeamName, payload.Cursor)
-				}
-			} else if payload.Cursor != "" {
-				// suppressed events still advance cursor
+			outcome := b.routeEvent(ctx, payload.Event)
+			if outcome == routeAdvance && payload.Cursor != "" {
 				_ = b.db.SetCursor(b.cfg.Session.TeamName, payload.Cursor)
 			}
+			// routeHold: cursor stays; next await-event re-delivers this event.
 		default:
 			// unknown status — do not advance cursor
 		}
@@ -99,10 +112,11 @@ func (b *Bridge) backoff(ctx context.Context) bool {
 	}
 }
 
-// routeEvent filters & pushes. Returns true if something was delivered (or
-// an irrecoverable push-failure occurred where the cursor should still advance).
-// Returns false for pure suppressed events (cursor should still advance).
-func (b *Bridge) routeEvent(ctx context.Context, raw json.RawMessage) bool {
+// routeEvent filters an event and, for the push cases, returns routeAdvance
+// on success (spec §4 + §4.2) or routeHold on transient push failure. Events
+// in the spec's "suppress" set also return routeAdvance — intentionally-
+// suppressed events should not wedge the cursor.
+func (b *Bridge) routeEvent(ctx context.Context, raw json.RawMessage) routeOutcome {
 	var ev struct {
 		EventID   string `json:"event_id"`
 		Type      string `json:"type"`
@@ -118,47 +132,68 @@ func (b *Bridge) routeEvent(ctx context.Context, raw json.RawMessage) bool {
 
 	switch ev.Type {
 	case "message_received":
-		if ev.ToWorker == FromWorker || ev.Worker == LeaderWorker {
-			return b.pushLeaderReply(ctx, ev.MessageID)
+		// B2 fix: only push leader→tg-bridge mails. Spec §4: "message_received
+		// with to_worker==tg-bridge". A leader send to some other worker is
+		// suppressed, not forwarded to TG.
+		if ev.ToWorker != FromWorker {
+			return routeAdvance
 		}
-		return true
+		return b.pushLeaderReply(ctx, ev.MessageID)
 	case "task_completed":
-		_, _ = b.bot.SendToSession(fmt.Sprintf("Task done: %s — %s", ev.TaskID, ev.Reason))
-		return true
+		return b.pushWithRetry(ctx, fmt.Sprintf("Task done: %s — %s", ev.TaskID, ev.Reason))
 	case "task_failed":
-		_, _ = b.bot.SendToSession(fmt.Sprintf("Task failed: %s — %s", ev.TaskID, ev.Reason))
-		return true
+		return b.pushWithRetry(ctx, fmt.Sprintf("Task failed: %s — %s", ev.TaskID, ev.Reason))
 	case "approval_decision":
-		_, _ = b.bot.SendToSession(fmt.Sprintf("Approval: %s → %s", ev.TaskID, ev.State))
-		return true
+		return b.pushWithRetry(ctx, fmt.Sprintf("Approval: %s → %s", ev.TaskID, ev.State))
 	case "all_workers_idle":
 		if time.Since(b.lastIdlePush) > 60*time.Second {
-			_, _ = b.bot.SendToSession("Team idle.")
-			b.lastIdlePush = time.Now()
+			outcome := b.pushWithRetry(ctx, "Team idle.")
+			if outcome == routeAdvance {
+				b.lastIdlePush = time.Now()
+			}
+			return outcome
 		}
-		return true
+		// Rate-limited suppression: still advance past this event.
+		return routeAdvance
 	case "shutdown_ack":
-		_, _ = b.bot.SendToSession(fmt.Sprintf("Team %s shut down.", b.cfg.Session.TeamName))
-		return true
+		return b.pushWithRetry(ctx, fmt.Sprintf("Team %s shut down.", b.cfg.Session.TeamName))
 	}
-	// default-deny: suppress
-	return true
+	// default-deny: explicitly suppress, advance cursor.
+	return routeAdvance
 }
 
-// pushLeaderReply fetches the full body for a specific message_id from the
-// tg-bridge mailbox and pushes it. Per G3 the event carries message_id, so
-// we look it up directly (no mailbox diff, no race). If the body is missing
-// (already marked delivered by a racing consumer), push a placeholder and
-// advance — keeps the stream unwedged.
-func (b *Bridge) pushLeaderReply(ctx context.Context, messageID string) bool {
+// pushWithRetry sends text to TG using the spec §4.2 backoff schedule.
+// Permanent TG errors (403/400 class) log ERROR but still advance the
+// cursor — retrying them won't help and holding the cursor would wedge
+// the stream permanently.
+func (b *Bridge) pushWithRetry(ctx context.Context, text string) routeOutcome {
+	err := b.bot.SendToSessionWithRetry(ctx, text)
+	if err == nil {
+		return routeAdvance
+	}
+	if errors.Is(err, tg.ErrPermanent) {
+		b.logger.Error("tg_send_permanent", "err", err)
+		return routeAdvance
+	}
+	b.logger.Warn("tg_send_transient_holding_cursor", "err", err)
+	return routeHold
+}
+
+// pushLeaderReply fetches the full body for the specific message_id from
+// the tg-bridge mailbox and pushes it. Per G3 the event carries message_id.
+// If message_id is empty, we log WARN and suppress rather than guess at
+// an oldest-undelivered fallback (picking the wrong message is worse than
+// missing one — user will see the next one and can ask for context).
+func (b *Bridge) pushLeaderReply(ctx context.Context, messageID string) routeOutcome {
 	if messageID == "" {
 		b.logger.Warn("leader_reply_no_message_id")
-		return false
+		return routeAdvance
 	}
 	env, err := b.omx.MailboxList(ctx, FromWorker, false)
 	if err != nil || !env.OK {
-		b.logger.Warn("mailbox_list_fail", "err", err)
-		return false
+		// Transient: the mailbox op failed, event stays in queue and we retry.
+		b.logger.Warn("mailbox_list_fail", "err", err, "message_id", messageID)
+		return routeHold
 	}
 	var list struct {
 		Messages []struct {
@@ -173,15 +208,21 @@ func (b *Bridge) pushLeaderReply(ctx context.Context, messageID string) bool {
 			continue
 		}
 		text := fmt.Sprintf("%s\n%s", m.FromWorker, m.Body)
-		if _, err := b.bot.SendToSession(text); err != nil {
-			b.logger.Error("tg_send_fail", "err", err)
-			return false
+		outcome := b.pushWithRetry(ctx, text)
+		if outcome == routeAdvance {
+			// Only mark delivered after successful TG push, so a push-failure
+			// retry on the next loop can re-fetch the body.
+			_, _ = b.omx.MailboxMarkDelivered(ctx, FromWorker, m.MessageID)
 		}
-		_, _ = b.omx.MailboxMarkDelivered(ctx, FromWorker, m.MessageID)
-		return true
+		return outcome
 	}
+	// Body not in mailbox — already delivered by someone else (shouldn't
+	// happen in v0.1 since only tg-bridge reads its own mailbox). Push a
+	// placeholder so the user sees *something*; still advance cursor.
 	b.logger.Warn("body_fetch_miss", "message_id", messageID)
-	_, _ = b.bot.SendToSession(fmt.Sprintf("%s\n[body unavailable]", LeaderWorker))
-	_, _ = b.omx.MailboxMarkDelivered(ctx, FromWorker, messageID)
-	return true
+	outcome := b.pushWithRetry(ctx, fmt.Sprintf("%s\n[body unavailable]", LeaderWorker))
+	if outcome == routeAdvance {
+		_, _ = b.omx.MailboxMarkDelivered(ctx, FromWorker, messageID)
+	}
+	return outcome
 }

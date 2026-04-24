@@ -118,7 +118,9 @@ func (b *Bridge) ingestUpdate(ctx context.Context, upd tgbotapi.Update) {
 		b.logger.Info("tg_update_dedupe", "update_id", upd.UpdateID)
 		return
 	}
-	_ = b.db.RecordMessage("in", int64(msg.MessageID), msg.From.ID, "", msg.Text)
+	// Inbound is persisted via tg_updates; commands land in `commands`;
+	// plain-text forwards land in `messages` at send-time (tx with
+	// mark-processed). We don't double-write here.
 	b.processUpdate(ctx, int64(upd.UpdateID), msg.From.ID, msg.Chat.ID, msg.Text, int64(msg.MessageID))
 }
 
