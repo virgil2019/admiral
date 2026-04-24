@@ -216,13 +216,11 @@ func (b *Bridge) pushLeaderReply(ctx context.Context, messageID string) routeOut
 		}
 		return outcome
 	}
-	// Body not in mailbox — already delivered by someone else (shouldn't
-	// happen in v0.1 since only tg-bridge reads its own mailbox). Push a
-	// placeholder so the user sees *something*; still advance cursor.
+	// Body not in mailbox — shouldn't happen in v0.1 since only tg-bridge
+	// reads its own mailbox. Push a placeholder so the user sees *something*
+	// and advance cursor. We do NOT call MailboxMarkDelivered here: if the
+	// message_id was never in our mailbox (e.g. a bug or stale event), marking
+	// it delivered would stamp the wrong mailbox entry or be a no-op at best.
 	b.logger.Warn("body_fetch_miss", "message_id", messageID)
-	outcome := b.pushWithRetry(ctx, fmt.Sprintf("%s\n[body unavailable]", LeaderWorker))
-	if outcome == routeAdvance {
-		_, _ = b.omx.MailboxMarkDelivered(ctx, FromWorker, messageID)
-	}
-	return outcome
+	return b.pushWithRetry(ctx, fmt.Sprintf("%s\n[body unavailable]", LeaderWorker))
 }
