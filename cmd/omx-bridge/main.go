@@ -52,6 +52,7 @@ func main() {
 		"team", cfg.Session.TeamName,
 		"cwd", cfg.Session.CWD,
 		"sqlite", cfg.Storage.SQLitePath,
+		"launch_mode", cfg.Launch.Mode,
 	)
 
 	if err := br.Run(ctx); err != nil && err != context.Canceled {

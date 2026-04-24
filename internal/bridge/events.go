@@ -145,7 +145,16 @@ func (b *Bridge) routeEvent(ctx context.Context, raw json.RawMessage) bool {
 	return true
 }
 
+// pushLeaderReply fetches the full body for a specific message_id from the
+// tg-bridge mailbox and pushes it. Per G3 the event carries message_id, so
+// we look it up directly (no mailbox diff, no race). If the body is missing
+// (already marked delivered by a racing consumer), push a placeholder and
+// advance — keeps the stream unwedged.
 func (b *Bridge) pushLeaderReply(ctx context.Context, messageID string) bool {
+	if messageID == "" {
+		b.logger.Warn("leader_reply_no_message_id")
+		return false
+	}
 	env, err := b.omx.MailboxList(ctx, FromWorker, false)
 	if err != nil || !env.OK {
 		b.logger.Warn("mailbox_list_fail", "err", err)
@@ -160,7 +169,7 @@ func (b *Bridge) pushLeaderReply(ctx context.Context, messageID string) bool {
 	}
 	_ = json.Unmarshal(env.Data, &list)
 	for _, m := range list.Messages {
-		if messageID != "" && m.MessageID != messageID {
+		if m.MessageID != messageID {
 			continue
 		}
 		text := fmt.Sprintf("%s\n%s", m.FromWorker, m.Body)
@@ -171,5 +180,8 @@ func (b *Bridge) pushLeaderReply(ctx context.Context, messageID string) bool {
 		_, _ = b.omx.MailboxMarkDelivered(ctx, FromWorker, m.MessageID)
 		return true
 	}
-	return false
+	b.logger.Warn("body_fetch_miss", "message_id", messageID)
+	_, _ = b.bot.SendToSession(fmt.Sprintf("%s\n[body unavailable]", LeaderWorker))
+	_, _ = b.omx.MailboxMarkDelivered(ctx, FromWorker, messageID)
+	return true
 }

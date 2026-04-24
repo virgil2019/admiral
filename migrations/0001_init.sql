@@ -33,3 +33,18 @@ CREATE TABLE IF NOT EXISTS event_cursor (
   after_event_id TEXT,
   updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS tg_updates (
+  update_id INTEGER PRIMARY KEY,
+  tg_user_id INTEGER,
+  tg_chat_id INTEGER,
+  body TEXT,
+  received_at TEXT,
+  processed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS kv (
+  key TEXT PRIMARY KEY,
+  value TEXT,
+  updated_at TEXT
+);

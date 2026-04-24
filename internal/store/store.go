@@ -46,6 +46,21 @@ CREATE TABLE IF NOT EXISTS event_cursor (
   after_event_id TEXT,
   updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS tg_updates (
+  update_id INTEGER PRIMARY KEY,
+  tg_user_id INTEGER,
+  tg_chat_id INTEGER,
+  body TEXT,
+  received_at TEXT,
+  processed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS kv (
+  key TEXT PRIMARY KEY,
+  value TEXT,
+  updated_at TEXT
+);
 `
 
 type Store struct {
@@ -105,5 +120,103 @@ func (s *Store) RecordCommand(tgUserID int64, cmd, args, status, result string) 
 	`, tgUserID, cmd, args, status, result,
 		time.Now().UTC().Format(time.RFC3339),
 		time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+// InsertTGUpdate inserts a TG update row if and only if update_id is new.
+// Returns true when a new row was inserted (update is fresh), false when
+// it was already present (duplicate — drop silently).
+func (s *Store) InsertTGUpdate(updateID, tgUserID, tgChatID int64, body string) (bool, error) {
+	res, err := s.DB.Exec(`
+		INSERT OR IGNORE INTO tg_updates(update_id, tg_user_id, tg_chat_id, body, received_at)
+		VALUES(?, ?, ?, ?, ?)
+	`, updateID, tgUserID, tgChatID, body, time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// MarkTGUpdateProcessed + RecordOutboundMessage atomically: same tx.
+func (s *Store) MarkTGUpdateProcessed(updateID int64, teamMessageID, body string, tgUserID int64) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := tx.Exec(
+		`UPDATE tg_updates SET processed_at=? WHERE update_id=?`,
+		now, updateID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO messages(direction, tg_message_id, tg_user_id, team_message_id, body, created_at)
+		 VALUES('out', ?, ?, ?, ?, ?)`,
+		updateID, tgUserID, teamMessageID, body, now,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// UnprocessedTGUpdates returns all rows where processed_at IS NULL, ordered by update_id ascending.
+type PendingTGUpdate struct {
+	UpdateID int64
+	UserID   int64
+	ChatID   int64
+	Body     string
+}
+
+func (s *Store) UnprocessedTGUpdates() ([]PendingTGUpdate, error) {
+	rows, err := s.DB.Query(`
+		SELECT update_id, tg_user_id, tg_chat_id, body
+		FROM tg_updates WHERE processed_at IS NULL ORDER BY update_id ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingTGUpdate
+	for rows.Next() {
+		var p PendingTGUpdate
+		if err := rows.Scan(&p.UpdateID, &p.UserID, &p.ChatID, &p.Body); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// MarkTGUpdateDone marks an update processed without writing a messages row
+// (used for command-only updates or non-deliverable failures we don't want to retry).
+func (s *Store) MarkTGUpdateDone(updateID int64) error {
+	_, err := s.DB.Exec(
+		`UPDATE tg_updates SET processed_at=? WHERE update_id=?`,
+		time.Now().UTC().Format(time.RFC3339), updateID,
+	)
+	return err
+}
+
+// KVGet / KVSet — simple string kv store used for wall-clock markers like last_successful_poll_at.
+func (s *Store) KVGet(key string) (string, error) {
+	var v string
+	err := s.DB.QueryRow(`SELECT value FROM kv WHERE key=?`, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return v, err
+}
+
+func (s *Store) KVSet(key, value string) error {
+	_, err := s.DB.Exec(`
+		INSERT INTO kv(key, value, updated_at) VALUES(?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+	`, key, value, time.Now().UTC().Format(time.RFC3339))
 	return err
 }

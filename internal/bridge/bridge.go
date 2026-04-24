@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -20,6 +21,9 @@ import (
 const (
 	FromWorker   = "tg-bridge"
 	LeaderWorker = "leader-fixed"
+
+	kvLastPoll         = "last_successful_poll_at"
+	kvLastWakeWarnedAt = "last_wake_warned_at"
 )
 
 type Bridge struct {
@@ -34,31 +38,41 @@ type Bridge struct {
 	eventRunning bool
 	eventCancel  context.CancelFunc
 	lastIdlePush time.Time
+
+	wrongChatReported map[int64]bool
 }
 
 func New(cfg *config.Config, bot *tg.Bot, omxClient *omx.Client, db *store.Store, logger *slog.Logger) *Bridge {
 	return &Bridge{
-		cfg:    cfg,
-		logger: logger,
-		bot:    bot,
-		omx:    omxClient,
-		db:     db,
-		wl:     NewWhitelist(cfg.AllowedTGUserIDs, cfg.Session.TGChatID),
+		cfg:               cfg,
+		logger:            logger,
+		bot:               bot,
+		omx:               omxClient,
+		db:                db,
+		wl:                NewWhitelist(cfg.AllowedTGUserIDs, cfg.Session.TGChatID),
+		wrongChatReported: map[int64]bool{},
 	}
 }
 
 func (b *Bridge) Run(ctx context.Context) error {
-	// If a cursor already exists, the team was previously up — resume event loop.
-	cur, err := b.db.GetCursor(b.cfg.Session.TeamName)
-	if err != nil {
-		b.logger.Error("cursor read failed", "err", err)
-	}
-	if cur != "" {
-		b.startEventLoop(ctx)
+	// G6: wall-clock wake check before we start polling.
+	b.maybeWarnAfterWake(ctx)
+
+	// G1: process any unprocessed TG updates persisted before the previous crash.
+	b.drainPending(ctx)
+
+	// If a cursor already exists AND the team is still up, resume event loop.
+	// If cursor exists but team is gone, do NOT hammer a dead team.
+	if cur, err := b.db.GetCursor(b.cfg.Session.TeamName); err == nil && cur != "" {
+		if env, err := b.omx.GetSummary(ctx); err == nil && env.OK {
+			b.startEventLoop(ctx)
+		} else {
+			b.logger.Info("cursor present but team not running — waiting for /start",
+				"team", b.cfg.Session.TeamName)
+		}
 	}
 
 	updates := b.bot.Updates()
-	wrongChatReported := map[int64]bool{}
 
 	for {
 		select {
@@ -69,31 +83,67 @@ func (b *Bridge) Run(ctx context.Context) error {
 			if !ok {
 				return fmt.Errorf("tg updates channel closed")
 			}
+			_ = b.db.KVSet(kvLastPoll, time.Now().UTC().Format(time.RFC3339))
 			if upd.Message == nil {
 				continue
 			}
-			msg := upd.Message
-			gate := b.wl.Check(msg.From.ID, msg.Chat.ID)
-			switch gate {
-			case GateRejectUser:
-				b.logger.Warn("whitelist_reject", "user_id", msg.From.ID, "chat_id", msg.Chat.ID)
-				continue
-			case GateRejectChat:
-				if !wrongChatReported[msg.Chat.ID] {
-					_, _ = b.bot.Send(msg.Chat.ID, "This bridge is bound to a single chat. Not this one.")
-					wrongChatReported[msg.Chat.ID] = true
-				}
-				continue
-			}
-			b.handleMessage(ctx, msg)
+			b.ingestUpdate(ctx, upd)
 		}
 	}
 }
 
-func (b *Bridge) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
-	text := msg.Text
-	b.logger.Info("tg_in", "user_id", msg.From.ID, "len", len(text))
-	_ = b.db.RecordMessage("in", int64(msg.MessageID), msg.From.ID, "", text)
+// ingestUpdate implements G1: persist the update before processing so a
+// crash mid-send-message doesn't lose the inbound.
+func (b *Bridge) ingestUpdate(ctx context.Context, upd tgbotapi.Update) {
+	msg := upd.Message
+	gate := b.wl.Check(msg.From.ID, msg.Chat.ID)
+	switch gate {
+	case GateRejectUser:
+		b.logger.Warn("whitelist_reject", "user_id", msg.From.ID, "chat_id", msg.Chat.ID)
+		return
+	case GateRejectChat:
+		if !b.wrongChatReported[msg.Chat.ID] {
+			_, _ = b.bot.Send(msg.Chat.ID, "This bridge is bound to a single chat. Not this one.")
+			b.wrongChatReported[msg.Chat.ID] = true
+		}
+		return
+	}
+
+	fresh, err := b.db.InsertTGUpdate(int64(upd.UpdateID), msg.From.ID, msg.Chat.ID, msg.Text)
+	if err != nil {
+		b.logger.Error("tg_update_persist_failed", "err", err)
+		return
+	}
+	if !fresh {
+		b.logger.Info("tg_update_dedupe", "update_id", upd.UpdateID)
+		return
+	}
+	_ = b.db.RecordMessage("in", int64(msg.MessageID), msg.From.ID, "", msg.Text)
+	b.processUpdate(ctx, int64(upd.UpdateID), msg.From.ID, msg.Chat.ID, msg.Text, int64(msg.MessageID))
+}
+
+// drainPending processes rows written by an earlier daemon run that died
+// before calling send-message.
+func (b *Bridge) drainPending(ctx context.Context) {
+	rows, err := b.db.UnprocessedTGUpdates()
+	if err != nil {
+		b.logger.Error("drain_pending_query_failed", "err", err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	b.logger.Info("draining_pending_tg_updates", "count", len(rows))
+	for _, r := range rows {
+		b.processUpdate(ctx, r.UpdateID, r.UserID, r.ChatID, r.Body, 0)
+	}
+}
+
+// processUpdate dispatches an already-persisted update. On success (or
+// terminal failure the user was told about), marks the row processed.
+func (b *Bridge) processUpdate(ctx context.Context, updateID, userID, chatID int64, text string, tgMessageID int64) {
+	text = strings.TrimRight(text, "\r\n")
+	b.logger.Info("tg_in", "user_id", userID, "update_id", updateID, "len", len(text))
 
 	if strings.HasPrefix(text, "/") {
 		parts := strings.SplitN(text, " ", 2)
@@ -102,33 +152,35 @@ func (b *Bridge) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		if len(parts) > 1 {
 			args = parts[1]
 		}
-		b.handleCommand(ctx, msg, cmd, args)
+		b.handleCommand(ctx, userID, chatID, cmd, args)
+		_ = b.db.RecordCommand(userID, cmd, args, "done", "")
+		_ = b.db.MarkTGUpdateDone(updateID)
 		return
 	}
-	b.handlePlainText(ctx, msg, text)
+	b.handlePlainText(ctx, updateID, userID, tgMessageID, text)
 }
 
-func (b *Bridge) handleCommand(ctx context.Context, msg *tgbotapi.Message, cmd, args string) {
+func (b *Bridge) handleCommand(ctx context.Context, userID, chatID int64, cmd, args string) {
 	switch cmd {
 	case "/start":
-		b.cmdStart(ctx, msg)
+		b.cmdStart(ctx)
 	case "/status":
-		b.cmdStatus(ctx, msg)
+		b.cmdStatus(ctx)
 	case "/stop":
-		b.cmdStop(ctx, msg)
+		b.cmdStop(ctx)
 	case "/help":
 		_, _ = b.bot.SendToSession(helpText())
 	case "/whoami":
 		_, _ = b.bot.SendToSession(fmt.Sprintf(
 			"tg_user_id=%d chat_id=%d team=%s cwd=%s",
-			msg.From.ID, msg.Chat.ID, b.cfg.Session.TeamName, b.cfg.Session.CWD,
+			userID, chatID, b.cfg.Session.TeamName, b.cfg.Session.CWD,
 		))
 	case "/cancel":
 		_, _ = b.bot.SendToSession("No long-running bridge operation to cancel.")
 	default:
 		_, _ = b.bot.SendToSession(fmt.Sprintf("Unknown command: %s. Try /help.", cmd))
 	}
-	_ = b.db.RecordCommand(msg.From.ID, cmd, args, "done", "")
+	_ = args
 }
 
 func helpText() string {
@@ -143,8 +195,7 @@ func helpText() string {
 	}, "\n")
 }
 
-func (b *Bridge) cmdStart(ctx context.Context, msg *tgbotapi.Message) {
-	// Pre-check running state via get-summary.
+func (b *Bridge) cmdStart(ctx context.Context) {
 	env, err := b.omx.GetSummary(ctx)
 	if err == nil && env.OK {
 		_, _ = b.bot.SendToSession(fmt.Sprintf("Team %s is already running.", b.cfg.Session.TeamName))
@@ -152,7 +203,22 @@ func (b *Bridge) cmdStart(ctx context.Context, msg *tgbotapi.Message) {
 		return
 	}
 	_, _ = b.bot.SendToSession(fmt.Sprintf("Launching omx team %s...\n(will report when leader is up)", b.cfg.Session.TeamName))
-	if err := b.omx.Launch(ctx); err != nil {
+
+	mode := omx.LaunchMode(b.cfg.Launch.Mode)
+	if mode == omx.LaunchPty {
+		b.logger.Warn("launch.mode=pty using_script_wrapper",
+			"pty_command", b.cfg.Launch.PtyCommand,
+			"team", b.cfg.Session.TeamName)
+	}
+	err = b.omx.Launch(ctx, mode, b.cfg.Launch.PtyCommand)
+	if err != nil {
+		if errors.Is(err, omx.ErrLaunchNeedsTTY) {
+			_, _ = b.bot.SendToSession(
+				"Launch failed: omx requires a TTY. Set launch.mode: pty in config, " +
+					"or run \"omx launch " + b.cfg.Session.TeamName + "\" from a terminal on the Mac yourself, then use /status here.")
+			b.logger.Error("launch_needs_tty_direct_mode")
+			return
+		}
 		b.logger.Error("launch failed", "err", err)
 		_, _ = b.bot.SendToSession(fmt.Sprintf("Launch failed: %s", shortErr(err)))
 		return
@@ -161,7 +227,7 @@ func (b *Bridge) cmdStart(ctx context.Context, msg *tgbotapi.Message) {
 	b.startEventLoop(ctx)
 }
 
-func (b *Bridge) cmdStatus(ctx context.Context, msg *tgbotapi.Message) {
+func (b *Bridge) cmdStatus(ctx context.Context) {
 	env, err := b.omx.GetSummary(ctx)
 	if err != nil {
 		_, _ = b.bot.SendToSession(fmt.Sprintf("Status error: %s", shortErr(err)))
@@ -173,18 +239,28 @@ func (b *Bridge) cmdStatus(ctx context.Context, msg *tgbotapi.Message) {
 	}
 	reply := formatSummary(b.cfg.Session.TeamName, env.Data)
 
-	idle, err := b.omx.ReadIdleState(ctx)
-	if err == nil && idle.OK {
-		var idleData struct {
-			AllWorkersIdle bool `json:"all_workers_idle"`
+	// Swap to read-stall-state per product ruling G4(2).
+	stall, err := b.omx.ReadStallState(ctx)
+	if err == nil && stall.OK {
+		var stallData struct {
+			TeamStalled bool     `json:"team_stalled"`
+			Reasons     []string `json:"reasons"`
 		}
-		_ = json.Unmarshal(idle.Data, &idleData)
-		reply += fmt.Sprintf("\n  all_idle: %s", yesNo(idleData.AllWorkersIdle))
+		_ = json.Unmarshal(stall.Data, &stallData)
+		line := fmt.Sprintf("\n  stalled: %s", yesNo(stallData.TeamStalled))
+		if stallData.TeamStalled && len(stallData.Reasons) > 0 {
+			joined := strings.Join(stallData.Reasons, ",")
+			if len(joined) > 120 {
+				joined = joined[:117] + "..."
+			}
+			line += " (" + joined + ")"
+		}
+		reply += line
 	}
 	_, _ = b.bot.SendToSession(reply)
 }
 
-func (b *Bridge) cmdStop(ctx context.Context, msg *tgbotapi.Message) {
+func (b *Bridge) cmdStop(ctx context.Context) {
 	env, err := b.omx.WriteShutdownRequest(ctx, LeaderWorker, FromWorker)
 	if err != nil || !env.OK {
 		if env != nil && env.Error != nil && env.Error.Code == "team_not_found" {
@@ -216,10 +292,11 @@ func (b *Bridge) cmdStop(ctx context.Context, msg *tgbotapi.Message) {
 		case <-time.After(1 * time.Second):
 		}
 	}
+	// Per G7: keep event loop running so any late shutdown_ack event still pushes.
 	_, _ = b.bot.SendToSession("Shutdown request sent; ack not seen in 30s — check the Mac.")
 }
 
-func (b *Bridge) handlePlainText(ctx context.Context, msg *tgbotapi.Message, text string) {
+func (b *Bridge) handlePlainText(ctx context.Context, updateID, userID, tgMessageID int64, text string) {
 	env, err := b.omx.SendMessage(ctx, omx.SendMessageInput{
 		FromWorker: FromWorker,
 		ToWorker:   LeaderWorker,
@@ -227,14 +304,16 @@ func (b *Bridge) handlePlainText(ctx context.Context, msg *tgbotapi.Message, tex
 	})
 	if err != nil {
 		_, _ = b.bot.SendToSession(fmt.Sprintf("Could not deliver: %s", shortErr(err)))
+		_ = b.db.MarkTGUpdateDone(updateID)
 		return
 	}
 	if !env.OK {
 		if env.Error != nil && env.Error.Code == "team_not_found" {
 			_, _ = b.bot.SendToSession(fmt.Sprintf("Team %s is not running. Use /start.", b.cfg.Session.TeamName))
-			return
+		} else {
+			_, _ = b.bot.SendToSession(fmt.Sprintf("Could not deliver: %s", env.Error.ErrorString()))
 		}
-		_, _ = b.bot.SendToSession(fmt.Sprintf("Could not deliver: %s", env.Error.ErrorString()))
+		_ = b.db.MarkTGUpdateDone(updateID)
 		return
 	}
 	var data struct {
@@ -243,8 +322,38 @@ func (b *Bridge) handlePlainText(ctx context.Context, msg *tgbotapi.Message, tex
 		} `json:"message"`
 	}
 	_ = json.Unmarshal(env.Data, &data)
-	_ = b.db.RecordMessage("out", int64(msg.MessageID), msg.From.ID, data.Message.MessageID, text)
+	// G1 transactional: mark processed + record outbound message in same tx.
+	if err := b.db.MarkTGUpdateProcessed(updateID, data.Message.MessageID, text, userID); err != nil {
+		b.logger.Error("mark_processed_failed", "err", err, "update_id", updateID)
+	}
 	b.startEventLoop(ctx)
+}
+
+// maybeWarnAfterWake implements G6: on boot, if last successful poll was
+// more than 23h ago, push a one-time "Bridge woke after <d>" notice, then
+// suppress re-push for 1h.
+func (b *Bridge) maybeWarnAfterWake(ctx context.Context) {
+	_ = ctx
+	last, _ := b.db.KVGet(kvLastPoll)
+	if last == "" {
+		return
+	}
+	lastT, err := time.Parse(time.RFC3339, last)
+	if err != nil {
+		return
+	}
+	gap := time.Since(lastT)
+	if gap < 23*time.Hour {
+		return
+	}
+	lastWarn, _ := b.db.KVGet(kvLastWakeWarnedAt)
+	if lastWarn != "" {
+		if wt, err := time.Parse(time.RFC3339, lastWarn); err == nil && time.Since(wt) < time.Hour {
+			return
+		}
+	}
+	_, _ = b.bot.SendToSession(fmt.Sprintf("Bridge woke after %s; some older updates may have been dropped by Telegram.", gap.Round(time.Minute)))
+	_ = b.db.KVSet(kvLastWakeWarnedAt, time.Now().UTC().Format(time.RFC3339))
 }
 
 func formatSummary(teamName string, data json.RawMessage) string {

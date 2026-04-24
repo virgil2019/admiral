@@ -48,14 +48,50 @@ go run ./cmd/omx-bridge --config /path/to/config.yaml
 | `/whoami` | Print identity |
 | plain text | Forwarded to team leader as a mailbox message |
 
+## Launch modes (config: `launch.mode`)
+
+- **`pty`** (default on macOS). The bridge prepends `launch.pty_command`
+  (default `/usr/bin/script -q /dev/null`) to `omx launch <team>` so omx
+  sees a real terminal. Logs a `WARN launch.mode=pty using_script_wrapper`
+  line on every `/start`.
+- **`direct`** (default elsewhere). No wrapper. If omx exits with the
+  "stdin is not a terminal" error, the bridge replies with instructions to
+  either flip `launch.mode: pty` or pre-launch from a terminal, and keeps
+  the daemon running so `/status` still works.
+
+`launch.pty_command` is user-configurable — override if you need a different
+PTY wrapper (Linux `script` has different flag semantics).
+
+## Event loop lifecycle
+
+The push goroutine starts when any of: `/start` succeeds; a plain-text
+message is sent successfully; or at boot if a cursor is persisted in SQLite
+AND `get-summary` confirms the team is still up. Boot with a non-empty
+cursor but a missing team does **not** start the loop — the bridge waits
+for `/start`.
+
+## Inbound delivery guarantee
+
+At-least-once. Dedupe key is the Telegram `update_id`. Every inbound update
+is persisted to `tg_updates (update_id PRIMARY KEY)` with `INSERT OR IGNORE`
+before processing, and marked processed in the same transaction as the
+outbound `messages` row. A bridge crash between persist and `send-message`
+is recovered on next boot — pending rows are drained before the long-poll
+resumes.
+
+## Mac sleep / wake > 23h
+
+On every successful long-poll, the bridge persists `last_successful_poll_at`.
+On boot (or after any gap), if the gap exceeds 23h (safety margin under
+TG's 24h retention window), a one-time `Bridge woke after <duration>; some
+older updates may have been dropped by Telegram.` is pushed. Re-push is
+suppressed for 1h to avoid spam on crash loops.
+
 ## Spec deviations
 
-- **`omx team api --cwd` flag does not exist.** The bridge sets its own
-  `exec.Cmd.Dir` to `session.cwd` instead. Functionally equivalent.
-- **`omx launch` refuses to run without a TTY.** The bridge wraps launches
-  with `/usr/bin/script -q /dev/null omx launch <team>` to provide a PTY.
-  This is macOS-specific; Linux would need `script -q -c '...' /dev/null`.
-  Documented here instead of extending scope.
+- **`omx team api --cwd` flag does not exist.** The bridge sets
+  `exec.Cmd.Dir = session.cwd` on every shell-out. Functionally equivalent.
+- **`omx launch` requires a TTY.** Handled via `launch.mode` — see above.
 
 ## Tests
 
@@ -63,12 +99,16 @@ go run ./cmd/omx-bridge --config /path/to/config.yaml
 go test ./...
 ```
 
-Included tests cover whitelist filtering (`internal/bridge`) and omx envelope
-parsing (`internal/omx`). Broader integration testing against a live omx
-team is manual per the acceptance criteria in the spec (task #5e39499c).
+Tests cover: whitelist filtering (`internal/bridge`), omx envelope parsing
+(`internal/omx`), TG update dedupe + transactional processing + KV store
+(`internal/store`). End-to-end acceptance criteria require a live TG bot
+token plus omx team and are manual (spec §7).
 
 ## Not in v0.1
 
 Multi-session, VPS deploy, webhook mode, Linear/GitHub integration, TG
 inline-keyboard approvals, attachments, voice, `/cancel` semantics, metrics,
-rich formatting. See spec §8.
+rich formatting, hot config reload (SIGHUP / file-watch), `/cleanup` or any
+TG-exposed team-cleanup path, inbound exactly-once semantics, a proper
+non-TTY launch path (pending upstream omx fix or a `--no-tty` flag). See
+spec §8 and product addenda on #5e39499c comment `4865398c`.

@@ -7,6 +7,14 @@ session:
   cwd: "/Users/georgehuang/Program/vibe-project"
   omx_bin_path: "/usr/local/bin/omx"
 
+launch:
+  # "pty" | "direct". Default: "pty" on macOS, "direct" elsewhere.
+  # Use "direct" if you pre-launched the team from a real terminal and want
+  # the bridge to fail loudly instead of wrapping omx in `script`.
+  mode: "pty"
+  # Only used when mode=pty. Prepended to `omx launch <team>`.
+  pty_command: ["/usr/bin/script", "-q", "/dev/null"]
+
 storage:
   sqlite_path: "~/.local/share/omx-bridge/bridge.db"
 

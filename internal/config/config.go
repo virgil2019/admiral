@@ -4,19 +4,26 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	BotToken          string      `yaml:"bot_token"`
-	AllowedTGUserIDs  []int64     `yaml:"allowed_tg_user_ids"`
-	Session           Session     `yaml:"session"`
-	Storage           Storage     `yaml:"storage"`
-	Telegram          Telegram    `yaml:"telegram"`
-	EventStream       EventStream `yaml:"event_stream"`
-	Logging           Logging     `yaml:"logging"`
+	BotToken         string      `yaml:"bot_token"`
+	AllowedTGUserIDs []int64     `yaml:"allowed_tg_user_ids"`
+	Session          Session     `yaml:"session"`
+	Launch           Launch      `yaml:"launch"`
+	Storage          Storage     `yaml:"storage"`
+	Telegram         Telegram    `yaml:"telegram"`
+	EventStream      EventStream `yaml:"event_stream"`
+	Logging          Logging     `yaml:"logging"`
+}
+
+type Launch struct {
+	Mode       string   `yaml:"mode"`
+	PtyCommand []string `yaml:"pty_command"`
 }
 
 type Session struct {
@@ -99,6 +106,21 @@ func (c *Config) validateAndExpand() error {
 	}
 	if c.Logging.Level == "" {
 		c.Logging.Level = "info"
+	}
+
+	switch c.Launch.Mode {
+	case "":
+		if runtime.GOOS == "darwin" {
+			c.Launch.Mode = "pty"
+		} else {
+			c.Launch.Mode = "direct"
+		}
+	case "pty", "direct":
+	default:
+		return fmt.Errorf("launch.mode must be 'pty' or 'direct' (got %q)", c.Launch.Mode)
+	}
+	if c.Launch.Mode == "pty" && len(c.Launch.PtyCommand) == 0 {
+		c.Launch.PtyCommand = []string{"/usr/bin/script", "-q", "/dev/null"}
 	}
 
 	if _, err := os.Stat(c.Session.OmxBinPath); err != nil {

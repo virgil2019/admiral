@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -87,17 +88,45 @@ func trimTail(b []byte) string {
 	return s
 }
 
-// Launch shells out `omx launch <team>` using `script` to provide a PTY,
-// since the omx launcher refuses to run without a terminal. This is a
-// spec deviation documented in README / task comment.
-func (c *Client) Launch(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "/usr/bin/script", "-q", "/dev/null",
-		c.BinPath, "launch", c.TeamName)
+// ErrLaunchNeedsTTY is returned by Launch when mode=direct and omx exits
+// with the "stdin is not a terminal" error.
+var ErrLaunchNeedsTTY = errors.New("omx requires a TTY")
+
+type LaunchMode string
+
+const (
+	LaunchDirect LaunchMode = "direct"
+	LaunchPty    LaunchMode = "pty"
+)
+
+// Launch shells out `omx launch <team>`. In "pty" mode, ptyCommand (e.g.
+// ["/usr/bin/script","-q","/dev/null"]) is prepended to the argv so omx
+// sees a TTY. In "direct" mode, no wrapper is used — if omx exits with a
+// TTY-required error, ErrLaunchNeedsTTY is returned.
+func (c *Client) Launch(ctx context.Context, mode LaunchMode, ptyCommand []string) error {
+	var cmd *exec.Cmd
+	switch mode {
+	case LaunchPty:
+		if len(ptyCommand) == 0 {
+			return fmt.Errorf("pty launch: pty_command is empty")
+		}
+		args := append([]string{}, ptyCommand[1:]...)
+		args = append(args, c.BinPath, "launch", c.TeamName)
+		cmd = exec.CommandContext(ctx, ptyCommand[0], args...)
+	case LaunchDirect:
+		cmd = exec.CommandContext(ctx, c.BinPath, "launch", c.TeamName)
+	default:
+		return fmt.Errorf("unknown launch mode %q", mode)
+	}
 	cmd.Dir = c.CWD
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("launch failed: %w (stderr=%s)", err, trimTail(stderr.Bytes()))
+		tail := trimTail(stderr.Bytes())
+		if strings.Contains(tail, "stdin is not a terminal") {
+			return ErrLaunchNeedsTTY
+		}
+		return fmt.Errorf("launch failed: %w (stderr=%s)", err, tail)
 	}
 	return nil
 }
@@ -127,6 +156,10 @@ func (c *Client) GetSummary(ctx context.Context) (*Envelope, error) {
 
 func (c *Client) ReadIdleState(ctx context.Context) (*Envelope, error) {
 	return c.API(ctx, "read-idle-state", nil)
+}
+
+func (c *Client) ReadStallState(ctx context.Context) (*Envelope, error) {
+	return c.API(ctx, "read-stall-state", nil)
 }
 
 type SendMessageInput struct {

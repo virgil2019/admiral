@@ -1,0 +1,96 @@
+package store
+
+import (
+	"path/filepath"
+	"testing"
+)
+
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+func TestInsertTGUpdate_DedupeByUpdateID(t *testing.T) {
+	s := newTestStore(t)
+
+	fresh, err := s.InsertTGUpdate(100, 1, 2, "hello")
+	if err != nil || !fresh {
+		t.Fatalf("first insert: fresh=%v err=%v", fresh, err)
+	}
+	fresh, err = s.InsertTGUpdate(100, 1, 2, "hello")
+	if err != nil || fresh {
+		t.Fatalf("second insert (same update_id) should be fresh=false; got fresh=%v err=%v", fresh, err)
+	}
+	fresh, err = s.InsertTGUpdate(101, 1, 2, "world")
+	if err != nil || !fresh {
+		t.Fatalf("different update_id must be fresh; got fresh=%v err=%v", fresh, err)
+	}
+}
+
+func TestUnprocessedTGUpdates_OrderedByUpdateID(t *testing.T) {
+	s := newTestStore(t)
+	for _, id := range []int64{42, 10, 99} {
+		if _, err := s.InsertTGUpdate(id, 1, 2, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.MarkTGUpdateDone(10); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.UnprocessedTGUpdates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 || pending[0].UpdateID != 42 || pending[1].UpdateID != 99 {
+		t.Fatalf("expected [42, 99] unprocessed, got %+v", pending)
+	}
+}
+
+func TestMarkTGUpdateProcessed_Transactional(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.InsertTGUpdate(7, 11, 22, "msg"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkTGUpdateProcessed(7, "team-msg-1", "msg", 11); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.UnprocessedTGUpdates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("expected no unprocessed; got %+v", pending)
+	}
+	var count int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM messages WHERE team_message_id='team-msg-1'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 messages row; got %d", count)
+	}
+}
+
+func TestKV_RoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	if v, _ := s.KVGet("missing"); v != "" {
+		t.Fatalf("expected empty for missing key, got %q", v)
+	}
+	if err := s.KVSet("k1", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := s.KVGet("k1"); v != "v1" {
+		t.Fatalf("expected v1, got %q", v)
+	}
+	if err := s.KVSet("k1", "v2"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := s.KVGet("k1"); v != "v2" {
+		t.Fatalf("expected v2 on upsert, got %q", v)
+	}
+}
