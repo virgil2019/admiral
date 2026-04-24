@@ -72,6 +72,16 @@ func (b *Bridge) Run(ctx context.Context) error {
 		}
 	}
 
+	// N4: heartbeat writer so kvLastPoll reflects long-poll health regardless
+	// of incoming message volume. Without this, an idle whitelisted user +
+	// restart after 24h would falsely trigger the wake-warn. Writes every 5m.
+	heartbeatStop := make(chan struct{})
+	defer close(heartbeatStop)
+	go b.heartbeat(heartbeatStop)
+
+	// Initial heartbeat so a fresh daemon doesn't appear "stale" to itself.
+	_ = b.db.KVSet(kvLastPoll, time.Now().UTC().Format(time.RFC3339))
+
 	updates := b.bot.Updates()
 
 	for {
@@ -88,6 +98,19 @@ func (b *Bridge) Run(ctx context.Context) error {
 				continue
 			}
 			b.ingestUpdate(ctx, upd)
+		}
+	}
+}
+
+func (b *Bridge) heartbeat(stop <-chan struct{}) {
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			_ = b.db.KVSet(kvLastPoll, time.Now().UTC().Format(time.RFC3339))
 		}
 	}
 }
@@ -305,11 +328,19 @@ func (b *Bridge) handlePlainText(ctx context.Context, updateID, userID, tgMessag
 		Body:       text,
 	})
 	if err != nil {
+		// N1: omx CLI exec / transport failure is transient. Tell the user
+		// we couldn't deliver right now, but leave the tg_updates row
+		// unprocessed so the next boot's drainPending retries it. Avoids
+		// losing inbound when the bridge crashes mid-send.
 		_, _ = b.bot.SendToSession(fmt.Sprintf("Could not deliver: %s", shortErr(err)))
-		_ = b.db.MarkTGUpdateDone(updateID)
+		b.logger.Warn("send_message_transient_leaving_unprocessed",
+			"update_id", updateID, "err", err)
 		return
 	}
 	if !env.OK {
+		// Non-OK envelope from omx is terminal for this message — mark done
+		// so we don't loop retrying a team-not-found / malformed input / etc.
+		// User gets a single notification; manual /start or retry is on them.
 		if env.Error != nil && env.Error.Code == "team_not_found" {
 			_, _ = b.bot.SendToSession(fmt.Sprintf("Team %s is not running. Use /start.", b.cfg.Session.TeamName))
 		} else {
