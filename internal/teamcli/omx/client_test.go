@@ -46,3 +46,11 @@ func TestParseEnvelope_BadJSON(t *testing.T) {
 		t.Fatal("expected parse error")
 	}
 }
+
+func TestCaps(t *testing.T) {
+	c := New("/bin/true", "/tmp", "t")
+	caps := c.Caps()
+	if !caps.SupportsAwaitEvent || !caps.SupportsIdleState || !caps.SupportsStallState {
+		t.Fatalf("omx should support all caps, got %+v", caps)
+	}
+}

@@ -12,27 +12,28 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
-	"github.com/georgehuang/omx-bridge/internal/config"
-	"github.com/georgehuang/omx-bridge/internal/omx"
-	"github.com/georgehuang/omx-bridge/internal/store"
-	"github.com/georgehuang/omx-bridge/internal/tg"
+	"github.com/georgehuang/admiral/internal/config"
+	"github.com/georgehuang/admiral/internal/store"
+	"github.com/georgehuang/admiral/internal/teamcli"
+	"github.com/georgehuang/admiral/internal/tg"
 )
 
 const (
-	FromWorker   = "tg-bridge"
-	LeaderWorker = "leader-fixed"
+	FromWorker = "tg-bridge"
 
 	kvLastPoll         = "last_successful_poll_at"
 	kvLastWakeWarnedAt = "last_wake_warned_at"
 )
 
 type Bridge struct {
-	cfg    *config.Config
-	logger *slog.Logger
-	bot    *tg.Bot
-	omx    *omx.Client
-	db     *store.Store
-	wl     *Whitelist
+	cfg          *config.Config
+	logger       *slog.Logger
+	bot          *tg.Bot
+	omx          teamcli.Provider
+	caps         teamcli.Capabilities
+	leaderWorker string
+	db           *store.Store
+	wl           *Whitelist
 
 	eventMu      sync.Mutex
 	eventRunning bool
@@ -42,12 +43,14 @@ type Bridge struct {
 	wrongChatReported map[int64]bool
 }
 
-func New(cfg *config.Config, bot *tg.Bot, omxClient *omx.Client, db *store.Store, logger *slog.Logger) *Bridge {
+func New(cfg *config.Config, bot *tg.Bot, provider teamcli.Provider, db *store.Store, logger *slog.Logger) *Bridge {
 	return &Bridge{
 		cfg:               cfg,
 		logger:            logger,
 		bot:               bot,
-		omx:               omxClient,
+		omx:               provider,
+		caps:              provider.Caps(),
+		leaderWorker:      cfg.Session.LeaderWorker,
 		db:                db,
 		wl:                NewWhitelist(cfg.AllowedTGUserIDs, cfg.Session.TGChatID),
 		wrongChatReported: map[int64]bool{},
@@ -210,7 +213,7 @@ func (b *Bridge) handleCommand(ctx context.Context, userID, chatID int64, cmd, a
 
 func helpText() string {
 	return strings.Join([]string{
-		"omx-bridge commands:",
+		"admiral commands:",
 		"/start  — launch the omx team",
 		"/status — show team summary",
 		"/stop   — shut down the team",
@@ -229,18 +232,24 @@ func (b *Bridge) cmdStart(ctx context.Context) {
 	}
 	_, _ = b.bot.SendToSession(fmt.Sprintf("Launching omx team %s...\n(will report when leader is up)", b.cfg.Session.TeamName))
 
-	mode := omx.LaunchMode(b.cfg.Launch.Mode)
-	if mode == omx.LaunchPty {
+	mode := teamcli.LaunchMode(b.cfg.Launch.Mode)
+	if mode == teamcli.LaunchPty {
 		b.logger.Warn("launch.mode=pty using_script_wrapper",
 			"pty_command", b.cfg.Launch.PtyCommand,
 			"team", b.cfg.Session.TeamName)
 	}
-	err = b.omx.Launch(ctx, mode, b.cfg.Launch.PtyCommand)
+	spec := teamcli.LaunchSpec{
+		WorkerCount: b.cfg.Launch.WorkerCount,
+		AgentType:   b.cfg.Launch.AgentType,
+		Task:        b.cfg.Launch.BootstrapTask,
+	}
+	err = b.omx.Launch(ctx, mode, b.cfg.Launch.PtyCommand, spec)
 	if err != nil {
-		if errors.Is(err, omx.ErrLaunchNeedsTTY) {
-			_, _ = b.bot.SendToSession(
-				"Launch failed: omx requires a TTY. Set launch.mode: pty in config, " +
-					"or run \"omx launch " + b.cfg.Session.TeamName + "\" from a terminal on the Mac yourself, then use /status here.")
+		if errors.Is(err, teamcli.ErrLaunchNeedsTTY) {
+			_, _ = b.bot.SendToSession(fmt.Sprintf(
+				"Launch failed: omx requires a TTY. Set launch.mode: pty in config, "+
+					"or run `omx team %d:%s %q` from a terminal on the Mac yourself, then use /status here.",
+				spec.WorkerCount, spec.AgentType, spec.Task))
 			b.logger.Error("launch_needs_tty_direct_mode")
 			return
 		}
@@ -248,7 +257,26 @@ func (b *Bridge) cmdStart(ctx context.Context) {
 		_, _ = b.bot.SendToSession(fmt.Sprintf("Launch failed: %s", shortErr(err)))
 		return
 	}
-	_, _ = b.bot.SendToSession(fmt.Sprintf("Team %s is up.", b.cfg.Session.TeamName))
+
+	// Poll get-summary until team is up (bounded 60s). omx team-launch
+	// returns once tmux panes are spawned; state may lag a second or two.
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		env, err := b.omx.GetSummary(ctx)
+		if err == nil && env.OK {
+			_, _ = b.bot.SendToSession(fmt.Sprintf("Team %s is up.", b.cfg.Session.TeamName))
+			b.startEventLoop(ctx)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+	_, _ = b.bot.SendToSession(fmt.Sprintf(
+		"Team %s launch returned OK but get-summary did not confirm within 60s — check `omx team status %s` on the Mac.",
+		b.cfg.Session.TeamName, b.cfg.Session.TeamName))
 	b.startEventLoop(ctx)
 }
 
@@ -264,7 +292,12 @@ func (b *Bridge) cmdStatus(ctx context.Context) {
 	}
 	reply := formatSummary(b.cfg.Session.TeamName, env.Data)
 
-	// Swap to read-stall-state per product ruling G4(2).
+	// Swap to read-stall-state per product ruling G4(2). Capability-gated:
+	// omc does not expose this endpoint and the line is omitted.
+	if !b.caps.SupportsStallState {
+		_, _ = b.bot.SendToSession(reply)
+		return
+	}
 	stall, err := b.omx.ReadStallState(ctx)
 	if err == nil && stall.OK {
 		var stallData struct {
@@ -286,7 +319,7 @@ func (b *Bridge) cmdStatus(ctx context.Context) {
 }
 
 func (b *Bridge) cmdStop(ctx context.Context) {
-	env, err := b.omx.WriteShutdownRequest(ctx, LeaderWorker, FromWorker)
+	env, err := b.omx.WriteShutdownRequest(ctx, b.leaderWorker, FromWorker)
 	if err != nil || !env.OK {
 		if env != nil && env.Error != nil && env.Error.Code == "team_not_found" {
 			_, _ = b.bot.SendToSession(fmt.Sprintf("Team %s is not running.", b.cfg.Session.TeamName))
@@ -299,7 +332,7 @@ func (b *Bridge) cmdStop(ctx context.Context) {
 
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		ack, err := b.omx.ReadShutdownAck(ctx, LeaderWorker)
+		ack, err := b.omx.ReadShutdownAck(ctx, b.leaderWorker)
 		if err == nil && ack.OK {
 			var ackData struct {
 				Ack map[string]any `json:"ack"`
@@ -322,10 +355,14 @@ func (b *Bridge) cmdStop(ctx context.Context) {
 }
 
 func (b *Bridge) handlePlainText(ctx context.Context, updateID, userID, tgMessageID int64, text string) {
-	env, err := b.omx.SendMessage(ctx, omx.SendMessageInput{
+	body := text
+	if b.cfg.Session.Provider == "omc" {
+		body = b.wrapForOmcReply(text)
+	}
+	env, err := b.omx.SendMessage(ctx, teamcli.SendMessageInput{
 		FromWorker: FromWorker,
-		ToWorker:   LeaderWorker,
-		Body:       text,
+		ToWorker:   b.leaderWorker,
+		Body:       body,
 	})
 	if err != nil {
 		// N1: omx CLI exec / transport failure is transient. Tell the user
@@ -387,6 +424,25 @@ func (b *Bridge) maybeWarnAfterWake(ctx context.Context) {
 	}
 	_, _ = b.bot.SendToSession(fmt.Sprintf("Bridge woke after %s; some older updates may have been dropped by Telegram.", gap.Round(time.Minute)))
 	_ = b.db.KVSet(kvLastWakeWarnedAt, time.Now().UTC().Format(time.RFC3339))
+}
+
+// wrapForOmcReply prepends explicit reply-via-API instructions to a plain-text
+// message routed at omc. Without this, claude's runtime decision to reply via
+// the send-message API vs printing in-pane is prompt-dependent — short or terse
+// user texts often get answered in the pane only and the reply never reaches
+// the tg-bridge mailbox. omx does not need this; its workers are launched with
+// dispatch hooks that handle the round-trip implicitly.
+func (b *Bridge) wrapForOmcReply(userText string) string {
+	return fmt.Sprintf(
+		"Telegram user message routed via admiral. To reply, run:\n\n"+
+			"omc team api send-message --json --input '{\"team_name\":%q,\"from_worker\":%q,\"to_worker\":%q,\"body\":\"<your reply text>\"}'\n\n"+
+			"Do not just print the answer in the pane; the user will not see it. Call the API.\n\n"+
+			"User: %s",
+		b.cfg.Session.TeamName,
+		b.leaderWorker,
+		FromWorker,
+		userText,
+	)
 }
 
 func formatSummary(teamName string, data json.RawMessage) string {

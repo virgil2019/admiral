@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/georgehuang/omx-bridge/internal/tg"
+	"github.com/georgehuang/admiral/internal/tg"
 )
 
 // routeOutcome describes how the event-loop should treat a single event
@@ -48,7 +48,17 @@ func (b *Bridge) stopEventLoop() {
 }
 
 func (b *Bridge) runEventLoop(ctx context.Context) {
-	b.logger.Info("event_loop_start", "team", b.cfg.Session.TeamName)
+	if b.caps.SupportsAwaitEvent {
+		b.runAwaitEventLoop(ctx)
+		return
+	}
+	b.runPollingLoop(ctx)
+}
+
+// runAwaitEventLoop is the omx-style long-poll loop that consumes the
+// `team api await-event` event stream and routes each event per spec §4.
+func (b *Bridge) runAwaitEventLoop(ctx context.Context) {
+	b.logger.Info("event_loop_start_await", "team", b.cfg.Session.TeamName)
 	defer b.logger.Info("event_loop_stop")
 
 	var missing int
@@ -99,6 +109,81 @@ func (b *Bridge) runEventLoop(ctx context.Context) {
 			// routeHold: cursor stays; next await-event re-delivers this event.
 		default:
 			// unknown status — do not advance cursor
+		}
+	}
+}
+
+// runPollingLoop is the omc-style fallback for providers without
+// await-event. It periodically (a) confirms team liveness via
+// get-summary, and (b) drains undelivered tg-bridge mailbox messages
+// to TG. Cursor state is unused — mailbox-mark-delivered handles
+// dedupe. omc does not synthesize task_completed / all_workers_idle
+// / approval_decision / shutdown_ack events, so those notifications
+// are not pushed under this provider.
+func (b *Bridge) runPollingLoop(ctx context.Context) {
+	b.logger.Info("event_loop_start_polling", "team", b.cfg.Session.TeamName)
+	defer b.logger.Info("event_loop_stop")
+
+	interval := time.Duration(b.cfg.EventStream.IdleBackoffMs) * time.Millisecond
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var missing int
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		summary, err := b.omx.GetSummary(ctx)
+		if err != nil {
+			b.logger.Warn("polling_summary_err", "err", err)
+			continue
+		}
+		if !summary.OK {
+			if summary.Error != nil && summary.Error.Code == "team_not_found" {
+				missing++
+				if missing >= 3 {
+					_, _ = b.bot.SendToSession(fmt.Sprintf(
+						"Team %s went down unexpectedly. Use /start to relaunch.",
+						b.cfg.Session.TeamName))
+					b.stopEventLoop()
+					return
+				}
+			}
+			continue
+		}
+		missing = 0
+
+		mb, err := b.omx.MailboxList(ctx, FromWorker, false)
+		if err != nil || !mb.OK {
+			if err != nil {
+				b.logger.Warn("polling_mailbox_err", "err", err)
+			}
+			continue
+		}
+		var list struct {
+			Messages []struct {
+				MessageID  string `json:"message_id"`
+				FromWorker string `json:"from_worker"`
+				Body       string `json:"body"`
+				Delivered  bool   `json:"delivered"`
+			} `json:"messages"`
+		}
+		_ = json.Unmarshal(mb.Data, &list)
+		for _, m := range list.Messages {
+			if m.Delivered {
+				continue
+			}
+			text := fmt.Sprintf("%s\n%s", m.FromWorker, m.Body)
+			if outcome := b.pushWithRetry(ctx, text); outcome == routeAdvance {
+				_, _ = b.omx.MailboxMarkDelivered(ctx, FromWorker, m.MessageID)
+			}
+			// routeHold: leave undelivered, next tick re-fetches.
 		}
 	}
 }
@@ -222,5 +307,5 @@ func (b *Bridge) pushLeaderReply(ctx context.Context, messageID string) routeOut
 	// message_id was never in our mailbox (e.g. a bug or stale event), marking
 	// it delivered would stamp the wrong mailbox entry or be a no-op at best.
 	b.logger.Warn("body_fetch_miss", "message_id", messageID)
-	return b.pushWithRetry(ctx, fmt.Sprintf("%s\n[body unavailable]", LeaderWorker))
+	return b.pushWithRetry(ctx, fmt.Sprintf("%s\n[body unavailable]", b.leaderWorker))
 }
