@@ -61,7 +61,7 @@ go run ./cmd/admiral --config /path/to/config.yaml
 |---|---|
 | `/start` | Launch the team (idempotent) |
 | `/status` | Team summary |
-| `/stop` | Request shutdown of team leader |
+| `/stop` | Request team shutdown (via leader mailbox) |
 | `/help` | List commands |
 | `/whoami` | Print identity |
 | plain text | Forwarded to team leader as a mailbox message |
