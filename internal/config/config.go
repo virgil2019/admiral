@@ -19,10 +19,61 @@ type Config struct {
 	Telegram         Telegram    `yaml:"telegram"`
 	EventStream      EventStream `yaml:"event_stream"`
 	Logging          Logging     `yaml:"logging"`
+	Linear           Linear      `yaml:"linear"`
+	Autopilot       Autopilot    `yaml:"autopilot"`
 
 	// Warnings collects non-fatal config notices (e.g. deprecated key
 	// usage). Populated during Load; main.go logs them after open.
 	Warnings []string `yaml:"-"`
+}
+
+// Linear holds Linear API + webhook auth. Required by the autopilot binary;
+// optional / unused by the TG bridge.
+type Linear struct {
+	// APIToken is the Linear personal API key (Authorization: <token>).
+	APIToken string `yaml:"api_token"`
+	// WebhookSecret is the signing secret configured on the Linear webhook;
+	// used to HMAC-SHA256 verify Linear-Signature on inbound POSTs.
+	WebhookSecret string `yaml:"webhook_secret"`
+	// AdmiralUserID is the Linear user UUID admiral acts on behalf of. The
+	// webhook handler only triggers on Issue.update events whose new
+	// assignee.id equals this.
+	AdmiralUserID string `yaml:"admiral_user_id"`
+	// ExecutingStateID, DoneStateID, FailedStateID are workflow state UUIDs
+	// the orchestrator sets via issueUpdate. All three are required —
+	// statuses are team-specific so we don't auto-discover.
+	ExecutingStateID string `yaml:"executing_state_id"`
+	DoneStateID      string `yaml:"done_state_id"`
+	FailedStateID    string `yaml:"failed_state_id"`
+	// APIBase overrides the Linear GraphQL endpoint. Optional; defaults to
+	// https://api.linear.app/graphql.
+	APIBase string `yaml:"api_base"`
+}
+
+// Autopilot configures the worktree + claude -p spawn path used by the
+// admiral-autopilot binary.
+type Autopilot struct {
+	// ListenAddr is the HTTP bind for the Linear webhook receiver, e.g.
+	// ":8787" or "127.0.0.1:8787". Default: ":8787".
+	ListenAddr string `yaml:"listen_addr"`
+	// RepoDir is the absolute path to the repo whose .worktrees/ directory
+	// admiral creates per-issue worktrees under. Required.
+	RepoDir string `yaml:"repo_dir"`
+	// WorktreeRoot is the directory worktrees are created beneath; relative
+	// paths resolve against RepoDir. Default: ".worktrees".
+	WorktreeRoot string `yaml:"worktree_root"`
+	// BaseBranch is the branch new worktrees are forked from. Default: "main".
+	BaseBranch string `yaml:"base_branch"`
+	// ClaudeBin is the absolute path to the `claude` CLI. Default: "claude" (PATH).
+	ClaudeBin string `yaml:"claude_bin"`
+	// AutopilotSkill is the skill name passed to claude -p (`--skill <name>` or
+	// "/<name>" prefix in the prompt). Default: empty (no skill).
+	AutopilotSkill string `yaml:"autopilot_skill"`
+	// GhBin is the absolute path to the `gh` CLI used for the PR fallback.
+	// Default: "gh" (PATH).
+	GhBin string `yaml:"gh_bin"`
+	// MaxRunSeconds caps a single claude -p invocation. Default: 1800 (30 min).
+	MaxRunSeconds int `yaml:"max_run_seconds"`
 }
 
 type Launch struct {
@@ -73,6 +124,33 @@ type Logging struct {
 }
 
 func Load(path string) (*Config, error) {
+	c, err := parse(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validateAndExpand(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// LoadAutopilot is the entry point for cmd/admiral-autopilot. It validates
+// only the linear / autopilot / storage / logging blocks; bridge-only keys
+// (bot_token, session.*, launch.*) are ignored so a single config.yaml can
+// serve both binaries OR the autopilot binary can run with a minimal config
+// that omits bridge keys entirely.
+func LoadAutopilot(path string) (*Config, error) {
+	c, err := parse(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validateAutopilotAndExpand(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func parse(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -81,10 +159,67 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	if err := c.validateAndExpand(); err != nil {
-		return nil, err
-	}
 	return &c, nil
+}
+
+func (c *Config) validateAutopilotAndExpand() error {
+	if strings.TrimSpace(c.Linear.APIToken) == "" {
+		return fmt.Errorf("linear.api_token is required")
+	}
+	if strings.TrimSpace(c.Linear.WebhookSecret) == "" {
+		return fmt.Errorf("linear.webhook_secret is required")
+	}
+	if strings.TrimSpace(c.Linear.AdmiralUserID) == "" {
+		return fmt.Errorf("linear.admiral_user_id is required")
+	}
+	if strings.TrimSpace(c.Linear.ExecutingStateID) == "" {
+		return fmt.Errorf("linear.executing_state_id is required")
+	}
+	if strings.TrimSpace(c.Linear.DoneStateID) == "" {
+		return fmt.Errorf("linear.done_state_id is required")
+	}
+	if strings.TrimSpace(c.Linear.FailedStateID) == "" {
+		return fmt.Errorf("linear.failed_state_id is required")
+	}
+	if strings.TrimSpace(c.Linear.APIBase) == "" {
+		c.Linear.APIBase = "https://api.linear.app/graphql"
+	}
+
+	if strings.TrimSpace(c.Autopilot.RepoDir) == "" {
+		return fmt.Errorf("autopilot.repo_dir is required")
+	}
+	c.Autopilot.RepoDir = expandTilde(c.Autopilot.RepoDir)
+	if fi, err := os.Stat(c.Autopilot.RepoDir); err != nil || !fi.IsDir() {
+		return fmt.Errorf("autopilot.repo_dir not a directory: %s", c.Autopilot.RepoDir)
+	}
+	if strings.TrimSpace(c.Autopilot.WorktreeRoot) == "" {
+		c.Autopilot.WorktreeRoot = ".worktrees"
+	}
+	if strings.TrimSpace(c.Autopilot.BaseBranch) == "" {
+		c.Autopilot.BaseBranch = "main"
+	}
+	if strings.TrimSpace(c.Autopilot.ClaudeBin) == "" {
+		c.Autopilot.ClaudeBin = "claude"
+	}
+	if strings.TrimSpace(c.Autopilot.GhBin) == "" {
+		c.Autopilot.GhBin = "gh"
+	}
+	if strings.TrimSpace(c.Autopilot.ListenAddr) == "" {
+		c.Autopilot.ListenAddr = ":8787"
+	}
+	if c.Autopilot.MaxRunSeconds <= 0 {
+		c.Autopilot.MaxRunSeconds = 1800
+	}
+
+	c.Storage.SQLitePath = expandTilde(c.Storage.SQLitePath)
+	if c.Storage.SQLitePath == "" {
+		c.Storage.SQLitePath = expandTilde("~/.local/share/admiral/autopilot.db")
+	}
+	c.Logging.File = expandTilde(c.Logging.File)
+	if c.Logging.Level == "" {
+		c.Logging.Level = "info"
+	}
+	return nil
 }
 
 func (c *Config) validateAndExpand() error {
