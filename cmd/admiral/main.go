@@ -11,11 +11,13 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/georgehuang/omx-bridge/internal/bridge"
-	"github.com/georgehuang/omx-bridge/internal/config"
-	"github.com/georgehuang/omx-bridge/internal/omx"
-	"github.com/georgehuang/omx-bridge/internal/store"
-	"github.com/georgehuang/omx-bridge/internal/tg"
+	"github.com/georgehuang/admiral/internal/bridge"
+	"github.com/georgehuang/admiral/internal/config"
+	"github.com/georgehuang/admiral/internal/store"
+	"github.com/georgehuang/admiral/internal/teamcli"
+	"github.com/georgehuang/admiral/internal/teamcli/omc"
+	"github.com/georgehuang/admiral/internal/teamcli/omx"
+	"github.com/georgehuang/admiral/internal/tg"
 )
 
 func main() {
@@ -31,6 +33,10 @@ func main() {
 
 	logger := newLogger(cfg.Logging)
 
+	for _, w := range cfg.Warnings {
+		logger.Warn("config_deprecation", "msg", w)
+	}
+
 	db, err := store.Open(cfg.Storage.SQLitePath)
 	if err != nil {
 		logger.Error("sqlite open failed", "err", err)
@@ -44,13 +50,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	oc := omx.New(cfg.Session.OmxBinPath, cfg.Session.CWD, cfg.Session.TeamName)
-	br := bridge.New(cfg, bot, oc, db, logger)
+	var provider teamcli.Provider
+	switch cfg.Session.Provider {
+	case "omc":
+		provider = omc.New(cfg.Session.CLIBinPath, cfg.Session.CWD, cfg.Session.TeamName)
+	default:
+		provider = omx.New(cfg.Session.CLIBinPath, cfg.Session.CWD, cfg.Session.TeamName)
+	}
+	br := bridge.New(cfg, bot, provider, db, logger)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	logger.Info("bridge starting",
+	logger.Info("admiral starting",
+		"provider", cfg.Session.Provider,
 		"team", cfg.Session.TeamName,
 		"cwd", cfg.Session.CWD,
 		"sqlite", cfg.Storage.SQLitePath,

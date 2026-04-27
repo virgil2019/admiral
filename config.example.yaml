@@ -7,36 +7,54 @@ session:
   # "vibe bridge session" sanitizes to "vibe-bridge-session".
   team_name: "vibe-bridge-session"
   cwd: "/Users/georgehuang/Program/vibe-project"
-  omx_bin_path: "/usr/local/bin/omx"
+  # provider: which team-cli to drive.
+  #   "omx" (default) — uses the await-event long-poll stream.
+  #   "omc"           — no await-event; bridge falls back to mailbox polling.
+  provider: "omx"
+  # Path to the team-cli binary that matches `provider`.
+  cli_bin_path: "/usr/local/bin/omx"
+  # Deprecated: omx_bin_path is still accepted as an alias for cli_bin_path
+  # and logs a WARN deprecation notice on boot. Will be removed in a future
+  # release.
+  # leader_worker: which worker plain-text TG messages get routed to and
+  # which worker shutdown requests target. Defaults are provider-specific:
+  #   omx → "leader-fixed" (the virtual dispatcher worker)
+  #   omc → "worker-1"     (omc's first concrete worker — leader-fixed has
+  #                         no live agent in omc and would silently drop)
+  # leader_worker: "worker-1"
 
 launch:
-  # "pty" | "direct". Default: "pty" on macOS, "direct" elsewhere.
-  # Use "direct" if you pre-launched the team from a real terminal and want
-  # the bridge to fail loudly instead of wrapping omx in `script`.
+  # "pty" | "direct". Used by the omx provider only.
+  # Defaults: omx → "pty" on darwin, "direct" elsewhere.
+  # The omc provider IGNORES this and launch.pty_command — it always
+  # allocates a real PTY via creack/pty so `omc team`'s tmux send-keys
+  # setup completes before the child sees stdin EOF.
   mode: "pty"
-  # Only used when mode=pty. Prepended to the omx argv.
+  # Only used when mode=pty under the omx provider.
   pty_command: ["/usr/bin/script", "-q", "/dev/null"]
-  # The N in "omx team N:agent-type". Worker panes spawned.
+  # The N in "<bin> team N:agent-type". Worker panes spawned.
   worker_count: 3
   # codex | claude | gemini
   agent_type: "codex"
-  # Free-form task description passed to omx team launch. The team name is
-  # DERIVED from this via omx's sanitize rule (lowercase, non-alnum
+  # Free-form task description passed to team launch. The team name is
+  # DERIVED from this via the team-cli's sanitize rule (lowercase, non-alnum
   # collapsed to "-", trimmed, max 30 chars). session.team_name MUST equal
   # that derived form or the bridge refuses to boot.
   bootstrap_task: "vibe bridge session"
 
 storage:
-  sqlite_path: "~/.local/share/omx-bridge/bridge.db"
+  sqlite_path: "~/.local/share/admiral/bridge.db"
 
 telegram:
   long_poll_timeout_s: 50
   api_base: "https://api.telegram.org"
 
 event_stream:
+  # await_timeout_ms is omx-only (await-event long-poll). Ignored for omc.
   await_timeout_ms: 30000
+  # idle_backoff_ms also drives the omc polling loop tick interval.
   idle_backoff_ms: 2000
 
 logging:
   level: "info"
-  file: "~/.local/share/omx-bridge/bridge.log"
+  file: "~/.local/share/admiral/bridge.log"

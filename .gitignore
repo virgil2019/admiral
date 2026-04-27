@@ -1,6 +1,10 @@
 /bridge.db
 /*.db
 /bin/
-/omx-bridge
+/admiral
 *.log
 .DS_Store
+config.yaml
+.omc/
+.omx/
+.task.md
