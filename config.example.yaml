@@ -58,3 +58,34 @@ event_stream:
 logging:
   level: "info"
   file: "~/.local/share/admiral/bridge.log"
+
+# admiral-autopilot (v0.3): Linear-driven autopilot daemon. Both linear and
+# autopilot blocks are required only when running `admiral-autopilot`; the
+# TG bridge ignores them.
+linear:
+  # Linear personal API key (Settings → API → Personal API keys).
+  api_token: "lin_api_xxxxxxxx"
+  # Webhook signing secret (Settings → API → Webhooks → <your webhook>).
+  webhook_secret: "lin_wh_xxxxxxxx"
+  # Linear user UUID for the admiral bot account. Webhook only fires on
+  # Issue.update events whose assignee.id equals this.
+  admiral_user_id: "00000000-0000-0000-0000-000000000000"
+  # Workflow state UUIDs. List with:
+  #   gql query { workflowStates { nodes { id name team { name } } } }
+  executing_state_id: "00000000-0000-0000-0000-000000000000"
+  done_state_id:      "00000000-0000-0000-0000-000000000000"
+  failed_state_id:    "00000000-0000-0000-0000-000000000000"
+  # api_base: "https://api.linear.app/graphql"  # default
+
+autopilot:
+  # HTTP bind address for the webhook receiver. Default: ":8787"
+  listen_addr: ":8787"
+  # Repo whose .worktrees/ admiral creates per-issue branches under.
+  repo_dir: "/Users/you/code/your-repo"
+  # Defaults shown:
+  # worktree_root:   ".worktrees"
+  # base_branch:     "main"
+  # claude_bin:      "claude"
+  # gh_bin:          "gh"
+  # autopilot_skill: ""           # claude skill name, e.g. "autopilot"
+  # max_run_seconds: 1800
