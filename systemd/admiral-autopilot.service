@@ -1,0 +1,44 @@
+[Unit]
+Description=admiral-autopilot — Linear-driven autopilot daemon
+Documentation=https://github.com/virgil2019/admiral
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# REQUIRED: replace with the unprivileged user that owns the target repo
+# checkout (and has `gh auth login`'d for that account's GitHub user, plus
+# `claude` trust dialog accepted on first interactive run).
+User=admiral
+Group=admiral
+
+# Writable by User. admiral writes per-issue worktrees under repo_dir
+# (config.yaml), and SQLite + log files under storage.sqlite_path /
+# logging.file (defaults: ~/.local/share/admiral/).
+WorkingDirectory=/home/admiral
+
+# Optional: pull extra env (proxy, GH_TOKEN overrides, etc.)
+EnvironmentFile=-/etc/admiral/admiral.env
+
+# Path may differ if you used --prefix=$HOME/.local in install.sh.
+# Adjust to /home/admiral/.local/bin/admiral-autopilot if so.
+ExecStart=/usr/local/bin/admiral-autopilot --config /etc/admiral/config.yaml
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+
+# Modest hardening — uncomment if your deploy paths fit. Beware:
+# ProtectSystem=strict will break worktree creation outside ReadWritePaths.
+# NoNewPrivileges=yes
+# PrivateTmp=yes
+# ProtectKernelTunables=yes
+# ProtectKernelModules=yes
+# RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
