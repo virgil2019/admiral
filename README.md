@@ -199,6 +199,12 @@ A separate binary that picks up Linear issues delegated to it (assign or
 a PR, and reports progress back into the Linear agent thread via the
 Linear Agent SDK.
 
+> **Deploying on Ubuntu 24.04?** See [docs/install.md](docs/install.md)
+> for the end-to-end install flow (system deps, OMC, harness-pack,
+> `gh auth`, `scripts/install.sh`, config, Linear webhook, optional
+> systemd unit). The subsections below are the dev-mode reference; the
+> install doc is the canonical production path.
+
 ### One-time Linear setup
 
 This is **manual** — the Linear OAuth handshake requires a workspace
