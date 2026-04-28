@@ -1,0 +1,280 @@
+// Package linear is admiral's Linear GraphQL client + webhook receiver,
+// scoped to the v0.3 happy path of the Linear Agent SDK: receive an
+// AgentSessionEvent, fetch issue context, post agent activities back.
+package linear
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type Client struct {
+	httpClient *http.Client
+	endpoint   string
+	apiToken   string
+}
+
+func NewClient(endpoint, apiToken string) *Client {
+	return &Client{
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+		endpoint:   endpoint,
+		apiToken:   apiToken,
+	}
+}
+
+// Issue is the subset of Linear issue fields admiral needs for prompt
+// context. Mirror of `agent.ts` issueToContext.
+type Issue struct {
+	ID          string
+	Identifier  string
+	Title       string
+	Description string
+	URL         string
+	StateName   string
+	Priority    int
+	AssigneeID  string
+	Labels      []string
+	Comments    []Comment
+}
+
+type Comment struct {
+	UserName  string
+	Body      string
+	CreatedAt string
+}
+
+type graphQLRequest struct {
+	Query     string         `json:"query"`
+	Variables map[string]any `json:"variables,omitempty"`
+}
+
+type graphQLError struct {
+	Message string `json:"message"`
+}
+
+type graphQLResponse struct {
+	Data   json.RawMessage `json:"data"`
+	Errors []graphQLError  `json:"errors"`
+}
+
+func (c *Client) do(ctx context.Context, req graphQLRequest, out any) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	// Linear accepts both "Bearer <token>" (OAuth access tokens, including
+	// agent-actor tokens like lin_oauth_*) and "<token>" bare (personal API
+	// keys, lin_api_*). Bearer works for both, so always use it.
+	httpReq.Header.Set("Authorization", bearer(c.apiToken))
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("post graphql: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read body: %w", err)
+	}
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("linear http %d: %s", resp.StatusCode, truncate(string(raw), 400))
+	}
+	var env graphQLResponse
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return fmt.Errorf("unmarshal envelope: %w", err)
+	}
+	if len(env.Errors) > 0 {
+		return fmt.Errorf("linear graphql: %s", env.Errors[0].Message)
+	}
+	if out != nil {
+		if err := json.Unmarshal(env.Data, out); err != nil {
+			return fmt.Errorf("unmarshal data: %w", err)
+		}
+	}
+	return nil
+}
+
+func bearer(token string) string {
+	if strings.HasPrefix(token, "Bearer ") {
+		return token
+	}
+	return "Bearer " + token
+}
+
+const issueQuery = `query Issue($id: String!) {
+  issue(id: $id) {
+    id
+    identifier
+    title
+    description
+    url
+    priority
+    state { name }
+    assignee { id }
+    labels { nodes { name } }
+    comments(first: 20) { nodes { body createdAt user { name } } }
+  }
+}`
+
+func (c *Client) GetIssue(ctx context.Context, id string) (*Issue, error) {
+	var data struct {
+		Issue *struct {
+			ID          string `json:"id"`
+			Identifier  string `json:"identifier"`
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			URL         string `json:"url"`
+			Priority    int    `json:"priority"`
+			State       *struct {
+				Name string `json:"name"`
+			} `json:"state"`
+			Assignee *struct {
+				ID string `json:"id"`
+			} `json:"assignee"`
+			Labels struct {
+				Nodes []struct {
+					Name string `json:"name"`
+				} `json:"nodes"`
+			} `json:"labels"`
+			Comments struct {
+				Nodes []struct {
+					Body      string `json:"body"`
+					CreatedAt string `json:"createdAt"`
+					User      *struct {
+						Name string `json:"name"`
+					} `json:"user"`
+				} `json:"nodes"`
+			} `json:"comments"`
+		} `json:"issue"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     issueQuery,
+		Variables: map[string]any{"id": id},
+	}, &data); err != nil {
+		return nil, err
+	}
+	if data.Issue == nil || data.Issue.ID == "" {
+		return nil, fmt.Errorf("issue %s not found", id)
+	}
+	out := &Issue{
+		ID:          data.Issue.ID,
+		Identifier:  data.Issue.Identifier,
+		Title:       data.Issue.Title,
+		Description: data.Issue.Description,
+		URL:         data.Issue.URL,
+		Priority:    data.Issue.Priority,
+	}
+	if data.Issue.State != nil {
+		out.StateName = data.Issue.State.Name
+	}
+	if data.Issue.Assignee != nil {
+		out.AssigneeID = data.Issue.Assignee.ID
+	}
+	for _, l := range data.Issue.Labels.Nodes {
+		out.Labels = append(out.Labels, l.Name)
+	}
+	for _, c := range data.Issue.Comments.Nodes {
+		cm := Comment{Body: c.Body, CreatedAt: c.CreatedAt}
+		if c.User != nil {
+			cm.UserName = c.User.Name
+		}
+		out.Comments = append(out.Comments, cm)
+	}
+	return out, nil
+}
+
+// AgentActivityType is the discriminator for the AgentActivityContent input.
+// Linear's schema names: "thought" (italic, ephemeral-friendly), "action"
+// (with action+parameter+optional result), "response" (the agent's answer
+// — usually one terminal post per session), "error" (visible failure),
+// "elicitation" (asking the user a question — surfaces a reply input).
+type AgentActivityType string
+
+const (
+	ActivityThought     AgentActivityType = "thought"
+	ActivityAction      AgentActivityType = "action"
+	ActivityResponse    AgentActivityType = "response"
+	ActivityError       AgentActivityType = "error"
+	ActivityElicitation AgentActivityType = "elicitation"
+)
+
+// AgentActivity is the input for agentActivityCreate. Use the typed
+// constructors below to keep field requirements straight per type — the
+// schema rejects e.g. an "action" without `action` + `parameter`.
+type AgentActivity struct {
+	Type      AgentActivityType `json:"type"`
+	Body      string            `json:"body,omitempty"`
+	Action    string            `json:"action,omitempty"`
+	Parameter string            `json:"parameter,omitempty"`
+	Result    string            `json:"result,omitempty"`
+	Ephemeral bool              `json:"ephemeral,omitempty"`
+}
+
+func Thought(body string, ephemeral bool) AgentActivity {
+	return AgentActivity{Type: ActivityThought, Body: body, Ephemeral: ephemeral}
+}
+
+func Action(action, parameter, result string) AgentActivity {
+	return AgentActivity{Type: ActivityAction, Action: action, Parameter: parameter, Result: result}
+}
+
+func Response(body string) AgentActivity {
+	return AgentActivity{Type: ActivityResponse, Body: body}
+}
+
+func ErrorActivity(body string) AgentActivity {
+	return AgentActivity{Type: ActivityError, Body: body}
+}
+
+func Elicitation(body string) AgentActivity {
+	return AgentActivity{Type: ActivityElicitation, Body: body}
+}
+
+const agentActivityCreateMutation = `mutation CreateAgentActivity($input: AgentActivityCreateInput!) {
+  agentActivityCreate(input: $input) {
+    success
+    agentActivity { id }
+  }
+}`
+
+// PostAgentActivity posts one activity into an agent session thread. The
+// session is durable: subsequent activities to the same sessionID land in
+// the same thread.
+func (c *Client) PostAgentActivity(ctx context.Context, sessionID string, a AgentActivity) error {
+	input := map[string]any{
+		"agentSessionId": sessionID,
+		"content":        a,
+	}
+	var data struct {
+		AgentActivityCreate struct {
+			Success bool `json:"success"`
+		} `json:"agentActivityCreate"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     agentActivityCreateMutation,
+		Variables: map[string]any{"input": input},
+	}, &data); err != nil {
+		return err
+	}
+	if !data.AgentActivityCreate.Success {
+		return fmt.Errorf("agentActivityCreate returned success=false")
+	}
+	return nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}

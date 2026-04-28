@@ -58,3 +58,31 @@ event_stream:
 logging:
   level: "info"
   file: "~/.local/share/admiral/bridge.log"
+
+# admiral-autopilot (v0.3): Linear-driven autopilot daemon. Both linear and
+# autopilot blocks are required only when running `admiral-autopilot`; the
+# TG bridge ignores them.
+#
+# Prereq: a Linear OAuth app installed as an Agent (actor=app, scopes
+# include app:mentionable + app:assignable), with a webhook subscribed to
+# "Agent session events". `oauth-callback.ts`-style flows are typical.
+linear:
+  # OAuth access token (lin_oauth_*) for the agent install, or a personal
+  # API key (lin_api_*). Both work — Bearer is added automatically.
+  api_token: "lin_oauth_xxxxxxxx"
+  # Webhook signing secret (app's Webhooks section, "Signing secret" field).
+  webhook_secret: "lin_wh_xxxxxxxx"
+  # api_base: "https://api.linear.app/graphql"  # default
+
+autopilot:
+  # HTTP bind address for the webhook receiver. Default: ":8787"
+  listen_addr: ":8787"
+  # Repo whose .worktrees/ admiral creates per-issue branches under.
+  repo_dir: "/Users/you/code/your-repo"
+  # Defaults shown:
+  # worktree_root:   ".worktrees"
+  # base_branch:     "main"
+  # claude_bin:      "claude"
+  # gh_bin:          "gh"
+  # autopilot_skill: ""           # claude skill name, e.g. "autopilot"
+  # max_run_seconds: 1800

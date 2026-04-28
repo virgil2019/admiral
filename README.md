@@ -1,12 +1,18 @@
 # admiral
 
-A Go daemon that bridges a single Telegram chat to a single team-cli team
-— either `oh-my-codex` (`omx`) or `oh-my-claudecode` (`omc`) — via
-`<bin> team api`. Mac-local MVP. Long-polling on TG, whitelist by TG
-user id, 1 bot : 1 team.
+Two Go binaries in one repo:
+
+- **`admiral`** — TG bridge. Bridges a single Telegram chat to a single
+  team-cli team (`omx` or `omc`) via `<bin> team api`. Mac-local MVP.
+  This is what the bulk of this README covers.
+- **`admiral-autopilot`** (v0.3) — Linear-driven autopilot. Listens for
+  Linear `AgentSessionEvent` webhooks (assign / @mention), creates a
+  worktree, runs `claude -p`, opens a PR, posts progress back into the
+  Linear agent thread. See [admiral-autopilot setup](#admiral-autopilot-v03-linear-driven)
+  for the dedicated section.
 
 Repo location: `/Users/georgehuang/Program/george/admiral` (repo root —
-`go run ./cmd/admiral` from here).
+`go run ./cmd/admiral` or `go run ./cmd/admiral-autopilot` from here).
 
 ## Prerequisites
 
@@ -186,6 +192,120 @@ crash loops.
 - **`omx team` requires a TTY.** Handled via `launch.mode` — see above.
   `omc team` does not require a TTY (verified via sanity test).
 
+## admiral-autopilot (v0.3, Linear-driven)
+
+A separate binary that picks up Linear issues delegated to it (assign or
+`@mention` an Agent app), runs `claude -p` in a per-issue worktree, opens
+a PR, and reports progress back into the Linear agent thread via the
+Linear Agent SDK.
+
+### One-time Linear setup
+
+This is **manual** — the Linear OAuth handshake requires a workspace
+admin to approve the install in a browser, so admiral can't bootstrap
+itself. Do this once per workspace:
+
+1. **Create an OAuth app** in Linear → Settings → API → "Create new" under
+   OAuth applications. Fill the form, then importantly:
+   - Toggle **Webhooks: ON** (otherwise no events ship + no signing
+     secret is generated)
+   - After Create, edit the app's **Webhooks** section: set URL to
+     `https://<your-tunnel>/webhook`, subscribe to **"Agent session
+     events"** (and only that — Issue events are not used in v0.3).
+2. **Run the OAuth flow** to get a `lin_oauth_*` access token. The
+   simplest path is to clone Linear's official agent demo or copy the
+   minimal `oauth-callback.ts` script (see
+   `/Users/georgehuang/Program/test/ai/team/linear/src/oauth-callback.ts`
+   in this dev's tree for a working reference).
+
+   Required ingredients for the flow:
+   - Authorization URL: `https://linear.app/oauth/authorize`
+   - Required query params: `response_type=code`, `client_id=...`,
+     `redirect_uri=http://127.0.0.1:8080/callback`,
+     `scope=read,write,app:mentionable,app:assignable`,
+     `actor=app`, `prompt=consent`, plus a CSRF `state`
+   - Token exchange: `POST https://api.linear.app/oauth/token` with
+     `code`, `redirect_uri`, `client_id`, `client_secret`,
+     `grant_type=authorization_code`
+   - Output: `access_token` (this is the value you paste into
+     `linear.api_token`), plus `refresh_token` for future renewal.
+3. **Save secrets** somewhere safe (1Password, etc.). admiral expects:
+   - `lin_oauth_*` access token → `linear.api_token`
+   - Webhook signing secret (Linear app's Webhooks section) →
+     `linear.webhook_secret`
+
+### Why an OAuth access token (not just client_secret or a Personal API key)
+
+- `client_id` + `client_secret` identify the **app** to Linear's OAuth
+  endpoint. They don't carry workspace context, install actor type, or
+  scopes — Linear's API rejects them as auth.
+- The `lin_oauth_*` access token is the only credential that simultaneously
+  encodes (workspace × `actor=app` (Agent) × `app:mentionable` /
+  `app:assignable` scopes). admiral needs all three for the Agent SDK to
+  route AgentSessionEvent to it.
+- A `lin_api_*` Personal API key is workspace-scoped but acts as **you**,
+  not as a separate Agent. Mentions/assignments aren't routed via
+  AgentSessionEvent for personal API keys. v0.3 is built around the
+  Agent SDK, so a personal key won't drive it.
+
+### Token expiry
+
+OAuth access tokens expire (Linear's lifetime is typically months but
+not eternal). v0.3 does NOT auto-refresh — when the token expires:
+
+- API calls return 401
+- Re-run the OAuth flow once, paste the new `access_token` into
+  `linear.api_token`, restart the daemon
+
+A `LINEAR_REFRESH_TOKEN` is also returned by the OAuth flow; auto-renewal
+using it is on the v0.4 list.
+
+### Run
+
+```
+# minimal config — see config.example.yaml for the full annotated form
+cat > ~/.config/admiral/config.yaml <<'YAML'
+linear:
+  api_token: "lin_oauth_..."
+  webhook_secret: "lin_wh_..."
+autopilot:
+  listen_addr: ":8787"
+  repo_dir: "/path/to/your/repo"
+storage:
+  sqlite_path: "~/.local/share/admiral/autopilot.db"
+logging:
+  level: "info"
+YAML
+
+# expose port 8787 publicly so Linear can reach the webhook
+cloudflared tunnel --url http://localhost:8787   # or ngrok http 8787
+
+# (update the Linear app's webhook URL to match the tunnel)
+
+# run the daemon
+go run ./cmd/admiral-autopilot --config ~/.config/admiral/config.yaml
+```
+
+In Linear, on a toy issue, either:
+- Assign the issue to admiral, or
+- `@mention` admiral in a comment
+
+The agent thread should show: 💭 thought → ⚡ action(s) → ✅ response with
+PR URL. The PR opens on `repo_dir`'s GitHub remote (admiral expects
+`gh auth login` to have been run for the right account).
+
+### What's not in v0.3
+
+- Follow-up messages in the agent thread (`AgentSessionEvent.prompted`)
+  — admiral posts a stub "v0.3 doesn't handle follow-ups yet" reply
+- Auto-refresh of expired OAuth tokens via `refresh_token`
+- Multi-issue parallel execution (single-flight: a second assignment
+  during a run gets a "busy" reply and is dropped)
+- Workflow state changes via `issueUpdate` (the agent thread carries
+  visible progress instead — board view stays static)
+- PR review comment → admiral feedback loop
+- Crash recovery / orphan job replay
+
 ## Tests
 
 ```
@@ -200,13 +320,16 @@ transactional processing + KV store (`internal/store`). End-to-end
 acceptance criteria require a live TG bot token plus a running team and
 are manual.
 
-## Not in v0.1
+## Not in v0.1 (TG bridge scope)
 
-Multi-session, VPS deploy, webhook mode, Linear/GitHub integration, TG
-inline-keyboard approvals, attachments, voice, `/cancel` semantics,
-metrics, rich formatting, hot config reload (SIGHUP / file-watch),
-`/cleanup` or any TG-exposed team-cleanup path, inbound exactly-once
-semantics, an event-stream substitute for omc beyond simple polling
-(reading omc's event log file, fsnotify on `.omc/state/team/<team>/`,
-or a future omc await-event endpoint), capability auto-detection
-against the running team-cli version.
+Multi-session, VPS deploy, webhook mode, TG inline-keyboard approvals,
+attachments, voice, `/cancel` semantics, metrics, rich formatting,
+hot config reload (SIGHUP / file-watch), `/cleanup` or any TG-exposed
+team-cleanup path, inbound exactly-once semantics, an event-stream
+substitute for omc beyond simple polling (reading omc's event log
+file, fsnotify on `.omc/state/team/<team>/`, or a future omc await-event
+endpoint), capability auto-detection against the running team-cli
+version.
+
+Linear/GitHub integration moved to its own binary — see
+[admiral-autopilot (v0.3)](#admiral-autopilot-v03-linear-driven) above.
