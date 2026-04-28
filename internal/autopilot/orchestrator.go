@@ -55,6 +55,14 @@ func (o *Orchestrator) HandleAgentEvent(ev linear.AgentEvent) {
 }
 
 func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
+	// Check for command mode: first line of PromptContext starts with /
+	if ev.PromptContext != "" {
+		if cmd := extractCommand(ev.PromptContext); cmd != "" {
+			o.handleCommand(ev, cmd)
+			return
+		}
+	}
+
 	o.mu.Lock()
 	if o.running {
 		o.mu.Unlock()
@@ -546,4 +554,45 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// extractCommand returns the command word (without leading /) if the first
+// non-empty line of text looks like /xxx, otherwise empty string.
+func extractCommand(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "/") {
+			parts := strings.SplitN(line, " ", 2)
+			cmd := strings.TrimSpace(parts[0])
+			return strings.ToLower(strings.TrimPrefix(cmd, "/"))
+		}
+		break // first non-empty line not starting with /, no command
+	}
+	return ""
+}
+
+func (o *Orchestrator) handleCommand(ev linear.AgentEvent, cmd string) {
+	o.mu.Lock()
+	running := o.running
+	o.mu.Unlock()
+
+	switch cmd {
+	case "status":
+		status := "idle"
+		if running {
+			status = "busy"
+		}
+		body := fmt.Sprintf("admiral status: %s\nsession: %s", status, ev.SessionID)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
+	default:
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(
+			fmt.Sprintf("Unknown command: /%s", cmd)))
+	}
 }
