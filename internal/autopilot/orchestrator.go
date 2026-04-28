@@ -180,13 +180,6 @@ func (f *flow) execute() error {
 		return fmt.Errorf("claude run: %w", err)
 	}
 
-	f.postActivity(linear.Action("commit_changes",
-		fmt.Sprintf("staging + committing in %s", f.worktreePath),
-		""))
-	if err := f.commitChanges(issue); err != nil {
-		return fmt.Errorf("commit changes: %w", err)
-	}
-
 	f.postActivity(linear.Action("ensure_pr",
 		fmt.Sprintf("gh pr (%s -> %s)", f.branch, f.o.cfg.BaseBranch),
 		""))
@@ -263,30 +256,6 @@ func (f *flow) configureWorktreeIgnores() error {
 	return err
 }
 
-// commitChanges stages everything (modulo `.git/info/exclude`), bails out if
-// nothing was actually staged, and commits with a canonical autopilot
-// message. Decoupling commit from claude's prompt makes the flow
-// deterministic — claude's job is to edit; orchestrator's job is to ship.
-func (f *flow) commitChanges(issue *linear.Issue) error {
-	if err := runCmd(f.ctx, f.worktreePath, "git", "add", "-A"); err != nil {
-		return fmt.Errorf("git add -A: %w", err)
-	}
-	cmd := exec.CommandContext(f.ctx, "git", "diff", "--cached", "--quiet")
-	cmd.Dir = f.worktreePath
-	err := cmd.Run()
-	if err == nil {
-		return fmt.Errorf("claude exited with no committable changes (worktree is clean)")
-	}
-	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 1 {
-		return fmt.Errorf("git diff --cached --quiet: %w", err)
-	}
-	msg := fmt.Sprintf("[autopilot] %s: %s", issue.Identifier, issue.Title)
-	if err := runCmd(f.ctx, f.worktreePath, "git", "commit", "-m", msg); err != nil {
-		return fmt.Errorf("git commit: %w", err)
-	}
-	return nil
-}
-
 // createWorktree fetches origin/<base> and creates a fresh worktree. If the
 // directory already exists (e.g. a prior failed run), it's removed first.
 func (f *flow) createWorktree() error {
@@ -312,12 +281,18 @@ func (f *flow) createWorktree() error {
 // runClaude spawns `claude -p` in stream-json mode inside the worktree and
 // drains stdout until exit.
 func (f *flow) runClaude(issue *linear.Issue) error {
-	prompt := buildPrompt(f.o.cfg.AutopilotSkill, issue, f.ev)
+	prompt := buildPrompt(f.o.cfg.AutopilotSkill, issue, f.ev, f.branch, f.o.cfg.BaseBranch)
 	args := []string{
 		"-p", prompt,
 		"--output-format", "stream-json",
 		"--verbose",
-		"--permission-mode", "acceptEdits",
+		// --dangerously-skip-permissions is Claude Code's canonical
+		// "non-interactive headless" switch: auto-allows Edit/Write AND Bash
+		// (so git/gh actually run). Without it, -p silently denies bash
+		// because the permission prompt has nobody to answer it. Acceptable
+		// here because the worktree is throwaway + the daemon already
+		// chose this binary on purpose.
+		"--dangerously-skip-permissions",
 	}
 	cctx, cancel := context.WithTimeout(f.ctx, time.Duration(f.o.cfg.MaxRunSeconds)*time.Second)
 	defer cancel()
@@ -471,8 +446,11 @@ func sanitizeForPath(s string) string {
 // buildPrompt mirrors the existing TS demo's issueToContext + agent prompt.
 // Format: full issue context (state / labels / description / recent comments)
 // followed by whatever the user said when triggering the agent (mention
-// text, delegate prompt, or "(assigned, no explicit prompt)" for raw assign).
-func buildPrompt(skill string, i *linear.Issue, ev linear.AgentEvent) string {
+// text, delegate prompt, or "(assigned, no explicit prompt)" for raw
+// assign), and a closing "Operating procedure" that tells claude exactly
+// the shape of the deliverable: edit, then `git add` / `commit` / `push`
+// the working branch, then `gh pr create`.
+func buildPrompt(skill string, i *linear.Issue, ev linear.AgentEvent, branch, baseBranch string) string {
 	var sb strings.Builder
 	if skill != "" {
 		sb.WriteString("/")
@@ -509,10 +487,32 @@ func buildPrompt(skill string, i *linear.Issue, ev linear.AgentEvent) string {
 	} else {
 		sb.WriteString("(assigned, no explicit prompt — act on the issue context above)")
 	}
-	// admiral-autopilot handles git add / commit / push / gh pr create after
-	// claude exits, so claude only needs to edit files. Telling claude to
-	// commit/push doubles the work and is unreliable in -p mode.
-	sb.WriteString("\n\nMake the necessary edits in this worktree. Do NOT run `git commit`, `git push`, or `gh pr create` — admiral handles those after you exit.")
+	fmt.Fprintf(&sb, `
+
+## Operating procedure (you MUST follow this exactly)
+
+You are running inside a fresh git worktree on branch %q, forked from %q.
+Your final deliverable is a pull request. Do these steps in order:
+
+1. Edit files as needed to address the issue above.
+2. Stage your changes: `+"`git add -A`"+`
+   (a `+"`.git/info/exclude`"+` is already configured to skip session-internal
+   directories like `+"`.omc/`"+`; everything else is fair game.)
+3. Commit with a clear conventional message referencing %s:
+   `+"`git commit -m \"<type>(<scope>): <summary> (%s)\""+`
+   (e.g. `+"`feat: add hello-world line to README (%s)`"+`).
+4. Push the branch: `+"`git push -u origin %s`"+`
+5. Open the PR: `+"`gh pr create --base %s --head %s --title \"[%s] %s\" --body \"<short summary plus the issue link>\"`"+`
+6. Print the PR URL on a line by itself, then exit.
+
+Do not skip any step. If you have nothing to change, still create a tiny
+no-op commit (e.g. clarify a comment) so a PR can be opened — admiral's
+flow expects a PR per session.
+`,
+		branch, baseBranch,
+		i.Identifier, i.Identifier, i.Identifier,
+		branch,
+		baseBranch, branch, i.Identifier, i.Title)
 	return sb.String()
 }
 

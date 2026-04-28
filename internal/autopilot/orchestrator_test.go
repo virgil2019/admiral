@@ -44,7 +44,7 @@ func TestBuildPrompt_AssignNoContext(t *testing.T) {
 		Description: "details",
 		StateName:   "Todo",
 		Labels:      []string{"backend"},
-	}, linear.AgentEvent{Action: linear.ActionCreated})
+	}, linear.AgentEvent{Action: linear.ActionCreated}, "linear/tst-1", "main")
 	if !strings.Contains(p, "TST-1: do the thing") {
 		t.Errorf("missing title line:\n%s", p)
 	}
@@ -57,6 +57,14 @@ func TestBuildPrompt_AssignNoContext(t *testing.T) {
 	if !strings.Contains(p, "(assigned, no explicit prompt") {
 		t.Errorf("missing assign placeholder:\n%s", p)
 	}
+	if !strings.Contains(p, "git push -u origin \"linear/tst-1\"") &&
+		!strings.Contains(p, "git push -u origin linear/tst-1") {
+		t.Errorf("missing branch in operating procedure:\n%s", p)
+	}
+	if !strings.Contains(p, "--base \"main\"") &&
+		!strings.Contains(p, "--base main") {
+		t.Errorf("missing base branch in operating procedure:\n%s", p)
+	}
 }
 
 func TestBuildPrompt_MentionWithContext(t *testing.T) {
@@ -65,7 +73,7 @@ func TestBuildPrompt_MentionWithContext(t *testing.T) {
 	}, linear.AgentEvent{
 		Action:        linear.ActionCreated,
 		PromptContext: "please refactor the auth module",
-	})
+	}, "linear/tst-2", "main")
 	if !strings.HasPrefix(p, "/autopilot\n\n") {
 		t.Errorf("skill not prefixed:\n%s", p)
 	}
@@ -81,7 +89,7 @@ func TestBuildPrompt_Comments(t *testing.T) {
 			{UserName: "alice", Body: "first comment"},
 			{UserName: "bob", Body: "second comment"},
 		},
-	}, linear.AgentEvent{Action: linear.ActionCreated})
+	}, linear.AgentEvent{Action: linear.ActionCreated}, "linear/tst-3", "main")
 	if !strings.Contains(p, "- alice: first comment") {
 		t.Errorf("missing alice comment:\n%s", p)
 	}
