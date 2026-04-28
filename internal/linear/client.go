@@ -1,6 +1,6 @@
-// Package linear is admiral's Linear GraphQL client + webhook receiver.
-// Scope is the v0.3 happy path: read an issue, set its workflow state,
-// post one comment.
+// Package linear is admiral's Linear GraphQL client + webhook receiver,
+// scoped to the v0.3 happy path of the Linear Agent SDK: receive an
+// AgentSessionEvent, fetch issue context, post agent activities back.
 package linear
 
 import (
@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -27,12 +28,25 @@ func NewClient(endpoint, apiToken string) *Client {
 	}
 }
 
+// Issue is the subset of Linear issue fields admiral needs for prompt
+// context. Mirror of `agent.ts` issueToContext.
 type Issue struct {
 	ID          string
 	Identifier  string
 	Title       string
 	Description string
 	URL         string
+	StateName   string
+	Priority    int
+	AssigneeID  string
+	Labels      []string
+	Comments    []Comment
+}
+
+type Comment struct {
+	UserName  string
+	Body      string
+	CreatedAt string
 }
 
 type graphQLRequest struct {
@@ -59,7 +73,10 @@ func (c *Client) do(ctx context.Context, req graphQLRequest, out any) error {
 		return err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", c.apiToken)
+	// Linear accepts both "Bearer <token>" (OAuth access tokens, including
+	// agent-actor tokens like lin_oauth_*) and "<token>" bare (personal API
+	// keys, lin_api_*). Bearer works for both, so always use it.
+	httpReq.Header.Set("Authorization", bearer(c.apiToken))
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("post graphql: %w", err)
@@ -87,6 +104,13 @@ func (c *Client) do(ctx context.Context, req graphQLRequest, out any) error {
 	return nil
 }
 
+func bearer(token string) string {
+	if strings.HasPrefix(token, "Bearer ") {
+		return token
+	}
+	return "Bearer " + token
+}
+
 const issueQuery = `query Issue($id: String!) {
   issue(id: $id) {
     id
@@ -94,17 +118,43 @@ const issueQuery = `query Issue($id: String!) {
     title
     description
     url
+    priority
+    state { name }
+    assignee { id }
+    labels { nodes { name } }
+    comments(first: 20) { nodes { body createdAt user { name } } }
   }
 }`
 
 func (c *Client) GetIssue(ctx context.Context, id string) (*Issue, error) {
 	var data struct {
-		Issue struct {
+		Issue *struct {
 			ID          string `json:"id"`
 			Identifier  string `json:"identifier"`
 			Title       string `json:"title"`
 			Description string `json:"description"`
 			URL         string `json:"url"`
+			Priority    int    `json:"priority"`
+			State       *struct {
+				Name string `json:"name"`
+			} `json:"state"`
+			Assignee *struct {
+				ID string `json:"id"`
+			} `json:"assignee"`
+			Labels struct {
+				Nodes []struct {
+					Name string `json:"name"`
+				} `json:"nodes"`
+			} `json:"labels"`
+			Comments struct {
+				Nodes []struct {
+					Body      string `json:"body"`
+					CreatedAt string `json:"createdAt"`
+					User      *struct {
+						Name string `json:"name"`
+					} `json:"user"`
+				} `json:"nodes"`
+			} `json:"comments"`
 		} `json:"issue"`
 	}
 	if err := c.do(ctx, graphQLRequest{
@@ -113,62 +163,111 @@ func (c *Client) GetIssue(ctx context.Context, id string) (*Issue, error) {
 	}, &data); err != nil {
 		return nil, err
 	}
-	if data.Issue.ID == "" {
+	if data.Issue == nil || data.Issue.ID == "" {
 		return nil, fmt.Errorf("issue %s not found", id)
 	}
-	return &Issue{
+	out := &Issue{
 		ID:          data.Issue.ID,
 		Identifier:  data.Issue.Identifier,
 		Title:       data.Issue.Title,
 		Description: data.Issue.Description,
 		URL:         data.Issue.URL,
-	}, nil
+		Priority:    data.Issue.Priority,
+	}
+	if data.Issue.State != nil {
+		out.StateName = data.Issue.State.Name
+	}
+	if data.Issue.Assignee != nil {
+		out.AssigneeID = data.Issue.Assignee.ID
+	}
+	for _, l := range data.Issue.Labels.Nodes {
+		out.Labels = append(out.Labels, l.Name)
+	}
+	for _, c := range data.Issue.Comments.Nodes {
+		cm := Comment{Body: c.Body, CreatedAt: c.CreatedAt}
+		if c.User != nil {
+			cm.UserName = c.User.Name
+		}
+		out.Comments = append(out.Comments, cm)
+	}
+	return out, nil
 }
 
-const issueUpdateMutation = `mutation IssueSetState($id: String!, $stateId: String!) {
-  issueUpdate(id: $id, input: {stateId: $stateId}) {
+// AgentActivityType is the discriminator for the AgentActivityContent input.
+// Linear's schema names: "thought" (italic, ephemeral-friendly), "action"
+// (with action+parameter+optional result), "response" (the agent's answer
+// — usually one terminal post per session), "error" (visible failure),
+// "elicitation" (asking the user a question — surfaces a reply input).
+type AgentActivityType string
+
+const (
+	ActivityThought     AgentActivityType = "thought"
+	ActivityAction      AgentActivityType = "action"
+	ActivityResponse    AgentActivityType = "response"
+	ActivityError       AgentActivityType = "error"
+	ActivityElicitation AgentActivityType = "elicitation"
+)
+
+// AgentActivity is the input for agentActivityCreate. Use the typed
+// constructors below to keep field requirements straight per type — the
+// schema rejects e.g. an "action" without `action` + `parameter`.
+type AgentActivity struct {
+	Type      AgentActivityType `json:"type"`
+	Body      string            `json:"body,omitempty"`
+	Action    string            `json:"action,omitempty"`
+	Parameter string            `json:"parameter,omitempty"`
+	Result    string            `json:"result,omitempty"`
+	Ephemeral bool              `json:"ephemeral,omitempty"`
+}
+
+func Thought(body string, ephemeral bool) AgentActivity {
+	return AgentActivity{Type: ActivityThought, Body: body, Ephemeral: ephemeral}
+}
+
+func Action(action, parameter, result string) AgentActivity {
+	return AgentActivity{Type: ActivityAction, Action: action, Parameter: parameter, Result: result}
+}
+
+func Response(body string) AgentActivity {
+	return AgentActivity{Type: ActivityResponse, Body: body}
+}
+
+func ErrorActivity(body string) AgentActivity {
+	return AgentActivity{Type: ActivityError, Body: body}
+}
+
+func Elicitation(body string) AgentActivity {
+	return AgentActivity{Type: ActivityElicitation, Body: body}
+}
+
+const agentActivityCreateMutation = `mutation CreateAgentActivity($input: AgentActivityCreateInput!) {
+  agentActivityCreate(input: $input) {
     success
+    agentActivity { id }
   }
 }`
 
-func (c *Client) SetIssueState(ctx context.Context, issueID, stateID string) error {
+// PostAgentActivity posts one activity into an agent session thread. The
+// session is durable: subsequent activities to the same sessionID land in
+// the same thread.
+func (c *Client) PostAgentActivity(ctx context.Context, sessionID string, a AgentActivity) error {
+	input := map[string]any{
+		"agentSessionId": sessionID,
+		"content":        a,
+	}
 	var data struct {
-		IssueUpdate struct {
+		AgentActivityCreate struct {
 			Success bool `json:"success"`
-		} `json:"issueUpdate"`
+		} `json:"agentActivityCreate"`
 	}
 	if err := c.do(ctx, graphQLRequest{
-		Query:     issueUpdateMutation,
-		Variables: map[string]any{"id": issueID, "stateId": stateID},
+		Query:     agentActivityCreateMutation,
+		Variables: map[string]any{"input": input},
 	}, &data); err != nil {
 		return err
 	}
-	if !data.IssueUpdate.Success {
-		return fmt.Errorf("issueUpdate returned success=false")
-	}
-	return nil
-}
-
-const commentCreateMutation = `mutation CommentCreate($issueId: String!, $body: String!) {
-  commentCreate(input: {issueId: $issueId, body: $body}) {
-    success
-  }
-}`
-
-func (c *Client) PostComment(ctx context.Context, issueID, body string) error {
-	var data struct {
-		CommentCreate struct {
-			Success bool `json:"success"`
-		} `json:"commentCreate"`
-	}
-	if err := c.do(ctx, graphQLRequest{
-		Query:     commentCreateMutation,
-		Variables: map[string]any{"issueId": issueID, "body": body},
-	}, &data); err != nil {
-		return err
-	}
-	if !data.CommentCreate.Success {
-		return fmt.Errorf("commentCreate returned success=false")
+	if !data.AgentActivityCreate.Success {
+		return fmt.Errorf("agentActivityCreate returned success=false")
 	}
 	return nil
 }

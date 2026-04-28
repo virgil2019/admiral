@@ -10,61 +10,97 @@ import (
 	"net/http"
 )
 
-// AssignmentEvent is what the webhook handler hands off to the orchestrator
-// when an Issue.update event flips the assignee to the configured admiral
-// user.
-type AssignmentEvent struct {
+// AgentEventAction is the verb on an AgentSessionEvent: "created" when an
+// agent session is opened (assign / @mention / explicit delegate); "prompted"
+// when the user posts a follow-up message inside an existing thread.
+type AgentEventAction string
+
+const (
+	ActionCreated  AgentEventAction = "created"
+	ActionPrompted AgentEventAction = "prompted"
+)
+
+// AgentEvent is the parsed shape the orchestrator consumes. SessionID is
+// the durable handle for `agentActivityCreate` calls; IssueID is what
+// GetIssue takes; PromptContext / UserMessage carry whatever the user
+// said (depending on action).
+type AgentEvent struct {
+	Action          AgentEventAction
+	SessionID       string
 	IssueID         string
 	IssueIdentifier string
 	IssueTitle      string
-	IssueBody       string
-	IssueURL        string
-	AssigneeID      string
-	WebhookID       string
+	// PromptContext is set on action=created. For mention triggers it's the
+	// comment text; for raw assignment it's empty; for delegate-to-agent
+	// it's whatever the user typed in the prompt input.
+	PromptContext string
+	// UserMessage is set on action=prompted: the user's follow-up text in
+	// the agent thread.
+	UserMessage string
+	CreatorID   string
+	WebhookID   string
 }
 
-// AssignmentHandler receives an event whose webhook signature has already been
-// verified and which has already been filtered down to "assigned to admiral".
-// Implementations should NOT block — kick off async work and return.
-type AssignmentHandler func(AssignmentEvent)
+// AgentHandler is invoked once per accepted (signature-verified, recognized
+// shape) AgentSessionEvent. Implementations should not block — kick off
+// async work and return.
+type AgentHandler func(AgentEvent)
 
-// rawWebhookPayload is the subset of the Linear webhook envelope we care
-// about. Linear sends many more fields; unknown ones are ignored.
-type rawWebhookPayload struct {
-	Action      string          `json:"action"`
-	Type        string          `json:"type"`
-	Data        json.RawMessage `json:"data"`
-	UpdatedFrom json.RawMessage `json:"updatedFrom"`
-	WebhookID   string          `json:"webhookId"`
+// rawAgentSessionPayload is the subset of Linear's webhook envelope we
+// care about. Linear sends many more fields; unknown ones are ignored.
+type rawAgentSessionPayload struct {
+	Type      string `json:"type"`
+	Action    string `json:"action"`
+	WebhookID string `json:"webhookId"`
+
+	// Linear has been observed to deliver the session under either the
+	// top-level `agentSession` key or a `data.agentSession` envelope —
+	// mirror agent.ts which checks both.
+	AgentSession *rawAgentSession `json:"agentSession"`
+	Data         *struct {
+		AgentSession  *rawAgentSession  `json:"agentSession"`
+		AgentActivity *rawAgentActivity `json:"agentActivity"`
+		PromptContext string            `json:"promptContext"`
+	} `json:"data"`
+
+	PromptContext string            `json:"promptContext"`
+	AgentActivity *rawAgentActivity `json:"agentActivity"`
 }
 
-type rawIssueData struct {
-	ID         string  `json:"id"`
-	Identifier string  `json:"identifier"`
-	Title      string  `json:"title"`
-	Body       string  `json:"description"`
-	URL        string  `json:"url"`
-	AssigneeID *string `json:"assigneeId"`
-	Assignee   *struct {
+type rawAgentSession struct {
+	ID    string `json:"id"`
+	Issue *struct {
+		ID         string `json:"id"`
+		Identifier string `json:"identifier"`
+		Title      string `json:"title"`
+	} `json:"issue"`
+	Creator *struct {
 		ID string `json:"id"`
-	} `json:"assignee"`
+	} `json:"creator"`
 }
 
-// Webhook is the HTTP receiver. Mount Handler at /linear/webhook (or
-// wherever).
+type rawAgentActivity struct {
+	Body string `json:"body"`
+}
+
+// Webhook is the HTTP receiver. Mount Handler at /webhook (matches Linear's
+// agent webhook URL convention) — main.go also exposes /linear/webhook as
+// an alias.
 type Webhook struct {
-	secret        []byte
-	admiralUserID string
-	onAssign      AssignmentHandler
-	logger        *slog.Logger
+	secret   []byte
+	onAgent  AgentHandler
+	logger   *slog.Logger
 }
 
-func NewWebhook(secret, admiralUserID string, onAssign AssignmentHandler, logger *slog.Logger) *Webhook {
+// NewWebhook constructs a receiver. Unlike v0.3 method-A, no admiral user
+// UUID is needed: AgentSessionEvent is already routed by Linear to the
+// specific agent app behind this webhook, so the filtering Linear does
+// for us replaces the per-user check.
+func NewWebhook(secret string, onAgent AgentHandler, logger *slog.Logger) *Webhook {
 	return &Webhook{
-		secret:        []byte(secret),
-		admiralUserID: admiralUserID,
-		onAssign:      onAssign,
-		logger:        logger,
+		secret:  []byte(secret),
+		onAgent: onAgent,
+		logger:  logger,
 	}
 }
 
@@ -89,94 +125,107 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var p rawWebhookPayload
+	var p rawAgentSessionPayload
 	if err := json.Unmarshal(body, &p); err != nil {
 		w.logger.Warn("linear_webhook_bad_payload", "err", err)
 		http.Error(rw, "bad payload", http.StatusBadRequest)
 		return
 	}
 
-	// Linear delivers many event types; we only act on Issue.update with
-	// an assignee change to admiral. Everything else: 200 OK, ignored.
+	// Always 200 once signature passes — Linear retries on non-2xx, and
+	// our internal filtering decisions (wrong type / unknown action) are
+	// not retry-worthy.
 	rw.WriteHeader(http.StatusOK)
 	_, _ = rw.Write([]byte("ok"))
 
-	if p.Type != "Issue" || p.Action != "update" {
+	if p.Type != "AgentSessionEvent" {
+		w.logger.Debug("linear_webhook_skip_non_agent",
+			"type", p.Type, "action", p.Action)
 		return
 	}
-	var issue rawIssueData
-	if err := json.Unmarshal(p.Data, &issue); err != nil {
-		w.logger.Warn("linear_webhook_issue_decode", "err", err)
-		return
-	}
-	// Linear's `updatedFrom` only includes keys that actually changed, so
-	// the literal presence of `assigneeId` is the gate — its value can be
-	// null when the previous assignee was unset.
-	if len(p.UpdatedFrom) == 0 {
-		return
-	}
-	var diff map[string]json.RawMessage
-	_ = json.Unmarshal(p.UpdatedFrom, &diff)
-	if _, hadAssigneeKey := diff["assigneeId"]; !hadAssigneeKey {
+	action := AgentEventAction(p.Action)
+	if action != ActionCreated && action != ActionPrompted {
+		w.logger.Debug("linear_webhook_skip_unknown_action",
+			"action", p.Action)
 		return
 	}
 
-	newAssignee := assigneeID(issue)
-	if newAssignee != w.admiralUserID {
+	session := p.AgentSession
+	if session == nil && p.Data != nil {
+		session = p.Data.AgentSession
+	}
+	if session == nil || session.ID == "" {
+		w.logger.Warn("linear_webhook_missing_session", "action", p.Action)
 		return
 	}
-	if w.onAssign == nil {
+
+	ev := AgentEvent{
+		Action:    action,
+		SessionID: session.ID,
+		WebhookID: p.WebhookID,
+	}
+	if session.Issue != nil {
+		ev.IssueID = session.Issue.ID
+		ev.IssueIdentifier = session.Issue.Identifier
+		ev.IssueTitle = session.Issue.Title
+	}
+	if session.Creator != nil {
+		ev.CreatorID = session.Creator.ID
+	}
+	switch action {
+	case ActionCreated:
+		ev.PromptContext = firstNonEmpty(p.PromptContext, dataPromptContext(p))
+	case ActionPrompted:
+		if p.AgentActivity != nil {
+			ev.UserMessage = p.AgentActivity.Body
+		} else if p.Data != nil && p.Data.AgentActivity != nil {
+			ev.UserMessage = p.Data.AgentActivity.Body
+		}
+	}
+
+	if w.onAgent == nil {
 		return
 	}
-	w.logger.Info("linear_assigned",
-		"issue_id", issue.ID,
-		"identifier", issue.Identifier,
-		"title", issue.Title)
-	go w.onAssign(AssignmentEvent{
-		IssueID:         issue.ID,
-		IssueIdentifier: issue.Identifier,
-		IssueTitle:      issue.Title,
-		IssueBody:       issue.Body,
-		IssueURL:        issue.URL,
-		AssigneeID:      newAssignee,
-		WebhookID:       p.WebhookID,
-	})
+	w.logger.Info("linear_agent_event",
+		"action", string(action),
+		"session", ev.SessionID,
+		"issue", ev.IssueIdentifier)
+	go w.onAgent(ev)
 }
 
-func assigneeID(i rawIssueData) string {
-	if i.AssigneeID != nil {
-		return *i.AssigneeID
+func dataPromptContext(p rawAgentSessionPayload) string {
+	if p.Data == nil {
+		return ""
 	}
-	if i.Assignee != nil {
-		return i.Assignee.ID
+	return p.Data.PromptContext
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
 	}
-	return ""
+	return b
 }
 
 // verifySignature is constant-time HMAC-SHA256 hex compare against the
-// Linear-Signature header. Returns false if header is empty/malformed.
+// Linear-Signature header.
 func verifySignature(secret []byte, headerSig string, body []byte) bool {
 	if len(secret) == 0 || headerSig == "" {
 		return false
 	}
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(body)
-	expected := hex.EncodeToString(mac.Sum(nil))
-	// hmac.Equal needs equal-length slices; hex strings of the same content
-	// are guaranteed same length.
+	expected := mac.Sum(nil)
 	got, err := hex.DecodeString(headerSig)
 	if err != nil {
 		return false
 	}
-	exp, _ := hex.DecodeString(expected)
-	return hmac.Equal(got, exp)
+	return hmac.Equal(got, expected)
 }
 
-// SignBody is exported for tests / smoke scripts: produces the same hex digest
-// Linear would send, given the same secret.
+// SignBody is exported for tests / smoke scripts.
 func SignBody(secret, body []byte) string {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(body)
 	return hex.EncodeToString(mac.Sum(nil))
 }
-
