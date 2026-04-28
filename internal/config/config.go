@@ -29,22 +29,21 @@ type Config struct {
 
 // Linear holds Linear API + webhook auth. Required by the autopilot binary;
 // optional / unused by the TG bridge.
+//
+// admiral-autopilot drives the Linear Agent SDK, so the OAuth app must be
+// installed with actor=app + app:mentionable + app:assignable scopes, and
+// its webhook must be subscribed to "Agent session events". Linear handles
+// per-agent routing — no admiral-side user UUID or workflow state UUIDs
+// are needed; status flows through agentActivityCreate into the agent
+// thread instead of comments + issueUpdate.
 type Linear struct {
-	// APIToken is the Linear personal API key (Authorization: <token>).
+	// APIToken is the Linear OAuth access token (lin_oauth_*) for the
+	// agent install, OR a personal API key (lin_api_*). The client adds
+	// `Bearer ` if not already prefixed; both forms work.
 	APIToken string `yaml:"api_token"`
 	// WebhookSecret is the signing secret configured on the Linear webhook;
 	// used to HMAC-SHA256 verify Linear-Signature on inbound POSTs.
 	WebhookSecret string `yaml:"webhook_secret"`
-	// AdmiralUserID is the Linear user UUID admiral acts on behalf of. The
-	// webhook handler only triggers on Issue.update events whose new
-	// assignee.id equals this.
-	AdmiralUserID string `yaml:"admiral_user_id"`
-	// ExecutingStateID, DoneStateID, FailedStateID are workflow state UUIDs
-	// the orchestrator sets via issueUpdate. All three are required —
-	// statuses are team-specific so we don't auto-discover.
-	ExecutingStateID string `yaml:"executing_state_id"`
-	DoneStateID      string `yaml:"done_state_id"`
-	FailedStateID    string `yaml:"failed_state_id"`
 	// APIBase overrides the Linear GraphQL endpoint. Optional; defaults to
 	// https://api.linear.app/graphql.
 	APIBase string `yaml:"api_base"`
@@ -168,18 +167,6 @@ func (c *Config) validateAutopilotAndExpand() error {
 	}
 	if strings.TrimSpace(c.Linear.WebhookSecret) == "" {
 		return fmt.Errorf("linear.webhook_secret is required")
-	}
-	if strings.TrimSpace(c.Linear.AdmiralUserID) == "" {
-		return fmt.Errorf("linear.admiral_user_id is required")
-	}
-	if strings.TrimSpace(c.Linear.ExecutingStateID) == "" {
-		return fmt.Errorf("linear.executing_state_id is required")
-	}
-	if strings.TrimSpace(c.Linear.DoneStateID) == "" {
-		return fmt.Errorf("linear.done_state_id is required")
-	}
-	if strings.TrimSpace(c.Linear.FailedStateID) == "" {
-		return fmt.Errorf("linear.failed_state_id is required")
 	}
 	if strings.TrimSpace(c.Linear.APIBase) == "" {
 		c.Linear.APIBase = "https://api.linear.app/graphql"

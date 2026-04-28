@@ -43,15 +43,14 @@ func main() {
 	defer db.Close()
 
 	lc := linear.NewClient(cfg.Linear.APIBase, cfg.Linear.APIToken)
-	orch := autopilot.New(&cfg.Autopilot, &cfg.Linear, lc, db, logger)
-	wh := linear.NewWebhook(
-		cfg.Linear.WebhookSecret,
-		cfg.Linear.AdmiralUserID,
-		orch.HandleAssignment,
-		logger,
-	)
+	orch := autopilot.New(&cfg.Autopilot, lc, db, logger)
+	wh := linear.NewWebhook(cfg.Linear.WebhookSecret, orch.HandleAgentEvent, logger)
 
 	mux := http.NewServeMux()
+	// /webhook matches Linear's typical agent webhook URL convention
+	// (the path used in the existing oauth-callback.ts demo). /linear/webhook
+	// is kept as an alias.
+	mux.Handle("/webhook", wh.Handler())
 	mux.Handle("/linear/webhook", wh.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))

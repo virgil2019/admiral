@@ -62,19 +62,16 @@ logging:
 # admiral-autopilot (v0.3): Linear-driven autopilot daemon. Both linear and
 # autopilot blocks are required only when running `admiral-autopilot`; the
 # TG bridge ignores them.
+#
+# Prereq: a Linear OAuth app installed as an Agent (actor=app, scopes
+# include app:mentionable + app:assignable), with a webhook subscribed to
+# "Agent session events". `oauth-callback.ts`-style flows are typical.
 linear:
-  # Linear personal API key (Settings → API → Personal API keys).
-  api_token: "lin_api_xxxxxxxx"
-  # Webhook signing secret (Settings → API → Webhooks → <your webhook>).
+  # OAuth access token (lin_oauth_*) for the agent install, or a personal
+  # API key (lin_api_*). Both work — Bearer is added automatically.
+  api_token: "lin_oauth_xxxxxxxx"
+  # Webhook signing secret (app's Webhooks section, "Signing secret" field).
   webhook_secret: "lin_wh_xxxxxxxx"
-  # Linear user UUID for the admiral bot account. Webhook only fires on
-  # Issue.update events whose assignee.id equals this.
-  admiral_user_id: "00000000-0000-0000-0000-000000000000"
-  # Workflow state UUIDs. List with:
-  #   gql query { workflowStates { nodes { id name team { name } } } }
-  executing_state_id: "00000000-0000-0000-0000-000000000000"
-  done_state_id:      "00000000-0000-0000-0000-000000000000"
-  failed_state_id:    "00000000-0000-0000-0000-000000000000"
   # api_base: "https://api.linear.app/graphql"  # default
 
 autopilot:
