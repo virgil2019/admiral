@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS kv (
 
 const migration0002 = `
 CREATE TABLE IF NOT EXISTS autopilot_jobs (
-  issue_id         TEXT PRIMARY KEY,
+  agent_session_id TEXT PRIMARY KEY,
+  issue_id         TEXT NOT NULL,
   issue_identifier TEXT,
   state            TEXT NOT NULL,
   worktree_path    TEXT,
@@ -75,6 +76,8 @@ CREATE TABLE IF NOT EXISTS autopilot_jobs (
   started_at       TEXT NOT NULL,
   finished_at      TEXT
 );
+CREATE INDEX IF NOT EXISTS autopilot_jobs_issue_id_idx
+  ON autopilot_jobs(issue_id);
 `
 
 type Store struct {
@@ -112,6 +115,7 @@ const (
 )
 
 type AutopilotJob struct {
+	AgentSessionID  string
 	IssueID         string
 	IssueIdentifier string
 	State           string
@@ -123,67 +127,49 @@ type AutopilotJob struct {
 	FinishedAt      string
 }
 
-// ClaimAutopilotJob inserts a RECEIVED row for issueID iff no row exists, OR
-// the existing row is in a terminal state (DONE/FAILED) — letting the same
-// issue be reassigned later. Returns (true, nil) when the caller now owns the
-// job, (false, nil) when another in-flight job already holds it.
-func (s *Store) ClaimAutopilotJob(issueID, identifier string) (bool, error) {
-	tx, err := s.DB.Begin()
+// ClaimAutopilotJob inserts a RECEIVED row for sessionID iff no row exists.
+// AgentSession UUIDs are unique per Linear-side session, so a duplicate
+// webhook delivery (Linear retries on non-2xx) re-claims a no-op. Returns
+// (true, nil) when the caller now owns the job; (false, nil) when the
+// session is already claimed (in any state, including DONE/FAILED — we
+// don't auto-restart a closed session).
+func (s *Store) ClaimAutopilotJob(sessionID, issueID, identifier string) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.DB.Exec(`
+		INSERT OR IGNORE INTO autopilot_jobs(
+			agent_session_id, issue_id, issue_identifier, state, started_at
+		) VALUES(?, ?, ?, ?, ?)
+	`, sessionID, issueID, identifier, JobStateReceived, now)
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback()
-	var existingState string
-	err = tx.QueryRow(`SELECT state FROM autopilot_jobs WHERE issue_id=?`, issueID).Scan(&existingState)
-	now := time.Now().UTC().Format(time.RFC3339)
-	switch err {
-	case sql.ErrNoRows:
-		if _, err := tx.Exec(`
-			INSERT INTO autopilot_jobs(issue_id, issue_identifier, state, started_at)
-			VALUES(?, ?, ?, ?)
-		`, issueID, identifier, JobStateReceived, now); err != nil {
-			return false, err
-		}
-	case nil:
-		if existingState != JobStateDone && existingState != JobStateFailed {
-			return false, tx.Commit()
-		}
-		if _, err := tx.Exec(`
-			UPDATE autopilot_jobs
-			SET state=?, issue_identifier=?, worktree_path=NULL, branch=NULL,
-			    pr_url=NULL, error=NULL, started_at=?, finished_at=NULL
-			WHERE issue_id=?
-		`, JobStateReceived, identifier, now, issueID); err != nil {
-			return false, err
-		}
-	default:
+	n, err := res.RowsAffected()
+	if err != nil {
 		return false, err
 	}
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	return true, nil
+	return n > 0, nil
 }
 
 // AnyAutopilotJobActive reports whether any job is in a non-terminal state.
-// Used by the orchestrator's single-flight gate.
+// Used by the orchestrator's single-flight gate (alongside the in-process
+// mutex).
 func (s *Store) AnyAutopilotJobActive() (bool, string, error) {
-	var issueID string
+	var sessionID string
 	err := s.DB.QueryRow(`
-		SELECT issue_id FROM autopilot_jobs
+		SELECT agent_session_id FROM autopilot_jobs
 		WHERE state NOT IN (?, ?)
 		ORDER BY started_at ASC LIMIT 1
-	`, JobStateDone, JobStateFailed).Scan(&issueID)
+	`, JobStateDone, JobStateFailed).Scan(&sessionID)
 	if err == sql.ErrNoRows {
 		return false, "", nil
 	}
 	if err != nil {
 		return false, "", err
 	}
-	return true, issueID, nil
+	return true, sessionID, nil
 }
 
-func (s *Store) UpdateAutopilotJob(issueID string, fn func(*AutopilotJob)) error {
+func (s *Store) UpdateAutopilotJob(sessionID string, fn func(*AutopilotJob)) error {
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return err
@@ -191,12 +177,13 @@ func (s *Store) UpdateAutopilotJob(issueID string, fn func(*AutopilotJob)) error
 	defer tx.Rollback()
 	var j AutopilotJob
 	err = tx.QueryRow(`
-		SELECT issue_id, issue_identifier, state, COALESCE(worktree_path,''),
-		       COALESCE(branch,''), COALESCE(pr_url,''), COALESCE(error,''),
+		SELECT agent_session_id, issue_id, issue_identifier, state,
+		       COALESCE(worktree_path,''), COALESCE(branch,''),
+		       COALESCE(pr_url,''), COALESCE(error,''),
 		       started_at, COALESCE(finished_at,'')
-		FROM autopilot_jobs WHERE issue_id=?
-	`, issueID).Scan(&j.IssueID, &j.IssueIdentifier, &j.State, &j.WorktreePath,
-		&j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt)
+		FROM autopilot_jobs WHERE agent_session_id=?
+	`, sessionID).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt)
 	if err != nil {
 		return err
 	}
@@ -205,24 +192,25 @@ func (s *Store) UpdateAutopilotJob(issueID string, fn func(*AutopilotJob)) error
 		UPDATE autopilot_jobs
 		SET issue_identifier=?, state=?, worktree_path=?, branch=?, pr_url=?,
 		    error=?, finished_at=?
-		WHERE issue_id=?
+		WHERE agent_session_id=?
 	`, j.IssueIdentifier, j.State, nullIfEmpty(j.WorktreePath), nullIfEmpty(j.Branch),
-		nullIfEmpty(j.PRURL), nullIfEmpty(j.Error), nullIfEmpty(j.FinishedAt), issueID)
+		nullIfEmpty(j.PRURL), nullIfEmpty(j.Error), nullIfEmpty(j.FinishedAt), sessionID)
 	if err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func (s *Store) GetAutopilotJob(issueID string) (*AutopilotJob, error) {
+func (s *Store) GetAutopilotJob(sessionID string) (*AutopilotJob, error) {
 	var j AutopilotJob
 	err := s.DB.QueryRow(`
-		SELECT issue_id, issue_identifier, state, COALESCE(worktree_path,''),
-		       COALESCE(branch,''), COALESCE(pr_url,''), COALESCE(error,''),
+		SELECT agent_session_id, issue_id, issue_identifier, state,
+		       COALESCE(worktree_path,''), COALESCE(branch,''),
+		       COALESCE(pr_url,''), COALESCE(error,''),
 		       started_at, COALESCE(finished_at,'')
-		FROM autopilot_jobs WHERE issue_id=?
-	`, issueID).Scan(&j.IssueID, &j.IssueIdentifier, &j.State, &j.WorktreePath,
-		&j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt)
+		FROM autopilot_jobs WHERE agent_session_id=?
+	`, sessionID).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

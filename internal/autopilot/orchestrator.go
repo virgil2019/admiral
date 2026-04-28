@@ -1,11 +1,11 @@
-// Package autopilot is the v0.3 happy-path orchestrator: pick up an
-// assignment from Linear, create a worktree, run `claude -p`, ensure a
-// PR was opened, write the result back to Linear.
+// Package autopilot is the v0.3 happy-path orchestrator: pick up a Linear
+// AgentSessionEvent, create a worktree, run `claude -p`, ensure a PR was
+// opened, post agent activities back into the Linear agent thread.
 //
 // Concurrency: single-flight. Only one job runs at a time. A second
-// assignment that arrives while a job is in flight is rejected with a
-// short comment back to Linear ("busy with <other-issue>") and the new
-// issue's webhook event is dropped. v0.3 does not queue.
+// AgentSessionEvent that arrives while a job is in flight is rejected with
+// a short "busy" response activity into the new session and dropped.
+// v0.3 does not queue.
 package autopilot
 
 import (
@@ -29,7 +29,6 @@ import (
 
 type Orchestrator struct {
 	cfg    *config.Autopilot
-	lcfg   *config.Linear
 	lc     *linear.Client
 	db     *store.Store
 	logger *slog.Logger
@@ -38,21 +37,34 @@ type Orchestrator struct {
 	running bool
 }
 
-func New(cfg *config.Autopilot, lcfg *config.Linear, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
-	return &Orchestrator{cfg: cfg, lcfg: lcfg, lc: lc, db: db, logger: logger}
+func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
+	return &Orchestrator{cfg: cfg, lc: lc, db: db, logger: logger}
 }
 
-// HandleAssignment is wired up as the linear.AssignmentHandler. Returns
-// quickly: the actual run happens on a background goroutine.
-func (o *Orchestrator) HandleAssignment(ev linear.AssignmentEvent) {
+// HandleAgentEvent is wired up as the linear.AgentHandler. Returns quickly:
+// the actual run happens on a background goroutine.
+func (o *Orchestrator) HandleAgentEvent(ev linear.AgentEvent) {
+	switch ev.Action {
+	case linear.ActionCreated:
+		o.handleCreated(ev)
+	case linear.ActionPrompted:
+		o.handlePrompted(ev)
+	default:
+		o.logger.Warn("autopilot_unknown_action", "action", ev.Action)
+	}
+}
+
+func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
 	o.mu.Lock()
 	if o.running {
 		o.mu.Unlock()
-		o.logger.Info("autopilot_busy_skip", "issue", ev.IssueIdentifier)
+		o.logger.Info("autopilot_busy_skip",
+			"issue", ev.IssueIdentifier, "session", ev.SessionID)
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		_ = o.lc.PostComment(ctx, ev.IssueID,
-			"admiral is busy with another issue and skipped this assignment. Reassign once the current run finishes.")
+		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(
+			"admiral is busy with another session. Reassign or @mention again "+
+				"once the current run finishes."))
 		return
 	}
 	o.running = true
@@ -68,60 +80,74 @@ func (o *Orchestrator) HandleAssignment(ev linear.AssignmentEvent) {
 	}()
 }
 
-func (o *Orchestrator) run(ev linear.AssignmentEvent) {
+// handlePrompted is the v0.3 stub for follow-up messages in an existing
+// agent thread. We post a polite "not yet" reply and don't touch any
+// running flow. The full clarify/iterate loop is deferred to v0.4.
+func (o *Orchestrator) handlePrompted(ev linear.AgentEvent) {
+	o.logger.Info("autopilot_prompted_stub",
+		"session", ev.SessionID, "msg_len", len(ev.UserMessage))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(
+		"v0.3 doesn't handle follow-up messages yet — this thread is "+
+			"single-shot. Open a new issue or reassign to start a fresh run."))
+}
+
+func (o *Orchestrator) run(ev linear.AgentEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 
-	claimed, err := o.db.ClaimAutopilotJob(ev.IssueID, ev.IssueIdentifier)
+	claimed, err := o.db.ClaimAutopilotJob(ev.SessionID, ev.IssueID, ev.IssueIdentifier)
 	if err != nil {
-		o.logger.Error("claim_job_failed", "err", err, "issue", ev.IssueIdentifier)
+		o.logger.Error("claim_job_failed", "err", err, "session", ev.SessionID)
 		return
 	}
 	if !claimed {
-		o.logger.Info("job_already_in_flight", "issue", ev.IssueIdentifier)
+		o.logger.Info("session_already_claimed",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
 		return
 	}
 
 	flow := newFlow(o, ctx, ev)
 	if err := flow.execute(); err != nil {
 		o.logger.Error("autopilot_failed",
-			"issue", ev.IssueIdentifier, "err", err)
+			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
 		flow.markFailed(err)
 		return
 	}
 	o.logger.Info("autopilot_done",
-		"issue", ev.IssueIdentifier, "pr", flow.prURL)
+		"issue", ev.IssueIdentifier, "session", ev.SessionID, "pr", flow.prURL)
 }
 
-// flow carries the per-job state across the run() steps. It exists so that
-// markFailed can post a meaningful comment using whatever was set so far
-// (worktree path, branch) without having run() pass everything through args.
+// flow carries the per-job state across the run() steps.
 type flow struct {
 	o   *Orchestrator
 	ctx context.Context
-	ev  linear.AssignmentEvent
+	ev  linear.AgentEvent
 
 	branch       string
 	worktreePath string
 	prURL        string
 }
 
-func newFlow(o *Orchestrator, ctx context.Context, ev linear.AssignmentEvent) *flow {
+func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
 	return &flow{o: o, ctx: ctx, ev: ev}
 }
 
+func (f *flow) postActivity(a linear.AgentActivity) {
+	if err := f.o.lc.PostAgentActivity(f.ctx, f.ev.SessionID, a); err != nil {
+		f.o.logger.Warn("post_activity_failed",
+			"session", f.ev.SessionID, "type", a.Type, "err", err)
+	}
+}
+
 func (f *flow) execute() error {
+	f.postActivity(linear.Thought("Reading issue context...", true))
+
 	issue, err := f.o.lc.GetIssue(f.ctx, f.ev.IssueID)
 	if err != nil {
 		return fmt.Errorf("fetch issue: %w", err)
-	}
-	if err := f.o.lc.SetIssueState(f.ctx, f.ev.IssueID, f.o.lcfg.ExecutingStateID); err != nil {
-		return fmt.Errorf("set executing state: %w", err)
-	}
-	if err := f.o.lc.PostComment(f.ctx, f.ev.IssueID,
-		"admiral picked up this issue and is running autopilot."); err != nil {
-		return fmt.Errorf("post pickup comment: %w", err)
 	}
 
 	f.branch = branchName(issue)
@@ -129,7 +155,7 @@ func (f *flow) execute() error {
 		absWorktreeRoot(f.o.cfg),
 		"linear-"+sanitizeForPath(issue.Identifier),
 	)
-	if err := f.o.db.UpdateAutopilotJob(f.ev.IssueID, func(j *store.AutopilotJob) {
+	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
 		j.State = store.JobStateExecuting
 		j.WorktreePath = f.worktreePath
 		j.Branch = f.branch
@@ -137,49 +163,53 @@ func (f *flow) execute() error {
 		return fmt.Errorf("update job to EXECUTING: %w", err)
 	}
 
+	f.postActivity(linear.Action("worktree_create",
+		fmt.Sprintf("%s @ %s", f.branch, f.o.cfg.BaseBranch),
+		""))
 	if err := f.createWorktree(); err != nil {
 		return fmt.Errorf("create worktree: %w", err)
 	}
 
+	f.postActivity(linear.Action("claude_run",
+		fmt.Sprintf("claude -p in %s", f.worktreePath),
+		""))
 	if err := f.runClaude(issue); err != nil {
 		return fmt.Errorf("claude run: %w", err)
 	}
 
+	f.postActivity(linear.Action("ensure_pr",
+		fmt.Sprintf("gh pr (%s -> %s)", f.branch, f.o.cfg.BaseBranch),
+		""))
 	prURL, err := f.ensurePR(issue)
 	if err != nil {
 		return fmt.Errorf("ensure PR: %w", err)
 	}
 	f.prURL = prURL
 
-	if err := f.o.db.UpdateAutopilotJob(f.ev.IssueID, func(j *store.AutopilotJob) {
+	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
 		j.State = store.JobStateDone
 		j.PRURL = prURL
 		j.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 	}); err != nil {
 		return fmt.Errorf("update job to DONE: %w", err)
 	}
-	if err := f.o.lc.SetIssueState(f.ctx, f.ev.IssueID, f.o.lcfg.DoneStateID); err != nil {
-		return fmt.Errorf("set done state: %w", err)
-	}
-	if err := f.o.lc.PostComment(f.ctx, f.ev.IssueID,
-		fmt.Sprintf("admiral finished. PR: %s", prURL)); err != nil {
-		return fmt.Errorf("post done comment: %w", err)
-	}
+
+	f.postActivity(linear.Response(fmt.Sprintf(
+		"Done. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
+		prURL, f.worktreePath, f.branch)))
 	return nil
 }
 
 func (f *flow) markFailed(runErr error) {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_ = f.o.db.UpdateAutopilotJob(f.ev.IssueID, func(j *store.AutopilotJob) {
+	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
 		j.State = store.JobStateFailed
 		j.Error = runErr.Error()
 		j.FinishedAt = now
 	})
-	// We deliberately don't bail on context.Done here; markFailed runs
-	// even if the parent ctx already expired (use a fresh short ctx).
+	// Use a fresh short ctx in case the parent is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_ = f.o.lc.SetIssueState(ctx, f.ev.IssueID, f.o.lcfg.FailedStateID)
 	body := "admiral failed: " + truncate(runErr.Error(), 1500)
 	if f.worktreePath != "" {
 		body += "\n\nWorktree: `" + f.worktreePath + "`"
@@ -187,7 +217,7 @@ func (f *flow) markFailed(runErr error) {
 	if f.branch != "" {
 		body += "\nBranch: `" + f.branch + "`"
 	}
-	_ = f.o.lc.PostComment(ctx, f.ev.IssueID, body)
+	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.ErrorActivity(body))
 }
 
 // createWorktree fetches origin/<base> and creates a fresh worktree. If the
@@ -198,9 +228,6 @@ func (f *flow) createWorktree() error {
 	if err := runCmd(f.ctx, repo, "git", "fetch", "origin", base); err != nil {
 		return fmt.Errorf("git fetch origin %s: %w", base, err)
 	}
-	// Best-effort cleanup of a prior worktree at the same path. `git worktree
-	// remove` will fail if the path doesn't exist; ignore that. If a stale
-	// branch with the same name exists locally, drop it too.
 	_ = runCmd(f.ctx, repo, "git", "worktree", "remove", "--force", f.worktreePath)
 	_ = os.RemoveAll(f.worktreePath)
 	_ = runCmd(f.ctx, repo, "git", "branch", "-D", f.branch)
@@ -216,10 +243,9 @@ func (f *flow) createWorktree() error {
 }
 
 // runClaude spawns `claude -p` in stream-json mode inside the worktree and
-// drains stdout until exit. We log each line as a child event but don't try
-// to interpret the protocol — v0.3 trusts claude to either complete or fail.
+// drains stdout until exit.
 func (f *flow) runClaude(issue *linear.Issue) error {
-	prompt := buildPrompt(f.o.cfg.AutopilotSkill, issue)
+	prompt := buildPrompt(f.o.cfg.AutopilotSkill, issue, f.ev)
 	args := []string{
 		"-p", prompt,
 		"--output-format", "stream-json",
@@ -230,7 +256,10 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	defer cancel()
 	cmd := exec.CommandContext(cctx, f.o.cfg.ClaudeBin, args...)
 	cmd.Dir = f.worktreePath
-	cmd.Env = append(os.Environ(), "CLAUDE_AUTOPILOT_ISSUE="+issue.Identifier)
+	cmd.Env = append(os.Environ(),
+		"CLAUDE_AUTOPILOT_ISSUE="+issue.Identifier,
+		"CLAUDE_AUTOPILOT_SESSION="+f.ev.SessionID,
+	)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -262,10 +291,6 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	return nil
 }
 
-// drainStreamJSON reads claude's stream-json output line by line and logs
-// the type/subtype + a short text snippet. We do NOT need the full content
-// for v0.3 — committing + PR creation is delegated to claude itself, and
-// our success signal is exit code 0 + presence of a PR.
 func (f *flow) drainStreamJSON(r io.Reader) {
 	s := bufio.NewScanner(r)
 	s.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
@@ -298,7 +323,6 @@ func (f *flow) ensurePR(issue *linear.Issue) (string, error) {
 	if url != "" {
 		return url, nil
 	}
-	// Push the branch to origin first so gh pr create has a remote head.
 	if err := runCmd(f.ctx, f.worktreePath, "git", "push", "-u", "origin", f.branch); err != nil {
 		return "", fmt.Errorf("git push: %w", err)
 	}
@@ -316,8 +340,6 @@ func (f *flow) ensurePR(issue *linear.Issue) (string, error) {
 	}
 	url = strings.TrimSpace(extractFirstURL(out))
 	if url == "" {
-		// gh prints the URL as the only output line on success; if we
-		// didn't find one, retry the lookup once.
 		url2, lerr := f.lookupPR()
 		if lerr == nil && url2 != "" {
 			return url2, nil
@@ -358,8 +380,8 @@ func branchName(i *linear.Issue) string {
 }
 
 // sanitizeForPath collapses anything outside [a-z0-9-] to '-' and trims.
-// The branch and worktree subdir names go through this so a hostile
-// identifier can't escape into shell or filesystem traversal.
+// Branch and worktree subdir names go through this so a hostile identifier
+// can't escape into shell or filesystem traversal.
 func sanitizeForPath(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	var b strings.Builder
@@ -379,18 +401,49 @@ func sanitizeForPath(s string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-func buildPrompt(skill string, i *linear.Issue) string {
-	header := fmt.Sprintf("Linear issue %s: %s", i.Identifier, i.Title)
-	body := i.Description
-	if body == "" {
-		body = "(no description)"
-	}
-	footer := "When done, commit your changes and open a PR via `gh pr create` against the base branch."
-	parts := []string{header, "", body, "", footer}
+// buildPrompt mirrors the existing TS demo's issueToContext + agent prompt.
+// Format: full issue context (state / labels / description / recent comments)
+// followed by whatever the user said when triggering the agent (mention
+// text, delegate prompt, or "(assigned, no explicit prompt)" for raw assign).
+func buildPrompt(skill string, i *linear.Issue, ev linear.AgentEvent) string {
+	var sb strings.Builder
 	if skill != "" {
-		parts = append([]string{"/" + skill, ""}, parts...)
+		sb.WriteString("/")
+		sb.WriteString(skill)
+		sb.WriteString("\n\n")
 	}
-	return strings.Join(parts, "\n")
+	fmt.Fprintf(&sb, "# Issue %s: %s\n\n", i.Identifier, i.Title)
+	if i.StateName != "" {
+		fmt.Fprintf(&sb, "State: %s\n", i.StateName)
+	}
+	if len(i.Labels) > 0 {
+		fmt.Fprintf(&sb, "Labels: %s\n", strings.Join(i.Labels, ", "))
+	}
+	sb.WriteString("\n## Description\n")
+	if i.Description == "" {
+		sb.WriteString("(empty)\n")
+	} else {
+		sb.WriteString(i.Description)
+		sb.WriteString("\n")
+	}
+	if len(i.Comments) > 0 {
+		sb.WriteString("\n## Recent comments\n")
+		for _, c := range i.Comments {
+			name := c.UserName
+			if name == "" {
+				name = "?"
+			}
+			fmt.Fprintf(&sb, "- %s: %s\n", name, truncate(c.Body, 400))
+		}
+	}
+	sb.WriteString("\n## User trigger\n")
+	if ev.PromptContext != "" {
+		sb.WriteString(ev.PromptContext)
+	} else {
+		sb.WriteString("(assigned, no explicit prompt — act on the issue context above)")
+	}
+	sb.WriteString("\n\nWhen done, commit your changes and open a PR via `gh pr create` against the base branch.")
+	return sb.String()
 }
 
 func runCmd(ctx context.Context, dir, name string, args ...string) error {

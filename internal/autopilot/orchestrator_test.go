@@ -1,6 +1,7 @@
 package autopilot
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/georgehuang/admiral/internal/linear"
@@ -36,14 +37,56 @@ func TestBranchName(t *testing.T) {
 	}
 }
 
-func TestBuildPrompt_WithSkill(t *testing.T) {
-	p := buildPrompt("autopilot", &linear.Issue{
+func TestBuildPrompt_AssignNoContext(t *testing.T) {
+	p := buildPrompt("", &linear.Issue{
 		Identifier:  "TST-1",
 		Title:       "do the thing",
 		Description: "details",
+		StateName:   "Todo",
+		Labels:      []string{"backend"},
+	}, linear.AgentEvent{Action: linear.ActionCreated})
+	if !strings.Contains(p, "TST-1: do the thing") {
+		t.Errorf("missing title line:\n%s", p)
+	}
+	if !strings.Contains(p, "State: Todo") {
+		t.Errorf("missing state:\n%s", p)
+	}
+	if !strings.Contains(p, "Labels: backend") {
+		t.Errorf("missing labels:\n%s", p)
+	}
+	if !strings.Contains(p, "(assigned, no explicit prompt") {
+		t.Errorf("missing assign placeholder:\n%s", p)
+	}
+}
+
+func TestBuildPrompt_MentionWithContext(t *testing.T) {
+	p := buildPrompt("autopilot", &linear.Issue{
+		Identifier: "TST-2", Title: "x", Description: "d",
+	}, linear.AgentEvent{
+		Action:        linear.ActionCreated,
+		PromptContext: "please refactor the auth module",
 	})
-	if got := p[:11]; got != "/autopilot\n" {
-		t.Errorf("prompt should start with /autopilot newline; got %q", got)
+	if !strings.HasPrefix(p, "/autopilot\n\n") {
+		t.Errorf("skill not prefixed:\n%s", p)
+	}
+	if !strings.Contains(p, "please refactor the auth module") {
+		t.Errorf("missing prompt context:\n%s", p)
+	}
+}
+
+func TestBuildPrompt_Comments(t *testing.T) {
+	p := buildPrompt("", &linear.Issue{
+		Identifier: "TST-3", Title: "x",
+		Comments: []linear.Comment{
+			{UserName: "alice", Body: "first comment"},
+			{UserName: "bob", Body: "second comment"},
+		},
+	}, linear.AgentEvent{Action: linear.ActionCreated})
+	if !strings.Contains(p, "- alice: first comment") {
+		t.Errorf("missing alice comment:\n%s", p)
+	}
+	if !strings.Contains(p, "- bob: second comment") {
+		t.Errorf("missing bob comment:\n%s", p)
 	}
 }
 
