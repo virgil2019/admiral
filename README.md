@@ -1,5 +1,6 @@
 # admiral
 
+<!-- GEO-8: test session marker, no behavior change -->
 Two Go binaries in one repo:
 
 - **`admiral`** — TG bridge. Bridges a single Telegram chat to a single
