@@ -169,12 +169,22 @@ func (f *flow) execute() error {
 	if err := f.createWorktree(); err != nil {
 		return fmt.Errorf("create worktree: %w", err)
 	}
+	if err := f.configureWorktreeIgnores(); err != nil {
+		return fmt.Errorf("configure worktree ignores: %w", err)
+	}
 
 	f.postActivity(linear.Action("claude_run",
 		fmt.Sprintf("claude -p in %s", f.worktreePath),
 		""))
 	if err := f.runClaude(issue); err != nil {
 		return fmt.Errorf("claude run: %w", err)
+	}
+
+	f.postActivity(linear.Action("commit_changes",
+		fmt.Sprintf("staging + committing in %s", f.worktreePath),
+		""))
+	if err := f.commitChanges(issue); err != nil {
+		return fmt.Errorf("commit changes: %w", err)
 	}
 
 	f.postActivity(linear.Action("ensure_pr",
@@ -218,6 +228,63 @@ func (f *flow) markFailed(runErr error) {
 		body += "\nBranch: `" + f.branch + "`"
 	}
 	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.ErrorActivity(body))
+}
+
+// configureWorktreeIgnores writes .git/info/exclude entries inside the
+// worktree so claude's session artifacts (currently `.omc/`) don't get
+// staged when the orchestrator does its post-run `git add -A`. Worktree
+// ignores live alongside the worktree's gitdir, which we resolve via
+// `git rev-parse --git-dir` (in a worktree, `.git` is a file, not a dir,
+// so we can't hardcode the path).
+func (f *flow) configureWorktreeIgnores() error {
+	out, err := captureCmd(f.ctx, f.worktreePath, "git", "rev-parse", "--git-dir")
+	if err != nil {
+		return fmt.Errorf("git rev-parse --git-dir: %w (output: %s)", err, truncate(out, 200))
+	}
+	gitDir := strings.TrimSpace(out)
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(f.worktreePath, gitDir)
+	}
+	infoDir := filepath.Join(gitDir, "info")
+	if err := os.MkdirAll(infoDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir info: %w", err)
+	}
+	excludeFile := filepath.Join(infoDir, "exclude")
+	existing, _ := os.ReadFile(excludeFile)
+	if strings.Contains(string(existing), "# admiral-autopilot") {
+		return nil
+	}
+	fh, err := os.OpenFile(excludeFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open exclude: %w", err)
+	}
+	defer fh.Close()
+	_, err = fh.WriteString("\n# admiral-autopilot — claude/omc session artifacts\n.omc/\n")
+	return err
+}
+
+// commitChanges stages everything (modulo `.git/info/exclude`), bails out if
+// nothing was actually staged, and commits with a canonical autopilot
+// message. Decoupling commit from claude's prompt makes the flow
+// deterministic — claude's job is to edit; orchestrator's job is to ship.
+func (f *flow) commitChanges(issue *linear.Issue) error {
+	if err := runCmd(f.ctx, f.worktreePath, "git", "add", "-A"); err != nil {
+		return fmt.Errorf("git add -A: %w", err)
+	}
+	cmd := exec.CommandContext(f.ctx, "git", "diff", "--cached", "--quiet")
+	cmd.Dir = f.worktreePath
+	err := cmd.Run()
+	if err == nil {
+		return fmt.Errorf("claude exited with no committable changes (worktree is clean)")
+	}
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 1 {
+		return fmt.Errorf("git diff --cached --quiet: %w", err)
+	}
+	msg := fmt.Sprintf("[autopilot] %s: %s", issue.Identifier, issue.Title)
+	if err := runCmd(f.ctx, f.worktreePath, "git", "commit", "-m", msg); err != nil {
+		return fmt.Errorf("git commit: %w", err)
+	}
+	return nil
 }
 
 // createWorktree fetches origin/<base> and creates a fresh worktree. If the
@@ -442,7 +509,10 @@ func buildPrompt(skill string, i *linear.Issue, ev linear.AgentEvent) string {
 	} else {
 		sb.WriteString("(assigned, no explicit prompt — act on the issue context above)")
 	}
-	sb.WriteString("\n\nWhen done, commit your changes and open a PR via `gh pr create` against the base branch.")
+	// admiral-autopilot handles git add / commit / push / gh pr create after
+	// claude exits, so claude only needs to edit files. Telling claude to
+	// commit/push doubles the work and is unreliable in -p mode.
+	sb.WriteString("\n\nMake the necessary edits in this worktree. Do NOT run `git commit`, `git push`, or `gh pr create` — admiral handles those after you exit.")
 	return sb.String()
 }
 
