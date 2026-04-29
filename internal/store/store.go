@@ -92,6 +92,10 @@ INSERT OR IGNORE INTO linear_oauth (id, access_token, refresh_token, expires_at,
 VALUES (1, '', '', '', '');
 `
 
+const migration0004 = `
+ALTER TABLE autopilot_jobs ADD COLUMN stream_log_path TEXT;
+`
+
 type Store struct {
 	DB *sql.DB
 }
@@ -118,6 +122,9 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(migration0003); err != nil {
 		return nil, fmt.Errorf("apply migration 0003: %w", err)
 	}
+	if _, err := db.Exec(migration0004); err != nil {
+		return nil, fmt.Errorf("apply migration 0004: %w", err)
+	}
 	return &Store{DB: db}, nil
 }
 
@@ -140,6 +147,7 @@ type AutopilotJob struct {
 	Error           string
 	StartedAt       string
 	FinishedAt      string
+	StreamLogPath   string
 }
 
 // ClaimAutopilotJob inserts a RECEIVED row for sessionID iff no row exists.
@@ -195,10 +203,12 @@ func (s *Store) UpdateAutopilotJob(sessionID string, fn func(*AutopilotJob)) err
 		SELECT agent_session_id, issue_id, issue_identifier, state,
 		       COALESCE(worktree_path,''), COALESCE(branch,''),
 		       COALESCE(pr_url,''), COALESCE(error,''),
-		       started_at, COALESCE(finished_at,'')
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(stream_log_path,'')
 		FROM autopilot_jobs WHERE agent_session_id=?
 	`, sessionID).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
-		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt)
+		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+		&j.StreamLogPath)
 	if err != nil {
 		return err
 	}
@@ -206,10 +216,11 @@ func (s *Store) UpdateAutopilotJob(sessionID string, fn func(*AutopilotJob)) err
 	_, err = tx.Exec(`
 		UPDATE autopilot_jobs
 		SET issue_identifier=?, state=?, worktree_path=?, branch=?, pr_url=?,
-		    error=?, finished_at=?
+		    error=?, finished_at=?, stream_log_path=?
 		WHERE agent_session_id=?
 	`, j.IssueIdentifier, j.State, nullIfEmpty(j.WorktreePath), nullIfEmpty(j.Branch),
-		nullIfEmpty(j.PRURL), nullIfEmpty(j.Error), nullIfEmpty(j.FinishedAt), sessionID)
+		nullIfEmpty(j.PRURL), nullIfEmpty(j.Error), nullIfEmpty(j.FinishedAt),
+		nullIfEmpty(j.StreamLogPath), sessionID)
 	if err != nil {
 		return err
 	}
@@ -222,10 +233,12 @@ func (s *Store) GetAutopilotJob(sessionID string) (*AutopilotJob, error) {
 		SELECT agent_session_id, issue_id, issue_identifier, state,
 		       COALESCE(worktree_path,''), COALESCE(branch,''),
 		       COALESCE(pr_url,''), COALESCE(error,''),
-		       started_at, COALESCE(finished_at,'')
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(stream_log_path,'')
 		FROM autopilot_jobs WHERE agent_session_id=?
 	`, sessionID).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
-		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt)
+		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+		&j.StreamLogPath)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

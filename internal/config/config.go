@@ -84,6 +84,12 @@ type Autopilot struct {
 	GhBin string `yaml:"gh_bin"`
 	// MaxRunSeconds caps a single claude -p invocation. Default: 1800 (30 min).
 	MaxRunSeconds int `yaml:"max_run_seconds"`
+	// JobStreamsDir is the directory where per-job claude stream-json files
+	// are written. Default: <sqlite_path dir>/job-streams (e.g. if
+	// sqlite_path is ~/.local/share/admiral/autopilot.db, the default is
+	// ~/.local/share/admiral/job-streams). The directory is created
+	// automatically on startup if it does not exist.
+	JobStreamsDir string `yaml:"job_streams_dir"`
 }
 
 type Launch struct {
@@ -213,6 +219,10 @@ func (c *Config) validateAutopilotAndExpand() error {
 	}
 	if c.Autopilot.MaxRunSeconds <= 0 {
 		c.Autopilot.MaxRunSeconds = 1800
+	}
+	if strings.TrimSpace(c.Autopilot.JobStreamsDir) == "" {
+		// Default: <sqlite_path dir>/job-streams
+		c.Autopilot.JobStreamsDir = filepath.Join(filepath.Dir(c.Storage.SQLitePath), "job-streams")
 	}
 
 	c.Storage.SQLitePath = expandTilde(c.Storage.SQLitePath)

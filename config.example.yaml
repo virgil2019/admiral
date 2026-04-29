@@ -93,3 +93,8 @@ autopilot:
   # gh_bin:          "gh"
   # autopilot_skill: ""           # claude skill name, e.g. "autopilot"
   # max_run_seconds: 1800
+  # job_streams_dir: "<sqlite_path dir>/job-streams"
+  #                  # Directory for per-job claude stream-json log files.
+  #                  # Each job writes one .jsonl file named <session_id>.jsonl.
+  #                  # Default is derived from storage.sqlite_path:
+  #                  # e.g. ~/.local/share/admiral/job-streams

@@ -38,7 +38,12 @@ type Orchestrator struct {
 }
 
 func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
-	return &Orchestrator{cfg: cfg, lc: lc, db: db, logger: logger}
+	o := &Orchestrator{cfg: cfg, lc: lc, db: db, logger: logger}
+	// Ensure job_streams_dir exists on startup.
+	if err := os.MkdirAll(cfg.JobStreamsDir, 0o755); err != nil {
+		logger.Warn("job_streams_dir_mkdir", "dir", cfg.JobStreamsDir, "err", err)
+	}
+	return o
 }
 
 // HandleAgentEvent is wired up as the linear.AgentHandler. Returns quickly:
@@ -129,6 +134,7 @@ type flow struct {
 	branch       string
 	worktreePath string
 	prURL        string
+	streamFile   *os.File
 }
 
 func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
@@ -176,6 +182,10 @@ func (f *flow) execute() error {
 	f.postActivity(linear.Action("claude_run",
 		fmt.Sprintf("claude -p in %s", f.worktreePath),
 		""))
+	if err := f.openStreamFile(); err != nil {
+		return fmt.Errorf("open stream file: %w", err)
+	}
+	defer f.closeStreamFile()
 	if err := f.runClaude(issue); err != nil {
 		return fmt.Errorf("claude run: %w", err)
 	}
@@ -203,6 +213,31 @@ func (f *flow) execute() error {
 	return nil
 }
 
+// openStreamFile opens the per-job stream log file for appending. The file
+// is created if it doesn't exist (0o644).
+func (f *flow) openStreamFile() error {
+	path := filepath.Join(f.o.cfg.JobStreamsDir, f.ev.SessionID+".jsonl")
+	fh, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	f.streamFile = fh
+	if f.o.db != nil {
+		_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+			j.StreamLogPath = path
+		})
+	}
+	return nil
+}
+
+// closeStreamFile closes the stream log file. Safe to call on nil.
+func (f *flow) closeStreamFile() {
+	if f.streamFile != nil {
+		f.streamFile.Close()
+		f.streamFile = nil
+	}
+}
+
 func (f *flow) markFailed(runErr error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
@@ -219,6 +254,9 @@ func (f *flow) markFailed(runErr error) {
 	}
 	if f.branch != "" {
 		body += "\nBranch: `" + f.branch + "`"
+	}
+	if j, err := f.o.db.GetAutopilotJob(f.ev.SessionID); err == nil && j.StreamLogPath != "" {
+		body += "\n\nStream log: " + j.StreamLogPath
 	}
 	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.ErrorActivity(body))
 }
@@ -338,6 +376,10 @@ func (f *flow) drainStreamJSON(r io.Reader) {
 	s.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
 	for s.Scan() {
 		line := s.Text()
+		// Write raw line to stream file (do NOT re-marshal).
+		if f.streamFile != nil {
+			f.streamFile.WriteString(line + "\n")
+		}
 		var msg struct {
 			Type    string `json:"type"`
 			Subtype string `json:"subtype"`
