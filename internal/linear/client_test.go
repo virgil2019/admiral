@@ -3,8 +3,10 @@ package linear
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -272,4 +274,144 @@ type testRefresher struct{ token string }
 
 func (r *testRefresher) RefreshAndRetry(ctx context.Context) (string, error) {
 	return r.token, nil
+}
+
+// Test: refresh request uses application/x-www-form-urlencoded with correct fields.
+func TestTokenRefresher_DoRefresh_FormURLEncoded(t *testing.T) {
+	var receivedContentType string
+	var receivedBody map[string]string
+
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedContentType = r.Header.Get("Content-Type")
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		receivedBody = map[string]string{
+			"client_id":     r.FormValue("client_id"),
+			"client_secret": r.FormValue("client_secret"),
+			"grant_type":    r.FormValue("grant_type"),
+			"refresh_token": r.FormValue("refresh_token"),
+		}
+		json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  "new_access_token",
+			"refresh_token": "new_refresh_token",
+		})
+	}))
+	defer tokenServer.Close()
+
+	ms := &mockStore{tokens: []*store.LinearOAuthToken{
+		{AccessToken: "old_token", RefreshToken: "refresh_token"},
+	}}
+	tr, _ := NewTokenRefresher("test_client_id", "test_client_secret", ms, nil, tokenServer.URL)
+
+	_, _ = tr.RefreshAndRetry(context.Background())
+
+	if receivedContentType != "application/x-www-form-urlencoded" {
+		t.Errorf("expected Content-Type 'application/x-www-form-urlencoded', got %q", receivedContentType)
+	}
+	if receivedBody["client_id"] != "test_client_id" {
+		t.Errorf("expected client_id 'test_client_id', got %q", receivedBody["client_id"])
+	}
+	if receivedBody["client_secret"] != "test_client_secret" {
+		t.Errorf("expected client_secret 'test_client_secret', got %q", receivedBody["client_secret"])
+	}
+	if receivedBody["grant_type"] != "refresh_token" {
+		t.Errorf("expected grant_type 'refresh_token', got %q", receivedBody["grant_type"])
+	}
+	if receivedBody["refresh_token"] != "refresh_token" {
+		t.Errorf("expected refresh_token 'refresh_token', got %q", receivedBody["refresh_token"])
+	}
+}
+
+// Test: error attribution - invalid_grant.
+func TestTokenRefresher_DoRefresh_InvalidGrant(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":             "invalid_grant",
+			"error_description": "Refresh token expired",
+		})
+	}))
+	defer tokenServer.Close()
+
+	ms := &mockStore{tokens: []*store.LinearOAuthToken{
+		{AccessToken: "old_token", RefreshToken: "bad_refresh_token"},
+	}}
+	tr, _ := NewTokenRefresher("client_id", "client_secret", ms, nil, tokenServer.URL)
+
+	_, err := tr.RefreshAndRetry(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	errStr := err.Error()
+	if !strings.Contains(errStr, "invalid_grant") {
+		t.Errorf("expected error to contain 'invalid_grant', got %q", errStr)
+	}
+	if strings.Contains(errStr, "or network error") {
+		t.Errorf("error should not contain 'or network error', got %q", errStr)
+	}
+	if !errors.Is(err, ErrTokenRefreshFailed) {
+		t.Errorf("expected errors.Is(err, ErrTokenRefreshFailed) to be true")
+	}
+}
+
+// Test: error attribution - invalid_request.
+func TestTokenRefresher_DoRefresh_InvalidRequest(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":             "invalid_request",
+			"error_description": "Invalid request: content must be application/x-www-form-urlencoded",
+		})
+	}))
+	defer tokenServer.Close()
+
+	ms := &mockStore{tokens: []*store.LinearOAuthToken{
+		{AccessToken: "old_token", RefreshToken: "refresh_token"},
+	}}
+	tr, _ := NewTokenRefresher("client_id", "client_secret", ms, nil, tokenServer.URL)
+
+	_, err := tr.RefreshAndRetry(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	errStr := err.Error()
+	if !strings.Contains(errStr, "invalid_request") {
+		t.Errorf("expected error to contain 'invalid_request', got %q", errStr)
+	}
+	if !errors.Is(err, ErrTokenRefreshFailed) {
+		t.Errorf("expected errors.Is(err, ErrTokenRefreshFailed) to be true")
+	}
+}
+
+// Test: error attribution - 5xx returns transient error.
+func TestTokenRefresher_DoRefresh_5xxTransient(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "server_error",
+		})
+	}))
+	defer tokenServer.Close()
+
+	ms := &mockStore{tokens: []*store.LinearOAuthToken{
+		{AccessToken: "old_token", RefreshToken: "refresh_token"},
+	}}
+	tr, _ := NewTokenRefresher("client_id", "client_secret", ms, nil, tokenServer.URL)
+
+	_, err := tr.RefreshAndRetry(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	errStr := err.Error()
+	if !strings.Contains(errStr, "502") {
+		t.Errorf("expected error to contain '502', got %q", errStr)
+	}
+	if !strings.Contains(errStr, "transient") {
+		t.Errorf("expected error to contain 'transient', got %q", errStr)
+	}
+	if !errors.Is(err, ErrTokenRefreshFailed) {
+		t.Errorf("expected errors.Is(err, ErrTokenRefreshFailed) to be true")
+	}
 }
