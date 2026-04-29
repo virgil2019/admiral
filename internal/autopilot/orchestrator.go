@@ -27,10 +27,25 @@ import (
 	"github.com/georgehuang/admiral/internal/store"
 )
 
+// storeInterface abstracts the store methods used by the orchestrator.
+type storeInterface interface {
+	AnyAutopilotJobActive() (bool, string, error)
+	GetLastAutopilotJob() (*store.AutopilotJob, error)
+	GetAutopilotJob(sessionID string) (*store.AutopilotJob, error)
+	UpdateAutopilotJob(sessionID string, fn func(*store.AutopilotJob)) error
+	ClaimAutopilotJob(sessionID, issueID, identifier string) (bool, error)
+}
+
+// linearClientInterface abstracts the linear client methods used by the orchestrator.
+type linearClientInterface interface {
+	PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error
+	GetIssue(ctx context.Context, id string) (*linear.Issue, error)
+}
+
 type Orchestrator struct {
 	cfg    *config.Autopilot
-	lc     *linear.Client
-	db     *store.Store
+	lc     linearClientInterface
+	db     storeInterface
 	logger *slog.Logger
 
 	mu      sync.Mutex
@@ -598,6 +613,31 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
+// relativeTime returns a human-friendly relative time string from an RFC3339
+// timestamp. Falls back to the raw string on parse failure.
+func relativeTime(rfc3339 string) string {
+	t, err := time.Parse(time.RFC3339, rfc3339)
+	if err != nil {
+		return rfc3339
+	}
+	elapsed := time.Since(t)
+	seconds := int(elapsed.Seconds())
+	if seconds < 60 {
+		return fmt.Sprintf("%ds ago", seconds)
+	}
+	minutes := seconds / 60
+	if minutes < 60 {
+		return fmt.Sprintf("%d min ago", minutes)
+	}
+	hours := minutes / 60
+	if hours < 24 {
+		remainingMin := minutes % 60
+		return fmt.Sprintf("%dh %d min ago", hours, remainingMin)
+	}
+	days := hours / 24
+	return fmt.Sprintf("%dd ago", days)
+}
+
 // extractCommand returns the command word (without leading /) if the first
 // non-empty line of text looks like /xxx, otherwise empty string.
 func extractCommand(text string) string {
@@ -616,25 +656,85 @@ func extractCommand(text string) string {
 	return ""
 }
 
+const availableCommandsHelp = `Available commands:
+  /status — show admiral state (idle/busy + current job info)
+  /help   — show this help`
+
 func (o *Orchestrator) handleCommand(ev linear.AgentEvent, cmd string) {
-	o.mu.Lock()
-	running := o.running
-	o.mu.Unlock()
+	o.logger.Info("command_invoked",
+		"session", ev.SessionID,
+		"cmd", cmd,
+		"creator_id", ev.CreatorID,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
 	switch cmd {
 	case "status":
-		status := "idle"
-		if running {
-			status = "busy"
+		active, sessionID, err := o.db.AnyAutopilotJobActive()
+		if err != nil {
+			o.logger.Warn("any_autopilot_job_active_failed", "err", err)
 		}
-		body := fmt.Sprintf("admiral status: %s\nsession: %s", status, ev.SessionID)
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
+
+		if active && sessionID != "" {
+			// busy state — show current job details
+			job, _ := o.db.GetAutopilotJob(sessionID)
+			body := "admiral status: busy\n\nCurrent job:\n"
+			if job != nil {
+				issueStr := job.IssueIdentifier
+				if issueStr == "" {
+					issueStr = job.IssueID
+				}
+				body += fmt.Sprintf("  - Issue: %s\n", issueStr)
+				body += fmt.Sprintf("  - Started: %s\n", relativeTime(job.StartedAt))
+				body += fmt.Sprintf("  - Worktree: %s\n", orDefault(job.WorktreePath, "(none)"))
+				body += fmt.Sprintf("  - Branch: %s\n", orDefault(job.Branch, "(none)"))
+				body += fmt.Sprintf("  - PR: %s\n", orDefault(job.PRURL, "(not yet)"))
+				body += fmt.Sprintf("  - Stream log: %s\n", orDefault(job.StreamLogPath, "(none)"))
+			} else {
+				body += "  - (job details unavailable)\n"
+			}
+			_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
+		} else {
+			// idle state — show last job info
+			lastJob, err := o.db.GetLastAutopilotJob()
+			if err != nil {
+				o.logger.Warn("get_last_autopilot_job_failed", "err", err)
+			}
+			if lastJob == nil {
+				_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response("admiral status: idle\n\n(no previous jobs)"))
+				return
+			}
+			body := "admiral status: idle\n\nLast job:\n"
+			body += fmt.Sprintf("  - Issue: %s\n", lastJob.IssueIdentifier)
+			body += fmt.Sprintf("  - State: %s\n", lastJob.State)
+			if lastJob.FinishedAt == "" && lastJob.State == store.JobStateDone {
+				body += "  - Finished: still running?\n"
+			} else {
+				body += fmt.Sprintf("  - Finished: %s\n", relativeTime(lastJob.FinishedAt))
+			}
+			body += fmt.Sprintf("  - PR: %s\n", orDefault(lastJob.PRURL, "(none)"))
+			if lastJob.State == store.JobStateFailed && lastJob.Error != "" {
+				errStr := lastJob.Error
+				if len(errStr) > 200 {
+					errStr = errStr[:200] + "..."
+				}
+				body += fmt.Sprintf("  - Error: %s\n", errStr)
+			}
+			_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
+		}
+	case "help":
+		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(availableCommandsHelp))
 	default:
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(
-			fmt.Sprintf("Unknown command: /%s", cmd)))
+		body := fmt.Sprintf("Unknown command: /%s\n\n%s", cmd, availableCommandsHelp)
+		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
 	}
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }

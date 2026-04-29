@@ -94,3 +94,55 @@ func TestKV_RoundTrip(t *testing.T) {
 		t.Fatalf("expected v2 on upsert, got %q", v)
 	}
 }
+
+func TestGetLastAutopilotJob_EmptyDB(t *testing.T) {
+	s := newTestStore(t)
+	j, err := s.GetLastAutopilotJob()
+	if err != nil {
+		t.Fatalf("expected (nil,nil), got err=%v", err)
+	}
+	if j != nil {
+		t.Fatalf("expected nil job for empty db, got %+v", j)
+	}
+}
+
+func TestGetLastAutopilotJob_SingleJob(t *testing.T) {
+	s := newTestStore(t)
+	claimed, err := s.ClaimAutopilotJob("session-1", "issue-1", "TEST-1")
+	if err != nil || !claimed {
+		t.Fatalf("claim failed: claimed=%v err=%v", claimed, err)
+	}
+	j, err := s.GetLastAutopilotJob()
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if j == nil || j.AgentSessionID != "session-1" {
+		t.Fatalf("expected session-1, got %+v", j)
+	}
+}
+
+func TestGetLastAutopilotJob_MultipleJobs_ReturnsLatest(t *testing.T) {
+	s := newTestStore(t)
+	// Create two jobs by claiming them at different times (using raw SQL to control ordering)
+	_, err := s.DB.Exec(`
+		INSERT INTO autopilot_jobs(agent_session_id, issue_id, issue_identifier, state, started_at, finished_at)
+		VALUES('older-session', 'issue-old', 'OLD-1', 'DONE', '2024-01-01T00:00:00Z', '2024-01-01T01:00:00Z')
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.DB.Exec(`
+		INSERT INTO autopilot_jobs(agent_session_id, issue_id, issue_identifier, state, started_at, finished_at)
+		VALUES('newer-session', 'issue-new', 'NEW-1', 'DONE', '2024-01-02T00:00:00Z', '2024-01-02T01:00:00Z')
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := s.GetLastAutopilotJob()
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if j == nil || j.AgentSessionID != "newer-session" {
+		t.Fatalf("expected newer-session, got %+v", j)
+	}
+}
