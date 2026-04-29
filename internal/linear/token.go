@@ -1,7 +1,6 @@
 package linear
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/georgehuang/admiral/internal/store"
@@ -16,7 +17,7 @@ import (
 
 // ErrTokenRefreshFailed is returned when token refresh fails (e.g.
 // invalid_grant because the refresh token is expired or revoked).
-var ErrTokenRefreshFailed = errors.New("token refresh failed: invalid_grant or network error")
+var ErrTokenRefreshFailed = errors.New("token refresh failed")
 
 // TokenStore is the interface that TokenRefresher needs from the DB layer.
 // *store.Store implements this interface.
@@ -128,28 +129,25 @@ func (tr *TokenRefresher) doRefresh(ctx context.Context) (string, error) {
 		return "", errors.New("no refresh token available in store")
 	}
 
-	body, err := json.Marshal(map[string]string{
-		"client_id":     tr.clientID,
-		"client_secret": tr.clientSecret,
-		"grant_type":    "refresh_token",
-		"refresh_token": tok.RefreshToken,
-	})
-	if err != nil {
-		return "", fmt.Errorf("marshal refresh request: %w", err)
-	}
+	form := url.Values{}
+	form.Set("client_id", tr.clientID)
+	form.Set("client_secret", tr.clientSecret)
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", tok.RefreshToken)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tr.tokenEndpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tr.tokenEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("build refresh request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		if tr.logger != nil {
 			tr.logger.Warn("linear_token_refresh_network_error", "err", err)
 		}
-		return "", ErrTokenRefreshFailed
+		return "", fmt.Errorf("token refresh failed: %w", ErrTokenRefreshFailed)
 	}
 	defer resp.Body.Close()
 
@@ -163,7 +161,7 @@ func (tr *TokenRefresher) doRefresh(ctx context.Context) (string, error) {
 			tr.logger.Warn("linear_token_refresh_http_error",
 				"status", resp.StatusCode, "body", string(raw))
 		}
-		return "", ErrTokenRefreshFailed
+		return "", tr.classifyError(resp.StatusCode, raw)
 	}
 
 	var result struct {
@@ -199,4 +197,27 @@ func (tr *TokenRefresher) doRefresh(ctx context.Context) (string, error) {
 		tr.logger.Info("linear_token_refreshed")
 	}
 	return result.AccessToken, nil
+}
+
+func (tr *TokenRefresher) classifyError(status int, body []byte) error {
+	var resp struct {
+		Error       string `json:"error"`
+		Description string `json:"error_description"`
+	}
+	json.Unmarshal(body, &resp)
+
+	switch resp.Error {
+	case "invalid_grant":
+		return fmt.Errorf("token refresh failed: invalid_grant (refresh token expired or revoked, manual re-OAuth required): %w", ErrTokenRefreshFailed)
+	case "invalid_request":
+		return fmt.Errorf("token refresh failed: invalid_request (client bug — check request format): %w", ErrTokenRefreshFailed)
+	case "invalid_client":
+		return fmt.Errorf("token refresh failed: invalid_client (check client_id/client_secret config): %w", ErrTokenRefreshFailed)
+	}
+
+	if status >= 500 {
+		return fmt.Errorf("token refresh failed: linear http %d (transient — will fail this attempt): %w", status, ErrTokenRefreshFailed)
+	}
+
+	return fmt.Errorf("token refresh failed: %w", ErrTokenRefreshFailed)
 }
