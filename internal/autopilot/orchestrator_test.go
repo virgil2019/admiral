@@ -1,9 +1,13 @@
 package autopilot
 
 import (
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/georgehuang/admiral/internal/config"
 	"github.com/georgehuang/admiral/internal/linear"
 )
 
@@ -102,5 +106,64 @@ func TestExtractFirstURL(t *testing.T) {
 	in := "Some preamble\nhttps://github.com/x/y/pull/42\nfooter"
 	if got := extractFirstURL(in); got != "https://github.com/x/y/pull/42" {
 		t.Errorf("got %q", got)
+	}
+}
+
+func TestOpenStreamFile(t *testing.T) {
+	tmp := t.TempDir()
+	sessionID := "test-session-abc"
+	expectedPath := filepath.Join(tmp, sessionID+".jsonl")
+
+	// Simulate flow with a mock orchestrator and open stream file.
+	o := &Orchestrator{cfg: &config.Autopilot{JobStreamsDir: tmp}, logger: slog.Default()}
+	f := &flow{o: o, ev: linear.AgentEvent{SessionID: sessionID}}
+
+	if err := f.openStreamFile(); err != nil {
+		t.Fatalf("openStreamFile failed: %v", err)
+	}
+	defer f.closeStreamFile()
+
+	if f.streamFile == nil {
+		t.Fatal("streamFile is nil after openStreamFile")
+	}
+	if _, err := os.Stat(expectedPath); err != nil {
+		t.Fatalf("stream file not created at expected path: %v", err)
+	}
+}
+
+func TestDrainStreamJSON_WritesRawLines(t *testing.T) {
+	tmp := t.TempDir()
+	sessionID := "test-session-def"
+	streamPath := filepath.Join(tmp, sessionID+".jsonl")
+
+	o := &Orchestrator{cfg: &config.Autopilot{JobStreamsDir: tmp}, logger: slog.Default()}
+	f := &flow{o: o, ev: linear.AgentEvent{SessionID: sessionID}}
+
+	if err := f.openStreamFile(); err != nil {
+		t.Fatalf("openStreamFile failed: %v", err)
+	}
+	defer f.closeStreamFile()
+
+	// Simulate N lines of stream-json output.
+	lines := []string{
+		`{"type":"system_init","subtype":"version"}`,
+		`{"type":"tool_use","name":"Bash","input":{}}`,
+		`{"type":"result","content":"ok"}`,
+	}
+	r := strings.NewReader(strings.Join(lines, "\n")+"\n")
+	f.drainStreamJSON(r)
+
+	data, err := os.ReadFile(streamPath)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	readLines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(readLines) != len(lines) {
+		t.Fatalf("expected %d lines, got %d", len(lines), len(readLines))
+	}
+	for i := range lines {
+		if readLines[i] != lines[i] {
+			t.Errorf("line %d: got %q, want %q", i, readLines[i], lines[i])
+		}
 	}
 }
