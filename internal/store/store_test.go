@@ -16,6 +16,28 @@ func newTestStore(t *testing.T) *Store {
 	return s
 }
 
+func TestOpen_IdempotentMigrations(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("close first: %v", err)
+	}
+
+	// Re-open against the same DB. Migration 0004 (ALTER TABLE ADD COLUMN)
+	// already ran in the first Open and would otherwise return
+	// "duplicate column name" — Open must tolerate that.
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second open: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+}
+
 func TestInsertTGUpdate_DedupeByUpdateID(t *testing.T) {
 	s := newTestStore(t)
 

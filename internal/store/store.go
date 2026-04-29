@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -123,7 +124,12 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("apply migration 0003: %w", err)
 	}
 	if _, err := db.Exec(migration0004); err != nil {
-		return nil, fmt.Errorf("apply migration 0004: %w", err)
+		// SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. On a
+		// pre-existing DB where this migration already ran, re-applying
+		// returns "duplicate column name". Treat as no-op.
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return nil, fmt.Errorf("apply migration 0004: %w", err)
+		}
 	}
 	return &Store{DB: db}, nil
 }
