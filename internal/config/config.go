@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -188,8 +189,14 @@ func (c *Config) validateAutopilotAndExpand() error {
 	if strings.TrimSpace(c.Autopilot.ClaudeBin) == "" {
 		c.Autopilot.ClaudeBin = "claude"
 	}
+	if _, err := exec.LookPath(c.Autopilot.ClaudeBin); err != nil {
+		return fmt.Errorf("autopilot.claude_bin not found: %w", err)
+	}
 	if strings.TrimSpace(c.Autopilot.GhBin) == "" {
 		c.Autopilot.GhBin = "gh"
+	}
+	if _, err := exec.LookPath(c.Autopilot.GhBin); err != nil {
+		return fmt.Errorf("autopilot.gh_bin not found: %w", err)
 	}
 	if strings.TrimSpace(c.Autopilot.ListenAddr) == "" {
 		c.Autopilot.ListenAddr = ":8787"
