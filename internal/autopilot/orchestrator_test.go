@@ -1,14 +1,17 @@
 package autopilot
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/georgehuang/admiral/internal/config"
 	"github.com/georgehuang/admiral/internal/linear"
+	"github.com/georgehuang/admiral/internal/store"
 )
 
 func TestSanitizeForPath(t *testing.T) {
@@ -165,5 +168,192 @@ func TestDrainStreamJSON_WritesRawLines(t *testing.T) {
 		if readLines[i] != lines[i] {
 			t.Errorf("line %d: got %q, want %q", i, readLines[i], lines[i])
 		}
+	}
+}
+
+func TestExtractCommand(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{`/status`, "status"},
+		{`/STATUS`, "status"},
+		{`/status extra args`, "status"},
+		{`  /status  `, "status"},
+		{"\n\n/status", "status"},
+		{"please /status", ""},
+		{"hello", ""},
+		{"", ""},
+		{"/", ""},
+		{"/   ", ""},
+		{"/status\n/help", "status"},
+	}
+	for _, c := range cases {
+		if got := extractCommand(c.in); got != c.want {
+			t.Errorf("extractCommand(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestRelativeTime(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		offset time.Duration
+		want   string
+	}{
+		{30 * time.Second, "30s ago"},
+		{59 * time.Second, "59s ago"},
+		{60 * time.Second, "1 min ago"},
+		{90 * time.Second, "1 min ago"},
+		{5 * time.Minute, "5 min ago"},
+		{59 * time.Minute, "59 min ago"},
+		{60 * time.Minute, "1h 0 min ago"},
+		{90 * time.Minute, "1h 30 min ago"},
+		{2*time.Hour + 15*time.Minute, "2h 15 min ago"},
+		{24 * time.Hour, "1d ago"},
+		{48*time.Hour + 30*time.Minute, "2d ago"},
+	}
+	for _, c := range cases {
+		past := now.Add(-c.offset)
+		if got := relativeTime(past.Format(time.RFC3339)); got != c.want {
+			t.Errorf("relativeTime(%s) = %q, want %q", past.Format(time.RFC3339), got, c.want)
+		}
+	}
+}
+
+// mockLinearClient implements linearClientInterface for testing.
+type mockLinearClient struct {
+	PostedBody string
+	PostErr    error
+}
+
+func (m *mockLinearClient) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {
+	m.PostedBody = a.Body
+	return m.PostErr
+}
+
+func (m *mockLinearClient) GetIssue(ctx context.Context, id string) (*linear.Issue, error) {
+	return nil, nil
+}
+
+// mockStore implements storeInterface for testing.
+type mockStore struct {
+	Active     bool
+	ActiveSID  string
+	ActiveErr  error
+	LastJob    *store.AutopilotJob
+	LastJobErr error
+	GetJob     *store.AutopilotJob
+	GetJobErr  error
+}
+
+func (m *mockStore) AnyAutopilotJobActive() (bool, string, error) {
+	return m.Active, m.ActiveSID, m.ActiveErr
+}
+
+func (m *mockStore) GetLastAutopilotJob() (*store.AutopilotJob, error) {
+	return m.LastJob, m.LastJobErr
+}
+
+func (m *mockStore) GetAutopilotJob(sessionID string) (*store.AutopilotJob, error) {
+	return m.GetJob, m.GetJobErr
+}
+
+func (m *mockStore) UpdateAutopilotJob(sessionID string, fn func(*store.AutopilotJob)) error {
+	return nil
+}
+
+func (m *mockStore) ClaimAutopilotJob(sessionID, issueID, identifier string) (bool, error) {
+	return true, nil
+}
+
+func TestHandleCommand_StatusIdle(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		Active: false,
+		LastJob: &store.AutopilotJob{
+			AgentSessionID:  "sess-1",
+			IssueIdentifier: "GEO-5",
+			State:           store.JobStateDone,
+			StartedAt:       time.Now().Add(-30 * time.Minute).Format(time.RFC3339),
+			FinishedAt:      time.Now().Add(-25 * time.Minute).Format(time.RFC3339),
+			PRURL:           "https://github.com/x/y/pull/1",
+		},
+	}
+	o := &Orchestrator{db: ms, lc: mlc, logger: slog.Default()}
+	ev := linear.AgentEvent{SessionID: "sess-1", CreatorID: "user-1"}
+
+	o.handleCommand(ev, "status")
+
+	if !strings.Contains(mlc.PostedBody, "idle") {
+		t.Errorf("expected 'idle' in response, got: %s", mlc.PostedBody)
+	}
+	if !strings.Contains(mlc.PostedBody, "GEO-5") {
+		t.Errorf("expected 'GEO-5' in response, got: %s", mlc.PostedBody)
+	}
+}
+
+func TestHandleCommand_StatusBusy(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		Active:    true,
+		ActiveSID: "sess-busy",
+		GetJob: &store.AutopilotJob{
+			AgentSessionID:  "sess-busy",
+			IssueIdentifier: "GEO-7",
+			State:           store.JobStateExecuting,
+			StartedAt:       time.Now().Add(-5 * time.Minute).Format(time.RFC3339),
+			WorktreePath:    "/tmp/worktrees/linear-geo-7",
+			Branch:          "linear/geo-7",
+		},
+	}
+	o := &Orchestrator{db: ms, lc: mlc, logger: slog.Default()}
+	ev := linear.AgentEvent{SessionID: "sess-busy", CreatorID: "user-2"}
+
+	o.handleCommand(ev, "status")
+
+	if !strings.Contains(mlc.PostedBody, "busy") {
+		t.Errorf("expected 'busy' in response, got: %s", mlc.PostedBody)
+	}
+	if !strings.Contains(mlc.PostedBody, "GEO-7") {
+		t.Errorf("expected 'GEO-7' in response, got: %s", mlc.PostedBody)
+	}
+}
+
+func TestHandleCommand_Help(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{}
+	o := &Orchestrator{db: ms, lc: mlc, logger: slog.Default()}
+	ev := linear.AgentEvent{SessionID: "sess-1", CreatorID: "user-1"}
+
+	o.handleCommand(ev, "help")
+
+	if !strings.Contains(mlc.PostedBody, "Available commands") {
+		t.Errorf("expected 'Available commands' in response, got: %s", mlc.PostedBody)
+	}
+	if !strings.Contains(mlc.PostedBody, "/status") {
+		t.Errorf("expected '/status' in response, got: %s", mlc.PostedBody)
+	}
+	if !strings.Contains(mlc.PostedBody, "/help") {
+		t.Errorf("expected '/help' in response, got: %s", mlc.PostedBody)
+	}
+	if strings.Contains(mlc.PostedBody, "Unknown command") {
+		t.Errorf("expected no 'Unknown command' in help response, got: %s", mlc.PostedBody)
+	}
+}
+
+func TestHandleCommand_Unknown(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{}
+	o := &Orchestrator{db: ms, lc: mlc, logger: slog.Default()}
+	ev := linear.AgentEvent{SessionID: "sess-1", CreatorID: "user-1"}
+
+	o.handleCommand(ev, "unknownxyz")
+
+	if !strings.Contains(mlc.PostedBody, "Unknown command: /unknownxyz") {
+		t.Errorf("expected 'Unknown command: /unknownxyz' in response, got: %s", mlc.PostedBody)
+	}
+	if !strings.Contains(mlc.PostedBody, "Available commands") {
+		t.Errorf("expected 'Available commands' in response, got: %s", mlc.PostedBody)
 	}
 }

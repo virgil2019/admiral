@@ -245,6 +245,28 @@ func (s *Store) GetAutopilotJob(sessionID string) (*AutopilotJob, error) {
 	return &j, err
 }
 
+// GetLastAutopilotJob returns the most recent autopilot job by started_at.
+// Returns (nil, nil) when the table is empty.
+func (s *Store) GetLastAutopilotJob() (*AutopilotJob, error) {
+	var j AutopilotJob
+	err := s.DB.QueryRow(`
+		SELECT agent_session_id, issue_id, issue_identifier, state,
+		       COALESCE(worktree_path,''), COALESCE(branch,''),
+		       COALESCE(pr_url,''), COALESCE(error,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(stream_log_path,'')
+		FROM autopilot_jobs
+		ORDER BY started_at DESC
+		LIMIT 1
+	`).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+		&j.StreamLogPath)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &j, err
+}
+
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil
