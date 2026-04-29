@@ -80,6 +80,18 @@ CREATE INDEX IF NOT EXISTS autopilot_jobs_issue_id_idx
   ON autopilot_jobs(issue_id);
 `
 
+const migration0003 = `
+CREATE TABLE IF NOT EXISTS linear_oauth (
+  id              INTEGER PRIMARY KEY CHECK (id = 1),
+  access_token    TEXT NOT NULL,
+  refresh_token   TEXT,
+  expires_at      TEXT,
+  updated_at      TEXT NOT NULL
+);
+INSERT OR IGNORE INTO linear_oauth (id, access_token, refresh_token, expires_at, updated_at)
+VALUES (1, '', '', '', '');
+`
+
 type Store struct {
 	DB *sql.DB
 }
@@ -102,6 +114,9 @@ func Open(path string) (*Store, error) {
 	}
 	if _, err := db.Exec(migration0002); err != nil {
 		return nil, fmt.Errorf("apply migration 0002: %w", err)
+	}
+	if _, err := db.Exec(migration0003); err != nil {
+		return nil, fmt.Errorf("apply migration 0003: %w", err)
 	}
 	return &Store{DB: db}, nil
 }
@@ -226,6 +241,45 @@ func nullIfEmpty(s string) any {
 
 func (s *Store) Close() error {
 	return s.DB.Close()
+}
+
+// LinearOAuthToken holds the persisted OAuth token set.
+type LinearOAuthToken struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresAt    string // RFC3339 UTC; empty if server didn't return one
+	UpdatedAt    string // RFC3339 UTC
+}
+
+// GetLinearOAuthToken returns the current token row (id=1). Returns
+// (nil, nil) when no token has been persisted yet.
+func (s *Store) GetLinearOAuthToken() (*LinearOAuthToken, error) {
+	var t LinearOAuthToken
+	err := s.DB.QueryRow(`
+		SELECT access_token, COALESCE(refresh_token,''), COALESCE(expires_at,''), updated_at
+		FROM linear_oauth WHERE id=1
+	`).Scan(&t.AccessToken, &t.RefreshToken, &t.ExpiresAt, &t.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// SaveLinearOAuthToken upserts the token row (id=1). Passing an empty
+// refreshToken leaves the stored refresh_token unchanged.
+func (s *Store) SaveLinearOAuthToken(accessToken, refreshToken, expiresAt string) error {
+	_, err := s.DB.Exec(`
+		UPDATE linear_oauth
+		SET access_token=?,
+		    refresh_token=CASE WHEN ?='' THEN refresh_token ELSE ? END,
+		    expires_at=?,
+		    updated_at=?
+		WHERE id=1
+	`, accessToken, refreshToken, refreshToken, expiresAt, time.Now().UTC().Format(time.RFC3339))
+	return err
 }
 
 func (s *Store) GetCursor(teamName string) (string, error) {
