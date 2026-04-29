@@ -273,6 +273,31 @@ func (s *Store) GetLastAutopilotJob() (*AutopilotJob, error) {
 	return &j, err
 }
 
+// GetLatestDoneJobByIssue returns the most recent DONE autopilot job for
+// the given Linear issue ID. Returns (nil, nil) when no DONE job exists
+// for that issue. Used by handleCreated to short-circuit re-spawning a
+// task that's already been completed.
+func (s *Store) GetLatestDoneJobByIssue(issueID string) (*AutopilotJob, error) {
+	var j AutopilotJob
+	err := s.DB.QueryRow(`
+		SELECT agent_session_id, issue_id, issue_identifier, state,
+		       COALESCE(worktree_path,''), COALESCE(branch,''),
+		       COALESCE(pr_url,''), COALESCE(error,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(stream_log_path,'')
+		FROM autopilot_jobs
+		WHERE issue_id=? AND state=?
+		ORDER BY started_at DESC
+		LIMIT 1
+	`, issueID, JobStateDone).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+		&j.StreamLogPath)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &j, err
+}
+
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil

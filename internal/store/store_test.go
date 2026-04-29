@@ -168,3 +168,60 @@ func TestGetLastAutopilotJob_MultipleJobs_ReturnsLatest(t *testing.T) {
 		t.Fatalf("expected newer-session, got %+v", j)
 	}
 }
+
+func TestGetLatestDoneJobByIssue_NoHistory(t *testing.T) {
+	s := newTestStore(t)
+	j, err := s.GetLatestDoneJobByIssue("ISSUE-NONE")
+	if err != nil {
+		t.Fatalf("expected (nil,nil), got err=%v", err)
+	}
+	if j != nil {
+		t.Fatalf("expected nil job for unknown issue, got %+v", j)
+	}
+}
+
+func TestGetLatestDoneJobByIssue_FailedButNoDone(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.DB.Exec(`
+		INSERT INTO autopilot_jobs(agent_session_id, issue_id, issue_identifier, state, started_at, finished_at)
+		VALUES('session-fail', 'issue-x', 'X-1', 'FAILED', '2024-01-01T00:00:00Z', '2024-01-01T01:00:00Z')
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := s.GetLatestDoneJobByIssue("issue-x")
+	if err != nil {
+		t.Fatalf("expected (nil,nil), got err=%v", err)
+	}
+	if j != nil {
+		t.Fatalf("expected nil for FAILED-only issue, got %+v", j)
+	}
+}
+
+func TestGetLatestDoneJobByIssue_MultipleDone_ReturnsLatest(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.DB.Exec(`
+		INSERT INTO autopilot_jobs(agent_session_id, issue_id, issue_identifier, state, started_at, finished_at, pr_url)
+		VALUES('older-done', 'issue-y', 'Y-1', 'DONE', '2024-01-01T00:00:00Z', '2024-01-01T01:00:00Z', 'https://github.com/x/y/pull/old')
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.DB.Exec(`
+		INSERT INTO autopilot_jobs(agent_session_id, issue_id, issue_identifier, state, started_at, finished_at, pr_url)
+		VALUES('newer-done', 'issue-y', 'Y-1', 'DONE', '2024-01-02T00:00:00Z', '2024-01-02T01:00:00Z', 'https://github.com/x/y/pull/new')
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := s.GetLatestDoneJobByIssue("issue-y")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if j == nil || j.AgentSessionID != "newer-done" {
+		t.Fatalf("expected newer-done, got %+v", j)
+	}
+	if j.PRURL != "https://github.com/x/y/pull/new" {
+		t.Fatalf("expected newer PR URL, got %q", j.PRURL)
+	}
+}
