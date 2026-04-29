@@ -42,7 +42,20 @@ func main() {
 	}
 	defer db.Close()
 
+	// Seed token store from config if empty (DB takes priority over config
+	// once a token has been stored, so we only seed on first run).
+	if err := seedTokenStore(db, &cfg.Linear, logger); err != nil {
+		logger.Warn("token_store_seed_failed", "err", err)
+	}
+
+	// Build Linear client and optionally wire token refresh.
 	lc := linear.NewClient(cfg.Linear.APIBase, cfg.Linear.APIToken)
+	tr, refreshAvailable := linear.NewTokenRefresher(
+		cfg.Linear.ClientID, cfg.Linear.ClientSecret, db, logger, "")
+	if refreshAvailable {
+		lc.SetTokenRefresher(tr)
+		logger.Info("linear_token_refresh_enabled")
+	}
 	orch := autopilot.New(&cfg.Autopilot, lc, db, logger)
 	wh := linear.NewWebhook(cfg.Linear.WebhookSecret, orch.HandleAgentEvent, logger)
 
@@ -115,4 +128,25 @@ func newLogger(c config.Logging) *slog.Logger {
 		}
 	}
 	return slog.New(slog.NewTextHandler(w, opts))
+}
+
+// seedTokenStore writes access_token + refresh_token from config into the
+// SQLite store only when the DB is empty (DB takes priority over config once
+// a token has been stored, to avoid overwriting a refreshed token with an
+// older config value).
+func seedTokenStore(db *store.Store, linCfg *config.Linear, logger *slog.Logger) error {
+	tok, err := db.GetLinearOAuthToken()
+	if err != nil {
+		return fmt.Errorf("get token: %w", err)
+	}
+	// DB already has a token — don't overwrite.
+	if tok != nil && tok.AccessToken != "" {
+		return nil
+	}
+	// DB is empty — seed from config.
+	if linCfg.APIToken == "" {
+		return nil // nothing to seed
+	}
+	logger.Info("linear_token_store_seeding_from_config")
+	return db.SaveLinearOAuthToken(linCfg.APIToken, linCfg.RefreshToken, "")
 }
