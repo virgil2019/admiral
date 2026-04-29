@@ -394,6 +394,129 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	return nil
 }
 
+// streamMsg is the full structure emitted by claude -p stream-json.
+// tool_use events live inside message.content[].type=="tool_use".
+type streamMsg struct {
+	Type    string `json:"type"`
+	Subtype string `json:"subtype"`
+	IsError bool   `json:"is_error,omitempty"`
+
+	// result event terminal fields
+	DurationMs int    `json:"duration_ms,omitempty"`
+	StopReason string `json:"stop_reason,omitempty"`
+
+	// assistant message wrapper (tool_use lives here in Anthropic stream-json)
+	Message struct {
+		Content []struct {
+			Type  string          `json:"type"`
+			Name  string          `json:"name,omitempty"`
+			Input json.RawMessage `json:"input,omitempty"`
+		} `json:"content,omitempty"`
+	} `json:"message,omitempty"`
+
+	// standalone error type
+	Error struct {
+		Message string `json:"message,omitempty"`
+	} `json:"error,omitempty"`
+}
+
+// truncateString truncates a string to at most n characters,
+// appending "(...truncated)" if it was cut.
+func truncateString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "(...truncated)"
+}
+
+// summarizeToolUse builds a 1-line summary string for a tool_use event,
+// truncating long fields to <= 200 chars.
+func summarizeToolUse(name string, rawInput json.RawMessage) string {
+	if len(rawInput) == 0 {
+		return "input=<empty>"
+	}
+
+	switch name {
+	case "Edit": {
+		var inp struct {
+			FilePath  string `json:"file_path"`
+			OldString string `json:"old_string"`
+			NewString string `json:"new_string"`
+		}
+		if err := json.Unmarshal(rawInput, &inp); err != nil {
+			return truncateString(string(rawInput), 200)
+		}
+		return fmt.Sprintf("file=%s (~%d chars old, ~%d chars new)",
+			inp.FilePath, len(inp.OldString), len(inp.NewString))
+	}
+	case "Write": {
+		var inp struct {
+			FilePath string `json:"file_path"`
+			Content  string `json:"content"`
+		}
+		if err := json.Unmarshal(rawInput, &inp); err != nil {
+			return truncateString(string(rawInput), 200)
+		}
+		return fmt.Sprintf("file=%s (~%d chars)", inp.FilePath, len(inp.Content))
+	}
+	case "Read": {
+		var inp struct {
+			FilePath string `json:"file_path"`
+			Offset   int    `json:"offset,omitempty"`
+		}
+		if err := json.Unmarshal(rawInput, &inp); err != nil {
+			return truncateString(string(rawInput), 200)
+		}
+		if inp.Offset > 0 {
+			return fmt.Sprintf("file=%s offset=%d", inp.FilePath, inp.Offset)
+		}
+		return fmt.Sprintf("file=%s", inp.FilePath)
+	}
+	case "Bash": {
+		var inp struct {
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal(rawInput, &inp); err != nil {
+			return truncateString(string(rawInput), 200)
+		}
+		return fmt.Sprintf("cmd=%s", truncateString(inp.Command, 200))
+	}
+	case "TodoWrite": {
+		var inp struct {
+			Todos []struct{} `json:"todos"`
+		}
+		if err := json.Unmarshal(rawInput, &inp); err != nil {
+			return truncateString(string(rawInput), 200)
+		}
+		return fmt.Sprintf("count=%d todos", len(inp.Todos))
+	}
+	case "Grep": {
+		var inp struct {
+			Pattern string `json:"pattern"`
+			Path    string `json:"path,omitempty"`
+		}
+		if err := json.Unmarshal(rawInput, &inp); err != nil {
+			return truncateString(string(rawInput), 200)
+		}
+		if inp.Path != "" {
+			return fmt.Sprintf("pattern=%s path=%s", truncateString(inp.Pattern, 200), inp.Path)
+		}
+		return fmt.Sprintf("pattern=%s", truncateString(inp.Pattern, 200))
+	}
+	case "Glob": {
+		var inp struct {
+			Pattern string `json:"pattern"`
+		}
+		if err := json.Unmarshal(rawInput, &inp); err != nil {
+			return truncateString(string(rawInput), 200)
+		}
+		return fmt.Sprintf("pattern=%s", inp.Pattern)
+	}
+	default:
+		return fmt.Sprintf("input=%s", truncateString(string(rawInput), 200))
+	}
+}
+
 func (f *flow) drainStreamJSON(r io.Reader) {
 	s := bufio.NewScanner(r)
 	s.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
@@ -403,10 +526,7 @@ func (f *flow) drainStreamJSON(r io.Reader) {
 		if f.streamFile != nil {
 			f.streamFile.WriteString(line + "\n")
 		}
-		var msg struct {
-			Type    string `json:"type"`
-			Subtype string `json:"subtype"`
-		}
+		var msg streamMsg
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
 			f.o.logger.Debug("claude_stream_nonjson",
 				"issue", f.ev.IssueIdentifier, "line", truncate(line, 200))
@@ -416,6 +536,47 @@ func (f *flow) drainStreamJSON(r io.Reader) {
 			"issue", f.ev.IssueIdentifier,
 			"type", msg.Type,
 			"subtype", msg.Subtype)
+
+		// Emit structured logs for the 3 critical event types.
+
+		// 1. tool_use events (nested inside assistant message.content)
+		if msg.Type == "assistant" {
+			for _, c := range msg.Message.Content {
+				if c.Type == "tool_use" {
+					f.o.logger.Info("claude_tool_use",
+						"session", f.ev.SessionID,
+						"issue", f.ev.IssueIdentifier,
+						"tool", c.Name,
+						"summary", summarizeToolUse(c.Name, c.Input))
+				}
+			}
+		}
+
+		// 2. result events (terminal state)
+		if msg.Type == "result" {
+			if msg.IsError {
+				f.o.logger.Warn("claude_error",
+					"session", f.ev.SessionID,
+					"issue", f.ev.IssueIdentifier,
+					"subtype", msg.Subtype)
+			} else {
+				f.o.logger.Info("claude_result",
+					"session", f.ev.SessionID,
+					"issue", f.ev.IssueIdentifier,
+					"success", true,
+					"duration_ms", msg.DurationMs,
+					"stop_reason", msg.StopReason,
+					"subtype", msg.Subtype)
+			}
+		}
+
+		// 3. standalone error type
+		if msg.Type == "error" {
+			f.o.logger.Warn("claude_error",
+				"session", f.ev.SessionID,
+				"issue", f.ev.IssueIdentifier,
+				"err", truncateString(msg.Error.Message, 200))
+		}
 	}
 }
 

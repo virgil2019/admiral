@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -355,5 +356,211 @@ func TestHandleCommand_Unknown(t *testing.T) {
 	}
 	if !strings.Contains(mlc.PostedBody, "Available commands") {
 		t.Errorf("expected 'Available commands' in response, got: %s", mlc.PostedBody)
+	}
+}
+
+// ---- Tests for summarizeToolUse ----
+
+func TestSummarizeToolUse_Edit(t *testing.T) {
+	input := []byte(`{"file_path":"internal/linear/token.go","old_string":"func old()","new_string":"func new()"}`)
+	summary := summarizeToolUse("Edit", input)
+	if !strings.Contains(summary, "file=internal/linear/token.go") {
+		t.Errorf("expected file path in summary, got: %s", summary)
+	}
+	if !strings.Contains(summary, "~10 chars old") {
+		t.Errorf("expected old string char count, got: %s", summary)
+	}
+	if !strings.Contains(summary, "~10 chars new") {
+		t.Errorf("expected new string char count, got: %s", summary)
+	}
+}
+
+func TestSummarizeToolUse_Write(t *testing.T) {
+	input := []byte(`{"file_path":"internal/linear/token.go","content":"package linear"}`)
+	summary := summarizeToolUse("Write", input)
+	if !strings.Contains(summary, "file=internal/linear/token.go") {
+		t.Errorf("expected file path in summary, got: %s", summary)
+	}
+	if !strings.Contains(summary, "~14 chars") {
+		t.Errorf("expected char count, got: %s", summary)
+	}
+}
+
+func TestSummarizeToolUse_Read(t *testing.T) {
+	input := []byte(`{"file_path":"internal/linear/token.go","offset":10}`)
+	summary := summarizeToolUse("Read", input)
+	if !strings.Contains(summary, "file=internal/linear/token.go") {
+		t.Errorf("expected file path in summary, got: %s", summary)
+	}
+	if !strings.Contains(summary, "offset=10") {
+		t.Errorf("expected offset in summary, got: %s", summary)
+	}
+}
+
+func TestSummarizeToolUse_ReadNoOffset(t *testing.T) {
+	input := []byte(`{"file_path":"internal/linear/token.go"}`)
+	summary := summarizeToolUse("Read", input)
+	if !strings.Contains(summary, "file=internal/linear/token.go") {
+		t.Errorf("expected file path in summary, got: %s", summary)
+	}
+	if strings.Contains(summary, "offset") {
+		t.Errorf("unexpected offset in summary, got: %s", summary)
+	}
+}
+
+func TestSummarizeToolUse_Bash(t *testing.T) {
+	input := []byte(`{"command":"go test ./..."}`)
+	summary := summarizeToolUse("Bash", input)
+	if !strings.Contains(summary, "cmd=go test ./...") {
+		t.Errorf("expected full cmd in summary, got: %s", summary)
+	}
+}
+
+func TestSummarizeToolUse_BashLong(t *testing.T) {
+	// command > 200 chars
+	longCmd := strings.Repeat("x", 250)
+	input := []byte(`{"command":"` + longCmd + `"}`)
+	summary := summarizeToolUse("Bash", input)
+	if !strings.Contains(summary, "(...truncated)") {
+		t.Errorf("expected truncation marker, got: %s", summary)
+	}
+	if len(summary) > 220 {
+		t.Errorf("summary too long: %d chars, got: %s", len(summary), summary)
+	}
+}
+
+func TestSummarizeToolUse_TodoWrite(t *testing.T) {
+	// 5 todos
+	input := []byte(`{"todos":[{},{},{},{},{}]}`)
+	summary := summarizeToolUse("TodoWrite", input)
+	if !strings.Contains(summary, "count=5 todos") {
+		t.Errorf("expected count=5 todos, got: %s", summary)
+	}
+}
+
+func TestSummarizeToolUse_Grep(t *testing.T) {
+	input := []byte(`{"pattern":"func.*main","path":"internal/linear/token.go"}`)
+	summary := summarizeToolUse("Grep", input)
+	if !strings.Contains(summary, "pattern=") {
+		t.Errorf("expected pattern in summary, got: %s", summary)
+	}
+	if !strings.Contains(summary, "path=internal/linear/token.go") {
+		t.Errorf("expected path in summary, got: %s", summary)
+	}
+}
+
+func TestSummarizeToolUse_Glob(t *testing.T) {
+	input := []byte(`{"pattern":"**/*.go"}`)
+	summary := summarizeToolUse("Glob", input)
+	if !strings.Contains(summary, "pattern=**/*.go") {
+		t.Errorf("expected pattern in summary, got: %s", summary)
+	}
+}
+
+func TestSummarizeToolUse_Unknown(t *testing.T) {
+	input := []byte(`{"some_field":"some_value","another":123}`)
+	summary := summarizeToolUse("SomeUnknownTool", input)
+	if !strings.Contains(summary, "input=") {
+		t.Errorf("expected input= fallback in summary, got: %s", summary)
+	}
+}
+
+func TestSummarizeToolUse_EmptyInput(t *testing.T) {
+	summary := summarizeToolUse("Edit", nil)
+	if summary != "input=<empty>" {
+		t.Errorf("expected input=<empty>, got: %s", summary)
+	}
+}
+
+// ---- Tests for drainStreamJSON structured event emission ----
+
+// captureHandler is a minimal slog.Handler that records all logged records.
+type captureHandler struct {
+	mu      sync.Mutex
+	Records []slog.Record
+}
+
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.Records = append(h.Records, r)
+	return nil
+}
+func (h *captureHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+func (h *captureHandler) WithAttrs(_ []slog.Attr) slog.Handler        { return h }
+func (h *captureHandler) WithGroup(_ string) slog.Handler             { return h }
+
+func TestDrainStreamJSON_EmitsStructuredEvents(t *testing.T) {
+	tmp := t.TempDir()
+	sessionID := "test-session-struct"
+	streamPath := filepath.Join(tmp, sessionID+".jsonl")
+
+	h := &captureHandler{}
+	logger := slog.New(h)
+	o := &Orchestrator{cfg: &config.Autopilot{JobStreamsDir: tmp}, logger: logger}
+	f := &flow{o: o, ev: linear.AgentEvent{
+		SessionID:       sessionID,
+		IssueIdentifier: "GEO-TEST",
+	}}
+
+	if err := f.openStreamFile(); err != nil {
+		t.Fatalf("openStreamFile failed: %v", err)
+	}
+	defer f.closeStreamFile()
+
+	lines := []string{
+		// tool_use inside assistant message content
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"internal/linear/token.go","offset":5}}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"go build ./..."}}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"internal/linear/token.go","old_string":"func old()","new_string":"func new()"}}]}}`,
+		// result success
+		`{"type":"result","subtype":"success","is_error":false,"duration_ms":12345,"stop_reason":"end_turn"}`,
+		// result error
+		`{"type":"result","subtype":"error_during_execution","is_error":true}`,
+		// standalone error
+		`{"type":"error","error":{"message":"something went wrong"}}`,
+		// non-tool-use assistant (should not emit claude_tool_use)
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}`,
+	}
+
+	r := strings.NewReader(strings.Join(lines, "\n") + "\n")
+	f.drainStreamJSON(r)
+
+	// Verify stream file was written
+	data, err := os.ReadFile(streamPath)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if len(strings.Split(strings.TrimRight(string(data), "\n"), "\n")) != len(lines) {
+		t.Errorf("expected %d lines in stream file, got different count", len(lines))
+	}
+
+	// Collect msg names
+	h.mu.Lock()
+	msgNames := make([]string, len(h.Records))
+	for i, r := range h.Records {
+		msgNames[i] = r.Message
+	}
+	h.mu.Unlock()
+
+	// Count occurrences
+	count := func(name string) int {
+		c := 0
+		for _, m := range msgNames {
+			if m == name {
+				c++
+			}
+		}
+		return c
+	}
+
+	if n := count("claude_tool_use"); n != 3 {
+		t.Errorf("expected 3 claude_tool_use events, got %d: %v", n, msgNames)
+	}
+	if n := count("claude_result"); n != 1 {
+		t.Errorf("expected 1 claude_result event, got %d: %v", n, msgNames)
+	}
+	if n := count("claude_error"); n != 2 {
+		t.Errorf("expected 2 claude_error events (1 result error + 1 standalone error), got %d: %v", n, msgNames)
 	}
 }
