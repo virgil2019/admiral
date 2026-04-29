@@ -14,10 +14,17 @@ import (
 	"time"
 )
 
+// TokenRefresherInterface is the interface for token refreshers.
+type TokenRefresherInterface interface {
+	RefreshAndRetry(ctx context.Context) (string, error)
+}
+
+// Client is admiral's Linear GraphQL client + webhook receiver.
 type Client struct {
-	httpClient *http.Client
-	endpoint   string
-	apiToken   string
+	httpClient     *http.Client
+	endpoint       string
+	apiToken       string
+	tokenRefresher TokenRefresherInterface
 }
 
 func NewClient(endpoint, apiToken string) *Client {
@@ -26,6 +33,12 @@ func NewClient(endpoint, apiToken string) *Client {
 		endpoint:   endpoint,
 		apiToken:   apiToken,
 	}
+}
+
+// SetTokenRefresher wires in the token refresher so that API calls that
+// receive a 401 can attempt an automatic token refresh + one-shot retry.
+func (c *Client) SetTokenRefresher(tr TokenRefresherInterface) {
+	c.tokenRefresher = tr
 }
 
 // Issue is the subset of Linear issue fields admiral needs for prompt
@@ -64,7 +77,14 @@ type graphQLResponse struct {
 }
 
 func (c *Client) do(ctx context.Context, req graphQLRequest, out any) error {
-	body, err := json.Marshal(req)
+	return c.doWithToken(ctx, c.apiToken, &req, out)
+}
+
+// doWithToken performs the GraphQL request with the given token. On HTTP 401
+// and a configured TokenRefresher, it attempts one token refresh + retry
+// before failing.
+func (c *Client) doWithToken(ctx context.Context, token string, graphqlReq *graphQLRequest, out any) error {
+	body, err := json.Marshal(graphqlReq)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
@@ -73,10 +93,7 @@ func (c *Client) do(ctx context.Context, req graphQLRequest, out any) error {
 		return err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	// Linear accepts both "Bearer <token>" (OAuth access tokens, including
-	// agent-actor tokens like lin_oauth_*) and "<token>" bare (personal API
-	// keys, lin_api_*). Bearer works for both, so always use it.
-	httpReq.Header.Set("Authorization", bearer(c.apiToken))
+	httpReq.Header.Set("Authorization", bearer(token))
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("post graphql: %w", err)
@@ -87,6 +104,15 @@ func (c *Client) do(ctx context.Context, req graphQLRequest, out any) error {
 		return fmt.Errorf("read body: %w", err)
 	}
 	if resp.StatusCode/100 != 2 {
+		// HTTP 401 — attempt one token refresh if available.
+		if resp.StatusCode == http.StatusUnauthorized && c.tokenRefresher != nil {
+			newToken, refreshErr := c.tokenRefresher.RefreshAndRetry(ctx)
+			if refreshErr != nil {
+				return fmt.Errorf("linear http 401 (token refresh failed): %w", refreshErr)
+			}
+			// Retry once with the new token.
+			return c.doWithToken(ctx, newToken, graphqlReq, out)
+		}
 		return fmt.Errorf("linear http %d: %s", resp.StatusCode, truncate(string(raw), 400))
 	}
 	var env graphQLResponse

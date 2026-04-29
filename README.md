@@ -256,15 +256,11 @@ itself. Do this once per workspace:
 
 ### Token expiry
 
-OAuth access tokens expire (Linear's lifetime is typically months but
-not eternal). v0.3 does NOT auto-refresh — when the token expires:
-
-- API calls return 401
-- Re-run the OAuth flow once, paste the new `access_token` into
-  `linear.api_token`, restart the daemon
-
-A `LINEAR_REFRESH_TOKEN` is also returned by the OAuth flow; auto-renewal
-using it is on the v0.4 list.
+OAuth access tokens expire. When an API call receives a 401, admiral
+automatically refreshes the token using the stored `refresh_token` and
+retries the request once. If the refresh fails (e.g. the refresh token
+is also expired or revoked), admiral fails fast with an error — no
+infinite retry loop.
 
 ### Run
 
@@ -304,7 +300,6 @@ PR URL. The PR opens on `repo_dir`'s GitHub remote (admiral expects
 
 - Follow-up messages in the agent thread (`AgentSessionEvent.prompted`)
   — admiral posts a stub "v0.3 doesn't handle follow-ups yet" reply
-- Auto-refresh of expired OAuth tokens via `refresh_token`
 - Multi-issue parallel execution (single-flight: a second assignment
   during a run gets a "busy" reply and is dropped)
 - Workflow state changes via `issueUpdate` (the agent thread carries

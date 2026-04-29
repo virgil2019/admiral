@@ -73,6 +73,13 @@ linear:
   # Webhook signing secret (app's Webhooks section, "Signing secret" field).
   webhook_secret: "lin_wh_xxxxxxxx"
   # api_base: "https://api.linear.app/graphql"  # default
+  # OAuth client ID and secret — required for automatic token refresh.
+  # If absent, token refresh is unavailable (v0.3 fallback).
+  # client_id: "lin_oauth_client_id"
+  # client_secret: "lin_oauth_client_secret"
+  # Refresh token from the initial OAuth flow — stored in SQLite and
+  # used automatically when the access token expires.
+  # refresh_token: "lin_oauth_refresh_token"
 
 autopilot:
   # HTTP bind address for the webhook receiver. Default: ":8787"

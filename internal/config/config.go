@@ -48,6 +48,16 @@ type Linear struct {
 	// APIBase overrides the Linear GraphQL endpoint. Optional; defaults to
 	// https://api.linear.app/graphql.
 	APIBase string `yaml:"api_base"`
+	// ClientID is the OAuth app client ID. Used for token refresh.
+	// Optional — if absent, token refresh is unavailable (v0.3 fallback).
+	ClientID string `yaml:"client_id"`
+	// ClientSecret is the OAuth app client secret. Used for token refresh.
+	// Optional — if absent, token refresh is unavailable (v0.3 fallback).
+	ClientSecret string `yaml:"client_secret"`
+	// RefreshToken is the OAuth refresh token from the initial OAuth flow.
+	// Used for automatic token renewal. Optional — if absent, token refresh
+	// is unavailable (v0.3 fallback).
+	RefreshToken string `yaml:"refresh_token"`
 }
 
 // Autopilot configures the worktree + claude -p spawn path used by the
