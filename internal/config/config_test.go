@@ -173,12 +173,18 @@ launch:
 }
 
 func TestLoadAutopilot_DefaultWorkerCount(t *testing.T) {
+	// Use os.Args[0] for claude_bin / gh_bin so LookPath validation passes
+	// in CI environments without claude/gh installed (matches the pattern
+	// other tests in this file use for cli_bin_path).
+	bin := os.Args[0]
 	body := `
 linear:
   api_token: "lin_api_test"
   webhook_secret: "wh_secret"
 autopilot:
   repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
 storage:
   sqlite_path: "` + t.TempDir() + `/autopilot.db"
 `
