@@ -25,7 +25,9 @@ import (
 
 func main() {
 	var cfgPath string
+	var listenAddr string
 	flag.StringVar(&cfgPath, "config", config.DefaultConfigPath(), "path to config.yaml")
+	flag.StringVar(&listenAddr, "listen", "", "local listen address for the OAuth callback HTTP server (e.g. :8080). When empty, defaults to the port in redirect_uri for localhost/127.0.0.1, or :8080 otherwise. Use this when redirect_uri is a public tunnel URL (e.g. cloudflared) so the local server binds an unprivileged port.")
 	flag.Parse()
 
 	cfg, err := config.LoadAutopilot(cfgPath)
@@ -34,13 +36,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := runLogin(cfg); err != nil {
+	if err := runLogin(cfg, listenAddr); err != nil {
 		fmt.Fprintf(os.Stderr, "OAuth login failed: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func runLogin(cfg *config.Config) error {
+func runLogin(cfg *config.Config, listenAddrOverride string) error {
 	// Validate required config fields
 	if strings.TrimSpace(cfg.Linear.ClientID) == "" {
 		return fmt.Errorf("linear.client_id is required (create a Linear OAuth app first)")
@@ -65,10 +67,22 @@ func runLogin(cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("invalid redirect_uri: %w", err)
 	}
-	listenAddr := u.Host
-	if u.Port() == "" {
-		if u.Scheme == "https" {
-			listenAddr = ":443"
+	// Listen address derivation. The redirect_uri tells us where Linear sends
+	// the user back to (public, may be a tunnel URL); the local HTTP server
+	// has to bind some local port that the tunnel forwards to. When the
+	// caller passes -listen, that wins. Otherwise: a localhost redirect_uri
+	// uses its own port (no tunnel), and any other host falls back to :8080
+	// (assume a tunnel is in front; never try to bind :443, which is
+	// privileged and almost certainly wrong here).
+	listenAddr := strings.TrimSpace(listenAddrOverride)
+	if listenAddr == "" {
+		host := u.Hostname()
+		if host == "127.0.0.1" || host == "localhost" {
+			port := u.Port()
+			if port == "" {
+				port = "8080"
+			}
+			listenAddr = ":" + port
 		} else {
 			listenAddr = ":8080"
 		}
