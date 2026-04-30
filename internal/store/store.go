@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -119,6 +118,129 @@ const migration0006 = `
 ALTER TABLE autopilot_jobs ADD COLUMN claude_session_id TEXT;
 `
 
+type migration struct {
+	Version int
+	SQL     string
+}
+
+var migrations = []migration{
+	{1, migration0001},
+	{2, migration0002},
+	{3, migration0003},
+	{4, migration0004},
+	{5, migration0005},
+	{6, migration0006},
+}
+
+func tableExists(db *sql.DB, name string) bool {
+	var n int
+	db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&n)
+	return n > 0
+}
+
+func columnExists(db *sql.DB, table, column string) bool {
+	var n int
+	db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`,
+		table, column,
+	).Scan(&n)
+	return n > 0
+}
+
+func loadAppliedVersions(db *sql.DB) (map[int]bool, error) {
+	rows, err := db.Query(`SELECT version FROM schema_migrations`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int]bool)
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out[v] = true
+	}
+	return out, rows.Err()
+}
+
+func backfillMigrations(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+
+	if !tableExists(db, "sessions") {
+		return nil
+	}
+
+	for _, v := range []int{1, 2, 3, 4, 5, 6} {
+		applied := false
+		switch v {
+		case 1:
+			applied = tableExists(db, "sessions")
+		case 2:
+			applied = tableExists(db, "autopilot_jobs")
+		case 3:
+			applied = tableExists(db, "linear_oauth")
+		case 4:
+			applied = columnExists(db, "autopilot_jobs", "stream_log_path")
+		case 5:
+			applied = tableExists(db, "events_inbox")
+		case 6:
+			applied = columnExists(db, "autopilot_jobs", "claude_session_id")
+		}
+		if applied {
+			_, err := db.Exec(
+				`INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`,
+				v, time.Now().UTC().Format(time.RFC3339),
+			)
+			if err != nil {
+				return fmt.Errorf("backfill version %d: %w", v, err)
+			}
+		}
+	}
+	return nil
+}
+
+func applyMigrations(db *sql.DB) error {
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version INTEGER PRIMARY KEY,
+			applied_at TEXT NOT NULL
+		)`); err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	if err := backfillMigrations(db); err != nil {
+		return err
+	}
+
+	applied, err := loadAppliedVersions(db)
+	if err != nil {
+		return err
+	}
+
+	for _, m := range migrations {
+		if applied[m.Version] {
+			continue
+		}
+		if _, err := db.Exec(m.SQL); err != nil {
+			return fmt.Errorf("apply migration %d: %w", m.Version, err)
+		}
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`,
+			m.Version, time.Now().UTC().Format(time.RFC3339),
+		); err != nil {
+			return fmt.Errorf("record migration %d: %w", m.Version, err)
+		}
+	}
+	return nil
+}
+
 type Store struct {
 	DB *sql.DB
 }
@@ -153,35 +275,8 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(`PRAGMA busy_timeout=5000;`); err != nil {
 		return nil, fmt.Errorf("set busy_timeout: %w", err)
 	}
-	if _, err := db.Exec(migration0001); err != nil {
-		return nil, fmt.Errorf("apply migration 0001: %w", err)
-	}
-	if _, err := db.Exec(migration0002); err != nil {
-		return nil, fmt.Errorf("apply migration 0002: %w", err)
-	}
-	if _, err := db.Exec(migration0003); err != nil {
-		return nil, fmt.Errorf("apply migration 0003: %w", err)
-	}
-	if _, err := db.Exec(migration0004); err != nil {
-		// SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. On a
-		// pre-existing DB where this migration already ran, re-applying
-		// returns "duplicate column name". Treat as no-op.
-		if !strings.Contains(err.Error(), "duplicate column name") {
-			return nil, fmt.Errorf("apply migration 0004: %w", err)
-		}
-	}
-	if _, err := db.Exec(migration0005); err != nil {
-		// CREATE TABLE IF NOT EXISTS is inherently idempotent, but
-		// on a freshly-initialized DB this should not fail.
-		return nil, fmt.Errorf("apply migration 0005: %w", err)
-	}
-	if _, err := db.Exec(migration0006); err != nil {
-		// SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. On a
-		// pre-existing DB where this migration already ran, re-applying
-		// returns "duplicate column name". Treat as no-op.
-		if !strings.Contains(err.Error(), "duplicate column name") {
-			return nil, fmt.Errorf("apply migration 0006: %w", err)
-		}
+	if err := applyMigrations(db); err != nil {
+		return nil, fmt.Errorf("migrations: %w", err)
 	}
 	return &Store{DB: db}, nil
 }
