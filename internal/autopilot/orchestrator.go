@@ -110,17 +110,48 @@ func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
 	go o.run(ev)
 }
 
-// handlePrompted is the v0.3 stub for follow-up messages in an existing
-// agent thread. We post a polite "not yet" reply and don't touch any
-// running flow. The full clarify/iterate loop is deferred to v0.4.
+// handlePrompted handles follow-up messages in an existing agent thread
+// by resuming the previous claude session on the original PR/branch.
 func (o *Orchestrator) handlePrompted(ev linear.AgentEvent) {
-	o.logger.Info("autopilot_prompted_stub",
+	o.logger.Info("autopilot_prompted",
 		"session", ev.SessionID, "msg_len", len(ev.UserMessage))
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(
-		"v0.3 doesn't handle follow-up messages yet — this thread is "+
-			"single-shot. Open a new issue or reassign to start a fresh run."))
+
+	job, err := o.db.GetAutopilotJob(ev.SessionID)
+	if err != nil {
+		o.logger.Error("get_job_for_prompted_failed", "err", err, "session", ev.SessionID)
+		return
+	}
+	if job == nil || job.IssueID == "" {
+		o.logger.Warn("prompted_without_history", "session", ev.SessionID)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(
+			"I don't have history for this session — please start a fresh issue."))
+		return
+	}
+	if job.ClaudeSessionID == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(
+			"This session was created before resume support. Please open a new issue."))
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(),
+			time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
+		defer cancel()
+
+		resumeFlow := newResumeFlow(o, ctx, ev, job)
+		if err := resumeFlow.executeResume(); err != nil {
+			o.logger.Error("autopilot_resume_failed",
+				"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
+			resumeFlow.markFailed(err)
+			return
+		}
+		o.logger.Info("autopilot_resume_done",
+			"issue", ev.IssueIdentifier, "session", ev.SessionID, "pr", resumeFlow.prURL)
+	}()
 }
 
 func (o *Orchestrator) run(ev linear.AgentEvent) {
@@ -155,6 +186,7 @@ type flow struct {
 	o   *Orchestrator
 	ctx context.Context
 	ev  linear.AgentEvent
+	job *store.AutopilotJob // populated for resume flows
 
 	branch          string
 	worktreePath    string
@@ -165,6 +197,11 @@ type flow struct {
 
 func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
 	return &flow{o: o, ctx: ctx, ev: ev}
+}
+
+// newResumeFlow creates a flow for resuming an existing session.
+func newResumeFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent, job *store.AutopilotJob) *flow {
+	return &flow{o: o, ctx: ctx, ev: ev, job: job}
 }
 
 func (f *flow) postActivity(a linear.AgentActivity) {
@@ -237,6 +274,128 @@ func (f *flow) execute() error {
 		"Done. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
 		prURL, f.worktreePath, f.branch)))
 	f.cleanupWorktree()
+	return nil
+}
+
+// executeResume resumes a claude session on the original branch/PR.
+func (f *flow) executeResume() error {
+	f.postActivity(linear.Thought("Resuming previous session...", true))
+
+	if err := f.ensureWorktree(); err != nil {
+		return fmt.Errorf("ensure worktree: %w", err)
+	}
+
+	f.postActivity(linear.Action("claude_resume",
+		fmt.Sprintf("claude -p --resume in %s", f.worktreePath),
+		""))
+	if err := f.openStreamFile(); err != nil {
+		return fmt.Errorf("open stream file: %w", err)
+	}
+	defer f.closeStreamFile()
+	if err := f.runClaudeResume(f.ev.UserMessage); err != nil {
+		return fmt.Errorf("claude resume: %w", err)
+	}
+
+	if err := f.pushBranch(); err != nil {
+		return fmt.Errorf("push: %w", err)
+	}
+
+	f.prURL = f.job.PRURL
+	f.postActivity(linear.Response("Updated PR with follow-up: " + f.prURL))
+
+	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateDone
+		j.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+	}); err != nil {
+		return fmt.Errorf("update job to DONE: %w", err)
+	}
+
+	f.cleanupWorktree()
+	return nil
+}
+
+// ensureWorktree re-enters the worktree if it still exists, or recreates it
+// on the original branch if it was cleaned up.
+func (f *flow) ensureWorktree() error {
+	if _, err := os.Stat(f.job.WorktreePath); err == nil {
+		f.worktreePath = f.job.WorktreePath
+		f.branch = f.job.Branch
+		return nil
+	}
+
+	// Worktree was cleaned up; recreate it on the original branch.
+	cmd := exec.Command("git", "fetch", "origin", f.job.Branch)
+	cmd.Dir = f.o.cfg.RepoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git fetch %s: %w (%s)", f.job.Branch, err, out)
+	}
+
+	cmd = exec.Command("git", "worktree", "add", f.job.WorktreePath, f.job.Branch)
+	cmd.Dir = f.o.cfg.RepoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git worktree add: %w (%s)", err, out)
+	}
+
+	f.worktreePath = f.job.WorktreePath
+	f.branch = f.job.Branch
+	return nil
+}
+
+// runClaudeResume spawns `claude -p --resume` in stream-json mode inside the worktree.
+func (f *flow) runClaudeResume(userMessage string) error {
+	args := []string{
+		"-p", userMessage,
+		"--resume", f.job.ClaudeSessionID,
+		"--output-format", "stream-json",
+		"--verbose",
+		"--dangerously-skip-permissions",
+	}
+	cctx, cancel := context.WithTimeout(f.ctx, time.Duration(f.o.cfg.MaxRunSeconds)*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, f.o.cfg.ClaudeBin, args...)
+	cmd.Dir = f.worktreePath
+	cmd.Env = append(os.Environ(),
+		"CLAUDE_AUTOPILOT_ISSUE="+f.ev.IssueIdentifier,
+		"CLAUDE_AUTOPILOT_SESSION="+f.ev.SessionID,
+	)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("claude stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("claude stderr pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("claude start: %w", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); f.drainStreamJSON(stdout) }()
+	go func() {
+		defer wg.Done()
+		s := bufio.NewScanner(stderr)
+		s.Buffer(make([]byte, 0, 1024*1024), 4*1024*1024)
+		for s.Scan() {
+			f.o.logger.Warn("claude_stderr", "issue", f.ev.IssueIdentifier, "line", s.Text())
+		}
+	}()
+	wg.Wait()
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("claude exit: %w", err)
+	}
+	return nil
+}
+
+// pushBranch pushes the branch to origin without creating a PR.
+func (f *flow) pushBranch() error {
+	cmd := exec.Command("git", "push", "origin", f.branch)
+	cmd.Dir = f.worktreePath
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git push: %w (%s)", err, out)
+	}
 	return nil
 }
 

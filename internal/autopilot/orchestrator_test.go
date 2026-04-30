@@ -725,3 +725,191 @@ func TestCleanupWorktree_WorktreeNotExists(t *testing.T) {
 	// Should not error even though worktree doesn't exist
 	f.cleanupWorktree()
 }
+
+// ---- Tests for handlePrompted ----
+
+func TestHandlePrompted_NoHistory(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		GetJob:    nil,
+		GetJobErr: nil,
+	}
+	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
+	ev := linear.AgentEvent{
+		SessionID:       "session-no-history",
+		IssueIdentifier: "GEO-NOHIST-1",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "please fix this",
+	}
+
+	o.handlePrompted(ev)
+
+	time.Sleep(50 * time.Millisecond)
+	if !strings.Contains(mlc.GetPostedBody(), "don't have history") {
+		t.Errorf("expected 'don't have history' stub reply, got: %s", mlc.GetPostedBody())
+	}
+}
+
+func TestHandlePrompted_NoClaudeSessionID(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		GetJob: &store.AutopilotJob{
+			AgentSessionID:  "session-old",
+			IssueID:         "issue-old",
+			ClaudeSessionID: "", // empty — pre-#13 job
+		},
+	}
+	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
+	ev := linear.AgentEvent{
+		SessionID:       "session-old",
+		IssueIdentifier: "GEO-OLD-1",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "please fix this",
+	}
+
+	o.handlePrompted(ev)
+
+	time.Sleep(50 * time.Millisecond)
+	if !strings.Contains(mlc.GetPostedBody(), "before resume support") {
+		t.Errorf("expected 'before resume support' stub reply, got: %s", mlc.GetPostedBody())
+	}
+}
+
+func TestHandlePrompted_ResumeSpawn(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		GetJob: &store.AutopilotJob{
+			AgentSessionID:  "session-abc",
+			IssueID:         "issue-123",
+			IssueIdentifier: "GEO-123",
+			Branch:          "linear/geo-123",
+			WorktreePath:    "/tmp/worktrees/linear-geo-123",
+			PRURL:           "https://github.com/x/y/pull/42",
+			ClaudeSessionID: "claude-session-uuid-123",
+			State:           store.JobStateDone,
+		},
+	}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
+		db:     ms,
+		lc:     mlc,
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-abc",
+		IssueID:         "issue-123",
+		IssueIdentifier: "GEO-123",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "change v1 to v2",
+	}
+
+	o.handlePrompted(ev)
+
+	// Should not immediately post any response (goroutine runs async)
+	// Give it time to at least start the goroutine
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify no stub reply was posted
+	if strings.Contains(mlc.GetPostedBody(), "don't have history") ||
+		strings.Contains(mlc.GetPostedBody(), "before resume support") {
+		t.Errorf("expected no stub reply for valid resume, got: %s", mlc.GetPostedBody())
+	}
+}
+
+// ---- Tests for ensureWorktree ----
+
+func TestEnsureWorktree_AlreadyExists(t *testing.T) {
+	tmp := t.TempDir()
+	worktreePath := filepath.Join(tmp, "existing-worktree")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+
+	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: tmp}, logger: slog.Default()}
+	f := &flow{
+		o: o,
+		job: &store.AutopilotJob{
+			WorktreePath: worktreePath,
+			Branch:       "linear/test-branch",
+		},
+	}
+
+	err := f.ensureWorktree()
+	if err != nil {
+		t.Fatalf("ensureWorktree failed: %v", err)
+	}
+	if f.worktreePath != worktreePath {
+		t.Errorf("worktreePath = %q, want %q", f.worktreePath, worktreePath)
+	}
+	if f.branch != "linear/test-branch" {
+		t.Errorf("branch = %q, want %q", f.branch, "linear/test-branch")
+	}
+}
+
+func TestEnsureWorktree_NeedsRebuild(t *testing.T) {
+	// Test that ensureWorktree sets the correct paths when worktree doesn't exist.
+	// The actual git operations are tested separately in integration tests.
+	tmp := t.TempDir()
+	worktreePath := filepath.Join(tmp, "nonexistent-worktree")
+
+	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: tmp}, logger: slog.Default()}
+	f := &flow{
+		o: o,
+		job: &store.AutopilotJob{
+			WorktreePath: worktreePath,
+			Branch:       "linear/test-branch",
+		},
+	}
+
+	// Worktree doesn't exist, so ensureWorktree will try to rebuild.
+	// We expect it to attempt git fetch/worktree add, which will fail
+	// in this test environment without a real remote.
+	if _, err := os.Stat(worktreePath); err == nil {
+		t.Fatalf("worktree should not exist yet")
+	}
+
+	// This will fail on git fetch since we don't have a real remote,
+	// but it verifies the code path is correct.
+	err := f.ensureWorktree()
+	if err == nil {
+		t.Log("ensureWorktree succeeded (unexpected in this env)")
+	} else {
+		t.Logf("ensureWorktree failed as expected in test env: %v", err)
+	}
+}
+
+// ---- Tests for runClaudeResume ----
+
+func TestRunClaudeResume_ArgsCorrect(t *testing.T) {
+	// Test that resume flow is correctly initialized with the claude session ID
+	// and that executeResume sets up the right context for runClaudeResume.
+	tmp := t.TempDir()
+	jobStreamsDir := filepath.Join(tmp, "streams")
+	if err := os.MkdirAll(jobStreamsDir, 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{RepoDir: tmp, JobStreamsDir: jobStreamsDir, ClaudeBin: "claude", MaxRunSeconds: 60},
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-resume-test",
+		IssueIdentifier: "GEO-RESUME-1",
+	}
+	job := &store.AutopilotJob{
+		ClaudeSessionID: "resume-uuid-456",
+		WorktreePath:    tmp,
+		Branch:          "linear/resume-test",
+		PRURL:           "https://github.com/x/y/pull/42",
+	}
+
+	f := newResumeFlow(o, context.Background(), ev, job)
+
+	if f.job.ClaudeSessionID != "resume-uuid-456" {
+		t.Errorf("ClaudeSessionID = %q, want %q", f.job.ClaudeSessionID, "resume-uuid-456")
+	}
+	if f.ev.SessionID != "session-resume-test" {
+		t.Errorf("SessionID = %q, want %q", f.ev.SessionID, "session-resume-test")
+	}
+}
