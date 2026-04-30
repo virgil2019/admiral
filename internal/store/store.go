@@ -587,7 +587,9 @@ func (s *Store) EnqueueEvent(webhookID, action, sessionID, issueID, payloadJSON 
 }
 
 // ClaimNextPendingEvent atomically picks one pending row and marks it
-// processing. Returns (nil, nil) when nothing pending.
+// processing. It skips sessions that already have a row in 'processing' state,
+// ensuring at most one in-flight job per session at any time (per-session FIFO).
+// Returns (nil, nil) when nothing pending.
 func (s *Store) ClaimNextPendingEvent() (*EventInboxRow, error) {
 	tx, err := s.DB.Begin()
 	if err != nil {
@@ -607,6 +609,9 @@ func (s *Store) ClaimNextPendingEvent() (*EventInboxRow, error) {
 		       COALESCE(last_error, '')
 		FROM events_inbox
 		WHERE status = 'pending'
+		  AND session_id NOT IN (
+		      SELECT session_id FROM events_inbox WHERE status = 'processing'
+		  )
 		ORDER BY received_at ASC
 		LIMIT 1
 	`).Scan(

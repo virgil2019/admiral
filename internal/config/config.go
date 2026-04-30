@@ -90,6 +90,12 @@ type Autopilot struct {
 	// ~/.local/share/admiral/job-streams). The directory is created
 	// automatically on startup if it does not exist.
 	JobStreamsDir string `yaml:"job_streams_dir"`
+	// WorkerCount is the number of concurrent webhook event workers.
+	// Each worker drains events_inbox and dispatches to orchestrator.
+	// Per-session FIFO ordering is preserved by the DB-level lock in
+	// ClaimNextPendingEvent, so increasing this only adds cross-session
+	// parallelism. Default: 3.
+	WorkerCount int `yaml:"worker_count"`
 }
 
 type Launch struct {
@@ -223,6 +229,9 @@ func (c *Config) validateAutopilotAndExpand() error {
 	if strings.TrimSpace(c.Autopilot.JobStreamsDir) == "" {
 		// Default: <sqlite_path dir>/job-streams
 		c.Autopilot.JobStreamsDir = filepath.Join(filepath.Dir(c.Storage.SQLitePath), "job-streams")
+	}
+	if c.Autopilot.WorkerCount <= 0 {
+		c.Autopilot.WorkerCount = 3
 	}
 
 	c.Storage.SQLitePath = expandTilde(c.Storage.SQLitePath)

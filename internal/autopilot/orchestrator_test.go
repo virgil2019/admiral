@@ -645,19 +645,14 @@ func TestHandleCreated_DoesNotShortCircuit_WhenPriorFailed(t *testing.T) {
 
 	o.handleCreated(ev)
 
-	// Wait for goroutine to at least start (it will fail due to no real git repo)
+	// Wait briefly for goroutine to start
 	time.Sleep(50 * time.Millisecond)
 
-	o.mu.Lock()
-	running := o.running
-	o.mu.Unlock()
-
-	// handleCreated should NOT have short-circuited (would have returned before setting running=true)
-	// So running should be true (goroutine was spawned), and PostedBody should NOT contain short-circuit msg
+	// handleCreated should NOT have short-circuited (would have returned before spawning)
+	// so PostedBody should NOT contain the short-circuit msg
 	if strings.Contains(mlc.GetPostedBody(), "already completed") {
 		t.Errorf("expected no 'already completed' for FAILED-only issue, got: %s", mlc.GetPostedBody())
 	}
-	_ = running // may be false if goroutine already finished; that's ok for this test
 }
 
 func TestHandleCreated_DoesNotShortCircuit_WhenPriorDoneNoPR(t *testing.T) {

@@ -64,9 +64,6 @@ func main() {
 	// webhook uses the enqueue path (store + signal); onAgent is nil
 	wh := linear.NewWebhook(cfg.Linear.WebhookSecret, db, sig, logger, nil)
 
-	// worker consumes from events_inbox and dispatches to orchestrator
-	worker := autopilot.NewWorker(db, orch, logger, sig)
-
 	mux := http.NewServeMux()
 	// /webhook matches Linear's typical agent webhook URL convention
 	// (the path used in the existing oauth-callback.ts demo). /linear/webhook
@@ -86,16 +83,21 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	n := cfg.Autopilot.WorkerCount
 	logger.Info("admiral-autopilot starting",
 		"listen", cfg.Autopilot.ListenAddr,
 		"repo", cfg.Autopilot.RepoDir,
 		"base_branch", cfg.Autopilot.BaseBranch,
 		"claude_bin", cfg.Autopilot.ClaudeBin,
 		"sqlite", cfg.Storage.SQLitePath,
+		"worker_count", n,
 	)
 
-	// Start worker to consume events from inbox
-	go worker.Run(ctx)
+	// worker pool: N workers consume from events_inbox and dispatch to orchestrator
+	for i := 0; i < n; i++ {
+		w := autopilot.NewWorker(db, orch, logger.With("worker", i), sig)
+		go w.Run(ctx)
+	}
 
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

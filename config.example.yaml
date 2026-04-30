@@ -98,3 +98,4 @@ autopilot:
   #                  # Each job writes one .jsonl file named <session_id>.jsonl.
   #                  # Default is derived from storage.sqlite_path:
   #                  # e.g. ~/.local/share/admiral/job-streams
+  # worker_count: 3   # max concurrent issues admiral processes; same-session events stay serialized
