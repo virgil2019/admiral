@@ -38,6 +38,20 @@ func TestOpen_IdempotentMigrations(t *testing.T) {
 	t.Cleanup(func() { _ = s2.Close() })
 }
 
+func TestOpen_SetsBusyTimeout(t *testing.T) {
+	s := newTestStore(t)
+
+	var ms int
+	if err := s.DB.QueryRow(`PRAGMA busy_timeout;`).Scan(&ms); err != nil {
+		t.Fatalf("query busy_timeout: %v", err)
+	}
+	if ms < 1000 {
+		// We set 5000 in Open. Anything less is a regression — concurrent
+		// writers would fail-fast with SQLITE_BUSY instead of waiting.
+		t.Errorf("busy_timeout = %d ms, want >= 1000 (Open should set 5000)", ms)
+	}
+}
+
 func TestInsertTGUpdate_DedupeByUpdateID(t *testing.T) {
 	s := newTestStore(t)
 
