@@ -1,8 +1,11 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -248,5 +251,132 @@ func TestGetLatestDoneJobByIssue_MultipleDone_ReturnsLatest(t *testing.T) {
 	}
 	if j.PRURL != "https://github.com/x/y/pull/new" {
 		t.Fatalf("expected newer PR URL, got %q", j.PRURL)
+	}
+}
+
+func TestApplyMigrations_FreshDB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fresh.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	var count int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
+		t.Fatalf("query schema_migrations: %v", err)
+	}
+	if count != 6 {
+		t.Fatalf("expected 6 migrations recorded, got %d", count)
+	}
+}
+
+func TestApplyMigrations_Idempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "idempotent.db")
+
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("close first: %v", err)
+	}
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second open: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	var count int
+	if err := s2.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
+		t.Fatalf("query schema_migrations: %v", err)
+	}
+	if count != 6 {
+		t.Fatalf("expected 6 migrations (no duplicates), got %d", count)
+	}
+}
+
+func TestBackfillMigrations_LegacyDB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+
+	// Simulate a pre-migration DB: run all 6 migration SQLs without schema_migrations
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+
+	if _, err := db.Exec(migration0001); err != nil {
+		t.Fatalf("migration0001: %v", err)
+	}
+	if _, err := db.Exec(migration0002); err != nil {
+		t.Fatalf("migration0002: %v", err)
+	}
+	if _, err := db.Exec(migration0003); err != nil {
+		t.Fatalf("migration0003: %v", err)
+	}
+	if _, err := db.Exec(migration0004); err != nil {
+		t.Fatalf("migration0004: %v", err)
+	}
+	if _, err := db.Exec(migration0005); err != nil {
+		t.Fatalf("migration0005: %v", err)
+	}
+	if _, err := db.Exec(migration0006); err != nil {
+		t.Fatalf("migration0006: %v", err)
+	}
+	db.Close()
+
+	// Open should backfill schema_migrations
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open after backfill: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	var count int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
+		t.Fatalf("query schema_migrations: %v", err)
+	}
+	if count != 6 {
+		t.Fatalf("expected 6 migrations backfilled, got %d", count)
+	}
+}
+
+func TestBackfillMigrations_PartialDB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "partial.db")
+
+	// Simulate a DB that ran migrations 0001-0003 only
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := db.Exec(migration0001); err != nil {
+		t.Fatalf("migration0001: %v", err)
+	}
+	if _, err := db.Exec(migration0002); err != nil {
+		t.Fatalf("migration0002: %v", err)
+	}
+	if _, err := db.Exec(migration0003); err != nil {
+		t.Fatalf("migration0003: %v", err)
+	}
+	db.Close()
+
+	// Open: backfill should record 1-3, applyMigrations should add 4-6
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open after backfill: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	var count int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
+		t.Fatalf("query schema_migrations: %v", err)
+	}
+	if count != 6 {
+		t.Fatalf("expected 6 migrations (3 backfilled + 3 applied), got %d", count)
 	}
 }
