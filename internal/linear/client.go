@@ -416,6 +416,36 @@ func (c *Client) GetWorkflowStates(ctx context.Context, teamID string) ([]Workfl
 	return states, nil
 }
 
+// GetProject returns the Linear project with the given ID, or an error if
+// the project does not exist or the API call fails.
+func (c *Client) GetProject(ctx context.Context, id string) (*Project, error) {
+	const query = `query Project($id: String!) {
+  project(id: $id) {
+    id
+    name
+  }
+}`
+	var data struct {
+		Project *struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"project"`
+	}
+	if err := c.do(ctx, graphQLRequest{Query: query, Variables: map[string]any{"id": id}}, &data); err != nil {
+		return nil, err
+	}
+	if data.Project == nil {
+		return nil, fmt.Errorf("project %s not found", id)
+	}
+	return &Project{ID: data.Project.ID, Name: data.Project.Name}, nil
+}
+
+// Project holds a Linear project.
+type Project struct {
+	ID   string
+	Name string
+}
+
 const issueUpdateMutation = `mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
   issueUpdate(id: $id, input: $input) { success }
 }`
