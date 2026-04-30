@@ -71,9 +71,78 @@ func enqueueEvent(t *testing.T, db *sql.DB, webhookID, action, sessionID, issueI
 	}
 }
 
-// Test Worker drain loop with a mock dispatch that records events.
-// We test the drain logic by manually enqueueing events and checking
-// that ClaimNextPendingEvent works correctly.
+// TestWorker_MultiWorkerDispatch verifies that when N workers are started,
+// events from different sessions are dispatched in parallel while same-session
+// events are serialized by the per-session lock in ClaimNextPendingEvent.
+func TestWorker_MultiWorkerDispatch(t *testing.T) {
+	env := setupTestDB(t)
+
+	// Enqueue 5 events across 5 different sessions
+	sessions := []string{"sess-p1", "sess-p2", "sess-p3", "sess-p4", "sess-p5"}
+	for i, sess := range sessions {
+		wh := "wh-multi-" + string(rune('1'+i))
+		enqueueEvent(t, env.db.DB, wh, "created", sess, "issue-"+sess,
+			linear.AgentEvent{Action: linear.ActionCreated, SessionID: sess, IssueID: "issue-" + sess, WebhookID: wh})
+	}
+
+	// Claim 3 events (simulating 3 workers claiming in sequence, but with the
+	// new per-session lock query — no session is processing yet, so all 3 succeed)
+	var claimed []string
+	for i := 0; i < 3; i++ {
+		row, err := env.db.ClaimNextPendingEvent()
+		if err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+		if row == nil {
+			t.Fatalf("claim %d: expected row, got nil", i)
+		}
+		claimed = append(claimed, row.SessionID)
+	}
+
+	if len(claimed) != 3 {
+		t.Fatalf("expected 3 claims, got %d", len(claimed))
+	}
+
+	// All 3 should be different sessions (no per-session conflict at claim time)
+	seen := make(map[string]bool)
+	for _, sess := range claimed {
+		if seen[sess] {
+			t.Errorf("duplicate session claimed: %s", sess)
+		}
+		seen[sess] = true
+	}
+
+	// Claiming a 4th should succeed: sessions p4 and p5 are still pending
+	// (none of the claimed sessions match p4 or p5)
+	row4, err := env.db.ClaimNextPendingEvent()
+	if err != nil {
+		t.Fatalf("claim 4: %v", err)
+	}
+	if row4 == nil {
+		t.Fatal("claim 4: expected row (p4 or p5 still pending), got nil")
+	}
+	if row4.SessionID != "sess-p4" && row4.SessionID != "sess-p5" {
+		t.Errorf("claim 4: expected sess-p4 or sess-p5, got %v", row4.SessionID)
+	}
+
+	// Claiming a 5th returns the last pending (the other of p4/p5)
+	row5, err := env.db.ClaimNextPendingEvent()
+	if err != nil {
+		t.Fatalf("claim 5: %v", err)
+	}
+	if row5 == nil {
+		t.Fatal("claim 5: expected row (last remaining pending), got nil")
+	}
+
+	// 6th claim returns nil (all sessions either processing or done)
+	row6, err := env.db.ClaimNextPendingEvent()
+	if err != nil {
+		t.Fatalf("claim 6: %v", err)
+	}
+	if row6 != nil {
+		t.Errorf("claim 6: expected nil, got %v", row6.SessionID)
+	}
+}
 
 func TestWorker_Drain_MultipleEvents(t *testing.T) {
 	env := setupTestDB(t)

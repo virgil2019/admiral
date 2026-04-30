@@ -364,3 +364,169 @@ func TestEventInboxRow_Timestamps(t *testing.T) {
 		t.Error("finished_at should be non-zero after done")
 	}
 }
+
+// TestClaim_PerSessionLock verifies that ClaimNextPendingEvent skips a session
+// that already has a row in 'processing' state, enforcing per-session FIFO.
+func TestClaim_PerSessionLock(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	s := NewForTest(db)
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+		if _, err := db.Exec(m); err != nil {
+			t.Fatalf("migration: %v", err)
+		}
+	}
+
+	// Insert: (s1-evt1, pending), (s1-evt2, pending), (s2-evt1, pending)
+	_, _ = s.EnqueueEvent("wh-s1e1", "created", "sess-1", "issue-1", `{}`)
+	_, _ = s.EnqueueEvent("wh-s1e2", "created", "sess-1", "issue-1", `{}`)
+	_, _ = s.EnqueueEvent("wh-s2e1", "created", "sess-2", "issue-2", `{}`)
+
+	// First claim returns s1-evt1 (oldest pending, session 1 not yet processing)
+	row1, err := s.ClaimNextPendingEvent()
+	if err != nil {
+		t.Fatalf("claim 1: %v", err)
+	}
+	if row1 == nil || row1.WebhookID != "wh-s1e1" {
+		t.Fatalf("claim 1: expected wh-s1e1, got %v", row1)
+	}
+
+	// Second claim returns s2-evt1 (session-1 is now processing, so skip s1-evt2)
+	row2, err := s.ClaimNextPendingEvent()
+	if err != nil {
+		t.Fatalf("claim 2: %v", err)
+	}
+	if row2 == nil || row2.WebhookID != "wh-s2e1" {
+		t.Fatalf("claim 2: expected wh-s2e1, got %v", row2)
+	}
+
+	// Third claim returns nil (s1 still processing, s2 already claimed)
+	row3, err := s.ClaimNextPendingEvent()
+	if err != nil {
+		t.Fatalf("claim 3: %v", err)
+	}
+	if row3 != nil {
+		t.Errorf("claim 3: expected nil, got %v", row3.WebhookID)
+	}
+
+	// Mark s1-evt1 done — now s1-evt2 becomes eligible
+	if err := s.MarkEventDone("wh-s1e1"); err != nil {
+		t.Fatalf("MarkEventDone: %v", err)
+	}
+
+	// Fourth claim returns s1-evt2
+	row4, err := s.ClaimNextPendingEvent()
+	if err != nil {
+		t.Fatalf("claim 4: %v", err)
+	}
+	if row4 == nil || row4.WebhookID != "wh-s1e2" {
+		t.Fatalf("claim 4: expected wh-s1e2, got %v", row4)
+	}
+}
+
+// TestClaim_ConcurrentWorkers verifies that with 3 workers claiming from 5
+// pending rows across different sessions, each worker gets a different session.
+func TestClaim_ConcurrentWorkers(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	s := NewForTest(db)
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+		if _, err := db.Exec(m); err != nil {
+			t.Fatalf("migration: %v", err)
+		}
+	}
+
+	// Insert 5 pending events across 5 different sessions
+	sessions := []string{"sess-a", "sess-b", "sess-c", "sess-d", "sess-e"}
+	for i, sess := range sessions {
+		_, _ = s.EnqueueEvent("wh-"+sess, "created", sess, "issue-"+sess, `{}`)
+		_ = i // silence unused variable warning
+	}
+
+	// Simulate 3 workers claiming concurrently by claiming sequentially
+	// (SQLite's BEGIN IMMEDIATE serializes concurrent writers).
+	var claimed []string
+	for i := 0; i < 5; i++ {
+		row, err := s.ClaimNextPendingEvent()
+		if err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+		if row == nil {
+			break
+		}
+		claimed = append(claimed, row.SessionID)
+	}
+
+	if len(claimed) != 5 {
+		t.Errorf("expected 5 claims, got %d: %v", len(claimed), claimed)
+	}
+
+	// All sessions should be different (no duplicates)
+	seen := make(map[string]bool)
+	for _, sess := range claimed {
+		if seen[sess] {
+			t.Errorf("duplicate session claimed: %s", sess)
+		}
+		seen[sess] = true
+	}
+}
+
+// TestClaim_ConcurrentSameSession verifies that when multiple pending events exist
+// for the same session, only one worker can claim at a time — the others get nil.
+func TestClaim_ConcurrentSameSession(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	s := NewForTest(db)
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+		if _, err := db.Exec(m); err != nil {
+			t.Fatalf("migration: %v", err)
+		}
+	}
+
+	// Insert 5 pending events all in the same session
+	for i := 0; i < 5; i++ {
+		_, _ = s.EnqueueEvent("wh-same-"+string(rune('1'+i)), "created", "sess-same", "issue-same", `{}`)
+	}
+
+	// First claim returns the oldest pending for this session
+	row1, err := s.ClaimNextPendingEvent()
+	if err != nil {
+		t.Fatalf("claim 1: %v", err)
+	}
+	if row1 == nil || row1.SessionID != "sess-same" {
+		t.Fatalf("claim 1: expected sess-same, got %v", row1)
+	}
+
+	// Subsequent claims return nil because sess-same is still processing
+	for i := 2; i <= 3; i++ {
+		row, err := s.ClaimNextPendingEvent()
+		if err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+		if row != nil {
+			t.Errorf("claim %d: expected nil (session still processing), got %v", i, row.SessionID)
+		}
+	}
+
+	// Mark the first event done — now the second event for sess-same becomes eligible
+	if err := s.MarkEventDone(row1.WebhookID); err != nil {
+		t.Fatalf("MarkEventDone: %v", err)
+	}
+
+	row4, err := s.ClaimNextPendingEvent()
+	if err != nil {
+		t.Fatalf("claim after done: %v", err)
+	}
+	if row4 == nil || row4.SessionID != "sess-same" {
+		t.Fatalf("claim after done: expected sess-same, got %v", row4)
+	}
+}

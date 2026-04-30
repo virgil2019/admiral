@@ -171,3 +171,22 @@ launch:
 		t.Fatal("expected error on invalid provider")
 	}
 }
+
+func TestLoadAutopilot_DefaultWorkerCount(t *testing.T) {
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repo_dir: "` + t.TempDir() + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if cfg.Autopilot.WorkerCount != 3 {
+		t.Errorf("WorkerCount default: got %d, want 3", cfg.Autopilot.WorkerCount)
+	}
+}

@@ -49,9 +49,6 @@ type Orchestrator struct {
 	lc     linearClientInterface
 	db     storeInterface
 	logger *slog.Logger
-
-	mu      sync.Mutex
-	running bool
 }
 
 func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
@@ -108,29 +105,9 @@ func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
 		}
 	}
 
-	o.mu.Lock()
-	if o.running {
-		o.mu.Unlock()
-		o.logger.Info("autopilot_busy_skip",
-			"issue", ev.IssueIdentifier, "session", ev.SessionID)
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(
-			"admiral is busy with another session. Reassign or @mention again "+
-				"once the current run finishes."))
-		return
-	}
-	o.running = true
-	o.mu.Unlock()
-
-	go func() {
-		defer func() {
-			o.mu.Lock()
-			o.running = false
-			o.mu.Unlock()
-		}()
-		o.run(ev)
-	}()
+	// Per-session FIFO is guaranteed by the DB-level lock in ClaimNextPendingEvent,
+	// so we can spawn directly without any in-process lock.
+	go o.run(ev)
 }
 
 // handlePrompted is the v0.3 stub for follow-up messages in an existing
