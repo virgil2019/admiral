@@ -334,3 +334,5 @@ version.
 
 Linear/GitHub integration moved to its own binary — see
 [admiral-autopilot (v0.3)](#admiral-autopilot-v03-linear-driven) above.
+
+<!-- parallel-test marker: 2026-04-30T03:30 -->
