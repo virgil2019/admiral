@@ -286,6 +286,24 @@ func (f *flow) postActivity(a linear.AgentActivity) {
 	}
 }
 
+// postActivityWithRetry posts the activity with up to 3 retries using exponential
+// backoff. If all attempts fail, it returns the last error.
+func (f *flow) postActivityWithRetry(a linear.AgentActivity) error {
+	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt <= len(delays); attempt++ {
+		err := f.o.lc.PostAgentActivity(f.ctx, f.ev.SessionID, a)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < len(delays) {
+			time.Sleep(delays[attempt])
+		}
+	}
+	return lastErr
+}
+
 func (f *flow) execute() error {
 	f.postActivity(linear.Thought("Reading issue context...", true))
 
@@ -364,9 +382,20 @@ func (f *flow) execute() error {
 	if f.ev.CreatorID != "" {
 		mention = "@" + f.ev.CreatorID + " "
 	}
-	f.postActivity(linear.Response(fmt.Sprintf(
+	doneBody := fmt.Sprintf(
 		"%sDone. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
-		mention, prURL, f.worktreePath, f.branch)))
+		mention, prURL, f.worktreePath, f.branch)
+	if err := f.postActivityWithRetry(linear.Response(doneBody)); err != nil {
+		f.o.logger.Error("final_activity_push_failed",
+			"session", f.ev.SessionID, "err", err)
+		_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+			j.State = store.JobStateDoneThreadInconsistent
+		})
+		// Add PR body footer as fallback signal.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = f.addInconsistencyFooter(ctx)
+		cancel()
+	}
 
 	// Update Linear issue status to "completed" asynchronously (non-blocking).
 	if f.o.cfg.UpdateIssueStatus != nil && *f.o.cfg.UpdateIssueStatus && f.teamID != "" {
@@ -561,7 +590,15 @@ func (f *flow) markFailed(runErr error) {
 	if j, err := f.o.db.GetAutopilotJob(f.ev.SessionID); err == nil && j.StreamLogPath != "" {
 		body += "\n\nStream log: " + j.StreamLogPath
 	}
-	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.ErrorActivity(body))
+	err := f.postActivityWithRetry(linear.ErrorActivity(body))
+	if err != nil {
+		f.o.logger.Error("final_activity_push_failed",
+			"session", f.ev.SessionID, "err", err)
+		_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+			j.State = store.JobStateDoneThreadInconsistent
+		})
+		_ = f.addInconsistencyFooter(ctx)
+	}
 	f.cleanupWorktree()
 }
 
@@ -1248,4 +1285,40 @@ func orDefault(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// addInconsistencyFooter appends a warning footer to the PR body when the final
+// Linear activity could not be delivered, indicating the task completed successfully
+// despite the thread inconsistency.
+func (f *flow) addInconsistencyFooter(ctx context.Context) error {
+	if f.prURL == "" {
+		return nil
+	}
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	footer := fmt.Sprintf("\n---\n\n> **Linear thread inconsistency**: admiral failed to post the final response activity to Linear thread (session: %q). The task itself completed successfully. Check admiral logs around %q for `final_activity_push_failed`.", f.ev.SessionID, timestamp)
+
+	// Get current PR body via gh pr view.
+	out, err := captureCmd(ctx, f.o.cfg.RepoDir, f.o.cfg.GhBin, "pr", "view", extractPRNumber(f.prURL), "--json", "body", "--jq", ".body")
+	if err != nil {
+		f.o.logger.Warn("pr_view_for_footer_failed", "err", err, "pr", f.prURL)
+		return err
+	}
+	currentBody := strings.TrimSpace(out)
+	newBody := currentBody + footer
+
+	_, err = captureCmd(ctx, f.o.cfg.RepoDir, f.o.cfg.GhBin, "pr", "edit", extractPRNumber(f.prURL), "--body", newBody)
+	if err != nil {
+		f.o.logger.Warn("pr_edit_footer_failed", "err", err, "pr", f.prURL)
+		return err
+	}
+	return nil
+}
+
+// extractPRNumber extracts the PR number from a PR URL like https://github.com/owner/repo/pull/123.
+func extractPRNumber(prURL string) string {
+	parts := strings.Split(prURL, "/")
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[len(parts)-1]
 }

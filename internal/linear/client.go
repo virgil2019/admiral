@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -85,6 +87,59 @@ type graphQLResponse struct {
 	Errors []graphQLError  `json:"errors"`
 }
 
+// retryHTTP wraps c.httpClient.Do with classification + backoff.
+// Caller should still inspect resp.StatusCode for HTTP-level errors;
+// retryHTTP only retries transient ones automatically.
+func (c *Client) retryHTTP(req *http.Request) (*http.Response, error) {
+	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+	// Read and clone body so each attempt gets a fresh reader.
+	var bodyBytes []byte
+	if req.Body != nil {
+		bodyBytes, _ = io.ReadAll(req.Body)
+		req.Body.Close()
+	}
+	var lastErr error
+	for attempt := 0; attempt <= len(delays); attempt++ {
+		if len(bodyBytes) > 0 {
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			if !isTransientNetErr(err) || attempt == len(delays) {
+				return nil, err
+			}
+		} else {
+			if !isTransientHTTPStatus(resp.StatusCode) {
+				return resp, nil
+			}
+			resp.Body.Close()
+			lastErr = fmt.Errorf("transient http %d", resp.StatusCode)
+			if attempt == len(delays) {
+				return nil, lastErr
+			}
+		}
+		time.Sleep(delays[attempt])
+	}
+	return nil, lastErr
+}
+
+// isTransientHTTPStatus returns true for 5xx, 408, 429.
+func isTransientHTTPStatus(s int) bool {
+	return s >= 500 || s == http.StatusRequestTimeout || s == http.StatusTooManyRequests
+}
+
+// isTransientNetErr returns true for temporary network errors.
+func isTransientNetErr(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return ne.Temporary() || ne.Timeout()
+	}
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.ErrUnexpectedEOF)
+}
+
 func (c *Client) do(ctx context.Context, req graphQLRequest, out any) error {
 	return c.doWithToken(ctx, c.apiToken, &req, out)
 }
@@ -103,9 +158,12 @@ func (c *Client) doWithToken(ctx context.Context, token string, graphqlReq *grap
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", bearer(token))
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.retryHTTP(httpReq)
 	if err != nil {
 		return fmt.Errorf("post graphql: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("post graphql: retryHTTP returned nil resp with err=%v", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)

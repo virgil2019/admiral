@@ -188,11 +188,12 @@ func Open(path string) (*Store, error) {
 
 // Autopilot job state constants. RECEIVED -> EXECUTING -> DONE|FAILED|TIMED_OUT.
 const (
-	JobStateReceived  = "RECEIVED"
-	JobStateExecuting = "EXECUTING"
-	JobStateDone      = "DONE"
-	JobStateFailed    = "FAILED"
-	JobStateTimedOut  = "TIMED_OUT"
+	JobStateReceived               = "RECEIVED"
+	JobStateExecuting              = "EXECUTING"
+	JobStateDone                   = "DONE"
+	JobStateFailed                 = "FAILED"
+	JobStateTimedOut               = "TIMED_OUT"
+	JobStateDoneThreadInconsistent = "DONE_THREAD_INCONSISTENT"
 )
 
 type AutopilotJob struct {
@@ -240,9 +241,9 @@ func (s *Store) AnyAutopilotJobActive() (bool, string, error) {
 	var sessionID string
 	err := s.DB.QueryRow(`
 		SELECT agent_session_id FROM autopilot_jobs
-		WHERE state NOT IN (?, ?, ?)
+		WHERE state NOT IN (?, ?, ?, ?)
 		ORDER BY started_at ASC LIMIT 1
-	`, JobStateDone, JobStateFailed, JobStateTimedOut).Scan(&sessionID)
+	`, JobStateDone, JobStateFailed, JobStateTimedOut, JobStateDoneThreadInconsistent).Scan(&sessionID)
 	if err == sql.ErrNoRows {
 		return false, "", nil
 	}
