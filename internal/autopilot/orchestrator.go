@@ -42,6 +42,8 @@ type storeInterface interface {
 type linearClientInterface interface {
 	PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error
 	GetIssue(ctx context.Context, id string) (*linear.Issue, error)
+	GetWorkflowStates(ctx context.Context, teamID string) ([]linear.WorkflowState, error)
+	IssueUpdate(ctx context.Context, issueID, stateID string) error
 }
 
 type Orchestrator struct {
@@ -49,6 +51,10 @@ type Orchestrator struct {
 	lc     linearClientInterface
 	db     storeInterface
 	logger *slog.Logger
+
+	// workflowStatesByTeam caches workflow states per team, keyed by teamID.
+	workflowStatesByTeam map[string][]linear.WorkflowState
+	workflowStatesMu     sync.Mutex
 }
 
 func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
@@ -58,6 +64,38 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		logger.Warn("job_streams_dir_mkdir", "dir", cfg.JobStreamsDir, "err", err)
 	}
 	return o
+}
+
+// stateIDByType returns the workflow state ID for the given type in the given
+// team. It uses an in-memory cache;首次调用会从Linear拉取.
+func (o *Orchestrator) stateIDByType(ctx context.Context, teamID, stateType string) (string, error) {
+	o.workflowStatesMu.Lock()
+	states, ok := o.workflowStatesByTeam[teamID]
+	if !ok {
+		var err error
+		states, err = o.lc.GetWorkflowStates(ctx, teamID)
+		if err != nil {
+			o.workflowStatesMu.Unlock()
+			return "", fmt.Errorf("get_workflow_states: %w", err)
+		}
+		if o.workflowStatesByTeam == nil {
+			o.workflowStatesByTeam = make(map[string][]linear.WorkflowState)
+		}
+		o.workflowStatesByTeam[teamID] = states
+	}
+	o.workflowStatesMu.Unlock()
+
+	var bestID string
+	var bestPos float64 = -1
+	for _, s := range states {
+		if s.Type == stateType {
+			if bestPos < 0 || s.Position < bestPos {
+				bestPos = s.Position
+				bestID = s.ID
+			}
+		}
+	}
+	return bestID, nil
 }
 
 // HandleAgentEvent is wired up as the linear.AgentHandler. Returns quickly:
@@ -161,6 +199,7 @@ type flow struct {
 	prURL           string
 	streamFile      *os.File
 	claudeSessionID string
+	teamID          string
 }
 
 func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
@@ -182,6 +221,7 @@ func (f *flow) execute() error {
 		return fmt.Errorf("fetch issue: %w", err)
 	}
 
+	f.teamID = issue.TeamID
 	f.branch = branchName(issue)
 	f.worktreePath = filepath.Join(
 		absWorktreeRoot(f.o.cfg),
@@ -193,6 +233,19 @@ func (f *flow) execute() error {
 		j.Branch = f.branch
 	}); err != nil {
 		return fmt.Errorf("update job to EXECUTING: %w", err)
+	}
+
+	// Update Linear issue status to "started" asynchronously (non-blocking).
+	if f.o.cfg.UpdateIssueStatus != nil && *f.o.cfg.UpdateIssueStatus && f.teamID != "" {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if id, err := f.o.stateIDByType(ctx, f.teamID, "started"); err == nil && id != "" {
+				if err := f.o.lc.IssueUpdate(ctx, f.ev.IssueID, id); err != nil {
+					f.o.logger.Warn("issue_update_started_failed", "err", err)
+				}
+			}
+		}()
 	}
 
 	f.postActivity(linear.Action("worktree_create",
@@ -233,9 +286,28 @@ func (f *flow) execute() error {
 		return fmt.Errorf("update job to DONE: %w", err)
 	}
 
+	// Build mention prefix for the creator.
+	mention := ""
+	if f.ev.CreatorID != "" {
+		mention = "@" + f.ev.CreatorID + " "
+	}
 	f.postActivity(linear.Response(fmt.Sprintf(
-		"Done. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
-		prURL, f.worktreePath, f.branch)))
+		"%sDone. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
+		mention, prURL, f.worktreePath, f.branch)))
+
+	// Update Linear issue status to "completed" asynchronously (non-blocking).
+	if f.o.cfg.UpdateIssueStatus != nil && *f.o.cfg.UpdateIssueStatus && f.teamID != "" {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if id, err := f.o.stateIDByType(ctx, f.teamID, "completed"); err == nil && id != "" {
+				if err := f.o.lc.IssueUpdate(ctx, f.ev.IssueID, id); err != nil {
+					f.o.logger.Warn("issue_update_completed_failed", "err", err)
+				}
+			}
+		}()
+	}
+
 	f.cleanupWorktree()
 	return nil
 }
@@ -275,7 +347,11 @@ func (f *flow) markFailed(runErr error) {
 	// Use a fresh short ctx in case the parent is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	body := "admiral failed: " + truncate(runErr.Error(), 1500)
+	mention := ""
+	if f.ev.CreatorID != "" {
+		mention = "@" + f.ev.CreatorID + " "
+	}
+	body := mention + "admiral failed: " + truncate(runErr.Error(), 1500)
 	if f.worktreePath != "" {
 		body += "\n\nWorktree: `" + f.worktreePath + "`"
 	}

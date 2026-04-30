@@ -196,3 +196,54 @@ storage:
 		t.Errorf("WorkerCount default: got %d, want 3", cfg.Autopilot.WorkerCount)
 	}
 }
+
+func TestLoadAutopilot_DefaultUpdateIssueStatus(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if cfg.Autopilot.UpdateIssueStatus == nil {
+		t.Fatal("UpdateIssueStatus should not be nil")
+	}
+	if !*cfg.Autopilot.UpdateIssueStatus {
+		t.Errorf("UpdateIssueStatus default: got false, want true")
+	}
+}
+
+func TestLoadAutopilot_UpdateIssueStatus_CanBeDisabled(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+  update_issue_status: false
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if cfg.Autopilot.UpdateIssueStatus == nil {
+		t.Fatal("UpdateIssueStatus should not be nil")
+	}
+	if *cfg.Autopilot.UpdateIssueStatus {
+		t.Errorf("UpdateIssueStatus: got true, want false")
+	}
+}
