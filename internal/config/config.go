@@ -96,6 +96,9 @@ type Autopilot struct {
 	// ClaimNextPendingEvent, so increasing this only adds cross-session
 	// parallelism. Default: 3.
 	WorkerCount int `yaml:"worker_count"`
+	// UpdateIssueStatus controls whether admiral updates Linear issue workflow
+	// state on task lifecycle (Backlog → Started → Completed). Default: true.
+	UpdateIssueStatus *bool `yaml:"update_issue_status"`
 }
 
 type Launch struct {
@@ -232,6 +235,10 @@ func (c *Config) validateAutopilotAndExpand() error {
 	}
 	if c.Autopilot.WorkerCount <= 0 {
 		c.Autopilot.WorkerCount = 3
+	}
+	if c.Autopilot.UpdateIssueStatus == nil {
+		trueVal := true
+		c.Autopilot.UpdateIssueStatus = &trueVal
 	}
 
 	c.Storage.SQLitePath = expandTilde(c.Storage.SQLitePath)
