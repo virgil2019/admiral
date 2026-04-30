@@ -226,15 +226,29 @@ func TestRelativeTime(t *testing.T) {
 type mockLinearClient struct {
 	PostedBody string
 	PostErr    error
+	PostedBodyMu sync.Mutex
 }
 
 func (m *mockLinearClient) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {
+	m.PostedBodyMu.Lock()
 	m.PostedBody = a.Body
+	m.PostedBodyMu.Unlock()
 	return m.PostErr
 }
 
+func (m *mockLinearClient) GetPostedBody() string {
+	m.PostedBodyMu.Lock()
+	defer m.PostedBodyMu.Unlock()
+	return m.PostedBody
+}
+
 func (m *mockLinearClient) GetIssue(ctx context.Context, id string) (*linear.Issue, error) {
-	return nil, nil
+	return &linear.Issue{
+		ID:          id,
+		Identifier:  "TEST-1",
+		Title:       "Test Issue",
+		Description: "Test description",
+	}, nil
 }
 
 // mockStore implements storeInterface for testing.
@@ -246,6 +260,13 @@ type mockStore struct {
 	LastJobErr error
 	GetJob     *store.AutopilotJob
 	GetJobErr  error
+
+	// GetLatestDoneJobByIssue
+	LatestDoneJob    *store.AutopilotJob
+	LatestDoneJobErr error
+
+	// For UpdateAutopilotJob tracking
+	LastUpdatedJob *store.AutopilotJob
 }
 
 func (m *mockStore) AnyAutopilotJobActive() (bool, string, error) {
@@ -257,15 +278,25 @@ func (m *mockStore) GetLastAutopilotJob() (*store.AutopilotJob, error) {
 }
 
 func (m *mockStore) GetAutopilotJob(sessionID string) (*store.AutopilotJob, error) {
+	if m.GetJob == nil {
+		return &store.AutopilotJob{}, nil
+	}
 	return m.GetJob, m.GetJobErr
 }
 
 func (m *mockStore) UpdateAutopilotJob(sessionID string, fn func(*store.AutopilotJob)) error {
+	if m.LastUpdatedJob != nil {
+		fn(m.LastUpdatedJob)
+	}
 	return nil
 }
 
 func (m *mockStore) ClaimAutopilotJob(sessionID, issueID, identifier string) (bool, error) {
 	return true, nil
+}
+
+func (m *mockStore) GetLatestDoneJobByIssue(issueID string) (*store.AutopilotJob, error) {
+	return m.LatestDoneJob, m.LatestDoneJobErr
 }
 
 func TestHandleCommand_StatusIdle(t *testing.T) {
@@ -563,4 +594,138 @@ func TestDrainStreamJSON_EmitsStructuredEvents(t *testing.T) {
 	if n := count("claude_error"); n != 2 {
 		t.Errorf("expected 2 claude_error events (1 result error + 1 standalone error), got %d: %v", n, msgNames)
 	}
+=======
+// handleCreated short-circuit tests
+
+func TestHandleCreated_ShortCircuits_WhenPriorDoneWithPR(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		LatestDoneJob: &store.AutopilotJob{
+			IssueID:    "issue-abc",
+			PRURL:      "https://github.com/x/y/pull/42",
+			State:      store.JobStateDone,
+			StartedAt:  time.Now().Add(-1 * time.Hour).Format(time.RFC3339),
+			FinishedAt: time.Now().Add(-30 * time.Minute).Format(time.RFC3339),
+		},
+	}
+	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
+	ev := linear.AgentEvent{
+		SessionID:      "new-session",
+		IssueID:        "issue-abc",
+		IssueIdentifier: "ABC-1",
+		Action:         linear.ActionCreated,
+	}
+
+	o.handleCreated(ev)
+
+	if !strings.Contains(mlc.PostedBody, "https://github.com/x/y/pull/42") {
+		t.Errorf("expected prior PR URL in response, got: %s", mlc.PostedBody)
+	}
+	if !strings.Contains(mlc.PostedBody, "already completed") {
+		t.Errorf("expected 'already completed' in response, got: %s", mlc.PostedBody)
+	}
+}
+
+func TestHandleCreated_DoesNotShortCircuit_WhenPriorFailed(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		Active:      false,
+		GetJob:      nil,
+		GetJobErr:   nil,
+		LatestDoneJob: nil, // no DONE job, only FAILED would be in DB
+	}
+	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
+	ev := linear.AgentEvent{
+		SessionID:       "new-session",
+		IssueID:         "issue-fail",
+		IssueIdentifier: "FAIL-1",
+		Action:          linear.ActionCreated,
+	}
+
+	o.handleCreated(ev)
+
+	// Wait for goroutine to at least start (it will fail due to no real git repo)
+	time.Sleep(50 * time.Millisecond)
+
+	o.mu.Lock()
+	running := o.running
+	o.mu.Unlock()
+
+	// handleCreated should NOT have short-circuited (would have returned before setting running=true)
+	// So running should be true (goroutine was spawned), and PostedBody should NOT contain short-circuit msg
+	if strings.Contains(mlc.GetPostedBody(), "already completed") {
+		t.Errorf("expected no 'already completed' for FAILED-only issue, got: %s", mlc.GetPostedBody())
+	}
+	_ = running // may be false if goroutine already finished; that's ok for this test
+}
+
+func TestHandleCreated_DoesNotShortCircuit_WhenPriorDoneNoPR(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		LatestDoneJob: &store.AutopilotJob{
+			IssueID:    "issue-nopr",
+			PRURL:      "", // empty PRURL — abnormal recovery path
+			State:      store.JobStateDone,
+			StartedAt:  time.Now().Add(-1 * time.Hour).Format(time.RFC3339),
+			FinishedAt: time.Now().Add(-30 * time.Minute).Format(time.RFC3339),
+		},
+	}
+	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
+	ev := linear.AgentEvent{
+		SessionID:       "new-session",
+		IssueID:         "issue-nopr",
+		IssueIdentifier: "NOPR-1",
+		Action:          linear.ActionCreated,
+	}
+
+	o.handleCreated(ev)
+
+	// Wait for goroutine to at least start
+	time.Sleep(50 * time.Millisecond)
+
+	// Should NOT short-circuit because PRURL is empty (abnormal recovery case)
+	if strings.Contains(mlc.GetPostedBody(), "already completed") {
+		t.Errorf("expected no short-circuit when PRURL is empty, got: %s", mlc.GetPostedBody())
+	}
+}
+
+func TestHandleCreated_DoesNotShortCircuit_WhenNoHistory(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		Active:         false,
+		LatestDoneJob:   nil, // no history at all
+		LatestDoneJobErr: nil,
+	}
+	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
+	ev := linear.AgentEvent{
+		SessionID:       "new-session",
+		IssueID:         "issue-never",
+		IssueIdentifier: "NEVER-1",
+		Action:          linear.ActionCreated,
+	}
+
+	o.handleCreated(ev)
+
+	// Wait for goroutine to at least start
+	time.Sleep(50 * time.Millisecond)
+
+	// Should NOT short-circuit because there's no prior history
+	if strings.Contains(mlc.GetPostedBody(), "already completed") {
+		t.Errorf("expected no short-circuit for unknown issue, got: %s", mlc.GetPostedBody())
+	}
+}
+
+// cleanupWorktree tests
+
+func TestCleanupWorktree_WorktreeNotExists(t *testing.T) {
+	tmp := t.TempDir()
+	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: tmp}, logger: slog.Default()}
+	f := &flow{
+		o:            o,
+		worktreePath: filepath.Join(tmp, "nonexistent-worktree"),
+		branch:       "linear/nonexistent",
+	}
+
+	// Should not error even though worktree doesn't exist
+	f.cleanupWorktree()
 }

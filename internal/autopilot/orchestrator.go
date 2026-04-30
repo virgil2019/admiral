@@ -34,6 +34,7 @@ type storeInterface interface {
 	GetAutopilotJob(sessionID string) (*store.AutopilotJob, error)
 	UpdateAutopilotJob(sessionID string, fn func(*store.AutopilotJob)) error
 	ClaimAutopilotJob(sessionID, issueID, identifier string) (bool, error)
+	GetLatestDoneJobByIssue(issueID string) (*store.AutopilotJob, error)
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -79,6 +80,29 @@ func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
 	if ev.PromptContext != "" {
 		if cmd := extractCommand(ev.PromptContext); cmd != "" {
 			o.handleCommand(ev, cmd)
+			return
+		}
+	}
+
+	// Check if this issue was already completed in a previous session.
+	// If so, post the prior PR URL into the new thread and don't re-spawn claude.
+	if ev.IssueID != "" {
+		prior, err := o.db.GetLatestDoneJobByIssue(ev.IssueID)
+		if err != nil {
+			o.logger.Warn("get_latest_done_job_failed", "err", err, "issue", ev.IssueID)
+		} else if prior != nil && prior.PRURL != "" {
+			o.logger.Info("autopilot_short_circuit_already_done",
+				"session", ev.SessionID,
+				"issue", ev.IssueIdentifier,
+				"prior_pr", prior.PRURL)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			body := fmt.Sprintf(
+				"This issue was already completed.\n\nPR: %s\n\n"+
+					"If you want additional changes, please open a new issue or "+
+					"wait for follow-up support (#15).",
+				prior.PRURL)
+			_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
 			return
 		}
 	}
@@ -233,6 +257,7 @@ func (f *flow) execute() error {
 	f.postActivity(linear.Response(fmt.Sprintf(
 		"Done. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
 		prURL, f.worktreePath, f.branch)))
+	f.cleanupWorktree()
 	return nil
 }
 
@@ -282,6 +307,37 @@ func (f *flow) markFailed(runErr error) {
 		body += "\n\nStream log: " + j.StreamLogPath
 	}
 	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.ErrorActivity(body))
+	f.cleanupWorktree()
+}
+
+// cleanupWorktree removes the worktree directory and local branch.
+// Best-effort: failures are logged at WARN but don't change job state.
+// Order matters: remove worktree before deleting branch (worktree
+// references the branch).
+func (f *flow) cleanupWorktree() {
+	if f.worktreePath == "" {
+		return
+	}
+
+	cmd := exec.Command("git", "worktree", "remove", "--force", f.worktreePath)
+	cmd.Dir = f.o.cfg.RepoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		f.o.logger.Warn("cleanup_worktree_remove_failed",
+			"err", err, "out", string(out), "path", f.worktreePath)
+	} else {
+		f.o.logger.Info("cleanup_worktree_removed", "path", f.worktreePath)
+	}
+
+	if f.branch != "" {
+		cmd := exec.Command("git", "branch", "-D", f.branch)
+		cmd.Dir = f.o.cfg.RepoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			f.o.logger.Warn("cleanup_branch_delete_failed",
+				"err", err, "out", string(out), "branch", f.branch)
+		} else {
+			f.o.logger.Info("cleanup_branch_deleted", "branch", f.branch)
+		}
+	}
 }
 
 // configureWorktreeIgnores writes .git/info/exclude entries inside the
