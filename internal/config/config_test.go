@@ -182,7 +182,10 @@ linear:
   api_token: "lin_api_test"
   webhook_secret: "wh_secret"
 autopilot:
-  repo_dir: "` + t.TempDir() + `"
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
   claude_bin: "` + bin + `"
   gh_bin: "` + bin + `"
 storage:
@@ -204,7 +207,10 @@ linear:
   api_token: "lin_api_test"
   webhook_secret: "wh_secret"
 autopilot:
-  repo_dir: "` + t.TempDir() + `"
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
   claude_bin: "` + bin + `"
   gh_bin: "` + bin + `"
 storage:
@@ -229,7 +235,10 @@ linear:
   api_token: "lin_api_test"
   webhook_secret: "wh_secret"
 autopilot:
-  repo_dir: "` + t.TempDir() + `"
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
   claude_bin: "` + bin + `"
   gh_bin: "` + bin + `"
   update_issue_status: false

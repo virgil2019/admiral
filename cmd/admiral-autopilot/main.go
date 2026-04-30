@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -174,8 +173,6 @@ func seedTokenStore(db *store.Store, linCfg *config.Linear, logger *slog.Logger)
 // seedRepos writes repos from config into the SQLite store only when the DB
 // repos table is empty (DB takes priority over config once repos have been
 // stored, to avoid overwriting user changes made via future admin APIs).
-// For backward compatibility, if no repos are configured in config.yaml but
-// a legacy repo_dir is present, a single-element repos list is seeded.
 func seedRepos(db *store.Store, apCfg *config.Autopilot, logger *slog.Logger) error {
 	existing, err := db.ListRepos()
 	if err != nil {
@@ -184,42 +181,21 @@ func seedRepos(db *store.Store, apCfg *config.Autopilot, logger *slog.Logger) er
 	if len(existing) > 0 {
 		return nil // DB already has repos — don't overwrite
 	}
-
-	var toSeed []config.RepoConfig
-
-	// New multi-repo format takes priority.
-	if len(apCfg.Repos) > 0 {
-		toSeed = apCfg.Repos
-	} else if strings.TrimSpace(apCfg.RepoDir) != "" {
-		// Legacy single-repo: convert repo_dir/base_branch to a single-element list.
-		baseBranch := apCfg.BaseBranch
-		if strings.TrimSpace(baseBranch) == "" {
-			baseBranch = "main"
-		}
-		// Use "legacy" as team_id and team_name for migrated configs.
-		toSeed = []config.RepoConfig{{
-			TeamID:     "legacy",
-			TeamName:   "LegacyRepo",
-			RepoDir:    apCfg.RepoDir,
-			BaseBranch: baseBranch,
-		}}
+	if len(apCfg.Repos) == 0 {
+		return nil // nothing to seed (validation already enforces non-empty)
 	}
 
-	if len(toSeed) == 0 {
-		return nil // nothing to seed
-	}
-
-	logger.Info("repos_seeding_from_config", "count", len(toSeed))
-	for _, r := range toSeed {
+	logger.Info("repos_seeding_from_config", "count", len(apCfg.Repos))
+	for _, r := range apCfg.Repos {
 		repo := store.Repo{
-			TeamID:     r.TeamID,
-			TeamName:   r.TeamName,
-			RepoDir:    r.RepoDir,
-			BaseBranch: r.BaseBranch,
-			Enabled:    true,
+			ProjectID:   r.ProjectID,
+			ProjectName: r.ProjectName,
+			RepoDir:     r.RepoDir,
+			BaseBranch:  r.BaseBranch,
+			Enabled:     true,
 		}
 		if err := db.UpsertRepo(repo); err != nil {
-			return fmt.Errorf("upsert repo %s: %w", r.TeamID, err)
+			return fmt.Errorf("upsert repo %s: %w", r.ProjectID, err)
 		}
 	}
 	return nil

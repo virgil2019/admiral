@@ -39,7 +39,7 @@ type storeInterface interface {
 	ClaimAutopilotJob(sessionID, issueID, identifier string) (bool, error)
 	GetLatestDoneJobByIssue(issueID string) (*store.AutopilotJob, error)
 	GetLatestTimedOutJobByIssue(issueID string) (*store.AutopilotJob, error)
-	GetRepoByTeamID(teamID string) (*store.Repo, error)
+	GetRepoByProjectID(projectID string) (*store.Repo, error)
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -317,13 +317,20 @@ func (f *flow) execute() error {
 
 	f.teamID = issue.TeamID
 
-	// Route to repo by team ID.
-	repo, err := f.o.db.GetRepoByTeamID(issue.TeamID)
+	// Route to repo by Linear project ID. The team is intentionally not used
+	// for routing — a Linear team can own multiple repos, and project↔repo
+	// is the cleaner 1:1 mapping. Issues without a project are rejected;
+	// the user must assign a Linear project that's configured in
+	// autopilot.repos.
+	if strings.TrimSpace(issue.ProjectID) == "" {
+		return fmt.Errorf("issue %s has no Linear project; admiral routes by project_id, please assign a project that is configured in autopilot.repos", issue.Identifier)
+	}
+	repo, err := f.o.db.GetRepoByProjectID(issue.ProjectID)
 	if err != nil {
-		return fmt.Errorf("get repo for team %s: %w", issue.TeamID, err)
+		return fmt.Errorf("get repo for project %s: %w", issue.ProjectID, err)
 	}
 	if repo == nil || !repo.Enabled {
-		return fmt.Errorf("no enabled repo configured for team %s", issue.TeamID)
+		return fmt.Errorf("no enabled repo configured for project %s", issue.ProjectID)
 	}
 	f.repoDir = repo.RepoDir
 	f.baseBranch = repo.BaseBranch

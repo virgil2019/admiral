@@ -267,8 +267,8 @@ func TestApplyMigrations_FreshDB(t *testing.T) {
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("query schema_migrations: %v", err)
 	}
-	if count != 7 {
-		t.Fatalf("expected 7 migrations recorded, got %d", count)
+	if count != 8 {
+		t.Fatalf("expected 8 migrations recorded, got %d", count)
 	}
 }
 
@@ -294,8 +294,8 @@ func TestApplyMigrations_Idempotent(t *testing.T) {
 	if err := s2.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("query schema_migrations: %v", err)
 	}
-	if count != 7 {
-		t.Fatalf("expected 7 migrations (no duplicates), got %d", count)
+	if count != 8 {
+		t.Fatalf("expected 8 migrations (no duplicates), got %d", count)
 	}
 }
 
@@ -340,8 +340,8 @@ func TestBackfillMigrations_LegacyDB(t *testing.T) {
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("query schema_migrations: %v", err)
 	}
-	if count != 7 {
-		t.Fatalf("expected 7 migrations backfilled (6 applied + v7 via columnExists checks), got %d", count)
+	if count != 8 {
+		t.Fatalf("expected 8 migrations (6 backfilled + v7,v8 applied at boot), got %d", count)
 	}
 }
 
@@ -376,7 +376,7 @@ func TestBackfillMigrations_PartialDB(t *testing.T) {
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("query schema_migrations: %v", err)
 	}
-	if count != 7 {
-		t.Fatalf("expected 7 migrations (3 backfilled + 4 applied), got %d", count)
+	if count != 8 {
+		t.Fatalf("expected 8 migrations (3 backfilled + 5 applied), got %d", count)
 	}
 }

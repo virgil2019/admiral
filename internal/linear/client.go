@@ -55,6 +55,7 @@ type Issue struct {
 	Priority    int
 	AssigneeID  string
 	TeamID      string
+	ProjectID   string
 	Labels      []string
 	Comments    []Comment
 }
@@ -215,6 +216,7 @@ const issueQuery = `query Issue($id: String!) {
     state { name }
     assignee { id }
     team { id }
+    project { id }
     labels { nodes { name } }
     comments(first: 20) { nodes { body createdAt user { name } } }
   }
@@ -238,6 +240,9 @@ func (c *Client) GetIssue(ctx context.Context, id string) (*Issue, error) {
 			Team *struct {
 				ID string `json:"id"`
 			} `json:"team"`
+			Project *struct {
+				ID string `json:"id"`
+			} `json:"project"`
 			Labels struct {
 				Nodes []struct {
 					Name string `json:"name"`
@@ -279,6 +284,9 @@ func (c *Client) GetIssue(ctx context.Context, id string) (*Issue, error) {
 	}
 	if data.Issue.Team != nil {
 		out.TeamID = data.Issue.Team.ID
+	}
+	if data.Issue.Project != nil {
+		out.ProjectID = data.Issue.Project.ID
 	}
 	for _, l := range data.Issue.Labels.Nodes {
 		out.Labels = append(out.Labels, l.Name)
