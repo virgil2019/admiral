@@ -105,6 +105,19 @@ func main() {
 		go w.Run(ctx)
 	}
 
+	// Admin API server — read-only HTTP endpoints for web UI (M4) data source.
+	// No auth (M5 scope); bound to localhost by default.
+	adminAddr := cfg.Autopilot.AdminListenAddr
+	logger.Info("admin server starting",
+		"listen", adminAddr,
+	)
+	go func() {
+		if err := autopilot.ServeAdminHTTP(adminAddr, db, lc, logger, n); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("admin server failed", "err", err)
+			cancel()
+		}
+	}()
+
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("http server failed", "err", err)

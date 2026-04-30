@@ -507,6 +507,52 @@ func (s *Store) GetLatestTimedOutJobByIssue(issueID string) (*AutopilotJob, erro
 	return &j, err
 }
 
+// ListAutopilotJobs returns jobs matching the given filters, ordered by started_at desc.
+func (s *Store) ListAutopilotJobs(status, issueID string, since *time.Time, limit int) ([]AutopilotJob, error) {
+	query := `
+		SELECT agent_session_id, issue_id, issue_identifier, state,
+		       COALESCE(worktree_path,''), COALESCE(branch,''),
+		       COALESCE(pr_url,''), COALESCE(error,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(stream_log_path,''),
+		       COALESCE(claude_session_id,'')
+		FROM autopilot_jobs WHERE 1=1`
+	args := []any{}
+	if status != "" {
+		query += " AND state=?"
+		args = append(args, status)
+	}
+	if issueID != "" {
+		query += " AND issue_id=?"
+		args = append(args, issueID)
+	}
+	if since != nil {
+		query += " AND started_at>=?"
+		args = append(args, since.UTC().Format(time.RFC3339))
+	}
+	query += " ORDER BY started_at DESC"
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AutopilotJob
+	for rows.Next() {
+		var j AutopilotJob
+		if err := rows.Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+			&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+			&j.StreamLogPath, &j.ClaudeSessionID); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil
