@@ -766,7 +766,107 @@ func TestCleanupWorktree_WorktreeNotExists(t *testing.T) {
 	}
 
 	// Should not error even though worktree doesn't exist
-	f.cleanupWorktree()
+	f.cleanupWorktree(cleanupDelete)
+}
+
+func TestCleanupWorktree_DeleteMode(t *testing.T) {
+	tmp := t.TempDir()
+	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: tmp}, logger: slog.Default()}
+	f := &flow{
+		o:            o,
+		worktreePath: filepath.Join(tmp, "nonexistent-worktree"),
+		branch:       "linear/nonexistent",
+	}
+
+	// Should not error even though worktree doesn't exist
+	f.cleanupWorktree(cleanupDelete)
+}
+
+// copyDir / copyFile tests
+
+func TestCopyDir_SimpleFile(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "out")
+
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	if err := copyDir(src, dst); err != nil {
+		t.Fatalf("copyDir: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dst, "a.txt"))
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Errorf("got %q, want %q", got, "hello")
+	}
+}
+
+func TestCopyDir_NestedDirs(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "out")
+
+	if err := os.MkdirAll(filepath.Join(src, "a", "b"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "a", "b", "c.txt"), []byte("nested"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "root.txt"), []byte("top"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	if err := copyDir(src, dst); err != nil {
+		t.Fatalf("copyDir: %v", err)
+	}
+
+	for _, tc := range []struct {
+		path, want string
+		mode       os.FileMode
+	}{
+		{"root.txt", "top", 0o644 & 0o777},
+		{"a/b/c.txt", "nested", 0o600 & 0o777},
+	} {
+		got, err := os.ReadFile(filepath.Join(dst, tc.path))
+		if err != nil {
+			t.Errorf("read %s: %v", tc.path, err)
+			continue
+		}
+		if string(got) != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestCopyFile_PreservesMode(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "out")
+
+	if err := os.WriteFile(filepath.Join(src, "mode.txt"), []byte("mode"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	if err := copyFile(filepath.Join(src, "mode.txt"), dst, 0o600); err != nil {
+		t.Fatalf("copyFile: %v", err)
+	}
+
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode() != 0o600 {
+		t.Errorf("mode = %v, want %v", info.Mode(), 0o600)
+	}
+}
+
+func TestCopyDir_SrcDoesNotExist(t *testing.T) {
+	err := copyDir("/nonexistent/src", t.TempDir())
+	if err == nil {
+		t.Error("expected error for nonexistent src")
+	}
 }
 
 // ---- Tests for mention + status update in flow lifecycle ----

@@ -410,7 +410,7 @@ func (f *flow) execute() error {
 		}()
 	}
 
-	f.cleanupWorktree()
+	f.cleanupWorktree(cleanupDelete)
 	return nil
 }
 
@@ -452,7 +452,7 @@ func (f *flow) executeResume() error {
 		return fmt.Errorf("update job to DONE: %w", err)
 	}
 
-	f.cleanupWorktree()
+	f.cleanupWorktree(cleanupDelete)
 	return nil
 }
 
@@ -599,7 +599,7 @@ func (f *flow) markFailed(runErr error) {
 		})
 		_ = f.addInconsistencyFooter(ctx)
 	}
-	f.cleanupWorktree()
+	f.cleanupWorktree(cleanupArchive)
 }
 
 func (f *flow) markTimedOut(runErr error) {
@@ -627,15 +627,33 @@ func (f *flow) markTimedOut(runErr error) {
 	// NO cleanupWorktree: keep worktree for resume
 }
 
-// cleanupWorktree removes the worktree directory and local branch.
+// cleanupMode controls whether cleanupWorktree deletes or archives the worktree.
+type cleanupMode int
+
+const (
+	cleanupDelete  cleanupMode = iota
+	cleanupArchive
+)
+
+// cleanupWorktree removes or archives the worktree depending on mode.
 // Best-effort: failures are logged at WARN but don't change job state.
-// Order matters: remove worktree before deleting branch (worktree
-// references the branch).
-func (f *flow) cleanupWorktree() {
+// Order matters for delete: remove worktree before deleting branch (worktree
+// references the branch). Archive mode preserves the branch.
+func (f *flow) cleanupWorktree(mode cleanupMode) {
 	if f.worktreePath == "" {
 		return
 	}
+	switch mode {
+	case cleanupDelete:
+		f.removeWorktreeAndBranch()
+	case cleanupArchive:
+		f.archiveWorktree()
+	}
+}
 
+// removeWorktreeAndBranch deletes the worktree and local branch.
+// Order matters: remove worktree before deleting branch.
+func (f *flow) removeWorktreeAndBranch() {
 	cmd := exec.Command("git", "worktree", "remove", "--force", f.worktreePath)
 	cmd.Dir = f.o.cfg.RepoDir
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -655,6 +673,85 @@ func (f *flow) cleanupWorktree() {
 			f.o.logger.Info("cleanup_branch_deleted", "branch", f.branch)
 		}
 	}
+}
+
+// archiveWorktree copies the worktree to .worktrees-archive/ then removes
+// the git registration. The branch is preserved for manual follow-up.
+// Best-effort: if archive copy fails, the worktree is NOT removed to avoid
+// data loss.
+func (f *flow) archiveWorktree() {
+	archiveRoot := filepath.Join(f.o.cfg.RepoDir, ".worktrees-archive")
+	if err := os.MkdirAll(archiveRoot, 0o755); err != nil {
+		f.o.logger.Warn("archive_mkdir_failed", "err", err, "path", archiveRoot)
+		return
+	}
+
+	issue := f.ev.IssueIdentifier
+	if issue == "" {
+		issue = f.ev.IssueID
+	}
+	if issue == "" {
+		issue = "unknown"
+	}
+	archivePath := filepath.Join(
+		archiveRoot,
+		fmt.Sprintf("%s-%d", sanitizeForPath(issue), time.Now().Unix()),
+	)
+
+	// 1. Copy worktree to archive path.
+	if err := copyDir(f.worktreePath, archivePath); err != nil {
+		f.o.logger.Warn("archive_copy_failed",
+			"err", err, "src", f.worktreePath, "dst", archivePath)
+		return
+	}
+
+	// 2. Remove the worktree from git registration + filesystem.
+	cmd := exec.Command("git", "worktree", "remove", "--force", f.worktreePath)
+	cmd.Dir = f.o.cfg.RepoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		f.o.logger.Warn("archive_worktree_remove_failed",
+			"err", err, "out", string(out), "path", f.worktreePath)
+		// Archive succeeded; leave dangling worktree for manual cleanup.
+	}
+
+	// 3. Branch is intentionally NOT deleted — user can checkout later.
+
+	f.o.logger.Info("archive_worktree_done",
+		"issue", issue, "path", archivePath)
+}
+
+// copyDir copies src to dst recursively using pure Go (no external commands).
+func copyDir(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+		return copyFile(path, target, info.Mode())
+	})
+}
+
+// copyFile copies a single file from src to dst.
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
 }
 
 // configureWorktreeIgnores writes .git/info/exclude entries inside the

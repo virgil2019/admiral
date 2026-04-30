@@ -264,6 +264,10 @@ linear:
 autopilot:
   listen_addr: ":8787"
   repo_dir: "/path/to/your/repo"
+
+# Optional: add .worktrees-archive/ to your .gitignore to keep failed
+# autopilot worktrees out of git status:
+#   echo ".worktrees-archive/" >> /path/to/your/repo/.gitignore
 storage:
   sqlite_path: "~/.local/share/admiral/autopilot.db"
 logging:
