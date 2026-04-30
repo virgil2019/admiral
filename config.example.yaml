@@ -85,11 +85,26 @@ linear:
 autopilot:
   # HTTP bind address for the webhook receiver. Default: ":8787"
   listen_addr: ":8787"
-  # Repo whose .worktrees/ admiral creates per-issue branches under.
+
+  # --- Multi-repo setup (recommended) ---
+  # When repos is populated, repo_dir and base_branch below are ignored.
+  # Each Linear team maps to one repo; issues from that team go to that repo.
+  repos:
+    - team_id: "abc-123"           # Linear team UUID
+      team_name: "Georgexu"        # Human-readable name (for logs/UI)
+      repo_dir: "/home/you/code/your-repo"
+      base_branch: "main"
+    # - team_id: "def-456"
+    #   team_name: "AnotherTeam"
+    #   repo_dir: "/home/you/code/another-repo"
+    #   base_branch: "main"
+
+  # --- Single-repo setup (legacy/backward compatible) ---
+  # Deprecated: use repos[] above instead. Still works for migration.
   repo_dir: "/Users/you/code/your-repo"
   # Defaults shown:
   # worktree_root:   ".worktrees"
-  # base_branch:     "main"
+  # base_branch:     "main"         # Deprecated: use repos[].base_branch
   # claude_bin:      "claude"
   # gh_bin:          "gh"
   # autopilot_skill: ""           # claude skill name, e.g. "autopilot"

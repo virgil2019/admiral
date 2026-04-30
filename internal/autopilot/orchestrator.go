@@ -39,6 +39,7 @@ type storeInterface interface {
 	ClaimAutopilotJob(sessionID, issueID, identifier string) (bool, error)
 	GetLatestDoneJobByIssue(issueID string) (*store.AutopilotJob, error)
 	GetLatestTimedOutJobByIssue(issueID string) (*store.AutopilotJob, error)
+	GetRepoByTeamID(teamID string) (*store.Repo, error)
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -268,6 +269,8 @@ type flow struct {
 	streamFile      *os.File
 	claudeSessionID string
 	teamID          string
+	repoDir        string
+	baseBranch     string
 }
 
 func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
@@ -313,9 +316,21 @@ func (f *flow) execute() error {
 	}
 
 	f.teamID = issue.TeamID
+
+	// Route to repo by team ID.
+	repo, err := f.o.db.GetRepoByTeamID(issue.TeamID)
+	if err != nil {
+		return fmt.Errorf("get repo for team %s: %w", issue.TeamID, err)
+	}
+	if repo == nil || !repo.Enabled {
+		return fmt.Errorf("no enabled repo configured for team %s", issue.TeamID)
+	}
+	f.repoDir = repo.RepoDir
+	f.baseBranch = repo.BaseBranch
+
 	f.branch = branchName(issue)
 	f.worktreePath = filepath.Join(
-		absWorktreeRoot(f.o.cfg),
+		absWorktreeRootWithRepo(f.o.cfg, f.repoDir),
 		"linear-"+sanitizeForPath(issue.Identifier),
 	)
 	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
@@ -340,7 +355,7 @@ func (f *flow) execute() error {
 	}
 
 	f.postActivity(linear.Action("worktree_create",
-		fmt.Sprintf("%s @ %s", f.branch, f.o.cfg.BaseBranch),
+		fmt.Sprintf("%s @ %s", f.branch, f.baseBranch),
 		""))
 	if err := f.createWorktree(); err != nil {
 		return fmt.Errorf("create worktree: %w", err)
@@ -361,7 +376,7 @@ func (f *flow) execute() error {
 	}
 
 	f.postActivity(linear.Action("ensure_pr",
-		fmt.Sprintf("gh pr (%s -> %s)", f.branch, f.o.cfg.BaseBranch),
+		fmt.Sprintf("gh pr (%s -> %s)", f.branch, f.baseBranch),
 		""))
 	prURL, err := f.ensurePR(issue)
 	if err != nil {
@@ -467,13 +482,13 @@ func (f *flow) ensureWorktree() error {
 
 	// Worktree was cleaned up; recreate it on the original branch.
 	cmd := exec.Command("git", "fetch", "origin", f.job.Branch)
-	cmd.Dir = f.o.cfg.RepoDir
+	cmd.Dir = f.repoDir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git fetch %s: %w (%s)", f.job.Branch, err, out)
 	}
 
 	cmd = exec.Command("git", "worktree", "add", f.job.WorktreePath, f.job.Branch)
-	cmd.Dir = f.o.cfg.RepoDir
+	cmd.Dir = f.repoDir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git worktree add: %w (%s)", err, out)
 	}
@@ -655,7 +670,7 @@ func (f *flow) cleanupWorktree(mode cleanupMode) {
 // Order matters: remove worktree before deleting branch.
 func (f *flow) removeWorktreeAndBranch() {
 	cmd := exec.Command("git", "worktree", "remove", "--force", f.worktreePath)
-	cmd.Dir = f.o.cfg.RepoDir
+	cmd.Dir = f.repoDir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		f.o.logger.Warn("cleanup_worktree_remove_failed",
 			"err", err, "out", string(out), "path", f.worktreePath)
@@ -665,7 +680,7 @@ func (f *flow) removeWorktreeAndBranch() {
 
 	if f.branch != "" {
 		cmd := exec.Command("git", "branch", "-D", f.branch)
-		cmd.Dir = f.o.cfg.RepoDir
+		cmd.Dir = f.repoDir
 		if out, err := cmd.CombinedOutput(); err != nil {
 			f.o.logger.Warn("cleanup_branch_delete_failed",
 				"err", err, "out", string(out), "branch", f.branch)
@@ -680,7 +695,7 @@ func (f *flow) removeWorktreeAndBranch() {
 // Best-effort: if archive copy fails, the worktree is NOT removed to avoid
 // data loss.
 func (f *flow) archiveWorktree() {
-	archiveRoot := filepath.Join(f.o.cfg.RepoDir, ".worktrees-archive")
+	archiveRoot := filepath.Join(f.repoDir, ".worktrees-archive")
 	if err := os.MkdirAll(archiveRoot, 0o755); err != nil {
 		f.o.logger.Warn("archive_mkdir_failed", "err", err, "path", archiveRoot)
 		return
@@ -707,7 +722,7 @@ func (f *flow) archiveWorktree() {
 
 	// 2. Remove the worktree from git registration + filesystem.
 	cmd := exec.Command("git", "worktree", "remove", "--force", f.worktreePath)
-	cmd.Dir = f.o.cfg.RepoDir
+	cmd.Dir = f.repoDir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		f.o.logger.Warn("archive_worktree_remove_failed",
 			"err", err, "out", string(out), "path", f.worktreePath)
@@ -790,8 +805,8 @@ func (f *flow) configureWorktreeIgnores() error {
 // createWorktree fetches origin/<base> and creates a fresh worktree. If the
 // directory already exists (e.g. a prior failed run), it's removed first.
 func (f *flow) createWorktree() error {
-	repo := f.o.cfg.RepoDir
-	base := f.o.cfg.BaseBranch
+	repo := f.repoDir
+	base := f.baseBranch
 	if err := runCmd(f.ctx, repo, "git", "fetch", "origin", base); err != nil {
 		return fmt.Errorf("git fetch origin %s: %w", base, err)
 	}
@@ -812,7 +827,7 @@ func (f *flow) createWorktree() error {
 // runClaude spawns `claude -p` in stream-json mode inside the worktree and
 // drains stdout until exit.
 func (f *flow) runClaude(issue *linear.Issue) error {
-	prompt := buildPrompt(f.o.cfg.AutopilotSkill, issue, f.ev, f.branch, f.o.cfg.BaseBranch)
+	prompt := buildPrompt(f.o.cfg.AutopilotSkill, issue, f.ev, f.branch, f.baseBranch)
 
 	claudeSessionID := uuid.NewString()
 	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
@@ -1082,7 +1097,7 @@ func (f *flow) ensurePR(issue *linear.Issue) (string, error) {
 		issue.Identifier, issue.URL, truncate(issue.Description, 4000))
 	out, err := captureCmd(f.ctx, f.worktreePath,
 		f.o.cfg.GhBin, "pr", "create",
-		"--base", f.o.cfg.BaseBranch,
+		"--base", f.baseBranch,
 		"--head", f.branch,
 		"--title", fmt.Sprintf("[%s] %s", issue.Identifier, issue.Title),
 		"--body", body,
@@ -1122,6 +1137,13 @@ func absWorktreeRoot(c *config.Autopilot) string {
 		return c.WorktreeRoot
 	}
 	return filepath.Join(c.RepoDir, c.WorktreeRoot)
+}
+
+func absWorktreeRootWithRepo(c *config.Autopilot, repoDir string) string {
+	if filepath.IsAbs(c.WorktreeRoot) {
+		return c.WorktreeRoot
+	}
+	return filepath.Join(repoDir, c.WorktreeRoot)
 }
 
 func branchName(i *linear.Issue) string {
@@ -1395,7 +1417,7 @@ func (f *flow) addInconsistencyFooter(ctx context.Context) error {
 	footer := fmt.Sprintf("\n---\n\n> **Linear thread inconsistency**: admiral failed to post the final response activity to Linear thread (session: %q). The task itself completed successfully. Check admiral logs around %q for `final_activity_push_failed`.", f.ev.SessionID, timestamp)
 
 	// Get current PR body via gh pr view.
-	out, err := captureCmd(ctx, f.o.cfg.RepoDir, f.o.cfg.GhBin, "pr", "view", extractPRNumber(f.prURL), "--json", "body", "--jq", ".body")
+	out, err := captureCmd(ctx, f.repoDir, f.o.cfg.GhBin, "pr", "view", extractPRNumber(f.prURL), "--json", "body", "--jq", ".body")
 	if err != nil {
 		f.o.logger.Warn("pr_view_for_footer_failed", "err", err, "pr", f.prURL)
 		return err
@@ -1403,7 +1425,7 @@ func (f *flow) addInconsistencyFooter(ctx context.Context) error {
 	currentBody := strings.TrimSpace(out)
 	newBody := currentBody + footer
 
-	_, err = captureCmd(ctx, f.o.cfg.RepoDir, f.o.cfg.GhBin, "pr", "edit", extractPRNumber(f.prURL), "--body", newBody)
+	_, err = captureCmd(ctx, f.repoDir, f.o.cfg.GhBin, "pr", "edit", extractPRNumber(f.prURL), "--body", newBody)
 	if err != nil {
 		f.o.logger.Warn("pr_edit_footer_failed", "err", err, "pr", f.prURL)
 		return err
