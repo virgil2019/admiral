@@ -1,16 +1,19 @@
 package linear
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/georgehuang/admiral/internal/store"
 )
@@ -142,12 +145,15 @@ func (tr *TokenRefresher) doRefresh(ctx context.Context) (string, error) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := tr.doHTTPWithRetry(req)
 	if err != nil {
 		if tr.logger != nil {
 			tr.logger.Warn("linear_token_refresh_network_error", "err", err)
 		}
 		return "", fmt.Errorf("token refresh failed: %w", ErrTokenRefreshFailed)
+	}
+	if resp == nil {
+		return "", fmt.Errorf("token refresh failed: doHTTPWithRetry returned nil resp")
 	}
 	defer resp.Body.Close()
 
@@ -197,6 +203,56 @@ func (tr *TokenRefresher) doRefresh(ctx context.Context) (string, error) {
 		tr.logger.Info("linear_token_refreshed")
 	}
 	return result.AccessToken, nil
+}
+
+// doHTTPWithRetry executes the request with exponential backoff for transient errors.
+func (tr *TokenRefresher) doHTTPWithRetry(req *http.Request) (*http.Response, error) {
+	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+	// Read and clone body so each attempt gets a fresh reader.
+	var bodyBytes []byte
+	if req.Body != nil {
+		bodyBytes, _ = io.ReadAll(req.Body)
+		req.Body.Close()
+	}
+	var lastErr error
+	client := &http.Client{Timeout: 30 * time.Second}
+	for attempt := 0; attempt <= len(delays); attempt++ {
+		if len(bodyBytes) > 0 {
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			if !isTokenTransientNetErr(err) || attempt == len(delays) {
+				return nil, err
+			}
+		} else {
+			if !isTokenTransientHTTPStatus(resp.StatusCode) {
+				return resp, nil
+			}
+			resp.Body.Close()
+			lastErr = fmt.Errorf("transient http %d", resp.StatusCode)
+			if attempt == len(delays) {
+				return nil, lastErr
+			}
+		}
+		time.Sleep(delays[attempt])
+	}
+	return nil, lastErr
+}
+
+func isTokenTransientHTTPStatus(s int) bool {
+	return s >= 500 || s == http.StatusRequestTimeout || s == http.StatusTooManyRequests
+}
+
+func isTokenTransientNetErr(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return ne.Temporary() || ne.Timeout()
+	}
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func (tr *TokenRefresher) classifyError(status int, body []byte) error {
