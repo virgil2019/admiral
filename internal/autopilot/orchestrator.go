@@ -25,6 +25,7 @@ import (
 	"github.com/georgehuang/admiral/internal/config"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
+	"github.com/google/uuid"
 )
 
 // storeInterface abstracts the store methods used by the orchestrator.
@@ -178,10 +179,11 @@ type flow struct {
 	ctx context.Context
 	ev  linear.AgentEvent
 
-	branch       string
-	worktreePath string
-	prURL        string
-	streamFile   *os.File
+	branch          string
+	worktreePath    string
+	prURL           string
+	streamFile      *os.File
+	claudeSessionID string
 }
 
 func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
@@ -399,8 +401,18 @@ func (f *flow) createWorktree() error {
 // drains stdout until exit.
 func (f *flow) runClaude(issue *linear.Issue) error {
 	prompt := buildPrompt(f.o.cfg.AutopilotSkill, issue, f.ev, f.branch, f.o.cfg.BaseBranch)
+
+	claudeSessionID := uuid.NewString()
+	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.ClaudeSessionID = claudeSessionID
+	}); err != nil {
+		f.o.logger.Warn("update_claude_session_id_failed", "session", f.ev.SessionID, "err", err)
+	}
+	f.claudeSessionID = claudeSessionID
+
 	args := []string{
 		"-p", prompt,
+		"--session-id", claudeSessionID,
 		"--output-format", "stream-json",
 		"--verbose",
 		// --dangerously-skip-permissions is Claude Code's canonical
