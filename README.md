@@ -218,25 +218,16 @@ itself. Do this once per workspace:
    - After Create, edit the app's **Webhooks** section: set URL to
      `https://<your-tunnel>/webhook`, subscribe to **"Agent session
      events"** (and only that — Issue events are not used in v0.3).
-2. **Run the OAuth flow** to get a `lin_oauth_*` access token. The
-   simplest path is to clone Linear's official agent demo or copy the
-   minimal `oauth-callback.ts` script (see
-   `/Users/georgehuang/Program/test/ai/team/linear/src/oauth-callback.ts`
-   in this dev's tree for a working reference).
-
-   Required ingredients for the flow:
-   - Authorization URL: `https://linear.app/oauth/authorize`
-   - Required query params: `response_type=code`, `client_id=...`,
-     `redirect_uri=http://127.0.0.1:8080/callback`,
-     `scope=read,write,app:mentionable,app:assignable`,
-     `actor=app`, `prompt=consent`, plus a CSRF `state`
-   - Token exchange: `POST https://api.linear.app/oauth/token` with
-     `code`, `redirect_uri`, `client_id`, `client_secret`,
-     `grant_type=authorization_code`
-   - Output: `access_token` (this is the value you paste into
-     `linear.api_token`), plus `refresh_token` for future renewal.
+2. **Run the OAuth flow** using the built-in CLI:
+   ```
+   admiral-oauth login --config ~/.config/admiral/config.yaml
+   ```
+   This opens your browser to Linear's authorization page. After you
+   approve, tokens are automatically stored in SQLite. No external
+   scripts needed.
 3. **Save secrets** somewhere safe (1Password, etc.). admiral expects:
-   - `lin_oauth_*` access token → `linear.api_token`
+   - `lin_oauth_*` access token → `linear.api_token` (already stored via
+     step 2; you can also set `linear.api_token` in config as a fallback)
    - Webhook signing secret (Linear app's Webhooks section) →
      `linear.webhook_secret`
 

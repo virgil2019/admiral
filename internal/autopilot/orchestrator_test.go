@@ -300,6 +300,10 @@ type mockStore struct {
 	LatestDoneJob    *store.AutopilotJob
 	LatestDoneJobErr error
 
+	// GetLatestTimedOutJobByIssue
+	LatestTimedOutJob    *store.AutopilotJob
+	LatestTimedOutJobErr error
+
 	// For UpdateAutopilotJob tracking
 	LastUpdatedJob *store.AutopilotJob
 }
@@ -332,6 +336,10 @@ func (m *mockStore) ClaimAutopilotJob(sessionID, issueID, identifier string) (bo
 
 func (m *mockStore) GetLatestDoneJobByIssue(issueID string) (*store.AutopilotJob, error) {
 	return m.LatestDoneJob, m.LatestDoneJobErr
+}
+
+func (m *mockStore) GetLatestTimedOutJobByIssue(issueID string) (*store.AutopilotJob, error) {
+	return m.LatestTimedOutJob, m.LatestTimedOutJobErr
 }
 
 func TestHandleCommand_StatusIdle(t *testing.T) {

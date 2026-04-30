@@ -12,6 +12,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/georgehuang/admiral/internal/config"
@@ -36,6 +38,7 @@ type storeInterface interface {
 	UpdateAutopilotJob(sessionID string, fn func(*store.AutopilotJob)) error
 	ClaimAutopilotJob(sessionID, issueID, identifier string) (bool, error)
 	GetLatestDoneJobByIssue(issueID string) (*store.AutopilotJob, error)
+	GetLatestTimedOutJobByIssue(issueID string) (*store.AutopilotJob, error)
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -143,6 +146,35 @@ func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
 		}
 	}
 
+	// Check if this issue has a TIMED_OUT job that can be resumed.
+	if ev.IssueID != "" {
+		timedOut, err := o.db.GetLatestTimedOutJobByIssue(ev.IssueID)
+		if err != nil {
+			o.logger.Warn("get_latest_timed_out_job_failed", "err", err, "issue", ev.IssueID)
+		} else if timedOut != nil && timedOut.ClaudeSessionID != "" {
+			o.logger.Info("autopilot_resuming_timed_out_job",
+				"session", ev.SessionID,
+				"issue", ev.IssueIdentifier,
+				"prior_session", timedOut.AgentSessionID,
+				"claude_session", timedOut.ClaudeSessionID)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(),
+					time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
+				defer cancel()
+				resumeFlow := newResumeFlow(o, ctx, ev, timedOut)
+				if err := resumeFlow.executeResume(); err != nil {
+					o.logger.Error("autopilot_resume_timed_out_failed",
+						"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
+					resumeFlow.markFailed(err)
+					return
+				}
+				o.logger.Info("autopilot_resume_timed_out_done",
+					"issue", ev.IssueIdentifier, "session", ev.SessionID, "pr", resumeFlow.prURL)
+			}()
+			return
+		}
+	}
+
 	// Per-session FIFO is guaranteed by the DB-level lock in ClaimNextPendingEvent,
 	// so we can spawn directly without any in-process lock.
 	go o.run(ev)
@@ -210,9 +242,13 @@ func (o *Orchestrator) run(ev linear.AgentEvent) {
 
 	flow := newFlow(o, ctx, ev)
 	if err := flow.execute(); err != nil {
-		o.logger.Error("autopilot_failed",
-			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
-		flow.markFailed(err)
+		if errors.Is(err, context.DeadlineExceeded) ||
+			strings.Contains(err.Error(), "signal: killed") ||
+			strings.Contains(err.Error(), "signal: terminated") {
+			flow.markTimedOut(err)
+		} else {
+			flow.markFailed(err)
+		}
 		return
 	}
 	o.logger.Info("autopilot_done",
@@ -248,6 +284,24 @@ func (f *flow) postActivity(a linear.AgentActivity) {
 		f.o.logger.Warn("post_activity_failed",
 			"session", f.ev.SessionID, "type", a.Type, "err", err)
 	}
+}
+
+// postActivityWithRetry posts the activity with up to 3 retries using exponential
+// backoff. If all attempts fail, it returns the last error.
+func (f *flow) postActivityWithRetry(a linear.AgentActivity) error {
+	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt <= len(delays); attempt++ {
+		err := f.o.lc.PostAgentActivity(f.ctx, f.ev.SessionID, a)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < len(delays) {
+			time.Sleep(delays[attempt])
+		}
+	}
+	return lastErr
 }
 
 func (f *flow) execute() error {
@@ -328,9 +382,20 @@ func (f *flow) execute() error {
 	if f.ev.CreatorID != "" {
 		mention = "@" + f.ev.CreatorID + " "
 	}
-	f.postActivity(linear.Response(fmt.Sprintf(
+	doneBody := fmt.Sprintf(
 		"%sDone. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
-		mention, prURL, f.worktreePath, f.branch)))
+		mention, prURL, f.worktreePath, f.branch)
+	if err := f.postActivityWithRetry(linear.Response(doneBody)); err != nil {
+		f.o.logger.Error("final_activity_push_failed",
+			"session", f.ev.SessionID, "err", err)
+		_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+			j.State = store.JobStateDoneThreadInconsistent
+		})
+		// Add PR body footer as fallback signal.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = f.addInconsistencyFooter(ctx)
+		cancel()
+	}
 
 	// Update Linear issue status to "completed" asynchronously (non-blocking).
 	if f.o.cfg.UpdateIssueStatus != nil && *f.o.cfg.UpdateIssueStatus && f.teamID != "" {
@@ -350,6 +415,8 @@ func (f *flow) execute() error {
 }
 
 // executeResume resumes a claude session on the original branch/PR.
+// For TIMED_OUT jobs, updates the original job row to DONE.
+// For prompted events, creates a new DONE row for the new session.
 func (f *flow) executeResume() error {
 	f.postActivity(linear.Thought("Resuming previous session...", true))
 
@@ -375,7 +442,10 @@ func (f *flow) executeResume() error {
 	f.prURL = f.job.PRURL
 	f.postActivity(linear.Response("Updated PR with follow-up: " + f.prURL))
 
-	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+	// Use the original job's session ID so TIMED_OUT resumes update the
+	// original row (not a new one) and prompted resumes create a new row.
+	sessionID := f.job.AgentSessionID
+	if err := f.o.db.UpdateAutopilotJob(sessionID, func(j *store.AutopilotJob) {
 		j.State = store.JobStateDone
 		j.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 	}); err != nil {
@@ -520,8 +590,41 @@ func (f *flow) markFailed(runErr error) {
 	if j, err := f.o.db.GetAutopilotJob(f.ev.SessionID); err == nil && j.StreamLogPath != "" {
 		body += "\n\nStream log: " + j.StreamLogPath
 	}
-	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.ErrorActivity(body))
+	err := f.postActivityWithRetry(linear.ErrorActivity(body))
+	if err != nil {
+		f.o.logger.Error("final_activity_push_failed",
+			"session", f.ev.SessionID, "err", err)
+		_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+			j.State = store.JobStateDoneThreadInconsistent
+		})
+		_ = f.addInconsistencyFooter(ctx)
+	}
 	f.cleanupWorktree(cleanupArchive)
+}
+
+func (f *flow) markTimedOut(runErr error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateTimedOut
+		j.Error = runErr.Error()
+		j.FinishedAt = now
+	})
+	// Use a fresh short ctx in case the parent is already done.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	mention := ""
+	if f.ev.CreatorID != "" {
+		mention = "@" + f.ev.CreatorID + " "
+	}
+	truncatedSession := f.claudeSessionID
+	if len(truncatedSession) > 8 {
+		truncatedSession = truncatedSession[:8]
+	}
+	body := mention + fmt.Sprintf(
+		"Task timed out after %ds. State preserved — re-mention me on this issue to resume from where I left off. (claude session: %s...)",
+		f.o.cfg.MaxRunSeconds, truncatedSession)
+	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.Response(body))
+	// NO cleanupWorktree: keep worktree for resume
 }
 
 // cleanupMode controls whether cleanupWorktree deletes or archives the worktree.
@@ -735,6 +838,10 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	cctx, cancel := context.WithTimeout(f.ctx, time.Duration(f.o.cfg.MaxRunSeconds)*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, f.o.cfg.ClaudeBin, args...)
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Dir = f.worktreePath
 	cmd.Env = append(os.Environ(),
 		"CLAUDE_AUTOPILOT_ISSUE="+issue.Identifier,
@@ -1275,4 +1382,40 @@ func orDefault(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// addInconsistencyFooter appends a warning footer to the PR body when the final
+// Linear activity could not be delivered, indicating the task completed successfully
+// despite the thread inconsistency.
+func (f *flow) addInconsistencyFooter(ctx context.Context) error {
+	if f.prURL == "" {
+		return nil
+	}
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	footer := fmt.Sprintf("\n---\n\n> **Linear thread inconsistency**: admiral failed to post the final response activity to Linear thread (session: %q). The task itself completed successfully. Check admiral logs around %q for `final_activity_push_failed`.", f.ev.SessionID, timestamp)
+
+	// Get current PR body via gh pr view.
+	out, err := captureCmd(ctx, f.o.cfg.RepoDir, f.o.cfg.GhBin, "pr", "view", extractPRNumber(f.prURL), "--json", "body", "--jq", ".body")
+	if err != nil {
+		f.o.logger.Warn("pr_view_for_footer_failed", "err", err, "pr", f.prURL)
+		return err
+	}
+	currentBody := strings.TrimSpace(out)
+	newBody := currentBody + footer
+
+	_, err = captureCmd(ctx, f.o.cfg.RepoDir, f.o.cfg.GhBin, "pr", "edit", extractPRNumber(f.prURL), "--body", newBody)
+	if err != nil {
+		f.o.logger.Warn("pr_edit_footer_failed", "err", err, "pr", f.prURL)
+		return err
+	}
+	return nil
+}
+
+// extractPRNumber extracts the PR number from a PR URL like https://github.com/owner/repo/pull/123.
+func extractPRNumber(prURL string) string {
+	parts := strings.Split(prURL, "/")
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[len(parts)-1]
 }
