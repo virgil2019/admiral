@@ -128,6 +128,11 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "read body", http.StatusBadRequest)
 		return
 	}
+	// Linear-Delivery header is unique per delivery attempt — the right key
+	// for events_inbox dedup. Body's webhookId is the agent app's webhook
+	// configuration id and stays the same across all events from one OAuth
+	// app, so it would collapse every event into one row.
+	deliveryID := r.Header.Get("Linear-Delivery")
 	sig := r.Header.Get("Linear-Signature")
 	if !verifySignature(w.secret, sig, body) {
 		w.logger.Warn("linear_webhook_bad_signature", "remote", r.RemoteAddr)
@@ -169,10 +174,19 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Prefer the Linear-Delivery header (unique per delivery attempt) for
+	// the dedup key. Fall back to body.webhookId only when the header is
+	// absent (test fixtures / non-Linear callers); admiral's prod path
+	// always sees a real header from Linear.
+	dedupKey := deliveryID
+	if dedupKey == "" {
+		dedupKey = p.WebhookID
+	}
+
 	ev := AgentEvent{
 		Action:    action,
 		SessionID: session.ID,
-		WebhookID: p.WebhookID,
+		WebhookID: dedupKey,
 	}
 	if session.Issue != nil {
 		ev.IssueID = session.Issue.ID
@@ -201,15 +215,15 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	if w.store != nil {
 		// at-least-once queue path: enqueue to SQLite and signal worker
-		fresh, err := w.store.EnqueueEvent(p.WebhookID, string(action), session.ID, ev.IssueID, string(payload))
+		fresh, err := w.store.EnqueueEvent(dedupKey, string(action), session.ID, ev.IssueID, string(payload))
 		if err != nil {
-			w.logger.Error("enqueue_event_failed", "err", err, "webhook_id", p.WebhookID)
+			w.logger.Error("enqueue_event_failed", "err", err, "webhook_id", dedupKey)
 			// Still return 200 — Linear shouldn't retry; the error is ours
 			return
 		}
 		if fresh {
 			w.logger.Info("event_enqueued",
-				"webhook_id", p.WebhookID,
+				"webhook_id", dedupKey,
 				"action", string(action),
 				"session", session.ID)
 			select {
@@ -218,7 +232,7 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 				// non-blocking: worker has 60s pollEvery as fallback
 			}
 		} else {
-			w.logger.Debug("event_duplicate_dropped", "webhook_id", p.WebhookID)
+			w.logger.Debug("event_duplicate_dropped", "webhook_id", dedupKey)
 		}
 		return
 	}
