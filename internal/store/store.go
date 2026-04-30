@@ -127,6 +127,16 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// SQLite is single-writer; *sql.DB pooling spawns extra connections
+	// under concurrent load. PRAGMAs (set just below) only apply to the
+	// connection that ran the Exec, so a freshly-opened pool connection
+	// would lose busy_timeout / WAL settings and fail-fast on contention.
+	// Cap the pool at 1 connection: Go-side serializes access, every
+	// query reuses the same conn, PRAGMAs persist. admiral's load is
+	// trivial (1 webhook receiver + 1 worker + few task goroutines, all
+	// sub-ms writes) — single conn is plenty and far simpler than a
+	// connection-init hook.
+	db.SetMaxOpenConns(1)
 	// WAL avoids SQLITE_BUSY between concurrent cursor + messages writes
 	// (event-push goroutine + inbound long-poll goroutine both write).
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
@@ -134,10 +144,8 @@ func Open(path string) (*Store, error) {
 	}
 	// busy_timeout makes concurrent writers wait instead of failing fast.
 	// Default is 0ms — without this, two writers racing return SQLITE_BUSY
-	// immediately. Concrete trigger: worker.MarkEventDone (events_inbox UPDATE)
-	// races with the spawned task goroutine's ClaimAutopilotJob (autopilot_jobs
-	// INSERT) right after HandleAgentEvent dispatches. 5s is overkill for
-	// sub-millisecond writes, but cheap insurance against future contention.
+	// immediately. With MaxOpenConns=1 above, this PRAGMA is set on the
+	// only conn admiral ever uses, so it's effectively permanent.
 	if _, err := db.Exec(`PRAGMA busy_timeout=5000;`); err != nil {
 		return nil, fmt.Errorf("set busy_timeout: %w", err)
 	}

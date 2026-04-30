@@ -38,6 +38,17 @@ func TestOpen_IdempotentMigrations(t *testing.T) {
 	t.Cleanup(func() { _ = s2.Close() })
 }
 
+func TestOpen_LimitsToSingleConnection(t *testing.T) {
+	s := newTestStore(t)
+
+	// Without MaxOpenConns=1, *sql.DB will spawn extra connections under
+	// concurrent load and PRAGMAs (busy_timeout, WAL) won't carry over,
+	// reproducing the original "SQLITE_BUSY (5)" race we observed in prod.
+	if got := s.DB.Stats().MaxOpenConnections; got != 1 {
+		t.Errorf("MaxOpenConnections = %d, want 1 (PRAGMAs only persist on a single conn)", got)
+	}
+}
+
 func TestOpen_SetsBusyTimeout(t *testing.T) {
 	s := newTestStore(t)
 
