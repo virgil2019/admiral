@@ -18,17 +18,18 @@ import (
 //go:embed static/*.html
 var templateFS embed.FS
 
-//go:embed static/htmx.min.js static/style.css
+//go:embed static/htmx.min.js static/style.css static/login.html static/login.css
 var staticFS embed.FS
 
 // adminServer serves the admin HTTP API (read + write).
 type adminServer struct {
-	db     *store.Store
-	lc     *linear.Client
-	logger *slog.Logger
-	ghBin  string
-	start  time.Time
-	workers int
+	db          *store.Store
+	lc          *linear.Client
+	logger      *slog.Logger
+	ghBin       string
+	start       time.Time
+	workers     int
+	adminToken  string
 }
 
 // adminRepoResponse is the JSON shape for /admin/repos.
@@ -105,8 +106,8 @@ type testCloneResponse struct {
 	Error      string `json:"error,omitempty"`
 }
 
-func newAdminServer(db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int) *adminServer {
-	return &adminServer{db: db, lc: lc, ghBin: ghBin, logger: logger, start: time.Now(), workers: workers}
+func newAdminServer(db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken string) *adminServer {
+	return &adminServer{db: db, lc: lc, ghBin: ghBin, logger: logger, start: time.Now(), workers: workers, adminToken: adminToken}
 }
 
 // --- Read handlers ---
@@ -686,40 +687,85 @@ func (s *adminServer) jobDetailHandler(w http.ResponseWriter, r *http.Request) {
 <div class="detail-row"><span class="label">Error</span><span class="value">%s</span></div>
 </div>`, job.AgentSessionID, job.IssueIdentifier, job.State, job.State, job.PRURL, job.ClaudeSessionID, job.WorktreePath, job.StartedAt, job.FinishedAt, streamLink, job.Error)))
 }
+// adminAuth returns an http.Handler that enforces Bearer token auth.
+// Paths /admin/ui/login and /admin/ui/login.css are always passed through.
+// Cookie auth via "admiral_admin" cookie is also accepted.
+// GET requests to /admin/ui/* are redirected to /admin/ui/login on auth failure.
+// All other requests receive 401 on auth failure.
+func adminAuth(token string, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/admin/ui/login" || r.URL.Path == "/admin/ui/login.css" {
+			h.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if auth == "Bearer "+token {
+			h.ServeHTTP(w, r)
+			return
+		}
+		if c, _ := r.Cookie("admiral_admin"); c != nil && c.Value == token {
+			h.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/admin/ui") && r.Method == "GET" {
+			http.Redirect(w, r, "/admin/ui/login", http.StatusFound)
+			return
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	})
+}
+
 // ServeAdminHTTP starts the admin HTTP server on addr.
-func ServeAdminHTTP(addr string, db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int) error {
+// If adminToken is empty the server is disabled (logged as warn) and returns nil immediately.
+func ServeAdminHTTP(addr string, db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken string) error {
+	if adminToken == "" {
+		logger.Warn("admin server disabled: autopilot.admin_token not set; set ADMIRAL_ADMIN_TOKEN env or autopilot.admin_token in config to enable")
+		return nil
+	}
+	as := newAdminServer(db, lc, ghBin, logger, workers, adminToken)
+	mux := newAdminMux(as, adminToken)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           newAdminMux(db, lc, ghBin, logger, workers),
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return srv.ListenAndServe()
 }
 
-func newAdminMux(db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int) *http.ServeMux {
-	as := newAdminServer(db, lc, ghBin, logger, workers)
+func newAdminMux(as *adminServer, adminToken string) *http.ServeMux {
+	mux := http.NewServeMux()
+	// Wrap all handlers with auth middleware
+	wrapped := adminAuth(adminToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		as.serveMux().ServeHTTP(w, r)
+	}))
+	mux.Handle("/", wrapped)
+	return mux
+}
+
+// serveMux returns the inner mux with all routes registered (no auth).
+func (s *adminServer) serveMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	// UI static files
 	uiFS := http.FileServer(http.FS(staticFS))
 	mux.Handle("/admin/ui/", http.StripPrefix("/admin/ui", uiFS))
 	// UI page routes
-	mux.HandleFunc("/admin/ui", as.uiHandler)
-	mux.HandleFunc("/admin/ui/repos", as.uiHandler)
-	mux.HandleFunc("/admin/ui/jobs", as.uiHandler)
-	mux.HandleFunc("/admin/ui/jobs/", as.uiHandler)
+	mux.HandleFunc("/admin/ui", s.uiHandler)
+	mux.HandleFunc("/admin/ui/repos", s.uiHandler)
+	mux.HandleFunc("/admin/ui/jobs", s.uiHandler)
+	mux.HandleFunc("/admin/ui/jobs/", s.uiHandler)
 	// htmx partials
-	mux.HandleFunc("/admin/ui/_partial/load_card", as.loadCardHandler)
-	mux.HandleFunc("/admin/ui/_partial/recent_jobs", as.recentJobsHandler)
-	mux.HandleFunc("/admin/ui/_partial/repos_table", as.reposTableHandler)
-	mux.HandleFunc("/admin/ui/_partial/jobs_table", as.jobsTableHandler)
-	mux.HandleFunc("/admin/ui/_partial/job_detail/", as.jobDetailHandler)
+	mux.HandleFunc("/admin/ui/_partial/load_card", s.loadCardHandler)
+	mux.HandleFunc("/admin/ui/_partial/recent_jobs", s.recentJobsHandler)
+	mux.HandleFunc("/admin/ui/_partial/repos_table", s.reposTableHandler)
+	mux.HandleFunc("/admin/ui/_partial/jobs_table", s.jobsTableHandler)
+	mux.HandleFunc("/admin/ui/_partial/job_detail/", s.jobDetailHandler)
 	// API routes
-	mux.HandleFunc("/admin/repos", as.reposDispatchHandler)
-	mux.HandleFunc("/admin/repos/", as.reposDispatchHandler)
-	mux.HandleFunc("/admin/jobs", as.listJobsHandler)
-	mux.HandleFunc("/admin/jobs/", as.getJobHandler)
-	mux.HandleFunc("/admin/load", as.loadHandler)
-	mux.HandleFunc("/admin/health", as.healthHandler)
+	mux.HandleFunc("/admin/repos", s.reposDispatchHandler)
+	mux.HandleFunc("/admin/repos/", s.reposDispatchHandler)
+	mux.HandleFunc("/admin/jobs", s.listJobsHandler)
+	mux.HandleFunc("/admin/jobs/", s.getJobHandler)
+	mux.HandleFunc("/admin/load", s.loadHandler)
+	mux.HandleFunc("/admin/health", s.healthHandler)
 	return mux
 }
 

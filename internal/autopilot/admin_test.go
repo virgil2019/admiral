@@ -15,6 +15,144 @@ import (
 	"github.com/georgehuang/admiral/internal/store"
 )
 
+func TestAdminAuth_BearerToken(t *testing.T) {
+	token := "test-secret-123"
+	h := adminAuth(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mux := http.NewServeMux()
+	mux.Handle("/", h)
+
+	req := httptest.NewRequest("GET", "/admin/health", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestAdminAuth_BearerToken_Wrong(t *testing.T) {
+	token := "test-secret-123"
+	h := adminAuth(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mux := http.NewServeMux()
+	mux.Handle("/", h)
+
+	req := httptest.NewRequest("GET", "/admin/health", nil)
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestAdminAuth_Cookie(t *testing.T) {
+	token := "test-secret-123"
+	h := adminAuth(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mux := http.NewServeMux()
+	mux.Handle("/", h)
+
+	req := httptest.NewRequest("GET", "/admin/health", nil)
+	req.AddCookie(&http.Cookie{Name: "admiral_admin", Value: token})
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestAdminAuth_Cookie_Wrong(t *testing.T) {
+	token := "test-secret-123"
+	h := adminAuth(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mux := http.NewServeMux()
+	mux.Handle("/", h)
+
+	req := httptest.NewRequest("GET", "/admin/health", nil)
+	req.AddCookie(&http.Cookie{Name: "admiral_admin", Value: "wrong-token"})
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestAdminAuth_UI_GET_Redirect(t *testing.T) {
+	token := "test-secret-123"
+	h := adminAuth(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mux := http.NewServeMux()
+	mux.Handle("/", h)
+
+	req := httptest.NewRequest("GET", "/admin/ui/", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", w.Code)
+	}
+	if w.Header().Get("Location") != "/admin/ui/login" {
+		t.Fatalf("expected redirect to /admin/ui/login, got %s", w.Header().Get("Location"))
+	}
+}
+
+func TestAdminAuth_API_GET_401(t *testing.T) {
+	token := "test-secret-123"
+	h := adminAuth(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mux := http.NewServeMux()
+	mux.Handle("/", h)
+
+	req := httptest.NewRequest("GET", "/admin/health", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestAdminAuth_LoginPage_Passthrough(t *testing.T) {
+	token := "test-secret-123"
+	h := adminAuth(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mux := http.NewServeMux()
+	mux.Handle("/", h)
+
+	for _, path := range []string{"/admin/ui/login", "/admin/ui/login.css"} {
+		req := httptest.NewRequest("GET", path, nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("path %s: expected 200, got %d", path, w.Code)
+		}
+	}
+}
+
+func TestAdminAuth_UI_GET_WithValidCookie(t *testing.T) {
+	token := "test-secret-123"
+	h := adminAuth(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mux := http.NewServeMux()
+	mux.Handle("/", h)
+
+	req := httptest.NewRequest("GET", "/admin/ui/", nil)
+	req.AddCookie(&http.Cookie{Name: "admiral_admin", Value: token})
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
 func TestListReposHandler_Empty(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
@@ -24,7 +162,7 @@ func TestListReposHandler_Empty(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/repos", as.listReposHandler)
 
@@ -63,7 +201,7 @@ func TestListReposHandler_WithRepos(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/repos", as.listReposHandler)
 
@@ -98,7 +236,7 @@ func TestListJobsHandler_Empty(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/jobs", as.listJobsHandler)
 
@@ -135,7 +273,7 @@ func TestListJobsHandler_WithJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/jobs", as.listJobsHandler)
 
@@ -170,7 +308,7 @@ func TestListJobsHandler_FilterByStatus(t *testing.T) {
 	_, _ = s.DB.Exec(`INSERT INTO autopilot_jobs(agent_session_id, issue_id, issue_identifier, state, started_at) VALUES('s1','i1','GEO-1','DONE','2024-01-01T00:00:00Z')`)
 	_, _ = s.DB.Exec(`INSERT INTO autopilot_jobs(agent_session_id, issue_id, issue_identifier, state, started_at) VALUES('s2','i2','GEO-2','EXECUTING','2024-01-01T00:00:00Z')`)
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/jobs", as.listJobsHandler)
 
@@ -194,7 +332,7 @@ func TestGetJobHandler_NotFound(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/jobs/", as.getJobHandler)
 
@@ -218,7 +356,7 @@ func TestGetJobHandler_Found(t *testing.T) {
 
 	_, _ = s.DB.Exec(`INSERT INTO autopilot_jobs(agent_session_id, issue_id, issue_identifier, state, started_at) VALUES('session-x','i1','GEO-1','DONE','2024-01-01T00:00:00Z')`)
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/jobs/", as.getJobHandler)
 
@@ -247,7 +385,7 @@ func TestGetJobHandler_StreamNotFound(t *testing.T) {
 
 	_, _ = s.DB.Exec(`INSERT INTO autopilot_jobs(agent_session_id, issue_id, issue_identifier, state, started_at) VALUES('session-y','i1','GEO-1','DONE','2024-01-01T00:00:00Z')`)
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/jobs/", as.getJobHandler)
 
@@ -275,7 +413,7 @@ func TestGetJobHandler_StreamServe(t *testing.T) {
 
 	_, _ = s.DB.Exec(`INSERT INTO autopilot_jobs(agent_session_id, issue_id, issue_identifier, state, started_at, stream_log_path) VALUES('session-z','i1','GEO-1','DONE','2024-01-01T00:00:00Z', ?)`, streamPath)
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/jobs/", as.getJobHandler)
 
@@ -300,7 +438,7 @@ func TestLoadHandler(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 5)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 5, "")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/load", as.loadHandler)
 
@@ -327,7 +465,7 @@ func TestHealthHandler(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/health", as.healthHandler)
 
@@ -376,7 +514,7 @@ func TestCreateRepoHandler_Success(t *testing.T) {
 	cmd.Dir = gitDir
 	cmd.Run()
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -410,7 +548,7 @@ func TestCreateRepoHandler_NotGitRepo(t *testing.T) {
 	notGit := filepath.Join(dir, "notgit")
 	os.MkdirAll(notGit, 0o755)
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -434,7 +572,7 @@ func TestCreateRepoHandler_BadRequest(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -459,7 +597,7 @@ func TestCreateRepoHandler_MethodNotAllowed(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -494,7 +632,7 @@ func TestUpdateRepoHandler_Success(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -528,7 +666,7 @@ func TestUpdateRepoHandler_NotFound(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -561,7 +699,7 @@ func TestUpdateRepoHandler_BadRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -586,7 +724,7 @@ func TestUpdateRepoHandler_MethodNotAllowed(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -622,7 +760,7 @@ func TestDeleteRepoHandler_Success(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -653,7 +791,7 @@ func TestDeleteRepoHandler_NotFound(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -675,7 +813,7 @@ func TestDeleteRepoHandler_MethodNotAllowed(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -700,7 +838,7 @@ func TestCheckGhHandler_NotFound(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -722,7 +860,7 @@ func TestCheckGhHandler_MethodNotAllowed(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -746,7 +884,7 @@ func TestTestCloneHandler_NotFound(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -780,7 +918,7 @@ func TestTestCloneHandler_NotGitRepo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -829,7 +967,7 @@ func TestTestCloneHandler_NoOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
@@ -851,7 +989,7 @@ func TestTestCloneHandler_MethodNotAllowed(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	as := newAdminServer(s, nil, "gh", slog.Default(), 3)
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
