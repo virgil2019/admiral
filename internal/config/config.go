@@ -113,6 +113,10 @@ type Autopilot struct {
 	// Set to ":8788" to listen on all interfaces (not recommended without
 	// M5 token auth).
 	AdminListenAddr string `yaml:"admin_listen_addr"`
+	// AdminToken is the static bearer token for admin API auth. If not set,
+	// admin server is disabled (v0.5 fail-safe). May also be set via
+	// ADMIRAL_ADMIN_TOKEN env var (env takes priority over config).
+	AdminToken string `yaml:"admin_token"`
 }
 
 // RepoConfig describes a single Linear project → repo mapping.
@@ -273,6 +277,13 @@ func (c *Config) validateAutopilotAndExpand() error {
 	if strings.TrimSpace(c.Autopilot.AdminListenAddr) == "" {
 		c.Autopilot.AdminListenAddr = "127.0.0.1:8788"
 	}
+	// AdminToken: env takes priority over config; if neither is set a
+	// transient token is generated at startup (caller logs it). If env
+	// is explicitly empty we treat it as "not set" too.
+	if envTok := os.Getenv("ADMIRAL_ADMIN_TOKEN"); envTok != "" {
+		c.Autopilot.AdminToken = envTok
+	}
+	// Note: we do NOT call expandTilde on AdminToken — it's a secret, not a path.
 	if c.Autopilot.MaxRunSeconds <= 0 {
 		c.Autopilot.MaxRunSeconds = 1800
 	}

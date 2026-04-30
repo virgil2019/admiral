@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -105,14 +106,27 @@ func main() {
 		go w.Run(ctx)
 	}
 
-	// Admin API server — read-only HTTP endpoints for web UI (M4) data source.
-	// No auth (M5 scope); bound to localhost by default.
+	// Build admin token: use config/env, or generate a transient token.
+	adminToken := cfg.Autopilot.AdminToken
+	if adminToken == "" {
+		// Generate a random hex token for this run.
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			logger.Error("admin token generation failed", "err", err)
+			os.Exit(1)
+		}
+		adminToken = fmt.Sprintf("%x", b)
+		logger.Info("admin_token_not_set_generated_transient",
+			"token", adminToken,
+			"hint", "set autopilot.admin_token in config or ADMIRAL_ADMIN_TOKEN env to persist")
+	}
+	// Admin API server — token auth (M5); bound to localhost by default.
 	adminAddr := cfg.Autopilot.AdminListenAddr
 	logger.Info("admin server starting",
 		"listen", adminAddr,
 	)
 	go func() {
-		if err := autopilot.ServeAdminHTTP(adminAddr, db, lc, cfg.Autopilot.GhBin, logger, n); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := autopilot.ServeAdminHTTP(adminAddr, db, lc, cfg.Autopilot.GhBin, logger, n, adminToken); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("admin server failed", "err", err)
 			cancel()
 		}
