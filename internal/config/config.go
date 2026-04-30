@@ -69,15 +69,14 @@ type Autopilot struct {
 	// ListenAddr is the HTTP bind for the Linear webhook receiver, e.g.
 	// ":8787" or "127.0.0.1:8787". Default: ":8787".
 	ListenAddr string `yaml:"listen_addr"`
-	// RepoDir is the absolute path to the repo whose .worktrees/ directory
-	// admiral creates per-issue worktrees under. Required for single-repo
-	// setups; for multi-repo setups use Repos instead.
+	// RepoDir is no longer used — repo routing is keyed on Linear project_id
+	// via Repos[]. Field kept for YAML backward-compat (silently ignored).
 	RepoDir string `yaml:"repo_dir"`
 	// WorktreeRoot is the directory worktrees are created beneath; relative
-	// paths resolve against RepoDir. Default: ".worktrees".
+	// paths resolve against the per-repo RepoDir. Default: ".worktrees".
 	WorktreeRoot string `yaml:"worktree_root"`
-	// BaseBranch is the branch new worktrees are forked from. Default: "main".
-	// Deprecated: use Repos[].base_branch instead for multi-repo setups.
+	// BaseBranch is no longer used — see Repos[].base_branch. Field kept for
+	// YAML backward-compat (silently ignored).
 	BaseBranch string `yaml:"base_branch"`
 	// ClaudeBin is the absolute path to the `claude` CLI. Default: "claude" (PATH).
 	ClaudeBin string `yaml:"claude_bin"`
@@ -104,18 +103,20 @@ type Autopilot struct {
 	// UpdateIssueStatus controls whether admiral updates Linear issue workflow
 	// state on task lifecycle (Backlog → Started → Completed). Default: true.
 	UpdateIssueStatus *bool `yaml:"update_issue_status"`
-	// Repos is the list of Linear team → repo mappings for multi-repo setups.
-	// When populated, RepoDir/BaseBranch are ignored (they only apply to
-	// single-repo setups for backward compatibility).
+	// Repos is the list of Linear project → repo mappings. Required: must
+	// contain at least one entry. An incoming Linear issue is routed to the
+	// repo whose project_id matches issue.project.id; issues without a
+	// project assignment are rejected.
 	Repos []RepoConfig `yaml:"repos"`
 }
 
-// RepoConfig describes a single Linear team → repo mapping.
+// RepoConfig describes a single Linear project → repo mapping.
 type RepoConfig struct {
-	// TeamID is the Linear team UUID.
-	TeamID string `yaml:"team_id"`
-	// TeamName is a human-readable name for the team (for log/UI clarity).
-	TeamName string `yaml:"team_name"`
+	// ProjectID is the Linear project UUID. Required when configured under
+	// autopilot.repos.
+	ProjectID string `yaml:"project_id"`
+	// ProjectName is a human-readable name for the project (log/UI only).
+	ProjectName string `yaml:"project_name"`
 	// RepoDir is the absolute path to the repo on disk.
 	RepoDir string `yaml:"repo_dir"`
 	// BaseBranch is the branch new worktrees are forked from. Default: "main".
@@ -222,41 +223,31 @@ func (c *Config) validateAutopilotAndExpand() error {
 		c.Linear.RedirectURI = "http://127.0.0.1:8080/callback"
 	}
 
-	if strings.TrimSpace(c.Autopilot.RepoDir) == "" {
-		return fmt.Errorf("autopilot.repo_dir is required")
-	}
-	c.Autopilot.RepoDir = expandTilde(c.Autopilot.RepoDir)
-	if fi, err := os.Stat(c.Autopilot.RepoDir); err != nil || !fi.IsDir() {
-		return fmt.Errorf("autopilot.repo_dir not a directory: %s", c.Autopilot.RepoDir)
-	}
 	if strings.TrimSpace(c.Autopilot.WorktreeRoot) == "" {
 		c.Autopilot.WorktreeRoot = ".worktrees"
 	}
-	if strings.TrimSpace(c.Autopilot.BaseBranch) == "" {
-		c.Autopilot.BaseBranch = "main"
+	// Multi-repo config: at least one entry required. Routing key is
+	// Linear project_id (each Linear project maps to exactly one repo).
+	if len(c.Autopilot.Repos) == 0 {
+		return fmt.Errorf("autopilot.repos must contain at least one entry")
 	}
-	// Validate multi-repo config if provided; otherwise expand paths.
-	// Multi-repo (Repos) takes precedence: if set, RepoDir/BaseBranch are
-	// only used as fallbacks for worktree_root resolution.
-	if len(c.Autopilot.Repos) > 0 {
-		for i := range c.Autopilot.Repos {
-			r := &c.Autopilot.Repos[i]
-			if strings.TrimSpace(r.TeamID) == "" {
-				return fmt.Errorf("autopilot.repos[%d].team_id is required", i)
-			}
-			if strings.TrimSpace(r.TeamName) == "" {
-				return fmt.Errorf("autopilot.repos[%d].team_name is required", i)
-			}
-			if strings.TrimSpace(r.RepoDir) == "" {
-				return fmt.Errorf("autopilot.repos[%d].repo_dir is required", i)
-			}
-			r.RepoDir = expandTilde(r.RepoDir)
-			if fi, err := os.Stat(r.RepoDir); err != nil || !fi.IsDir() {
-				return fmt.Errorf("autopilot.repos[%d].repo_dir not a directory: %s", i, r.RepoDir)
-			}
-			if strings.TrimSpace(r.BaseBranch) == "" {
-				r.BaseBranch = "main"
-			}
+	for i := range c.Autopilot.Repos {
+		r := &c.Autopilot.Repos[i]
+		if strings.TrimSpace(r.ProjectID) == "" {
+			return fmt.Errorf("autopilot.repos[%d].project_id is required", i)
+		}
+		if strings.TrimSpace(r.ProjectName) == "" {
+			return fmt.Errorf("autopilot.repos[%d].project_name is required", i)
+		}
+		if strings.TrimSpace(r.RepoDir) == "" {
+			return fmt.Errorf("autopilot.repos[%d].repo_dir is required", i)
+		}
+		r.RepoDir = expandTilde(r.RepoDir)
+		if fi, err := os.Stat(r.RepoDir); err != nil || !fi.IsDir() {
+			return fmt.Errorf("autopilot.repos[%d].repo_dir not a directory: %s", i, r.RepoDir)
+		}
+		if strings.TrimSpace(r.BaseBranch) == "" {
+			r.BaseBranch = "main"
 		}
 	}
 	if strings.TrimSpace(c.Autopilot.ClaudeBin) == "" {

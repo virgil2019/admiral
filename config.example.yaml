@@ -86,25 +86,28 @@ autopilot:
   # HTTP bind address for the webhook receiver. Default: ":8787"
   listen_addr: ":8787"
 
-  # --- Multi-repo setup (recommended) ---
-  # When repos is populated, repo_dir and base_branch below are ignored.
-  # Each Linear team maps to one repo; issues from that team go to that repo.
+  # Repo routing: each Linear *project* maps to exactly one repo. An incoming
+  # Linear issue is routed by its project_id; issues without a project
+  # assigned are rejected (no fallback). If one logical product spans
+  # multiple repos, create one Linear project per repo and let issues live
+  # in the project that matches the repo they touch.
+  #
+  # Tip — finding a project UUID: Linear's web URL only exposes a slug, not
+  # the UUID. Use the GraphQL API (or the Linear MCP `list_projects` tool)
+  # to fetch full UUIDs:
+  #   query { projects { nodes { id name } } }
   repos:
-    - team_id: "abc-123"           # Linear team UUID
-      team_name: "Georgexu"        # Human-readable name (for logs/UI)
+    - project_id: "00000000-0000-0000-0000-000000000000"  # Linear project UUID
+      project_name: "Admiral"                              # log/UI only
       repo_dir: "/home/you/code/your-repo"
       base_branch: "main"
-    # - team_id: "def-456"
-    #   team_name: "AnotherTeam"
+    # - project_id: "11111111-1111-1111-1111-111111111111"
+    #   project_name: "AnotherProject"
     #   repo_dir: "/home/you/code/another-repo"
     #   base_branch: "main"
 
-  # --- Single-repo setup (legacy/backward compatible) ---
-  # Deprecated: use repos[] above instead. Still works for migration.
-  repo_dir: "/Users/you/code/your-repo"
   # Defaults shown:
   # worktree_root:   ".worktrees"
-  # base_branch:     "main"         # Deprecated: use repos[].base_branch
   # claude_bin:      "claude"
   # gh_bin:          "gh"
   # autopilot_skill: ""           # claude skill name, e.g. "autopilot"

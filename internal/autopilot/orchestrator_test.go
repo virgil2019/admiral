@@ -342,7 +342,7 @@ func (m *mockStore) GetLatestTimedOutJobByIssue(issueID string) (*store.Autopilo
 	return m.LatestTimedOutJob, m.LatestTimedOutJobErr
 }
 
-func (m *mockStore) GetRepoByTeamID(teamID string) (*store.Repo, error) {
+func (m *mockStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
 	return nil, nil
 }
 
