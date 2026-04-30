@@ -97,6 +97,24 @@ const migration0004 = `
 ALTER TABLE autopilot_jobs ADD COLUMN stream_log_path TEXT;
 `
 
+const migration0005 = `
+CREATE TABLE IF NOT EXISTS events_inbox (
+  webhook_id    TEXT PRIMARY KEY,
+  action        TEXT NOT NULL,
+  session_id    TEXT NOT NULL,
+  issue_id      TEXT,
+  payload_json  TEXT NOT NULL,
+  status        TEXT NOT NULL,
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  received_at   INTEGER NOT NULL,
+  started_at    INTEGER,
+  finished_at   INTEGER,
+  last_error    TEXT
+);
+CREATE INDEX IF NOT EXISTS events_inbox_status_received
+  ON events_inbox(status, received_at);
+`
+
 type Store struct {
 	DB *sql.DB
 }
@@ -130,6 +148,11 @@ func Open(path string) (*Store, error) {
 		if !strings.Contains(err.Error(), "duplicate column name") {
 			return nil, fmt.Errorf("apply migration 0004: %w", err)
 		}
+	}
+	if _, err := db.Exec(migration0005); err != nil {
+		// CREATE TABLE IF NOT EXISTS is inherently idempotent, but
+		// on a freshly-initialized DB this should not fail.
+		return nil, fmt.Errorf("apply migration 0005: %w", err)
 	}
 	return &Store{DB: db}, nil
 }
@@ -282,6 +305,13 @@ func nullIfEmpty(s string) any {
 
 func (s *Store) Close() error {
 	return s.DB.Close()
+}
+
+// NewForTest creates a Store wrapper around an already-open *sql.DB.
+// Caller is responsible for applying migrations before use.
+// This is for unit tests only — not part of the public API.
+func NewForTest(db *sql.DB) *Store {
+	return &Store{DB: db}
 }
 
 // LinearOAuthToken holds the persisted OAuth token set.
@@ -457,4 +487,143 @@ func (s *Store) KVSet(key, value string) error {
 		ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
 	`, key, value, time.Now().UTC().Format(time.RFC3339))
 	return err
+}
+
+// --- events_inbox ---
+
+// EventInboxRow represents a queued webhook event awaiting processing.
+type EventInboxRow struct {
+	WebhookID    string
+	Action      string
+	SessionID   string
+	IssueID     string
+	PayloadJSON string
+	Status      string
+	Attempts    int
+	ReceivedAt  time.Time
+	StartedAt   *time.Time
+	FinishedAt  *time.Time
+	LastError   string
+}
+
+// EnqueueEvent inserts a pending row. Returns true when a fresh row was
+// inserted, false when webhook_id already existed (Linear retry / dup).
+func (s *Store) EnqueueEvent(webhookID, action, sessionID, issueID, payloadJSON string) (bool, error) {
+	now := time.Now().UTC()
+	result, err := s.DB.Exec(`
+		INSERT OR IGNORE INTO events_inbox(
+			webhook_id, action, session_id, issue_id, payload_json,
+			status, attempts, received_at
+		) VALUES(?, ?, ?, ?, ?, 'pending', 0, ?)
+	`, webhookID, action, sessionID, issueID, payloadJSON, now.Unix())
+	if err != nil {
+		return false, err
+	}
+	// Check if we actually inserted (RowsAffected=0 means conflict)
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// ClaimNextPendingEvent atomically picks one pending row and marks it
+// processing. Returns (nil, nil) when nothing pending.
+func (s *Store) ClaimNextPendingEvent() (*EventInboxRow, error) {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// BEGIN IMMEDIATE acquires a write lock immediately, preventing
+	// concurrent claims on the same row.
+	var row EventInboxRow
+	var receivedUnix, startedUnix, finishedUnix int64
+	err = tx.QueryRow(`
+		SELECT webhook_id, action, session_id, issue_id, payload_json,
+		       status, attempts, received_at,
+		       COALESCE(started_at, 0),
+		       COALESCE(finished_at, 0),
+		       COALESCE(last_error, '')
+		FROM events_inbox
+		WHERE status = 'pending'
+		ORDER BY received_at ASC
+		LIMIT 1
+	`).Scan(
+		&row.WebhookID, &row.Action, &row.SessionID, &row.IssueID, &row.PayloadJSON,
+		&row.Status, &row.Attempts, &receivedUnix, &startedUnix, &finishedUnix, &row.LastError,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	row.ReceivedAt = time.Unix(receivedUnix, 0).UTC()
+	if startedUnix > 0 {
+		t := time.Unix(startedUnix, 0).UTC()
+		row.StartedAt = &t
+	}
+	if finishedUnix > 0 {
+		t := time.Unix(finishedUnix, 0).UTC()
+		row.FinishedAt = &t
+	}
+
+	now := time.Now().UTC().Unix()
+	_, err = tx.Exec(`
+		UPDATE events_inbox
+		SET status='processing', attempts=attempts+1, started_at=?
+		WHERE webhook_id=? AND status='pending'
+	`, now, row.WebhookID)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	row.Status = "processing"
+	row.Attempts++
+	started := time.Unix(now, 0).UTC()
+	row.StartedAt = &started
+
+	return &row, nil
+}
+
+// MarkEventDone sets status=done and finished_at.
+func (s *Store) MarkEventDone(webhookID string) error {
+	now := time.Now().UTC().Unix()
+	_, err := s.DB.Exec(`
+		UPDATE events_inbox SET status='done', finished_at=? WHERE webhook_id=?
+	`, now, webhookID)
+	return err
+}
+
+// MarkEventFailed sets status=failed (dead letter) with last_error;
+// retryAvailable=true means status returns to 'pending' for retry,
+// false means status='failed' permanently.
+func (s *Store) MarkEventFailed(webhookID string, errMsg string, retryAvailable bool) error {
+	now := time.Now().UTC().Unix()
+	var status string
+	if retryAvailable {
+		status = "pending"
+	} else {
+		status = "failed"
+	}
+	_, err := s.DB.Exec(`
+		UPDATE events_inbox SET status=?, last_error=?, finished_at=? WHERE webhook_id=?
+	`, status, errMsg, now, webhookID)
+	return err
+}
+
+// CountPendingEvents returns count of pending+processing rows for backlog observability.
+func (s *Store) CountPendingEvents() (int, error) {
+	var count int
+	err := s.DB.QueryRow(`
+		SELECT COUNT(*) FROM events_inbox WHERE status IN ('pending', 'processing')
+	`).Scan(&count)
+	return count, err
 }

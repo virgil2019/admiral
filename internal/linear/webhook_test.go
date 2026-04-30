@@ -3,6 +3,7 @@ package linear
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,12 +11,32 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/georgehuang/admiral/internal/store"
 )
+
+func newTestDB(t *testing.T) *store.Store {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	s := store.NewForTest(db)
+	return s
+}
 
 func newTestWebhook(t *testing.T, h AgentHandler) *Webhook {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewWebhook("test-secret", h, logger)
+	sig := make(chan struct{}, 1)
+	return NewWebhook("test-secret", nil, sig, logger, h)
+}
+
+func newTestWebhookWithStore(t *testing.T, s *store.Store, sig chan<- struct{}) *Webhook {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return NewWebhook("test-secret", s, sig, logger, nil)
 }
 
 func post(t *testing.T, w *Webhook, body []byte, sig string) *httptest.ResponseRecorder {

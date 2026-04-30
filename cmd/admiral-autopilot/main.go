@@ -57,7 +57,15 @@ func main() {
 		logger.Info("linear_token_refresh_enabled")
 	}
 	orch := autopilot.New(&cfg.Autopilot, lc, db, logger)
-	wh := linear.NewWebhook(cfg.Linear.WebhookSecret, orch.HandleAgentEvent, logger)
+
+	// signal channel for the webhook to notify worker of new events
+	sig := make(chan struct{}, 1)
+
+	// webhook uses the enqueue path (store + signal); onAgent is nil
+	wh := linear.NewWebhook(cfg.Linear.WebhookSecret, db, sig, logger, nil)
+
+	// worker consumes from events_inbox and dispatches to orchestrator
+	worker := autopilot.NewWorker(db, orch, logger, sig)
 
 	mux := http.NewServeMux()
 	// /webhook matches Linear's typical agent webhook URL convention
@@ -85,6 +93,9 @@ func main() {
 		"claude_bin", cfg.Autopilot.ClaudeBin,
 		"sqlite", cfg.Storage.SQLitePath,
 	)
+
+	// Start worker to consume events from inbox
+	go worker.Run(ctx)
 
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

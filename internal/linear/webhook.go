@@ -8,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+
+	"github.com/georgehuang/admiral/internal/store"
 )
 
 // AgentEventAction is the verb on an AgentSessionEvent: "created" when an
@@ -88,19 +90,27 @@ type rawAgentActivity struct {
 // an alias.
 type Webhook struct {
 	secret   []byte
-	onAgent  AgentHandler
+	onAgent  AgentHandler // retained for test compatibility; production uses store enqueue path
 	logger   *slog.Logger
+	store    *store.Store
+	signal   chan<- struct{}
 }
 
 // NewWebhook constructs a receiver. Unlike v0.3 method-A, no admiral user
 // UUID is needed: AgentSessionEvent is already routed by Linear to the
 // specific agent app behind this webhook, so the filtering Linear does
 // for us replaces the per-user check.
-func NewWebhook(secret string, onAgent AgentHandler, logger *slog.Logger) *Webhook {
+//
+// The store+signal parameters enable the at-least-once queue path: events
+// are persisted to events_inbox rather than processed synchronously.
+// The onAgent callback is retained for test compatibility.
+func NewWebhook(secret string, store *store.Store, signal chan<- struct{}, logger *slog.Logger, onAgent AgentHandler) *Webhook {
 	return &Webhook{
 		secret:  []byte(secret),
 		onAgent: onAgent,
 		logger:  logger,
+		store:   store,
+		signal:  signal,
 	}
 }
 
@@ -183,9 +193,37 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if w.onAgent == nil {
+	if w.store == nil && w.onAgent == nil {
 		return
 	}
+
+	payload, _ := json.Marshal(ev)
+
+	if w.store != nil {
+		// at-least-once queue path: enqueue to SQLite and signal worker
+		fresh, err := w.store.EnqueueEvent(p.WebhookID, string(action), session.ID, ev.IssueID, string(payload))
+		if err != nil {
+			w.logger.Error("enqueue_event_failed", "err", err, "webhook_id", p.WebhookID)
+			// Still return 200 — Linear shouldn't retry; the error is ours
+			return
+		}
+		if fresh {
+			w.logger.Info("event_enqueued",
+				"webhook_id", p.WebhookID,
+				"action", string(action),
+				"session", session.ID)
+			select {
+			case w.signal <- struct{}{}:
+			default:
+				// non-blocking: worker has 60s pollEvery as fallback
+			}
+		} else {
+			w.logger.Debug("event_duplicate_dropped", "webhook_id", p.WebhookID)
+		}
+		return
+	}
+
+	// Legacy synchronous path (tests only, when store is nil but onAgent is set)
 	w.logger.Info("linear_agent_event",
 		"action", string(action),
 		"session", ev.SessionID,
