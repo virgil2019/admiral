@@ -186,13 +186,14 @@ func Open(path string) (*Store, error) {
 	return &Store{DB: db}, nil
 }
 
-// Autopilot job state constants. RECEIVED -> EXECUTING -> DONE|FAILED.
+// Autopilot job state constants. RECEIVED -> EXECUTING -> DONE|FAILED|TIMED_OUT.
 const (
-	JobStateReceived                = "RECEIVED"
-	JobStateExecuting               = "EXECUTING"
-	JobStateDone                    = "DONE"
-	JobStateFailed                  = "FAILED"
-	JobStateDoneThreadInconsistent  = "DONE_THREAD_INCONSISTENT"
+	JobStateReceived               = "RECEIVED"
+	JobStateExecuting              = "EXECUTING"
+	JobStateDone                   = "DONE"
+	JobStateFailed                 = "FAILED"
+	JobStateTimedOut               = "TIMED_OUT"
+	JobStateDoneThreadInconsistent = "DONE_THREAD_INCONSISTENT"
 )
 
 type AutopilotJob struct {
@@ -240,9 +241,9 @@ func (s *Store) AnyAutopilotJobActive() (bool, string, error) {
 	var sessionID string
 	err := s.DB.QueryRow(`
 		SELECT agent_session_id FROM autopilot_jobs
-		WHERE state NOT IN (?, ?, ?)
+		WHERE state NOT IN (?, ?, ?, ?)
 		ORDER BY started_at ASC LIMIT 1
-	`, JobStateDone, JobStateFailed, JobStateDoneThreadInconsistent).Scan(&sessionID)
+	`, JobStateDone, JobStateFailed, JobStateTimedOut, JobStateDoneThreadInconsistent).Scan(&sessionID)
 	if err == sql.ErrNoRows {
 		return false, "", nil
 	}
@@ -348,6 +349,31 @@ func (s *Store) GetLatestDoneJobByIssue(issueID string) (*AutopilotJob, error) {
 		ORDER BY started_at DESC
 		LIMIT 1
 	`, issueID, JobStateDone).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+		&j.StreamLogPath, &j.ClaudeSessionID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &j, err
+}
+
+// GetLatestTimedOutJobByIssue returns the most recent TIMED_OUT autopilot
+// job for the given Linear issue ID. Used by handleCreated to detect
+// resume scenarios. Returns (nil, nil) when no TIMED_OUT job exists.
+func (s *Store) GetLatestTimedOutJobByIssue(issueID string) (*AutopilotJob, error) {
+	var j AutopilotJob
+	err := s.DB.QueryRow(`
+		SELECT agent_session_id, issue_id, issue_identifier, state,
+		       COALESCE(worktree_path,''), COALESCE(branch,''),
+		       COALESCE(pr_url,''), COALESCE(error,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(stream_log_path,''),
+		       COALESCE(claude_session_id,'')
+		FROM autopilot_jobs
+		WHERE issue_id=? AND state=?
+		ORDER BY started_at DESC
+		LIMIT 1
+	`, issueID, JobStateTimedOut).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
 		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
 		&j.StreamLogPath, &j.ClaudeSessionID)
 	if err == sql.ErrNoRows {

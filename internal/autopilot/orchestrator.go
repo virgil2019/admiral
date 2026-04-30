@@ -12,6 +12,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/georgehuang/admiral/internal/config"
@@ -36,6 +38,7 @@ type storeInterface interface {
 	UpdateAutopilotJob(sessionID string, fn func(*store.AutopilotJob)) error
 	ClaimAutopilotJob(sessionID, issueID, identifier string) (bool, error)
 	GetLatestDoneJobByIssue(issueID string) (*store.AutopilotJob, error)
+	GetLatestTimedOutJobByIssue(issueID string) (*store.AutopilotJob, error)
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -143,6 +146,35 @@ func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
 		}
 	}
 
+	// Check if this issue has a TIMED_OUT job that can be resumed.
+	if ev.IssueID != "" {
+		timedOut, err := o.db.GetLatestTimedOutJobByIssue(ev.IssueID)
+		if err != nil {
+			o.logger.Warn("get_latest_timed_out_job_failed", "err", err, "issue", ev.IssueID)
+		} else if timedOut != nil && timedOut.ClaudeSessionID != "" {
+			o.logger.Info("autopilot_resuming_timed_out_job",
+				"session", ev.SessionID,
+				"issue", ev.IssueIdentifier,
+				"prior_session", timedOut.AgentSessionID,
+				"claude_session", timedOut.ClaudeSessionID)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(),
+					time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
+				defer cancel()
+				resumeFlow := newResumeFlow(o, ctx, ev, timedOut)
+				if err := resumeFlow.executeResume(); err != nil {
+					o.logger.Error("autopilot_resume_timed_out_failed",
+						"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
+					resumeFlow.markFailed(err)
+					return
+				}
+				o.logger.Info("autopilot_resume_timed_out_done",
+					"issue", ev.IssueIdentifier, "session", ev.SessionID, "pr", resumeFlow.prURL)
+			}()
+			return
+		}
+	}
+
 	// Per-session FIFO is guaranteed by the DB-level lock in ClaimNextPendingEvent,
 	// so we can spawn directly without any in-process lock.
 	go o.run(ev)
@@ -210,9 +242,13 @@ func (o *Orchestrator) run(ev linear.AgentEvent) {
 
 	flow := newFlow(o, ctx, ev)
 	if err := flow.execute(); err != nil {
-		o.logger.Error("autopilot_failed",
-			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
-		flow.markFailed(err)
+		if errors.Is(err, context.DeadlineExceeded) ||
+			strings.Contains(err.Error(), "signal: killed") ||
+			strings.Contains(err.Error(), "signal: terminated") {
+			flow.markTimedOut(err)
+		} else {
+			flow.markFailed(err)
+		}
 		return
 	}
 	o.logger.Info("autopilot_done",
@@ -379,6 +415,8 @@ func (f *flow) execute() error {
 }
 
 // executeResume resumes a claude session on the original branch/PR.
+// For TIMED_OUT jobs, updates the original job row to DONE.
+// For prompted events, creates a new DONE row for the new session.
 func (f *flow) executeResume() error {
 	f.postActivity(linear.Thought("Resuming previous session...", true))
 
@@ -404,7 +442,10 @@ func (f *flow) executeResume() error {
 	f.prURL = f.job.PRURL
 	f.postActivity(linear.Response("Updated PR with follow-up: " + f.prURL))
 
-	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+	// Use the original job's session ID so TIMED_OUT resumes update the
+	// original row (not a new one) and prompted resumes create a new row.
+	sessionID := f.job.AgentSessionID
+	if err := f.o.db.UpdateAutopilotJob(sessionID, func(j *store.AutopilotJob) {
 		j.State = store.JobStateDone
 		j.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 	}); err != nil {
@@ -561,6 +602,31 @@ func (f *flow) markFailed(runErr error) {
 	f.cleanupWorktree()
 }
 
+func (f *flow) markTimedOut(runErr error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateTimedOut
+		j.Error = runErr.Error()
+		j.FinishedAt = now
+	})
+	// Use a fresh short ctx in case the parent is already done.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	mention := ""
+	if f.ev.CreatorID != "" {
+		mention = "@" + f.ev.CreatorID + " "
+	}
+	truncatedSession := f.claudeSessionID
+	if len(truncatedSession) > 8 {
+		truncatedSession = truncatedSession[:8]
+	}
+	body := mention + fmt.Sprintf(
+		"Task timed out after %ds. State preserved — re-mention me on this issue to resume from where I left off. (claude session: %s...)",
+		f.o.cfg.MaxRunSeconds, truncatedSession)
+	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.Response(body))
+	// NO cleanupWorktree: keep worktree for resume
+}
+
 // cleanupWorktree removes the worktree directory and local branch.
 // Best-effort: failures are logged at WARN but don't change job state.
 // Order matters: remove worktree before deleting branch (worktree
@@ -675,6 +741,10 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	cctx, cancel := context.WithTimeout(f.ctx, time.Duration(f.o.cfg.MaxRunSeconds)*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, f.o.cfg.ClaudeBin, args...)
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Dir = f.worktreePath
 	cmd.Env = append(os.Environ(),
 		"CLAUDE_AUTOPILOT_ISSUE="+issue.Identifier,
