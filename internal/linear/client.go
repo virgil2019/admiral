@@ -52,8 +52,17 @@ type Issue struct {
 	StateName   string
 	Priority    int
 	AssigneeID  string
+	TeamID      string
 	Labels      []string
 	Comments    []Comment
+}
+
+// WorkflowState represents a Linear workflow state.
+type WorkflowState struct {
+	ID       string
+	Name     string
+	Type     string // "triage" / "backlog" / "unstarted" / "started" / "completed" / "canceled"
+	Position float64
 }
 
 type Comment struct {
@@ -147,6 +156,7 @@ const issueQuery = `query Issue($id: String!) {
     priority
     state { name }
     assignee { id }
+    team { id }
     labels { nodes { name } }
     comments(first: 20) { nodes { body createdAt user { name } } }
   }
@@ -167,6 +177,9 @@ func (c *Client) GetIssue(ctx context.Context, id string) (*Issue, error) {
 			Assignee *struct {
 				ID string `json:"id"`
 			} `json:"assignee"`
+			Team *struct {
+				ID string `json:"id"`
+			} `json:"team"`
 			Labels struct {
 				Nodes []struct {
 					Name string `json:"name"`
@@ -205,6 +218,9 @@ func (c *Client) GetIssue(ctx context.Context, id string) (*Issue, error) {
 	}
 	if data.Issue.Assignee != nil {
 		out.AssigneeID = data.Issue.Assignee.ID
+	}
+	if data.Issue.Team != nil {
+		out.TeamID = data.Issue.Team.ID
 	}
 	for _, l := range data.Issue.Labels.Nodes {
 		out.Labels = append(out.Labels, l.Name)
@@ -294,6 +310,66 @@ func (c *Client) PostAgentActivity(ctx context.Context, sessionID string, a Agen
 	}
 	if !data.AgentActivityCreate.Success {
 		return fmt.Errorf("agentActivityCreate returned success=false")
+	}
+	return nil
+}
+
+const workflowStatesQuery = `query WorkflowStates($teamID: String!) {
+  workflowStates(filter: {team: {id: {eq: $teamID}}}) {
+    nodes { id name type position }
+  }
+}`
+
+// GetWorkflowStates returns all workflow states for a given team.
+func (c *Client) GetWorkflowStates(ctx context.Context, teamID string) ([]WorkflowState, error) {
+	var data struct {
+		WorkflowStates struct {
+			Nodes []struct {
+				ID       string  `json:"id"`
+				Name     string  `json:"name"`
+				Type     string  `json:"type"`
+				Position float64 `json:"position"`
+			} `json:"nodes"`
+		} `json:"workflowStates"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     workflowStatesQuery,
+		Variables: map[string]any{"teamID": teamID},
+	}, &data); err != nil {
+		return nil, err
+	}
+	states := make([]WorkflowState, 0, len(data.WorkflowStates.Nodes))
+	for _, n := range data.WorkflowStates.Nodes {
+		states = append(states, WorkflowState{
+			ID:       n.ID,
+			Name:     n.Name,
+			Type:     n.Type,
+			Position: n.Position,
+		})
+	}
+	return states, nil
+}
+
+const issueUpdateMutation = `mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $id, input: $input) { success }
+}`
+
+// IssueUpdate sets the workflow state of an issue.
+func (c *Client) IssueUpdate(ctx context.Context, issueID, stateID string) error {
+	input := map[string]any{"stateId": stateID}
+	var data struct {
+		IssueUpdate struct {
+			Success bool `json:"success"`
+		} `json:"issueUpdate"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     issueUpdateMutation,
+		Variables: map[string]any{"id": issueID, "input": input},
+	}, &data); err != nil {
+		return err
+	}
+	if !data.IssueUpdate.Success {
+		return fmt.Errorf("issueUpdate returned success=false")
 	}
 	return nil
 }

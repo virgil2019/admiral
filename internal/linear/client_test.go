@@ -15,6 +15,78 @@ import (
 	"github.com/georgehuang/admiral/internal/store"
 )
 
+func TestGetWorkflowStates(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req graphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		if req.Query == "" {
+			t.Fatal("query is empty")
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"workflowStates": map[string]any{
+					"nodes": []map[string]any{
+						{"id": "state-1", "name": "Backlog", "type": "backlog", "position": 0.0},
+						{"id": "state-2", "name": "Todo", "type": "unstarted", "position": 1.0},
+						{"id": "state-3", "name": "In Progress", "type": "started", "position": 2.0},
+						{"id": "state-4", "name": "Done", "type": "completed", "position": 3.0},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	states, err := c.GetWorkflowStates(context.Background(), "team-abc")
+	if err != nil {
+		t.Fatalf("GetWorkflowStates failed: %v", err)
+	}
+	if len(states) != 4 {
+		t.Fatalf("expected 4 states, got %d", len(states))
+	}
+	if states[2].Type != "started" {
+		t.Errorf("expected type 'started', got %q", states[2].Type)
+	}
+	if states[2].ID != "state-3" {
+		t.Errorf("expected id 'state-3', got %q", states[2].ID)
+	}
+}
+
+func TestIssueUpdate(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueUpdate": map[string]any{"success": true},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	err := c.IssueUpdate(context.Background(), "issue-123", "state-done")
+	if err != nil {
+		t.Fatalf("IssueUpdate failed: %v", err)
+	}
+
+	vars := receivedBody["variables"].(map[string]any)
+	input := vars["input"].(map[string]any)
+	if input["stateId"] != "state-done" {
+		t.Errorf("expected stateId 'state-done', got %v", input["stateId"])
+	}
+	if vars["id"] != "issue-123" {
+		t.Errorf("expected id 'issue-123', got %v", vars["id"])
+	}
+}
+
 // mockStore is a test double for store.Store.
 type mockStore struct {
 	mu         sync.Mutex

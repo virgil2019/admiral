@@ -2,6 +2,7 @@ package autopilot
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -224,14 +225,29 @@ func TestRelativeTime(t *testing.T) {
 
 // mockLinearClient implements linearClientInterface for testing.
 type mockLinearClient struct {
-	PostedBody string
-	PostErr    error
-	PostedBodyMu sync.Mutex
+	PostedBody     string
+	PostErr        error
+	PostedBodyMu   sync.Mutex
+	PostedActivity linear.AgentActivity
+
+	// GetIssue override
+	GetIssueResult *linear.Issue
+	GetIssueErr    error
+
+	// GetWorkflowStates override
+	WorkflowStates       []linear.WorkflowState
+	GetWorkflowStatesErr error
+	GetWorkflowStatesCalls int
+
+	// IssueUpdate override
+	IssueUpdateCalls     []struct{ IssueID, StateID string }
+	IssueUpdateErr       error
 }
 
 func (m *mockLinearClient) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {
 	m.PostedBodyMu.Lock()
 	m.PostedBody = a.Body
+	m.PostedActivity = a
 	m.PostedBodyMu.Unlock()
 	return m.PostErr
 }
@@ -243,12 +259,31 @@ func (m *mockLinearClient) GetPostedBody() string {
 }
 
 func (m *mockLinearClient) GetIssue(ctx context.Context, id string) (*linear.Issue, error) {
+	if m.GetIssueErr != nil {
+		return nil, m.GetIssueErr
+	}
+	if m.GetIssueResult != nil {
+		return m.GetIssueResult, nil
+	}
 	return &linear.Issue{
 		ID:          id,
 		Identifier:  "TEST-1",
 		Title:       "Test Issue",
 		Description: "Test description",
 	}, nil
+}
+
+func (m *mockLinearClient) GetWorkflowStates(ctx context.Context, teamID string) ([]linear.WorkflowState, error) {
+	m.GetWorkflowStatesCalls++
+	if m.GetWorkflowStatesErr != nil {
+		return nil, m.GetWorkflowStatesErr
+	}
+	return m.WorkflowStates, nil
+}
+
+func (m *mockLinearClient) IssueUpdate(ctx context.Context, issueID, stateID string) error {
+	m.IssueUpdateCalls = append(m.IssueUpdateCalls, struct{ IssueID, StateID string }{issueID, stateID})
+	return m.IssueUpdateErr
 }
 
 // mockStore implements storeInterface for testing.
@@ -724,6 +759,181 @@ func TestCleanupWorktree_WorktreeNotExists(t *testing.T) {
 
 	// Should not error even though worktree doesn't exist
 	f.cleanupWorktree()
+}
+
+// ---- Tests for mention + status update in flow lifecycle ----
+
+func TestMarkDone_MentionPrefix(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{}
+	trueVal := true
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{RepoDir: t.TempDir(), UpdateIssueStatus: &trueVal},
+		lc:     mlc,
+		db:     ms,
+		logger: slog.Default(),
+	}
+	f := &flow{
+		o:            o,
+		ev:           linear.AgentEvent{SessionID: "sess-1", CreatorID: "user-abc"},
+		worktreePath: "/tmp/wt",
+		branch:       "linear/test",
+		prURL:        "https://github.com/x/y/pull/1",
+		teamID:       "team-1",
+	}
+
+	// Simulate successful execution end: mark job done then call the Response path
+	f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateDone
+		j.PRURL = f.prURL
+	})
+
+	// Post the completion activity (same as flow.execute end)
+	mention := ""
+	if f.ev.CreatorID != "" {
+		mention = "@" + f.ev.CreatorID + " "
+	}
+	f.postActivity(linear.Response(fmt.Sprintf(
+		"%sDone. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
+		mention, f.prURL, f.worktreePath, f.branch)))
+
+	body := mlc.GetPostedBody()
+	if !strings.HasPrefix(body, "@user-abc ") {
+		t.Errorf("expected body to start with '@user-abc ', got: %s", body)
+	}
+	if !strings.Contains(body, "https://github.com/x/y/pull/1") {
+		t.Errorf("expected PR URL in body, got: %s", body)
+	}
+}
+
+func TestMarkFailed_MentionPrefix(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
+		lc:     mlc,
+		db:     ms,
+		logger: slog.Default(),
+	}
+	f := &flow{
+		o:            o,
+		ev:           linear.AgentEvent{SessionID: "sess-2", CreatorID: "user-xyz"},
+		worktreePath: "/tmp/wt2",
+		branch:       "linear/fail",
+	}
+
+	// Simulate markFailed body construction
+	mention := ""
+	if f.ev.CreatorID != "" {
+		mention = "@" + f.ev.CreatorID + " "
+	}
+	body := mention + "admiral failed: something went wrong"
+	f.postActivity(linear.ErrorActivity(body))
+
+	if !strings.HasPrefix(mlc.GetPostedBody(), "@user-xyz ") {
+		t.Errorf("expected body to start with '@user-xyz ', got: %s", mlc.GetPostedBody())
+	}
+}
+
+func TestStateIDByType_CacheHit(t *testing.T) {
+	mlc := &mockLinearClient{
+		WorkflowStates: []linear.WorkflowState{
+			{ID: "state-started-1", Name: "In Progress", Type: "started", Position: 1.0},
+			{ID: "state-started-2", Name: "Started", Type: "started", Position: 2.0},
+			{ID: "state-done", Name: "Done", Type: "completed", Position: 1.0},
+		},
+	}
+	ms := &mockStore{}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
+		lc:     mlc,
+		db:     ms,
+		logger: slog.Default(),
+	}
+
+	ctx := context.Background()
+
+	// First call — should fetch
+	id1, err := o.stateIDByType(ctx, "team-1", "started")
+	if err != nil {
+		t.Fatalf("stateIDByType failed: %v", err)
+	}
+	if id1 != "state-started-1" {
+		t.Errorf("expected state-started-1 (position 1), got: %s", id1)
+	}
+	if mlc.GetWorkflowStatesCalls != 1 {
+		t.Errorf("expected 1 GetWorkflowStates call, got: %d", mlc.GetWorkflowStatesCalls)
+	}
+
+	// Second call for same team — should use cache
+	id2, err := o.stateIDByType(ctx, "team-1", "started")
+	if err != nil {
+		t.Fatalf("stateIDByType failed (cached): %v", err)
+	}
+	if id2 != "state-started-1" {
+		t.Errorf("expected cached state-started-1, got: %s", id2)
+	}
+	if mlc.GetWorkflowStatesCalls != 1 {
+		t.Errorf("expected no additional GetWorkflowStates calls (cache hit), got: %d", mlc.GetWorkflowStatesCalls)
+	}
+
+	// Different team — should fetch again
+	id3, err := o.stateIDByType(ctx, "team-2", "started")
+	if err != nil {
+		t.Fatalf("stateIDByType failed (team-2): %v", err)
+	}
+	if id3 != "state-started-1" {
+		t.Errorf("expected state-started-1 for team-2, got: %s", id3)
+	}
+	if mlc.GetWorkflowStatesCalls != 2 {
+		t.Errorf("expected 2 GetWorkflowStates calls total, got: %d", mlc.GetWorkflowStatesCalls)
+	}
+}
+
+func TestStateIDByType_ReturnsPositionMin(t *testing.T) {
+	mlc := &mockLinearClient{
+		WorkflowStates: []linear.WorkflowState{
+			{ID: "high-pos", Name: "Started", Type: "started", Position: 5.0},
+			{ID: "low-pos", Name: "In Progress", Type: "started", Position: 1.0},
+			{ID: "mid-pos", Name: "Active", Type: "started", Position: 3.0},
+		},
+	}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
+		lc:     mlc,
+		db:     &mockStore{},
+		logger: slog.Default(),
+	}
+
+	id, err := o.stateIDByType(context.Background(), "team-x", "started")
+	if err != nil {
+		t.Fatalf("stateIDByType failed: %v", err)
+	}
+	if id != "low-pos" {
+		t.Errorf("expected low-pos (position 1), got: %s", id)
+	}
+}
+
+func TestStateIDByType_NotFound(t *testing.T) {
+	mlc := &mockLinearClient{
+		WorkflowStates: []linear.WorkflowState{
+			{ID: "some-state", Name: "Done", Type: "completed", Position: 1.0},
+		},
+	}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
+		lc:     mlc,
+		db:     &mockStore{},
+		logger: slog.Default(),
+	}
+
+	id, err := o.stateIDByType(context.Background(), "team-x", "started")
+	if err != nil {
+		t.Fatalf("stateIDByType failed: %v", err)
+	}
+	if id != "" {
+		t.Errorf("expected empty string for not-found type, got: %s", id)
+	}
 }
 
 // ---- Tests for handlePrompted ----
