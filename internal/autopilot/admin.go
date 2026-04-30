@@ -2,6 +2,7 @@ package autopilot
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,12 @@ import (
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
+
+//go:embed static/*.html
+var templateFS embed.FS
+
+//go:embed static/htmx.min.js static/style.css
+var staticFS embed.FS
 
 // adminServer serves the admin HTTP API (read + write).
 type adminServer struct {
@@ -532,6 +539,153 @@ func isGitRepo(dir string) bool {
 	return strings.TrimSpace(out) == "true"
 }
 
+// --- UI handlers ---
+
+func (s *adminServer) uiHandler(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	var name string
+	switch path {
+	case "/admin/ui", "/admin/ui/":
+		name = "index.html"
+	case "/admin/ui/repos":
+		name = "repos.html"
+	case "/admin/ui/jobs", "/admin/ui/jobs/":
+		name = "jobs.html"
+	default:
+		if strings.HasPrefix(path, "/admin/ui/jobs/") {
+			name = "job-detail.html"
+		} else {
+			http.NotFound(w, r)
+			return
+		}
+	}
+	data, err := templateFS.ReadFile(name)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html")
+	w.Write(data)
+}
+
+// loadCardHandler returns the dashboard load card HTML fragment.
+func (s *adminServer) loadCardHandler(w http.ResponseWriter, r *http.Request) {
+	pending, _ := s.db.CountPendingEvents()
+	var processing int
+	s.db.DB.QueryRow(`SELECT COUNT(*) FROM events_inbox WHERE status='processing'`).Scan(&processing)
+	inFlight, _, _ := s.db.AnyAutopilotJobActive()
+	inFlightJobs := 0
+	if inFlight {
+		inFlightJobs = 1
+	}
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(fmt.Sprintf(`<div class="card">
+<div class="stat"><span class="label">Workers</span><span class="value">%d</span></div>
+<div class="stat"><span class="label">Pending</span><span class="value">%d</span></div>
+<div class="stat"><span class="label">Processing</span><span class="value">%d</span></div>
+<div class="stat"><span class="label">In-Flight</span><span class="value">%d</span></div>
+</div>`, s.workers, pending, processing, inFlightJobs)))
+}
+
+// recentJobsHandler returns the 5 most recent jobs HTML fragment.
+func (s *adminServer) recentJobsHandler(w http.ResponseWriter, r *http.Request) {
+	jobs, _ := s.db.ListAutopilotJobs("", "", nil, 5)
+	w.Header().Set("Content-Type", "text/html")
+	if len(jobs) == 0 {
+		w.Write([]byte(`<p>No jobs yet.</p>`))
+		return
+	}
+	var b strings.Builder
+	b.WriteString(`<table><thead><tr><th>ID</th><th>Issue</th><th>State</th><th>Started</th></tr></thead><tbody>`)
+	for _, j := range jobs {
+		b.WriteString(fmt.Sprintf(`<tr><td><a href="/admin/ui/jobs/%s">%s</a></td><td>%s</td><td><span class="badge badge-%s">%s</span></td><td>%s</td></tr>`,
+			j.AgentSessionID, j.AgentSessionID, j.IssueIdentifier, j.State, j.State, j.StartedAt))
+	}
+	b.WriteString(`</tbody></table>`)
+	w.Write([]byte(b.String()))
+}
+
+// reposTableHandler returns the repos table HTML fragment.
+func (s *adminServer) reposTableHandler(w http.ResponseWriter, r *http.Request) {
+	repos, _ := s.db.ListRepos()
+	w.Header().Set("Content-Type", "text/html")
+	if len(repos) == 0 {
+		w.Write([]byte(`<p>No repos configured.</p>`))
+		return
+	}
+	var b strings.Builder
+	b.WriteString(`<table><thead><tr><th>Project</th><th>Repo Dir</th><th>Branch</th><th>Enabled</th><th>Actions</th></tr></thead><tbody>`)
+	for _, r := range repos {
+		enabled := "Yes"
+		if !r.Enabled {
+			enabled = "No"
+		}
+		b.WriteString(fmt.Sprintf(`<tr>
+<td>%s</td><td>%s</td><td>%s</td><td>%s</td>
+<td>
+<button class="secondary" hx-post="/admin/repos/%s/check_gh" hx-swap="none">Test GH</button>
+<button class="danger" hx-delete="/admin/repos/%s" hx-confirm="Delete %s?" hx-swap="none">Delete</button>
+</td></tr>`, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, r.ProjectID, r.ProjectID, r.ProjectName))
+	}
+	b.WriteString(`</tbody></table>`)
+	w.Write([]byte(b.String()))
+}
+
+// jobsTableHandler returns filtered jobs table HTML fragment.
+func (s *adminServer) jobsTableHandler(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	status := r.Form.Get("status")
+	teamID := r.Form.Get("team_id")
+	jobs, _ := s.db.ListAutopilotJobs(status, teamID, nil, 100)
+	w.Header().Set("Content-Type", "text/html")
+	if len(jobs) == 0 {
+		w.Write([]byte(`<p>No jobs found.</p>`))
+		return
+	}
+	var b strings.Builder
+	b.WriteString(`<table><thead><tr><th>Session ID</th><th>Issue</th><th>State</th><th>Started</th><th>Finished</th></tr></thead><tbody>`)
+	for _, j := range jobs {
+		b.WriteString(fmt.Sprintf(`<tr><td><a href="/admin/ui/jobs/%s">%s</a></td><td>%s</td><td><span class="badge badge-%s">%s</span></td><td>%s</td><td>%s</td></tr>`,
+			j.AgentSessionID, j.AgentSessionID, j.IssueIdentifier, j.State, j.State, j.StartedAt, j.FinishedAt))
+	}
+	b.WriteString(`</tbody></table>`)
+	w.Write([]byte(b.String()))
+}
+
+// jobDetailHandler returns a single job detail HTML fragment.
+func (s *adminServer) jobDetailHandler(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimPrefix(r.URL.Path, "/admin/ui/_partial/job_detail/")
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		http.Error(w, "session_id required", http.StatusBadRequest)
+		return
+	}
+	job, err := s.db.GetAutopilotJob(sessionID)
+	if err != nil || job == nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html")
+	streamLink := ""
+	if job.StreamLogPath != "" {
+		streamLink = fmt.Sprintf(`<a href="/admin/jobs/%s/stream">Stream Log</a>`, sessionID)
+	}
+	w.Write([]byte(fmt.Sprintf(`<div class="card">
+<div class="detail-row"><span class="label">Session ID</span><span class="value">%s</span></div>
+<div class="detail-row"><span class="label">Issue</span><span class="value">%s</span></div>
+<div class="detail-row"><span class="label">State</span><span class="value"><span class="badge badge-%s">%s</span></span></div>
+<div class="detail-row"><span class="label">PR URL</span><span class="value">%s</span></div>
+<div class="detail-row"><span class="label">Claude Session</span><span class="value">%s</span></div>
+<div class="detail-row"><span class="label">Worktree</span><span class="value">%s</span></div>
+<div class="detail-row"><span class="label">Started</span><span class="value">%s</span></div>
+<div class="detail-row"><span class="label">Finished</span><span class="value">%s</span></div>
+<div class="detail-row"><span class="label">Stream Log</span><span class="value">%s</span></div>
+<div class="detail-row"><span class="label">Error</span><span class="value">%s</span></div>
+</div>`, job.AgentSessionID, job.IssueIdentifier, job.State, job.State, job.PRURL, job.ClaudeSessionID, job.WorktreePath, job.StartedAt, job.FinishedAt, streamLink, job.Error)))
+}
 // ServeAdminHTTP starts the admin HTTP server on addr.
 func ServeAdminHTTP(addr string, db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int) error {
 	srv := &http.Server{
@@ -545,7 +699,21 @@ func ServeAdminHTTP(addr string, db *store.Store, lc *linear.Client, ghBin strin
 func newAdminMux(db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int) *http.ServeMux {
 	as := newAdminServer(db, lc, ghBin, logger, workers)
 	mux := http.NewServeMux()
-	// Register both /admin/repos and /admin/repos/ to avoid redirect from mux
+	// UI static files
+	uiFS := http.FileServer(http.FS(staticFS))
+	mux.Handle("/admin/ui/", http.StripPrefix("/admin/ui", uiFS))
+	// UI page routes
+	mux.HandleFunc("/admin/ui", as.uiHandler)
+	mux.HandleFunc("/admin/ui/repos", as.uiHandler)
+	mux.HandleFunc("/admin/ui/jobs", as.uiHandler)
+	mux.HandleFunc("/admin/ui/jobs/", as.uiHandler)
+	// htmx partials
+	mux.HandleFunc("/admin/ui/_partial/load_card", as.loadCardHandler)
+	mux.HandleFunc("/admin/ui/_partial/recent_jobs", as.recentJobsHandler)
+	mux.HandleFunc("/admin/ui/_partial/repos_table", as.reposTableHandler)
+	mux.HandleFunc("/admin/ui/_partial/jobs_table", as.jobsTableHandler)
+	mux.HandleFunc("/admin/ui/_partial/job_detail/", as.jobDetailHandler)
+	// API routes
 	mux.HandleFunc("/admin/repos", as.reposDispatchHandler)
 	mux.HandleFunc("/admin/repos/", as.reposDispatchHandler)
 	mux.HandleFunc("/admin/jobs", as.listJobsHandler)

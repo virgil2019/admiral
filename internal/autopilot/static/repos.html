@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Repos – Admiral</title>
+<link rel="stylesheet" href="/admin/ui/style.css">
+<script src="/admin/ui/htmx.min.js"></script>
+</head>
+<body>
+<nav>
+  <a href="/admin/ui/">Dashboard</a>
+  <a href="/admin/ui/repos">Repos</a>
+  <a href="/admin/ui/jobs">Jobs</a>
+</nav>
+<main>
+  <h1>Repos</h1>
+
+  <h2>Add Repo</h2>
+  <form hx-post="/admin/repos" hx-target="#repos-table" hx-swap="innerHTML" class="add-repo-form">
+    <input name="team_id" placeholder="Project ID" required>
+    <input name="team_name" placeholder="Project Name" required>
+    <input name="repo_dir" placeholder="/path/to/repo" required>
+    <input name="base_branch" placeholder="main" value="main">
+    <button type="submit">Add Repo</button>
+  </form>
+
+  <h2>Configured Repos</h2>
+  <div id="repos-table" hx-get="/admin/ui/_partial/repos_table" hx-trigger="load, every 10s" hx-swap="innerHTML">
+    <p>Loading...</p>
+  </div>
+</main>
+<div id="toast" class="toast hidden"></div>
+<script>
+document.body.addEventListener('htmx:afterRequest', function(evt) {
+  if (evt.detail.xhr.status >= 400) {
+    var toast = document.getElementById('toast');
+    try {
+      var body = JSON.parse(evt.detail.xhr.responseText);
+      toast.textContent = body.error || 'Error: ' + evt.detail.xhr.status;
+    } catch(e) {
+      toast.textContent = 'Error: ' + evt.detail.xhr.status;
+    }
+    toast.classList.remove('hidden');
+    setTimeout(function() { toast.classList.add('hidden'); }, 4000);
+  }
+});
+</script>
+</body>
+</html>
