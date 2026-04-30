@@ -108,6 +108,11 @@ type Autopilot struct {
 	// repo whose project_id matches issue.project.id; issues without a
 	// project assignment are rejected.
 	Repos []RepoConfig `yaml:"repos"`
+	// AdminListenAddr is the HTTP bind for the read-only admin API. Default:
+	// "127.0.0.1:8788" (localhost-only; ssh tunnel required for remote access).
+	// Set to ":8788" to listen on all interfaces (not recommended without
+	// M5 token auth).
+	AdminListenAddr string `yaml:"admin_listen_addr"`
 }
 
 // RepoConfig describes a single Linear project → repo mapping.
@@ -264,6 +269,9 @@ func (c *Config) validateAutopilotAndExpand() error {
 	}
 	if strings.TrimSpace(c.Autopilot.ListenAddr) == "" {
 		c.Autopilot.ListenAddr = ":8787"
+	}
+	if strings.TrimSpace(c.Autopilot.AdminListenAddr) == "" {
+		c.Autopilot.AdminListenAddr = "127.0.0.1:8788"
 	}
 	if c.Autopilot.MaxRunSeconds <= 0 {
 		c.Autopilot.MaxRunSeconds = 1800
