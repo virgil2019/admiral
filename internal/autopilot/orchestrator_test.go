@@ -594,7 +594,8 @@ func TestDrainStreamJSON_EmitsStructuredEvents(t *testing.T) {
 	if n := count("claude_error"); n != 2 {
 		t.Errorf("expected 2 claude_error events (1 result error + 1 standalone error), got %d: %v", n, msgNames)
 	}
-=======
+}
+
 // handleCreated short-circuit tests
 
 func TestHandleCreated_ShortCircuits_WhenPriorDoneWithPR(t *testing.T) {
