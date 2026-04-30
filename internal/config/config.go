@@ -58,6 +58,9 @@ type Linear struct {
 	// Used for automatic token renewal. Optional — if absent, token refresh
 	// is unavailable (v0.3 fallback).
 	RefreshToken string `yaml:"refresh_token"`
+	// RedirectURI is the OAuth callback URL. Must match the value registered
+	// in your Linear OAuth app. Default: "http://127.0.0.1:8080/callback".
+	RedirectURI string `yaml:"redirect_uri"`
 }
 
 // Autopilot configures the worktree + claude -p spawn path used by the
@@ -196,6 +199,9 @@ func (c *Config) validateAutopilotAndExpand() error {
 	}
 	if strings.TrimSpace(c.Linear.APIBase) == "" {
 		c.Linear.APIBase = "https://api.linear.app/graphql"
+	}
+	if strings.TrimSpace(c.Linear.RedirectURI) == "" {
+		c.Linear.RedirectURI = "http://127.0.0.1:8080/callback"
 	}
 
 	if strings.TrimSpace(c.Autopilot.RepoDir) == "" {
