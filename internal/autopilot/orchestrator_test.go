@@ -342,6 +342,10 @@ func (m *mockStore) GetLatestTimedOutJobByIssue(issueID string) (*store.Autopilo
 	return m.LatestTimedOutJob, m.LatestTimedOutJobErr
 }
 
+func (m *mockStore) GetRepoByTeamID(teamID string) (*store.Repo, error) {
+	return nil, nil
+}
+
 func TestHandleCommand_StatusIdle(t *testing.T) {
 	mlc := &mockLinearClient{}
 	ms := &mockStore{

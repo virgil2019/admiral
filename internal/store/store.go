@@ -118,6 +118,18 @@ const migration0006 = `
 ALTER TABLE autopilot_jobs ADD COLUMN claude_session_id TEXT;
 `
 
+const migration0007 = `
+CREATE TABLE IF NOT EXISTS repos (
+  team_id          TEXT PRIMARY KEY,
+  team_name        TEXT NOT NULL,
+  repo_dir         TEXT NOT NULL,
+  base_branch      TEXT NOT NULL DEFAULT 'main',
+  enabled          INTEGER NOT NULL DEFAULT 1,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
+);
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -130,6 +142,7 @@ var migrations = []migration{
 	{4, migration0004},
 	{5, migration0005},
 	{6, migration0006},
+	{7, migration0007},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -812,4 +825,83 @@ func (s *Store) CountPendingEvents() (int, error) {
 		SELECT COUNT(*) FROM events_inbox WHERE status IN ('pending', 'processing')
 	`).Scan(&count)
 	return count, err
+}
+
+// --- repos ---
+
+// Repo holds a Linear team → repo mapping.
+type Repo struct {
+	TeamID     string
+	TeamName   string
+	RepoDir    string
+	BaseBranch string
+	Enabled    bool
+}
+
+// ListRepos returns all repos ordered by team_name.
+func (s *Store) ListRepos() ([]Repo, error) {
+	rows, err := s.DB.Query(`
+		SELECT team_id, team_name, repo_dir, base_branch, enabled
+		FROM repos ORDER BY team_name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Repo
+	for rows.Next() {
+		var r Repo
+		var enabled int
+		if err := rows.Scan(&r.TeamID, &r.TeamName, &r.RepoDir, &r.BaseBranch, &enabled); err != nil {
+			return nil, err
+		}
+		r.Enabled = enabled == 1
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// GetRepoByTeamID returns the repo for a given Linear team ID.
+// Returns (nil, nil) when no repo is configured for that team.
+func (s *Store) GetRepoByTeamID(teamID string) (*Repo, error) {
+	var r Repo
+	var enabled int
+	err := s.DB.QueryRow(`
+		SELECT team_id, team_name, repo_dir, base_branch, enabled
+		FROM repos WHERE team_id=?
+	`, teamID).Scan(&r.TeamID, &r.TeamName, &r.RepoDir, &r.BaseBranch, &enabled)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.Enabled = enabled == 1
+	return &r, nil
+}
+
+// UpsertRepo inserts or replaces a repo.
+func (s *Store) UpsertRepo(r Repo) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	enabled := 0
+	if r.Enabled {
+		enabled = 1
+	}
+	_, err := s.DB.Exec(`
+		INSERT INTO repos(team_id, team_name, repo_dir, base_branch, enabled, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(team_id) DO UPDATE SET
+			team_name=excluded.team_name,
+			repo_dir=excluded.repo_dir,
+			base_branch=excluded.base_branch,
+			enabled=excluded.enabled,
+			updated_at=excluded.updated_at
+	`, r.TeamID, r.TeamName, r.RepoDir, r.BaseBranch, enabled, now, now)
+	return err
+}
+
+// DeleteRepo removes a repo by team_id.
+func (s *Store) DeleteRepo(teamID string) error {
+	_, err := s.DB.Exec(`DELETE FROM repos WHERE team_id=?`, teamID)
+	return err
 }

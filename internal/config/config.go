@@ -70,12 +70,14 @@ type Autopilot struct {
 	// ":8787" or "127.0.0.1:8787". Default: ":8787".
 	ListenAddr string `yaml:"listen_addr"`
 	// RepoDir is the absolute path to the repo whose .worktrees/ directory
-	// admiral creates per-issue worktrees under. Required.
+	// admiral creates per-issue worktrees under. Required for single-repo
+	// setups; for multi-repo setups use Repos instead.
 	RepoDir string `yaml:"repo_dir"`
 	// WorktreeRoot is the directory worktrees are created beneath; relative
 	// paths resolve against RepoDir. Default: ".worktrees".
 	WorktreeRoot string `yaml:"worktree_root"`
 	// BaseBranch is the branch new worktrees are forked from. Default: "main".
+	// Deprecated: use Repos[].base_branch instead for multi-repo setups.
 	BaseBranch string `yaml:"base_branch"`
 	// ClaudeBin is the absolute path to the `claude` CLI. Default: "claude" (PATH).
 	ClaudeBin string `yaml:"claude_bin"`
@@ -102,6 +104,22 @@ type Autopilot struct {
 	// UpdateIssueStatus controls whether admiral updates Linear issue workflow
 	// state on task lifecycle (Backlog → Started → Completed). Default: true.
 	UpdateIssueStatus *bool `yaml:"update_issue_status"`
+	// Repos is the list of Linear team → repo mappings for multi-repo setups.
+	// When populated, RepoDir/BaseBranch are ignored (they only apply to
+	// single-repo setups for backward compatibility).
+	Repos []RepoConfig `yaml:"repos"`
+}
+
+// RepoConfig describes a single Linear team → repo mapping.
+type RepoConfig struct {
+	// TeamID is the Linear team UUID.
+	TeamID string `yaml:"team_id"`
+	// TeamName is a human-readable name for the team (for log/UI clarity).
+	TeamName string `yaml:"team_name"`
+	// RepoDir is the absolute path to the repo on disk.
+	RepoDir string `yaml:"repo_dir"`
+	// BaseBranch is the branch new worktrees are forked from. Default: "main".
+	BaseBranch string `yaml:"base_branch"`
 }
 
 type Launch struct {
@@ -216,6 +234,30 @@ func (c *Config) validateAutopilotAndExpand() error {
 	}
 	if strings.TrimSpace(c.Autopilot.BaseBranch) == "" {
 		c.Autopilot.BaseBranch = "main"
+	}
+	// Validate multi-repo config if provided; otherwise expand paths.
+	// Multi-repo (Repos) takes precedence: if set, RepoDir/BaseBranch are
+	// only used as fallbacks for worktree_root resolution.
+	if len(c.Autopilot.Repos) > 0 {
+		for i := range c.Autopilot.Repos {
+			r := &c.Autopilot.Repos[i]
+			if strings.TrimSpace(r.TeamID) == "" {
+				return fmt.Errorf("autopilot.repos[%d].team_id is required", i)
+			}
+			if strings.TrimSpace(r.TeamName) == "" {
+				return fmt.Errorf("autopilot.repos[%d].team_name is required", i)
+			}
+			if strings.TrimSpace(r.RepoDir) == "" {
+				return fmt.Errorf("autopilot.repos[%d].repo_dir is required", i)
+			}
+			r.RepoDir = expandTilde(r.RepoDir)
+			if fi, err := os.Stat(r.RepoDir); err != nil || !fi.IsDir() {
+				return fmt.Errorf("autopilot.repos[%d].repo_dir not a directory: %s", i, r.RepoDir)
+			}
+			if strings.TrimSpace(r.BaseBranch) == "" {
+				r.BaseBranch = "main"
+			}
+		}
 	}
 	if strings.TrimSpace(c.Autopilot.ClaudeBin) == "" {
 		c.Autopilot.ClaudeBin = "claude"
