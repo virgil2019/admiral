@@ -115,6 +115,10 @@ CREATE INDEX IF NOT EXISTS events_inbox_status_received
   ON events_inbox(status, received_at);
 `
 
+const migration0006 = `
+ALTER TABLE autopilot_jobs ADD COLUMN claude_session_id TEXT;
+`
+
 type Store struct {
 	DB *sql.DB
 }
@@ -171,6 +175,14 @@ func Open(path string) (*Store, error) {
 		// on a freshly-initialized DB this should not fail.
 		return nil, fmt.Errorf("apply migration 0005: %w", err)
 	}
+	if _, err := db.Exec(migration0006); err != nil {
+		// SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. On a
+		// pre-existing DB where this migration already ran, re-applying
+		// returns "duplicate column name". Treat as no-op.
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return nil, fmt.Errorf("apply migration 0006: %w", err)
+		}
+	}
 	return &Store{DB: db}, nil
 }
 
@@ -194,6 +206,7 @@ type AutopilotJob struct {
 	StartedAt       string
 	FinishedAt      string
 	StreamLogPath   string
+	ClaudeSessionID string
 }
 
 // ClaimAutopilotJob inserts a RECEIVED row for sessionID iff no row exists.
@@ -250,11 +263,12 @@ func (s *Store) UpdateAutopilotJob(sessionID string, fn func(*AutopilotJob)) err
 		       COALESCE(worktree_path,''), COALESCE(branch,''),
 		       COALESCE(pr_url,''), COALESCE(error,''),
 		       started_at, COALESCE(finished_at,''),
-		       COALESCE(stream_log_path,'')
+		       COALESCE(stream_log_path,''),
+		       COALESCE(claude_session_id,'')
 		FROM autopilot_jobs WHERE agent_session_id=?
 	`, sessionID).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
 		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
-		&j.StreamLogPath)
+		&j.StreamLogPath, &j.ClaudeSessionID)
 	if err != nil {
 		return err
 	}
@@ -262,11 +276,11 @@ func (s *Store) UpdateAutopilotJob(sessionID string, fn func(*AutopilotJob)) err
 	_, err = tx.Exec(`
 		UPDATE autopilot_jobs
 		SET issue_identifier=?, state=?, worktree_path=?, branch=?, pr_url=?,
-		    error=?, finished_at=?, stream_log_path=?
+		    error=?, finished_at=?, stream_log_path=?, claude_session_id=?
 		WHERE agent_session_id=?
 	`, j.IssueIdentifier, j.State, nullIfEmpty(j.WorktreePath), nullIfEmpty(j.Branch),
 		nullIfEmpty(j.PRURL), nullIfEmpty(j.Error), nullIfEmpty(j.FinishedAt),
-		nullIfEmpty(j.StreamLogPath), sessionID)
+		nullIfEmpty(j.StreamLogPath), nullIfEmpty(j.ClaudeSessionID), sessionID)
 	if err != nil {
 		return err
 	}
@@ -280,11 +294,12 @@ func (s *Store) GetAutopilotJob(sessionID string) (*AutopilotJob, error) {
 		       COALESCE(worktree_path,''), COALESCE(branch,''),
 		       COALESCE(pr_url,''), COALESCE(error,''),
 		       started_at, COALESCE(finished_at,''),
-		       COALESCE(stream_log_path,'')
+		       COALESCE(stream_log_path,''),
+		       COALESCE(claude_session_id,'')
 		FROM autopilot_jobs WHERE agent_session_id=?
 	`, sessionID).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
 		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
-		&j.StreamLogPath)
+		&j.StreamLogPath, &j.ClaudeSessionID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -300,13 +315,14 @@ func (s *Store) GetLastAutopilotJob() (*AutopilotJob, error) {
 		       COALESCE(worktree_path,''), COALESCE(branch,''),
 		       COALESCE(pr_url,''), COALESCE(error,''),
 		       started_at, COALESCE(finished_at,''),
-		       COALESCE(stream_log_path,'')
+		       COALESCE(stream_log_path,''),
+		       COALESCE(claude_session_id,'')
 		FROM autopilot_jobs
 		ORDER BY started_at DESC
 		LIMIT 1
 	`).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
 		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
-		&j.StreamLogPath)
+		&j.StreamLogPath, &j.ClaudeSessionID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -324,14 +340,15 @@ func (s *Store) GetLatestDoneJobByIssue(issueID string) (*AutopilotJob, error) {
 		       COALESCE(worktree_path,''), COALESCE(branch,''),
 		       COALESCE(pr_url,''), COALESCE(error,''),
 		       started_at, COALESCE(finished_at,''),
-		       COALESCE(stream_log_path,'')
+		       COALESCE(stream_log_path,''),
+		       COALESCE(claude_session_id,'')
 		FROM autopilot_jobs
 		WHERE issue_id=? AND state=?
 		ORDER BY started_at DESC
 		LIMIT 1
 	`, issueID, JobStateDone).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
 		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
-		&j.StreamLogPath)
+		&j.StreamLogPath, &j.ClaudeSessionID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
