@@ -56,6 +56,7 @@ type Orchestrator struct {
 	db     storeInterface
 	gh     ghProbe
 	logger *slog.Logger
+	ghUser string // login of the configured gh user (for open-PR author comparison)
 
 	// workflowStatesByTeam caches workflow states per team, keyed by teamID.
 	workflowStatesByTeam map[string][]linear.WorkflowState
@@ -69,6 +70,7 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		db:     db,
 		gh:     newGhCLIProbe(cfg.GhBin),
 		logger: logger,
+		ghUser: cfg.GhUser,
 	}
 	// Ensure job_streams_dir exists on startup.
 	if err := os.MkdirAll(cfg.JobStreamsDir, 0o755); err != nil {
@@ -530,6 +532,21 @@ func (f *flow) execute() error {
 		}
 	}
 
+	// Open-PR-by-human short-circuit. A human may have opened a PR for the
+	// same deterministic branch while admiral was queued or offline. We
+	// detect this by checking for an open PR on the branch authored by
+	// someone other than admiral. If found, short-circuit so we don't
+	// create a duplicate PR. Skipped on follow-up flows (suffixed branch
+	// is intentionally unique).
+	if f.followupSuffix == "" && f.o.ghUser != "" {
+		if url, author, found, err := f.o.gh.FindOpenPRForBranch(f.ctx, f.repoDir, f.branch); err != nil {
+			f.o.logger.Warn("open_pr_check_failed",
+				"err", err, "branch", f.branch)
+		} else if found && author != f.o.ghUser {
+			return f.markOpenPRByOther(url, author)
+		}
+	}
+
 	f.worktreePath = filepath.Join(
 		absWorktreeRootWithRepo(f.o.cfg, f.repoDir),
 		worktreeName,
@@ -826,6 +843,39 @@ func (f *flow) markAlreadyMerged(prURL, mergeSHA string) error {
 	f.o.logger.Info("autopilot_already_merged",
 		"issue", f.ev.IssueIdentifier, "session", f.ev.SessionID,
 		"pr", prURL, "sha", mergeSHA)
+	return nil
+}
+
+// markOpenPRByOther is the short-circuit path when a human has already opened
+// a PR for the deterministic branch. It posts a courtesy Linear response,
+// marks the job DONE pointing at the existing PR, and skips worktree creation
+// entirely. Returns nil so flow.run() treats the job as cleanly finished.
+func (f *flow) markOpenPRByOther(prURL, author string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateDone
+		j.PRURL = prURL
+		j.Branch = f.branch
+		j.FinishedAt = now
+	}); err != nil {
+		f.o.logger.Warn("mark_open_pr_by_other_update_failed",
+			"err", err, "session", f.ev.SessionID)
+	}
+
+	mention := ""
+	if f.ev.CreatorID != "" {
+		mention = "@" + f.ev.CreatorID + " "
+	}
+	body := fmt.Sprintf(
+		"%sOpen PR already exists at %s — admiral is not duplicating work. Re-mention me after the PR is merged or closed if you still need follow-up work.",
+		mention, prURL)
+	if err := f.postActivityWithRetry(linear.Response(body)); err != nil {
+		f.o.logger.Warn("mark_open_pr_by_other_post_failed",
+			"err", err, "session", f.ev.SessionID)
+	}
+	f.o.logger.Info("autopilot_open_pr_by_other",
+		"issue", f.ev.IssueIdentifier, "session", f.ev.SessionID,
+		"pr", prURL, "author", author)
 	return nil
 }
 

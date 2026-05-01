@@ -26,6 +26,11 @@ type ghProbe interface {
 	// "CLOSED", or "" when the PR can't be located. Errors are returned
 	// only for unexpected failures.
 	PRState(ctx context.Context, prURL string) (state string, err error)
+
+	// FindOpenPRForBranch looks up the most recent open PR whose head branch
+	// matches the given name. Returns the PR url, author login, and head
+	// ref name when found.
+	FindOpenPRForBranch(ctx context.Context, repoDir, branch string) (url, author string, found bool, err error)
 }
 
 // ghCLIProbe is the default ghProbe — a thin shell around `gh pr list` and
@@ -106,4 +111,40 @@ func (g *ghCLIProbe) PRState(ctx context.Context, prURL string) (string, error) 
 		return "", fmt.Errorf("parse gh pr view output: %w (raw: %s)", err, truncate(out, 200))
 	}
 	return resp.State, nil
+}
+
+// FindOpenPRForBranch shells out to:
+//
+//	gh pr list --head <branch> --state open --json url,author,headRefName --limit 1
+//
+// gh prints `[]` when no PRs match, which we treat as found=false. Anything
+// else (auth error, network error, gh not installed) bubbles up as err.
+func (g *ghCLIProbe) FindOpenPRForBranch(ctx context.Context, repoDir, branch string) (string, string, bool, error) {
+	if branch == "" {
+		return "", "", false, nil
+	}
+	out, err := captureCmd(ctx, repoDir, g.bin,
+		"pr", "list",
+		"--head", branch,
+		"--state", "open",
+		"--json", "url,author,headRefName",
+		"--limit", "1",
+	)
+	if err != nil {
+		return "", "", false, fmt.Errorf("gh pr list --head %s: %w (output: %s)", branch, err, truncate(out, 200))
+	}
+	var rows []struct {
+		URL         string `json:"url"`
+		Author      struct {
+			Login string `json:"login"`
+		} `json:"author"`
+		HeadRefName string `json:"headRefName"`
+	}
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		return "", "", false, fmt.Errorf("parse gh pr list output: %w (raw: %s)", err, truncate(out, 200))
+	}
+	if len(rows) == 0 {
+		return "", "", false, nil
+	}
+	return rows[0].URL, rows[0].Author.Login, true, nil
 }
