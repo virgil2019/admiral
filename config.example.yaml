@@ -86,6 +86,16 @@ autopilot:
   # HTTP bind address for the webhook receiver. Default: ":8787"
   listen_addr: ":8787"
 
+  # Admin API/UI HTTP bind. Default: "127.0.0.1:8788" (localhost only).
+  # Change to ":8788" to bind on all interfaces (exposes admin UI externally).
+  admin_listen_addr: "127.0.0.1:8788"
+
+  # Static bearer token for admin API and admin UI login. Required for the
+  # admin server to start. If unset a transient token is generated on each
+  # boot (logged to stderr) — set a persistent value in production.
+  # Can also be set via ADMIRAL_ADMIN_TOKEN env var (env takes priority).
+  # admin_token: "change-me"
+
   # Repo routing: each Linear *project* maps to exactly one repo. An incoming
   # Linear issue is routed by its project_id; issues without a project
   # assigned are rejected (no fallback). If one logical product spans

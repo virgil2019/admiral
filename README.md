@@ -5,7 +5,7 @@ Two Go binaries in one repo:
 - **`admiral`** — TG bridge. Bridges a single Telegram chat to a single
   team-cli team (`omx` or `omc`) via `<bin> team api`. Mac-local MVP.
   This is what the bulk of this README covers.
-- **`admiral-autopilot`** (v0.3) — Linear-driven autopilot. Listens for
+- **`admiral-autopilot`** (v0.5) — Linear-driven autopilot. Listens for
   Linear `AgentSessionEvent` webhooks (assign / @mention), creates a
   worktree, runs `claude -p`, opens a PR, posts progress back into the
   Linear agent thread. See [admiral-autopilot setup](#admiral-autopilot-v03-linear-driven)
@@ -192,9 +192,9 @@ crash loops.
 - **`omx team` requires a TTY.** Handled via `launch.mode` — see above.
   `omc team` does not require a TTY (verified via sanity test).
 
-## admiral-autopilot (v0.3, Linear-driven)
+## admiral-autopilot (v0.5, Linear-driven)
 
-A separate binary that picks up Linear issues delegated to it (assign or
+A separate binary that picks up Linear issues assigned to it (assign or
 `@mention` an Agent app), runs `claude -p` in a per-issue worktree, opens
 a PR, and reports progress back into the Linear agent thread via the
 Linear Agent SDK.
@@ -217,7 +217,7 @@ itself. Do this once per workspace:
      secret is generated)
    - After Create, edit the app's **Webhooks** section: set URL to
      `https://<your-tunnel>/webhook`, subscribe to **"Agent session
-     events"** (and only that — Issue events are not used in v0.3).
+     events"** (and only that — Issue events are not used).
 2. **Run the OAuth flow** using the built-in CLI:
    ```
    admiral-oauth login --config ~/.config/admiral/config.yaml
@@ -242,8 +242,7 @@ itself. Do this once per workspace:
   route AgentSessionEvent to it.
 - A `lin_api_*` Personal API key is workspace-scoped but acts as **you**,
   not as a separate Agent. Mentions/assignments aren't routed via
-  AgentSessionEvent for personal API keys. v0.3 is built around the
-  Agent SDK, so a personal key won't drive it.
+  AgentSessionEvent for personal API keys.
 
 ### Token expiry
 
@@ -251,33 +250,64 @@ OAuth access tokens expire. When an API call receives a 401, admiral
 automatically refreshes the token using the stored `refresh_token` and
 retries the request once. If the refresh fails (e.g. the refresh token
 is also expired or revoked), admiral fails fast with an error — no
-infinite retry loop.
+infinite retry loop. If `bot_token` and `allowed_tg_user_ids` are
+configured, admiral also sends a Telegram alert so you know to re-run
+`admiral-oauth login`.
+
+### Routing (project_id, multi-repo)
+
+Issues are routed by their Linear **project UUID** — not team ID. Each
+project maps to exactly one repo in `autopilot.repos`:
+
+```yaml
+autopilot:
+  repos:
+    - project_id: "00000000-0000-0000-0000-000000000000"  # Linear project UUID
+      project_name: "Admiral"
+      repo_dir: "/path/to/your-repo"
+      base_branch: "main"
+```
+
+Finding a project UUID: Linear's web URL only exposes a slug. Use the
+GraphQL API (or the Linear MCP `list_projects` tool):
+```
+query { projects { nodes { id name } } }
+```
+
+An issue without a project assigned is **rejected** at pre-flight. If
+one product spans multiple repos, create one Linear project per repo.
 
 ### Run
 
-```
-# minimal config — see config.example.yaml for the full annotated form
-cat > ~/.config/admiral/config.yaml <<'YAML'
+```yaml
+# config.yaml — minimal autopilot section
 linear:
   api_token: "lin_oauth_..."
   webhook_secret: "lin_wh_..."
 autopilot:
-  listen_addr: ":8787"
+  listen_addr: ":8787"        # webhook receiver (Linear → this port)
+  admin_listen_addr: "127.0.0.1:8788"  # admin API/UI (localhost only by default)
+  admin_token: "change-me"    # static token for admin auth (Bearer or cookie)
   repo_dir: "/path/to/your/repo"
-
-# Optional: add .worktrees-archive/ to your .gitignore to keep failed
-# autopilot worktrees out of git status:
-#   echo ".worktrees-archive/" >> /path/to/your/repo/.gitignore
+  repos:
+    - project_id: "..."
+      project_name: "MyProject"
+      repo_dir: "/path/to/my-repo"
+      base_branch: "main"
+  # bot_token and allowed_tg_user_ids enable Telegram alerts when OAuth breaks:
+  # bot_token: "123456:ABC-..."
+  # allowed_tg_user_ids: [111222333]
 storage:
   sqlite_path: "~/.local/share/admiral/autopilot.db"
 logging:
   level: "info"
-YAML
+```
 
+```
 # expose port 8787 publicly so Linear can reach the webhook
 cloudflared tunnel --url http://localhost:8787   # or ngrok http 8787
 
-# (update the Linear app's webhook URL to match the tunnel)
+# update the Linear app's webhook URL to match the tunnel
 
 # run the daemon
 go run ./cmd/admiral-autopilot --config ~/.config/admiral/config.yaml
@@ -291,16 +321,112 @@ The agent thread should show: 💭 thought → ⚡ action(s) → ✅ response wi
 PR URL. The PR opens on `repo_dir`'s GitHub remote (admiral expects
 `gh auth login` to have been run for the right account).
 
-### What's not in v0.3
+### Admin API (read + write)
 
-- Follow-up messages in the agent thread (`AgentSessionEvent.prompted`)
-  — admiral posts a stub "v0.3 doesn't handle follow-ups yet" reply
+The admin server binds to `autopilot.admin_listen_addr` (default
+`127.0.0.1:8788`) and is authenticated with the static token in
+`autopilot.admin_token`. Pass the token as a Bearer header:
+
+```
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8788/admin/health
+```
+
+Or visit `/admin/ui/login` in a browser and log in — a cookie is set.
+
+#### Read-only endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/admin/health` | `{"ok": bool, "uptime_s": int, "db_ok": bool, "linear_token_valid": bool}` |
+| GET | `/admin/load` | `{"workers": int, "pending_events": int, "processing_events": int, "in_flight_jobs": int}` |
+| GET | `/admin/repos` | `[{project_id, project_name, repo_dir, base_branch, enabled}]` |
+| GET | `/admin/jobs` | `?status=&team_id=&since=&limit=` — list jobs |
+| GET | `/admin/jobs/<session_id>` | single job detail |
+| GET | `/admin/jobs/<session_id>/stream` | `claude -p` stream-json log file |
+
+#### Write endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/admin/repos` | add a repo `{"team_id","team_name","repo_dir","base_branch?"}` |
+| PATCH | `/admin/repos/<project_id>` | update `{"repo_dir?","base_branch?","enabled?"}` |
+| DELETE | `/admin/repos/<project_id>` | remove a repo |
+| POST | `/admin/repos/<project_id>/check_gh` | verify `gh auth status` for the repo's remote |
+| POST | `/admin/repos/<project_id>/test_clone` | verify git fetch works against the remote |
+
+#### Admin web UI
+
+The admin UI is an htmx console at `/admin/ui/`:
+
+| URL | Purpose |
+|-----|---------|
+| `/admin/ui/` | Dashboard: load card + recent jobs |
+| `/admin/ui/login` | Login form |
+| `/admin/ui/repos` | Repo management |
+| `/admin/ui/jobs/` | Jobs list with filters |
+| `/admin/ui/jobs/<session_id>` | Single job detail + stream log |
+
+### Operations
+
+#### OAuth failure (circuit breaker + Telegram alert)
+
+When the Linear API starts returning 401s and token refresh also fails,
+the worker short-circuits: it stops dispatching new issues and logs a
+permanent-failure event. If `bot_token` and `allowed_tg_user_ids` are
+set, admiral sends one Telegram message per outage to the first user in
+`allowed_tg_user_ids`:
+
+```
+⚠️ admiral OAuth has stopped working: <reason>
+
+Run `admiral-oauth` to re-authorize. N webhook event(s) queued waiting.
+```
+
+After re-running `admiral-oauth login`, admiral automatically detects the
+new token on the next health check and resumes.
+
+#### Pre-flight short-circuits
+
+Before running `claude -p`, admiral checks the Linear issue state:
+
+- **Already done** — if the issue was closed/resolved before pre-flight,
+  the job is marked `done` immediately with no worktree created.
+- **Branch already merged** — if a prior run opened a PR that was already
+  merged, the worktree is archived (not deleted) and the job is marked
+  `done`.
+- **Prior follow-up** — if a prior session ended with a `done` state and
+  a new `AgentSessionEvent.prompted` (follow-up) arrives, admiral
+  dispatches a `resume` reply on the existing job rather than starting
+  fresh.
+
+Jobs in these states appear in the admin UI (`/admin/ui/jobs/`) with their
+state badge so you can distinguish a successful run from a short-circuit.
+
+#### Worktree layout
+
+```
+<repo_dir>/
+  .worktrees/               # worktree_root (default)
+    <issue-id>-<session>/   # one worktree per job
+  .worktrees-archive/       # archived (merged/failed) worktrees land here
+```
+
+Add `.worktrees-archive/` to your `.gitignore` to keep completed worktrees
+out of git status:
+
+```
+echo ".worktrees-archive/" >> /path/to/your/repo/.gitignore
+```
+
+### What's not in v0.5
+
 - Multi-issue parallel execution (single-flight: a second assignment
   during a run gets a "busy" reply and is dropped)
+- PR review comment → admiral feedback loop
+- Crash recovery / orphan job replay (jobs stay in whatever state they
+  were in when the process died)
 - Workflow state changes via `issueUpdate` (the agent thread carries
   visible progress instead — board view stays static)
-- PR review comment → admiral feedback loop
-- Crash recovery / orphan job replay
 
 ## Tests
 
@@ -328,6 +454,6 @@ endpoint), capability auto-detection against the running team-cli
 version.
 
 Linear/GitHub integration moved to its own binary — see
-[admiral-autopilot (v0.3)](#admiral-autopilot-v03-linear-driven) above.
+[admiral-autopilot (v0.5)](#admiral-autopilot-v05-linear-driven) above.
 
 <!-- parallel-test marker: 2026-04-30T03:30 -->
