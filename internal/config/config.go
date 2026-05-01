@@ -86,6 +86,10 @@ type Autopilot struct {
 	// GhBin is the absolute path to the `gh` CLI used for the PR fallback.
 	// Default: "gh" (PATH).
 	GhBin string `yaml:"gh_bin"`
+	// GhUser is the GitHub username of the account running admiral (used to
+	// distinguish admiral-authored PRs from human-authored ones in the
+	// open-PR short-circuit). Default: the login from `gh auth status`.
+	GhUser string `yaml:"gh_user"`
 	// MaxRunSeconds caps a single claude -p invocation. Default: 1800 (30 min).
 	MaxRunSeconds int `yaml:"max_run_seconds"`
 	// JobStreamsDir is the directory where per-job claude stream-json files
