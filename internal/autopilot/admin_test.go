@@ -1011,3 +1011,95 @@ func (s *adminServer) registerRoutesForTest(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/load", s.loadHandler)
 	mux.HandleFunc("/admin/health", s.healthHandler)
 }
+
+// integrationAdminMux builds a mux with all UI + API routes wired up (no auth).
+func integrationAdminMux(as *adminServer) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/admin/ui/", http.StripPrefix("/admin/ui", http.FileServer(http.FS(uiFS))))
+	mux.HandleFunc("/admin/ui", as.uiHandler)
+	mux.HandleFunc("/admin/ui/login", as.uiHandler)
+	mux.HandleFunc("/admin/ui/repos", as.uiHandler)
+	mux.HandleFunc("/admin/ui/jobs", as.uiHandler)
+	mux.HandleFunc("/admin/ui/jobs/", as.uiHandler)
+	mux.HandleFunc("/admin/repos", as.reposDispatchHandler)
+	mux.HandleFunc("/admin/repos/", as.reposDispatchHandler)
+	mux.HandleFunc("/admin/jobs", as.listJobsHandler)
+	mux.HandleFunc("/admin/jobs/", as.getJobHandler)
+	mux.HandleFunc("/admin/load", as.loadHandler)
+	mux.HandleFunc("/admin/health", as.healthHandler)
+	return mux
+}
+
+// TestUI_LoginPage tests that /admin/ui/login returns 200 with login.html content.
+func TestUI_LoginPage(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
+	mux := integrationAdminMux(as)
+
+	for _, path := range []string{"/admin/ui/login"} {
+		req := httptest.NewRequest("GET", path, nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: expected 200, got %d", path, w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "Admiral Admin") {
+			t.Errorf("%s: expected login page content, got %q", path, w.Body.String())
+		}
+	}
+}
+
+// TestUI_LoginCSS tests that /admin/ui/login.css serves login.css.
+func TestUI_LoginCSS(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
+	mux := integrationAdminMux(as)
+
+	req := httptest.NewRequest("GET", "/admin/ui/login.css", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("/admin/ui/login.css: expected 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "box-sizing") {
+		t.Errorf("/admin/ui/login.css: expected CSS content, got %q", w.Body.String())
+	}
+}
+
+// TestUI_Dashboard tests that /admin/ui/ returns 200 with index.html content.
+func TestUI_Dashboard(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "")
+	mux := integrationAdminMux(as)
+
+	req := httptest.NewRequest("GET", "/admin/ui/", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("/admin/ui/: expected 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "Admiral") {
+		t.Errorf("/admin/ui/: expected dashboard content, got %q", w.Body.String())
+	}
+}

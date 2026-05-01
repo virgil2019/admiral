@@ -5,6 +5,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -15,11 +16,18 @@ import (
 	"github.com/georgehuang/admiral/internal/store"
 )
 
-//go:embed static/*.html
-var templateFS embed.FS
-
-//go:embed static/htmx.min.js static/style.css static/login.html static/login.css
+//go:embed static
 var staticFS embed.FS
+
+// uiFS is the fs.FS rooted at "static" (via fs.Sub), used for ReadFile.
+var uiFS fs.FS = must(fs.Sub(staticFS, "static"))
+
+func must(fsys fs.FS, err error) fs.FS {
+	if err != nil {
+		panic("static FS setup failed: " + err.Error())
+	}
+	return fsys
+}
 
 // adminServer serves the admin HTTP API (read + write).
 type adminServer struct {
@@ -548,6 +556,8 @@ func (s *adminServer) uiHandler(w http.ResponseWriter, r *http.Request) {
 	switch path {
 	case "/admin/ui", "/admin/ui/":
 		name = "index.html"
+	case "/admin/ui/login":
+		name = "login.html"
 	case "/admin/ui/repos":
 		name = "repos.html"
 	case "/admin/ui/jobs", "/admin/ui/jobs/":
@@ -560,7 +570,7 @@ func (s *adminServer) uiHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	data, err := templateFS.ReadFile(name)
+	data, err := fs.ReadFile(uiFS.(fs.FS), name)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -746,10 +756,10 @@ func newAdminMux(as *adminServer, adminToken string) *http.ServeMux {
 func (s *adminServer) serveMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	// UI static files
-	uiFS := http.FileServer(http.FS(staticFS))
-	mux.Handle("/admin/ui/", http.StripPrefix("/admin/ui", uiFS))
+	mux.Handle("/admin/ui/", http.StripPrefix("/admin/ui", http.FileServer(http.FS(uiFS))))
 	// UI page routes
 	mux.HandleFunc("/admin/ui", s.uiHandler)
+	mux.HandleFunc("/admin/ui/login", s.uiHandler)
 	mux.HandleFunc("/admin/ui/repos", s.uiHandler)
 	mux.HandleFunc("/admin/ui/jobs", s.uiHandler)
 	mux.HandleFunc("/admin/ui/jobs/", s.uiHandler)
