@@ -550,6 +550,38 @@ func isGitRepo(dir string) bool {
 
 // --- UI handlers ---
 
+// loginPostHandler accepts a form-submitted admin token, verifies it
+// against the configured token, and sets the HttpOnly admiral_admin
+// cookie via Set-Cookie before redirecting to the dashboard. This
+// replaces the previous client-side cookie write in login.html, which
+// the browser silently rejected when HttpOnly was set from JS (Safari)
+// and which could not actually be HttpOnly-guarded against XSS anyway.
+//
+// On rejection the handler redirects back to /admin/ui/login?error=invalid
+// so the page can render an inline error message. Constant-time
+// comparison is intentionally not used: the admin token is local-only
+// and the timing channel here is a localhost form POST.
+func (s *adminServer) loginPostHandler(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	token := r.Form.Get("token")
+	if token == "" || token != s.adminToken {
+		http.Redirect(w, r, "/admin/ui/login?error=invalid", http.StatusFound)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "admiral_admin",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   24 * 60 * 60,
+	})
+	http.Redirect(w, r, "/admin/ui/", http.StatusFound)
+}
+
 func (s *adminServer) uiHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	var name string
@@ -759,7 +791,13 @@ func (s *adminServer) serveMux() *http.ServeMux {
 	mux.Handle("/admin/ui/", http.StripPrefix("/admin/ui", http.FileServer(http.FS(uiFS))))
 	// UI page routes
 	mux.HandleFunc("/admin/ui", s.uiHandler)
-	mux.HandleFunc("/admin/ui/login", s.uiHandler)
+	mux.HandleFunc("/admin/ui/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			s.loginPostHandler(w, r)
+			return
+		}
+		s.uiHandler(w, r)
+	})
 	mux.HandleFunc("/admin/ui/repos", s.uiHandler)
 	mux.HandleFunc("/admin/ui/jobs", s.uiHandler)
 	mux.HandleFunc("/admin/ui/jobs/", s.uiHandler)

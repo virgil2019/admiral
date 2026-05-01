@@ -1017,7 +1017,13 @@ func integrationAdminMux(as *adminServer) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/admin/ui/", http.StripPrefix("/admin/ui", http.FileServer(http.FS(uiFS))))
 	mux.HandleFunc("/admin/ui", as.uiHandler)
-	mux.HandleFunc("/admin/ui/login", as.uiHandler)
+	mux.HandleFunc("/admin/ui/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			as.loginPostHandler(w, r)
+			return
+		}
+		as.uiHandler(w, r)
+	})
 	mux.HandleFunc("/admin/ui/repos", as.uiHandler)
 	mux.HandleFunc("/admin/ui/jobs", as.uiHandler)
 	mux.HandleFunc("/admin/ui/jobs/", as.uiHandler)
@@ -1101,5 +1107,108 @@ func TestUI_Dashboard(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "Admiral") {
 		t.Errorf("/admin/ui/: expected dashboard content, got %q", w.Body.String())
+	}
+}
+
+// TestUI_LoginPost_ValidToken verifies that POST /admin/ui/login with the
+// correct token sets a server-side HttpOnly admiral_admin cookie and
+// redirects to the dashboard. The previous client-side cookie write was
+// silently rejected by some browsers when HttpOnly was set from JS.
+func TestUI_LoginPost_ValidToken(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	const token = "test-secret-123"
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, token)
+	mux := integrationAdminMux(as)
+
+	req := httptest.NewRequest("POST", "/admin/ui/login", strings.NewReader("token="+token))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d: %s", w.Code, w.Body.String())
+	}
+	if loc := w.Header().Get("Location"); loc != "/admin/ui/" {
+		t.Errorf("expected redirect to /admin/ui/, got %s", loc)
+	}
+	setCookie := w.Header().Get("Set-Cookie")
+	if !strings.Contains(setCookie, "admiral_admin="+token) {
+		t.Errorf("expected admiral_admin=<token> in Set-Cookie, got %q", setCookie)
+	}
+	if !strings.Contains(strings.ToLower(setCookie), "httponly") {
+		t.Errorf("expected HttpOnly attribute in Set-Cookie, got %q", setCookie)
+	}
+	if !strings.Contains(setCookie, "SameSite=Lax") {
+		t.Errorf("expected SameSite=Lax in Set-Cookie, got %q", setCookie)
+	}
+	if !strings.Contains(strings.ToLower(setCookie), "path=/") {
+		t.Errorf("expected Path=/ in Set-Cookie, got %q", setCookie)
+	}
+}
+
+// TestUI_LoginPost_InvalidToken verifies a wrong token redirects back to
+// the login page with ?error=invalid and does not set a cookie.
+func TestUI_LoginPost_InvalidToken(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "real-secret")
+	mux := integrationAdminMux(as)
+
+	req := httptest.NewRequest("POST", "/admin/ui/login", strings.NewReader("token=wrong-token"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d: %s", w.Code, w.Body.String())
+	}
+	if loc := w.Header().Get("Location"); loc != "/admin/ui/login?error=invalid" {
+		t.Errorf("expected redirect to /admin/ui/login?error=invalid, got %s", loc)
+	}
+	if setCookie := w.Header().Get("Set-Cookie"); setCookie != "" {
+		t.Errorf("expected no Set-Cookie on failed login, got %q", setCookie)
+	}
+}
+
+// TestUI_LoginPost_EmptyToken verifies an empty submission redirects with
+// the same invalid-token error and does not set a cookie.
+func TestUI_LoginPost_EmptyToken(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "real-secret")
+	mux := integrationAdminMux(as)
+
+	req := httptest.NewRequest("POST", "/admin/ui/login", strings.NewReader("token="))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d: %s", w.Code, w.Body.String())
+	}
+	if loc := w.Header().Get("Location"); loc != "/admin/ui/login?error=invalid" {
+		t.Errorf("expected redirect to /admin/ui/login?error=invalid, got %s", loc)
+	}
+	if setCookie := w.Header().Get("Set-Cookie"); setCookie != "" {
+		t.Errorf("expected no Set-Cookie on empty submission, got %q", setCookie)
 	}
 }
