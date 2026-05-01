@@ -1,13 +1,21 @@
 name: pr-checklist
 
-# Fails the PR check while any unchecked task box (`- [ ]`) remains in the
-# PR description. Re-runs whenever the body is edited.
+# Gates PR merge readiness using two signals:
 #
-# Convention: when an agent opens a PR, every box that the agent itself
-# verified must already be `[x]`. Only items that genuinely require human
-# action (e.g. external services, manual end-to-end runs) stay `[ ]`. The
-# user checks them off in the GitHub UI as they complete each step; the
-# check flips green once nothing is left.
+# 1. No unchecked task boxes remain in the PR body.
+# 2. The `human-verified` label is present (applied by a repo collaborator,
+#    not the PR author — this is enforced by GitHub branch protection if set;
+#    on Free-plan repos the check still produces a visible red ❌).
+#
+# The `human-verified` label replaces the old "all boxes checked" heuristic.
+# It solves the self-ticking bypass: an agent can pre-fill every box but cannot
+# apply the label — only a human collaborator can do that in the GitHub UI.
+#
+# PR body convention (required for the parser below to work):
+#   Every PR MUST contain a "## Test plan" section with two sub-sections:
+#     ### Agent-completed   — boxes the author has already verified
+#     ### Human-required    — boxes a human must verify before merge
+#   See CONTRIBUTING.md § "PR checklist convention" for the full contract.
 #
 # NOTE: GitHub branch protection rules ("require status check before
 # merge") are not available on Free-plan private repos. This workflow
@@ -26,16 +34,40 @@ jobs:
       - name: Verify PR checklist
         env:
           BODY: ${{ github.event.pull_request.body }}
+          # human-verified is set by repo collaborators — not the PR author
+          HAS_HUMAN_VERIFIED_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'human-verified') }}
         run: |
+          # ------------------------------------------------------------------
+          # Signal 1: no unchecked boxes in the PR body
+          # ------------------------------------------------------------------
           if [ -z "$BODY" ]; then
             echo "PR body is empty — nothing to verify."
-            exit 0
+          else
+            if echo "$BODY" | grep -qE '^- \[ \]'; then
+              echo "::error::Unchecked tasks remain in PR description. Tick every '- [ ]' box before merging."
+              echo ""
+              echo "Unchecked tasks:"
+              echo "$BODY" | grep -nE '^- \[ \]' | sed 's/^/  /'
+              # Do not exit early — also report the label check below
+            fi
           fi
-          if echo "$BODY" | grep -qE '^- \[ \]'; then
-            echo "::error::Unchecked tasks remain in PR description. Tick every '- [ ]' box before merging."
+
+          # ------------------------------------------------------------------
+          # Signal 2: human-verified label must be present
+          # ------------------------------------------------------------------
+          if [ "$HAS_HUMAN_VERIFIED_LABEL" != "true" ]; then
+            echo "::error::Missing 'human-verified' label. A repo collaborator must apply this label after performing the Human-required verification steps listed in the PR body. The agent cannot self-apply this label."
             echo ""
-            echo "Unchecked tasks:"
-            echo "$BODY" | grep -nE '^- \[ \]' | sed 's/^/  /'
+            echo "Human-required steps (from PR body):"
+            echo "$BODY" | sed -n '/## Test plan/,/^## /p' | sed -n '/### Human-required/,/### /p' | grep -E '^\- \[' | sed 's/^/  /'
+          fi
+
+          # ------------------------------------------------------------------
+          # Fail if either signal is missing
+          # ------------------------------------------------------------------
+          if [ "$HAS_HUMAN_VERIFIED_LABEL" = "true" ] && { [ -z "$BODY" ] || ! echo "$BODY" | grep -qE '^- \[ \]'; }; then
+            echo ""
+            echo "All checklist items are checked and human-verified label is present."
+          else
             exit 1
           fi
-          echo "All checklist items are checked."
