@@ -10,28 +10,21 @@
 <div class="login-container">
   <h1>Admiral Admin</h1>
   <p>Enter your admin token to continue.</p>
-  <form id="login-form">
+  <form id="login-form" method="POST" action="/admin/ui/login">
     <input type="password" id="token" name="token" placeholder="Admin token" required autocomplete="current-password">
     <button type="submit">Sign In</button>
   </form>
   <p id="error" class="error hidden"></p>
 </div>
 <script>
-document.getElementById('login-form').addEventListener('submit', function(e) {
-  e.preventDefault();
-  var token = document.getElementById('token').value;
-  if (!token) return;
-
-  // Set cookie (HttpOnly, Secure=false for localhost dev compatibility)
-  var expires = new Date();
-  expires.setTime(expires.getTime() + 24 * 60 * 60 * 1000); // 24 hours
-  document.cookie = 'admiral_admin=' + encodeURIComponent(token) +
-    '; path=/; HttpOnly; SameSite=Lax' +
-    '; expires=' + expires.toUTCString();
-
-  // Redirect to dashboard
-  window.location.href = '/admin/ui/';
-});
+(function() {
+  var params = new URLSearchParams(window.location.search);
+  if (params.get('error') === 'invalid') {
+    var err = document.getElementById('error');
+    err.textContent = 'Invalid token.';
+    err.classList.remove('hidden');
+  }
+})();
 </script>
 </body>
 </html>

@@ -550,6 +550,29 @@ func isGitRepo(dir string) bool {
 
 // --- UI handlers ---
 
+// loginPostHandler handles POST /admin/ui/login (form submission).
+func (s *adminServer) loginPostHandler(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Redirect(w, r, "/admin/ui/login?error=invalid", http.StatusFound)
+		return
+	}
+	token := r.Form.Get("token")
+	if token == "" || token != s.adminToken {
+		http.Redirect(w, r, "/admin/ui/login?error=invalid", http.StatusFound)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "admiral_admin",
+		Value:    token,
+		Path:     "/",
+		MaxAge:   86400,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.Redirect(w, r, "/admin/ui/", http.StatusFound)
+}
+
+// uiHandler serves UI pages by path.
 func (s *adminServer) uiHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	var name string
@@ -759,7 +782,7 @@ func (s *adminServer) serveMux() *http.ServeMux {
 	mux.Handle("/admin/ui/", http.StripPrefix("/admin/ui", http.FileServer(http.FS(uiFS))))
 	// UI page routes
 	mux.HandleFunc("/admin/ui", s.uiHandler)
-	mux.HandleFunc("/admin/ui/login", s.uiHandler)
+	mux.HandleFunc("/admin/ui/login", s.loginPostHandler) // POST from login form
 	mux.HandleFunc("/admin/ui/repos", s.uiHandler)
 	mux.HandleFunc("/admin/ui/jobs", s.uiHandler)
 	mux.HandleFunc("/admin/ui/jobs/", s.uiHandler)
