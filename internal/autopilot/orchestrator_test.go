@@ -1726,3 +1726,52 @@ func TestFollowupSuffix(t *testing.T) {
 		}
 	}
 }
+
+// TestClassifyGhCreateError covers the two known benign failure shapes from
+// `gh pr create` plus the fall-through fatal case. Inputs are real-world
+// stderr fragments observed in past admiral runs (issue #38).
+func TestClassifyGhCreateError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want ghCreateErrorKind
+	}{
+		{
+			name: "no commits between (real GEO-14 stderr)",
+			in:   "pull request create failed: GraphQL: No commits between main and linear/geo-14 (createPullRequest)",
+			want: ghCreateNoCommits,
+		},
+		{
+			name: "already exists",
+			in:   "a pull request for branch \"linear/geo-99\" into branch \"main\" already exists:\nhttps://github.com/owner/repo/pull/123",
+			want: ghCreateAlreadyExists,
+		},
+		{
+			name: "case insensitive — uppercase variant",
+			in:   "ERROR: NO COMMITS BETWEEN base AND head",
+			want: ghCreateNoCommits,
+		},
+		{
+			name: "auth error → fatal",
+			in:   "error: GraphQL: Resource not accessible by integration",
+			want: ghCreateFatal,
+		},
+		{
+			name: "rate limit → fatal",
+			in:   "API rate limit exceeded for user",
+			want: ghCreateFatal,
+		},
+		{
+			name: "empty → fatal",
+			in:   "",
+			want: ghCreateFatal,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyGhCreateError(tc.in)
+			if got != tc.want {
+				t.Errorf("classifyGhCreateError(%q) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}

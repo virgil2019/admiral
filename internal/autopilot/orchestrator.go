@@ -580,7 +580,8 @@ func (f *flow) execute() error {
 		fmt.Sprintf("gh pr (%s -> %s)", f.branch, f.baseBranch),
 		""))
 	prURL, err := f.ensurePR(issue)
-	if err != nil {
+	isNoop := errors.Is(err, errPRNoCommits)
+	if err != nil && !isNoop {
 		return fmt.Errorf("ensure PR: %w", err)
 	}
 	f.prURL = prURL
@@ -598,9 +599,16 @@ func (f *flow) execute() error {
 	if f.ev.CreatorID != "" {
 		mention = "@" + f.ev.CreatorID + " "
 	}
-	doneBody := fmt.Sprintf(
-		"%sDone. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
-		mention, prURL, f.worktreePath, f.branch)
+	var doneBody string
+	if isNoop {
+		doneBody = fmt.Sprintf(
+			"%sNo diff produced — task understood as noop, no PR opened.\n\nWorktree: `%s`\nBranch: `%s`",
+			mention, f.worktreePath, f.branch)
+	} else {
+		doneBody = fmt.Sprintf(
+			"%sDone. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
+			mention, prURL, f.worktreePath, f.branch)
+	}
 	if err := f.postActivityWithRetry(linear.Response(doneBody)); err != nil {
 		f.o.logger.Error("final_activity_push_failed",
 			"session", f.ev.SessionID, "err", err)
@@ -614,7 +622,9 @@ func (f *flow) execute() error {
 	}
 
 	// Update Linear issue status to "completed" asynchronously (non-blocking).
-	if f.o.cfg.UpdateIssueStatus != nil && *f.o.cfg.UpdateIssueStatus && f.teamID != "" {
+	// Skip on noop: claude produced no diff, so admiral does not assert the
+	// issue is actually done — leave that judgment to the user.
+	if !isNoop && f.o.cfg.UpdateIssueStatus != nil && *f.o.cfg.UpdateIssueStatus && f.teamID != "" {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -1341,9 +1351,49 @@ func (f *flow) drainStreamJSON(r io.Reader) {
 	}
 }
 
+// errPRNoCommits is returned by ensurePR when `gh pr create` fails with
+// "No commits between <base> and <head>" — i.e. claude finished cleanly
+// but produced no diff. The caller treats this as a soft success: mark
+// the job DONE without a PR URL and post a noop reply on the thread.
+var errPRNoCommits = errors.New("no commits between base and head — task understood as noop")
+
+// ghCreateErrorKind classifies the (non-zero exit) result of `gh pr create`
+// using stdout/stderr substring matching. gh has no typed error codes, so
+// this is best-effort; unknown shapes fall through as fatal.
+type ghCreateErrorKind int
+
+const (
+	ghCreateFatal ghCreateErrorKind = iota
+	ghCreateNoCommits
+	ghCreateAlreadyExists
+)
+
+// classifyGhCreateError inspects the combined stdout+stderr of a failed
+// `gh pr create` invocation and tags the two known benign cases. Anything
+// else is treated as a real failure to be surfaced to the caller.
+//
+// TODO: replace with structured-error parsing once gh CLI exposes typed
+// error codes (https://github.com/cli/cli — none today).
+func classifyGhCreateError(combined string) ghCreateErrorKind {
+	s := strings.ToLower(combined)
+	if strings.Contains(s, "no commits between") {
+		return ghCreateNoCommits
+	}
+	if strings.Contains(s, "already exists") {
+		return ghCreateAlreadyExists
+	}
+	return ghCreateFatal
+}
+
 // ensurePR returns the URL of an open PR with HEAD = the working branch.
 // If claude already opened one, we use that. Otherwise fall back to
-// `gh pr create`.
+// `gh pr create`. Two benign failure modes from `gh pr create` are
+// translated into soft outcomes:
+//   - "No commits between" → returns ("", errPRNoCommits) sentinel; caller
+//     marks the job DONE with no PR URL.
+//   - "already exists" → looks up the existing PR with `gh pr list` and
+//     returns its URL. If the lookup fails, the original create error is
+//     surfaced as fatal.
 func (f *flow) ensurePR(issue *linear.Issue) (string, error) {
 	url, err := f.lookupPR()
 	if err != nil {
@@ -1365,7 +1415,17 @@ func (f *flow) ensurePR(issue *linear.Issue) (string, error) {
 		"--body", body,
 	)
 	if err != nil {
-		return "", fmt.Errorf("gh pr create: %w (output: %s)", err, truncate(out, 400))
+		switch classifyGhCreateError(out) {
+		case ghCreateNoCommits:
+			return "", errPRNoCommits
+		case ghCreateAlreadyExists:
+			if url2, lerr := f.lookupPR(); lerr == nil && url2 != "" {
+				return url2, nil
+			}
+			return "", fmt.Errorf("gh pr create reported already-exists but lookupPR could not recover URL: %w (output: %s)", err, truncate(out, 400))
+		default:
+			return "", fmt.Errorf("gh pr create: %w (output: %s)", err, truncate(out, 400))
+		}
 	}
 	url = strings.TrimSpace(extractFirstURL(out))
 	if url == "" {
