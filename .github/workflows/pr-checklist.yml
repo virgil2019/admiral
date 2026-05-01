@@ -1,0 +1,41 @@
+name: pr-checklist
+
+# Fails the PR check while any unchecked task box (`- [ ]`) remains in the
+# PR description. Re-runs whenever the body is edited.
+#
+# Convention: when an agent opens a PR, every box that the agent itself
+# verified must already be `[x]`. Only items that genuinely require human
+# action (e.g. external services, manual end-to-end runs) stay `[ ]`. The
+# user checks them off in the GitHub UI as they complete each step; the
+# check flips green once nothing is left.
+#
+# NOTE: GitHub branch protection rules ("require status check before
+# merge") are not available on Free-plan private repos. This workflow
+# still produces a red ❌ on the PR's Checks tab — a strong visual signal
+# even without hard enforcement. Upgrade to Pro to actually block merge.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, ready_for_review]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Verify PR checklist
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [ -z "$BODY" ]; then
+            echo "PR body is empty — nothing to verify."
+            exit 0
+          fi
+          if echo "$BODY" | grep -qE '^- \[ \]'; then
+            echo "::error::Unchecked tasks remain in PR description. Tick every '- [ ]' box before merging."
+            echo ""
+            echo "Unchecked tasks:"
+            echo "$BODY" | grep -nE '^- \[ \]' | sed 's/^/  /'
+            exit 1
+          fi
+          echo "All checklist items are checked."
