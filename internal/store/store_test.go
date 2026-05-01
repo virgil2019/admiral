@@ -267,8 +267,8 @@ func TestApplyMigrations_FreshDB(t *testing.T) {
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("query schema_migrations: %v", err)
 	}
-	if count != 8 {
-		t.Fatalf("expected 8 migrations recorded, got %d", count)
+	if count != 9 {
+		t.Fatalf("expected 9 migrations recorded, got %d", count)
 	}
 }
 
@@ -294,8 +294,8 @@ func TestApplyMigrations_Idempotent(t *testing.T) {
 	if err := s2.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("query schema_migrations: %v", err)
 	}
-	if count != 8 {
-		t.Fatalf("expected 8 migrations (no duplicates), got %d", count)
+	if count != 9 {
+		t.Fatalf("expected 9 migrations (no duplicates), got %d", count)
 	}
 }
 
@@ -340,8 +340,8 @@ func TestBackfillMigrations_LegacyDB(t *testing.T) {
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("query schema_migrations: %v", err)
 	}
-	if count != 8 {
-		t.Fatalf("expected 8 migrations (6 backfilled + v7,v8 applied at boot), got %d", count)
+	if count != 9 {
+		t.Fatalf("expected 9 migrations (6 backfilled + v7,v8,v9 applied at boot), got %d", count)
 	}
 }
 
@@ -376,7 +376,73 @@ func TestBackfillMigrations_PartialDB(t *testing.T) {
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("query schema_migrations: %v", err)
 	}
-	if count != 8 {
-		t.Fatalf("expected 8 migrations (3 backfilled + 5 applied), got %d", count)
+	if count != 9 {
+		t.Fatalf("expected 9 migrations (3 backfilled + 6 applied), got %d", count)
+	}
+}
+
+func TestAuthError_HealthyByDefault(t *testing.T) {
+	s := newTestStore(t)
+	st, err := s.GetAuthError()
+	if err != nil {
+		t.Fatalf("GetAuthError: %v", err)
+	}
+	if st.Reason != "" || st.ErrAt != "" || st.NotifiedAt != "" {
+		t.Fatalf("expected zero AuthErrorState, got %+v", st)
+	}
+}
+
+func TestAuthError_MarkAndClearRoundtrip(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.MarkAuthBroken("invalid_grant: refresh token revoked"); err != nil {
+		t.Fatalf("MarkAuthBroken: %v", err)
+	}
+	st, err := s.GetAuthError()
+	if err != nil {
+		t.Fatalf("GetAuthError: %v", err)
+	}
+	if st.Reason != "invalid_grant: refresh token revoked" {
+		t.Fatalf("Reason: got %q", st.Reason)
+	}
+	if st.ErrAt == "" {
+		t.Fatal("ErrAt: expected RFC3339, got empty")
+	}
+
+	// MarkAuthBroken is idempotent on the timestamp — calling again should
+	// keep the original ErrAt so the caller can tell how long we've been
+	// broken.
+	firstErrAt := st.ErrAt
+	if err := s.MarkAuthBroken("invalid_grant: still broken"); err != nil {
+		t.Fatalf("MarkAuthBroken (second): %v", err)
+	}
+	st, _ = s.GetAuthError()
+	if st.ErrAt != firstErrAt {
+		t.Fatalf("ErrAt should be sticky: was %q, became %q", firstErrAt, st.ErrAt)
+	}
+	if st.Reason != "invalid_grant: still broken" {
+		t.Fatalf("Reason should update on re-mark: got %q", st.Reason)
+	}
+
+	if err := s.ClearAuthError(); err != nil {
+		t.Fatalf("ClearAuthError: %v", err)
+	}
+	st, _ = s.GetAuthError()
+	if st.Reason != "" || st.ErrAt != "" || st.NotifiedAt != "" {
+		t.Fatalf("after Clear, expected zero state, got %+v", st)
+	}
+}
+
+func TestAuthError_MarkNotified(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.MarkAuthBroken("invalid_grant"); err != nil {
+		t.Fatalf("MarkAuthBroken: %v", err)
+	}
+	if err := s.MarkAuthNotified("2026-04-30T12:00:00Z"); err != nil {
+		t.Fatalf("MarkAuthNotified: %v", err)
+	}
+	st, _ := s.GetAuthError()
+	if st.NotifiedAt != "2026-04-30T12:00:00Z" {
+		t.Fatalf("NotifiedAt: got %q", st.NotifiedAt)
 	}
 }

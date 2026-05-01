@@ -19,17 +19,26 @@ type Worker struct {
 	signal      <-chan struct{}
 	pollEvery   time.Duration
 	maxAttempts int
+	// AuthAlerter, when non-nil, is invoked once per broken-auth window to
+	// surface the failure to the user (e.g. via Telegram). If it returns
+	// nil, the worker stamps notified_at to dedupe; otherwise the alert
+	// is retried on the next tick.
+	AuthAlerter func(reason string) error
+	// AlertReNotifyAfter is the minimum gap between repeat alerts when the
+	// breaker stays open. Zero disables re-alerting (one alert per outage).
+	AlertReNotifyAfter time.Duration
 }
 
 // NewWorker creates a Worker that consumes from the events_inbox queue.
 func NewWorker(db *store.Store, orch *Orchestrator, logger *slog.Logger, signal <-chan struct{}) *Worker {
 	return &Worker{
-		db:          db,
-		orch:        orch,
-		logger:      logger,
-		signal:      signal,
-		pollEvery:   60 * time.Second,
-		maxAttempts: 5,
+		db:                 db,
+		orch:               orch,
+		logger:             logger,
+		signal:             signal,
+		pollEvery:          60 * time.Second,
+		maxAttempts:        5,
+		AlertReNotifyAfter: 6 * time.Hour,
 	}
 }
 
@@ -56,8 +65,14 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
-// drain repeatedly claims and dispatches until the queue is empty.
+// drain repeatedly claims and dispatches until the queue is empty. If the
+// OAuth circuit breaker is open it short-circuits without touching the
+// queue — events stay pending and naturally drain once the user re-OAuths
+// and ClearAuthError fires.
 func (w *Worker) drain() {
+	if w.authBroken() {
+		return
+	}
 	for {
 		row, err := w.db.ClaimNextPendingEvent()
 		if err != nil {
@@ -69,6 +84,52 @@ func (w *Worker) drain() {
 			break
 		}
 		w.dispatch(context.Background(), row)
+	}
+}
+
+// authBroken reports whether the Linear OAuth circuit breaker is open. When
+// it is, the worker skips the queue entirely and (best-effort) fires a
+// user-facing alert deduped via linear_oauth.notified_at.
+func (w *Worker) authBroken() bool {
+	st, err := w.db.GetAuthError()
+	if err != nil {
+		w.logger.Warn("worker_auth_state_check_failed", "err", err)
+		return false // fail-open: rather process events than block on a check
+	}
+	if st.Reason == "" {
+		return false
+	}
+	w.logger.Warn("worker_auth_broken_skip_drain",
+		"reason", st.Reason, "since", st.ErrAt)
+	w.maybeAlert(st)
+	return true
+}
+
+// maybeAlert sends the user-facing alert if (a) one hasn't been sent yet,
+// or (b) the previous alert is older than AlertReNotifyAfter. Either path
+// stamps notified_at on success so we don't spam.
+func (w *Worker) maybeAlert(st store.AuthErrorState) {
+	if w.AuthAlerter == nil {
+		return
+	}
+	now := time.Now().UTC()
+	if st.NotifiedAt != "" {
+		if w.AlertReNotifyAfter <= 0 {
+			return
+		}
+		last, err := time.Parse(time.RFC3339, st.NotifiedAt)
+		if err == nil && now.Sub(last) < w.AlertReNotifyAfter {
+			return
+		}
+	}
+	if err := w.AuthAlerter(st.Reason); err != nil {
+		w.logger.Warn("worker_auth_alert_send_failed", "err", err)
+		return
+	}
+	if err := w.db.MarkAuthNotified(now.Format(time.RFC3339)); err != nil {
+		w.logger.Warn("worker_auth_notified_persist_failed", "err", err)
+	} else {
+		w.logger.Info("worker_auth_alert_sent", "reason", st.Reason)
 	}
 }
 

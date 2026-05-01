@@ -34,7 +34,8 @@ func setupTestDB(t *testing.T) *testWorkerEnv {
 		`CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);`,
 		`CREATE TABLE IF NOT EXISTS autopilot_jobs (agent_session_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, issue_identifier TEXT, state TEXT NOT NULL, worktree_path TEXT, branch TEXT, pr_url TEXT, error TEXT, started_at TEXT NOT NULL, finished_at TEXT, stream_log_path TEXT);`,
 		`CREATE INDEX IF NOT EXISTS autopilot_jobs_issue_id_idx ON autopilot_jobs(issue_id);`,
-		`CREATE TABLE IF NOT EXISTS linear_oauth (id INTEGER PRIMARY KEY CHECK (id = 1), access_token TEXT NOT NULL, refresh_token TEXT, expires_at TEXT, updated_at TEXT NOT NULL);`,
+		`CREATE TABLE IF NOT EXISTS linear_oauth (id INTEGER PRIMARY KEY CHECK (id = 1), access_token TEXT NOT NULL, refresh_token TEXT, expires_at TEXT, updated_at TEXT NOT NULL, auth_error TEXT, auth_error_at TEXT, notified_at TEXT);`,
+		`INSERT OR IGNORE INTO linear_oauth (id, access_token, refresh_token, expires_at, updated_at) VALUES (1, '', '', '', '');`,
 		`CREATE TABLE IF NOT EXISTS events_inbox (webhook_id TEXT PRIMARY KEY, action TEXT NOT NULL, session_id TEXT NOT NULL, issue_id TEXT, payload_json TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, last_error TEXT);`,
 		`CREATE INDEX IF NOT EXISTS events_inbox_status_received ON events_inbox(status, received_at);`,
 	}
@@ -321,6 +322,100 @@ func TestCountPendingEvents(t *testing.T) {
 	}
 	if count != 5 {
 		t.Errorf("count after 5 enqueues: got %d, want 5", count)
+	}
+}
+
+// TestWorker_AuthBroken_SkipsDrain confirms that an open OAuth circuit
+// breaker stops drain() from claiming events. Pending rows must stay
+// pending so they replay naturally once the user re-OAuths.
+func TestWorker_AuthBroken_SkipsDrain(t *testing.T) {
+	env := setupTestDB(t)
+
+	wh := "wh-broken"
+	enqueueEvent(t, env.db.DB, wh, "created", "sess-broken", "issue-broken",
+		linear.AgentEvent{Action: linear.ActionCreated, SessionID: "sess-broken", IssueID: "issue-broken", WebhookID: wh})
+
+	if err := env.db.MarkAuthBroken("invalid_grant"); err != nil {
+		t.Fatalf("MarkAuthBroken: %v", err)
+	}
+
+	w := NewWorker(env.db, nil, slog.New(slog.NewTextHandler(&discardHandler{t}, nil)), env.sig)
+	w.drain()
+
+	// Event must still be pending — drain bailed before claiming.
+	var status string
+	if err := env.db.DB.QueryRow(`SELECT status FROM events_inbox WHERE webhook_id=?`, wh).Scan(&status); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if status != "pending" {
+		t.Errorf("expected status=pending while breaker open, got %q", status)
+	}
+}
+
+// TestWorker_AuthBroken_AlertOnceAndDedup confirms (a) the alerter fires
+// once when the breaker opens, (b) notified_at gets stamped, (c) the next
+// drain tick sees the stamp and skips the alerter (no spam).
+func TestWorker_AuthBroken_AlertOnceAndDedup(t *testing.T) {
+	env := setupTestDB(t)
+
+	if err := env.db.MarkAuthBroken("invalid_grant"); err != nil {
+		t.Fatalf("MarkAuthBroken: %v", err)
+	}
+
+	var sent []string
+	w := NewWorker(env.db, nil, slog.New(slog.NewTextHandler(&discardHandler{t}, nil)), env.sig)
+	w.AlertReNotifyAfter = 6 * time.Hour
+	w.AuthAlerter = func(reason string) error {
+		sent = append(sent, reason)
+		return nil
+	}
+
+	w.drain() // first tick — should alert
+	w.drain() // second tick — should be deduped
+	w.drain() // third tick — still deduped
+
+	if len(sent) != 1 {
+		t.Fatalf("expected exactly 1 alert, got %d: %v", len(sent), sent)
+	}
+	st, _ := env.db.GetAuthError()
+	if st.NotifiedAt == "" {
+		t.Error("notified_at should be stamped after successful alert")
+	}
+}
+
+// TestWorker_AuthRecovery_ResumesDrain confirms that once ClearAuthError
+// fires (e.g. via admiral-oauth), the worker drains the backlog.
+func TestWorker_AuthRecovery_ResumesDrain(t *testing.T) {
+	env := setupTestDB(t)
+
+	wh := "wh-recover"
+	enqueueEvent(t, env.db.DB, wh, "created", "sess-recover", "issue-recover",
+		linear.AgentEvent{Action: linear.ActionCreated, SessionID: "sess-recover", IssueID: "issue-recover", WebhookID: wh})
+
+	if err := env.db.MarkAuthBroken("invalid_grant"); err != nil {
+		t.Fatalf("MarkAuthBroken: %v", err)
+	}
+
+	w := NewWorker(env.db, nil, slog.New(slog.NewTextHandler(&discardHandler{t}, nil)), env.sig)
+	w.drain()
+	// Still pending — breaker is open.
+
+	if err := env.db.ClearAuthError(); err != nil {
+		t.Fatalf("ClearAuthError: %v", err)
+	}
+
+	// drain() now reaches ClaimNextPendingEvent. Since orch is nil, dispatch
+	// will panic on `w.orch.HandleAgentEvent`; the worker recovers it via
+	// the deferred recover() and marks the event failed/retry. Either way
+	// the event status moves off "pending", which is what we assert.
+	w.drain()
+
+	var status string
+	if err := env.db.DB.QueryRow(`SELECT status FROM events_inbox WHERE webhook_id=?`, wh).Scan(&status); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if status == "pending" {
+		t.Error("expected event to be claimed after recovery, but it is still pending")
 	}
 }
 

@@ -146,6 +146,15 @@ CREATE TABLE repos (
 );
 `
 
+// migration0009 adds OAuth circuit-breaker state to linear_oauth so the
+// daemon can detect a permanently-revoked refresh token, stop retrying
+// against Linear, and dedupe the user-facing alert.
+const migration0009 = `
+ALTER TABLE linear_oauth ADD COLUMN auth_error      TEXT;
+ALTER TABLE linear_oauth ADD COLUMN auth_error_at   TEXT;
+ALTER TABLE linear_oauth ADD COLUMN notified_at     TEXT;
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -160,6 +169,7 @@ var migrations = []migration{
 	{6, migration0006},
 	{7, migration0007},
 	{8, migration0008},
+	{9, migration0009},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -607,6 +617,68 @@ func (s *Store) SaveLinearOAuthToken(accessToken, refreshToken, expiresAt string
 		    updated_at=?
 		WHERE id=1
 	`, accessToken, refreshToken, refreshToken, expiresAt, time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+// AuthErrorState describes the OAuth circuit-breaker state. Reason is empty
+// when auth is healthy; non-empty means refresh hit a permanent failure
+// (invalid_grant / invalid_client) and the user must run admiral-oauth.
+// ErrAt is when the failure was first detected; NotifiedAt is when we last
+// alerted the user (used to dedupe the TG message).
+type AuthErrorState struct {
+	Reason     string
+	ErrAt      string // RFC3339 UTC, empty if healthy
+	NotifiedAt string // RFC3339 UTC, empty if not yet notified
+}
+
+// GetAuthError returns the current auth-error state. Healthy state is
+// (AuthErrorState{}, nil) — caller checks `Reason != ""` to decide.
+func (s *Store) GetAuthError() (AuthErrorState, error) {
+	var st AuthErrorState
+	err := s.DB.QueryRow(`
+		SELECT COALESCE(auth_error,''),
+		       COALESCE(auth_error_at,''),
+		       COALESCE(notified_at,'')
+		FROM linear_oauth WHERE id=1
+	`).Scan(&st.Reason, &st.ErrAt, &st.NotifiedAt)
+	if err == sql.ErrNoRows {
+		return AuthErrorState{}, nil
+	}
+	return st, err
+}
+
+// MarkAuthBroken records a permanent OAuth failure. The first-seen timestamp
+// (auth_error_at) is preserved across repeated calls so callers can tell how
+// long the daemon has been broken.
+func (s *Store) MarkAuthBroken(reason string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.DB.Exec(`
+		UPDATE linear_oauth
+		SET auth_error=?,
+		    auth_error_at=COALESCE(NULLIF(auth_error_at,''), ?)
+		WHERE id=1
+	`, reason, now)
+	return err
+}
+
+// MarkAuthNotified records that the user-facing alert was sent at `at`.
+// Stamping is idempotent — caller decides whether to overwrite (e.g. when
+// re-alerting after a stale window).
+func (s *Store) MarkAuthNotified(at string) error {
+	_, err := s.DB.Exec(`
+		UPDATE linear_oauth SET notified_at=? WHERE id=1
+	`, at)
+	return err
+}
+
+// ClearAuthError marks auth as healthy again. Called after a successful
+// token refresh or a successful admiral-oauth re-bootstrap.
+func (s *Store) ClearAuthError() error {
+	_, err := s.DB.Exec(`
+		UPDATE linear_oauth
+		SET auth_error=NULL, auth_error_at=NULL, notified_at=NULL
+		WHERE id=1
+	`)
 	return err
 }
 

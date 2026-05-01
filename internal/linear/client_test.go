@@ -89,10 +89,13 @@ func TestIssueUpdate(t *testing.T) {
 
 // mockStore is a test double for store.Store.
 type mockStore struct {
-	mu         sync.Mutex
-	tokens     []*store.LinearOAuthToken
-	saveCalled int
-	saveToken  *store.LinearOAuthToken
+	mu             sync.Mutex
+	tokens         []*store.LinearOAuthToken
+	saveCalled     int
+	saveToken      *store.LinearOAuthToken
+	authErr        store.AuthErrorState
+	markBrokenArgs []string
+	clearCalled    int
 }
 
 func (m *mockStore) GetLinearOAuthToken() (*store.LinearOAuthToken, error) {
@@ -127,6 +130,33 @@ func (m *mockStore) SaveCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.saveCalled
+}
+
+func (m *mockStore) GetAuthError() (store.AuthErrorState, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.authErr, nil
+}
+
+func (m *mockStore) MarkAuthBroken(reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.markBrokenArgs = append(m.markBrokenArgs, reason)
+	if m.authErr.Reason == "" {
+		m.authErr = store.AuthErrorState{
+			Reason: reason,
+			ErrAt:  time.Now().UTC().Format(time.RFC3339),
+		}
+	}
+	return nil
+}
+
+func (m *mockStore) ClearAuthError() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clearCalled++
+	m.authErr = store.AuthErrorState{}
+	return nil
 }
 
 // Test 1: API call → 401 → token refresh succeeds → retry succeeds.
@@ -610,5 +640,91 @@ func TestClient_RetryHTTP_408Retries(t *testing.T) {
 	}
 	if calls.Load() != 2 {
 		t.Errorf("expected 2 calls (408 then success), got %d", calls.Load())
+	}
+}
+
+// Test: invalid_grant from Linear flips the circuit breaker so the worker
+// can short-circuit. The mark must include the error reason so the user
+// knows what to fix.
+func TestRefresh_InvalidGrant_MarksAuthBroken(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"Refresh token revoked"}`))
+	}))
+	defer tokenServer.Close()
+
+	ms := &mockStore{tokens: []*store.LinearOAuthToken{
+		{AccessToken: "stale", RefreshToken: "revoked_rt"},
+	}}
+	tr, _ := NewTokenRefresher("cid", "csec", ms, nil, tokenServer.URL)
+
+	_, err := tr.RefreshAndRetry(context.Background())
+	if err == nil {
+		t.Fatal("expected error from invalid_grant refresh")
+	}
+	if len(ms.markBrokenArgs) != 1 {
+		t.Fatalf("expected MarkAuthBroken to be called once, got %d calls", len(ms.markBrokenArgs))
+	}
+	if !strings.Contains(ms.markBrokenArgs[0], "invalid_grant") {
+		t.Fatalf("MarkAuthBroken reason should mention invalid_grant; got %q", ms.markBrokenArgs[0])
+	}
+	if ms.authErr.Reason == "" {
+		t.Fatal("authErr should be set after invalid_grant")
+	}
+}
+
+// Test: when the breaker is already open, doRefresh returns immediately
+// without making an HTTP call to Linear (no log spam, no quota burn).
+func TestRefresh_CircuitBreakerOpen_SkipsHTTP(t *testing.T) {
+	var calls atomic.Int32
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"access_token":"new"}`))
+	}))
+	defer tokenServer.Close()
+
+	ms := &mockStore{
+		tokens: []*store.LinearOAuthToken{
+			{AccessToken: "stale", RefreshToken: "rt"},
+		},
+		authErr: store.AuthErrorState{Reason: "invalid_grant", ErrAt: "2026-04-30T12:00:00Z"},
+	}
+	tr, _ := NewTokenRefresher("cid", "csec", ms, nil, tokenServer.URL)
+
+	_, err := tr.RefreshAndRetry(context.Background())
+	if err == nil {
+		t.Fatal("expected error when circuit breaker is open")
+	}
+	if calls.Load() != 0 {
+		t.Errorf("expected 0 HTTP calls (breaker open), got %d", calls.Load())
+	}
+}
+
+// Test: a successful refresh clears the breaker, so a transient mis-flag
+// (or a recovery between admiral restarts) self-heals.
+func TestRefresh_Success_ClearsAuthError(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "new_access",
+			"refresh_token": "new_refresh",
+			"expires_in":    86400,
+		})
+	}))
+	defer tokenServer.Close()
+
+	ms := &mockStore{tokens: []*store.LinearOAuthToken{
+		{AccessToken: "stale", RefreshToken: "still_valid"},
+	}}
+	tr, _ := NewTokenRefresher("cid", "csec", ms, nil, tokenServer.URL)
+
+	tok, err := tr.RefreshAndRetry(context.Background())
+	if err != nil {
+		t.Fatalf("RefreshAndRetry: %v", err)
+	}
+	if tok != "new_access" {
+		t.Fatalf("expected new_access, got %q", tok)
+	}
+	if ms.clearCalled == 0 {
+		t.Error("ClearAuthError should be called on successful refresh")
 	}
 }

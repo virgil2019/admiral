@@ -204,6 +204,13 @@ func handleCallback(cfg *config.Config, db *store.Store, expectedState, redirect
 			errCh <- fmt.Errorf("save token: %w", err)
 			return
 		}
+		// Clear the OAuth circuit breaker so admiral-autopilot's worker
+		// resumes draining queued events on its next tick. Best-effort: if
+		// this fails, the breaker stays open until the next successful
+		// token refresh hits the same code path in token.go::doRefresh.
+		if err := db.ClearAuthError(); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: clear auth error state: %v\n", err)
+		}
 
 		// Return success page
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
