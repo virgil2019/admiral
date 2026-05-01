@@ -40,7 +40,14 @@ type AgentEvent struct {
 	// the agent thread.
 	UserMessage string
 	CreatorID   string
-	WebhookID   string
+	// CreatorName is the creator's full display name (e.g. "George Huang").
+	// Set when Linear includes it in the webhook payload; empty otherwise.
+	CreatorName string
+	// CreatorDisplayName is the creator's Linear handle (e.g. "george.huang"),
+	// which is what `@<handle>` mentions in markdown require to actually
+	// notify the user. Falls back to CreatorName, then "" — see flow.creatorMention.
+	CreatorDisplayName string
+	WebhookID          string
 }
 
 // AgentHandler is invoked once per accepted (signature-verified, recognized
@@ -77,7 +84,9 @@ type rawAgentSession struct {
 		Title      string `json:"title"`
 	} `json:"issue"`
 	Creator *struct {
-		ID string `json:"id"`
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		DisplayName string `json:"displayName"`
 	} `json:"creator"`
 }
 
@@ -195,6 +204,8 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 	if session.Creator != nil {
 		ev.CreatorID = session.Creator.ID
+		ev.CreatorName = session.Creator.Name
+		ev.CreatorDisplayName = session.Creator.DisplayName
 	}
 	switch action {
 	case ActionCreated:

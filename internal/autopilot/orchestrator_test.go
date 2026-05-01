@@ -1159,7 +1159,7 @@ func TestMarkDone_MentionPrefix(t *testing.T) {
 	}
 	f := &flow{
 		o:            o,
-		ev:           linear.AgentEvent{SessionID: "sess-1", CreatorID: "user-abc"},
+		ev:           linear.AgentEvent{SessionID: "sess-1", CreatorID: "user-abc", CreatorDisplayName: "user.abc"},
 		worktreePath: "/tmp/wt",
 		branch:       "linear/test",
 		prURL:        "https://github.com/x/y/pull/1",
@@ -1173,17 +1173,13 @@ func TestMarkDone_MentionPrefix(t *testing.T) {
 	})
 
 	// Post the completion activity (same as flow.execute end)
-	mention := ""
-	if f.ev.CreatorID != "" {
-		mention = "@" + f.ev.CreatorID + " "
-	}
 	f.postActivity(linear.Response(fmt.Sprintf(
 		"%sDone. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
-		mention, f.prURL, f.worktreePath, f.branch)))
+		f.creatorMention(), f.prURL, f.worktreePath, f.branch)))
 
 	body := mlc.GetPostedBody()
-	if !strings.HasPrefix(body, "@user-abc ") {
-		t.Errorf("expected body to start with '@user-abc ', got: %s", body)
+	if !strings.HasPrefix(body, "@user.abc ") {
+		t.Errorf("expected body to start with '@user.abc ' (displayName), got: %s", body)
 	}
 	if !strings.Contains(body, "https://github.com/x/y/pull/1") {
 		t.Errorf("expected PR URL in body, got: %s", body)
@@ -1201,21 +1197,57 @@ func TestMarkFailed_MentionPrefix(t *testing.T) {
 	}
 	f := &flow{
 		o:            o,
-		ev:           linear.AgentEvent{SessionID: "sess-2", CreatorID: "user-xyz"},
+		ev:           linear.AgentEvent{SessionID: "sess-2", CreatorID: "user-xyz", CreatorDisplayName: "user.xyz"},
 		worktreePath: "/tmp/wt2",
 		branch:       "linear/fail",
 	}
 
 	// Simulate markFailed body construction
-	mention := ""
-	if f.ev.CreatorID != "" {
-		mention = "@" + f.ev.CreatorID + " "
-	}
-	body := mention + "admiral failed: something went wrong"
+	body := f.creatorMention() + "admiral failed: something went wrong"
 	f.postActivity(linear.ErrorActivity(body))
 
-	if !strings.HasPrefix(mlc.GetPostedBody(), "@user-xyz ") {
-		t.Errorf("expected body to start with '@user-xyz ', got: %s", mlc.GetPostedBody())
+	if !strings.HasPrefix(mlc.GetPostedBody(), "@user.xyz ") {
+		t.Errorf("expected body to start with '@user.xyz ' (displayName), got: %s", mlc.GetPostedBody())
+	}
+}
+
+// TestCreatorMention covers the displayName → name → "" fallback chain
+// for building the "@<handle>" prefix on Linear thread replies. CreatorID
+// (Linear UUID) is intentionally ignored — Linear's mention syntax requires
+// a handle, not a UUID.
+func TestCreatorMention(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ev   linear.AgentEvent
+		want string
+	}{
+		{
+			name: "displayName preferred",
+			ev:   linear.AgentEvent{CreatorID: "u-1", CreatorName: "Test User", CreatorDisplayName: "test.user"},
+			want: "@test.user ",
+		},
+		{
+			name: "name fallback when displayName empty",
+			ev:   linear.AgentEvent{CreatorID: "u-1", CreatorName: "Test User"},
+			want: "@Test User ",
+		},
+		{
+			name: "empty when only id known (UUID is not a mention)",
+			ev:   linear.AgentEvent{CreatorID: "00000000-0000-0000-0000-000000000000"},
+			want: "",
+		},
+		{
+			name: "empty when no creator info at all",
+			ev:   linear.AgentEvent{},
+			want: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &flow{ev: tc.ev}
+			if got := f.creatorMention(); got != tc.want {
+				t.Errorf("creatorMention() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
