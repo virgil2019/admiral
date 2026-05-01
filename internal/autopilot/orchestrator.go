@@ -39,6 +39,7 @@ type storeInterface interface {
 	ClaimAutopilotJob(sessionID, issueID, identifier string) (bool, error)
 	GetLatestDoneJobByIssue(issueID string) (*store.AutopilotJob, error)
 	GetLatestTimedOutJobByIssue(issueID string) (*store.AutopilotJob, error)
+	FindActiveJobByIssue(issueID, excludeSessionID string) (*store.AutopilotJob, error)
 	GetRepoByProjectID(projectID string) (*store.Repo, error)
 }
 
@@ -56,6 +57,7 @@ type Orchestrator struct {
 	db     storeInterface
 	gh     ghProbe
 	logger *slog.Logger
+	ghUser string // login of the configured gh user (for open-PR author comparison)
 
 	// workflowStatesByTeam caches workflow states per team, keyed by teamID.
 	workflowStatesByTeam map[string][]linear.WorkflowState
@@ -69,6 +71,7 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		db:     db,
 		gh:     newGhCLIProbe(cfg.GhBin),
 		logger: logger,
+		ghUser: cfg.GhUser,
 	}
 	// Ensure job_streams_dir exists on startup.
 	if err := os.MkdirAll(cfg.JobStreamsDir, 0o755); err != nil {
@@ -530,6 +533,36 @@ func (f *flow) execute() error {
 		}
 	}
 
+	// Active-session short-circuit. A prior autopilot session for this
+	// issue may still be in flight (RECEIVED/EXECUTING/etc.) when a fresh
+	// AgentSessionEvent.created arrives — typically because admiral
+	// dispatched in parallel with a human edit, or because Linear delivered
+	// a duplicate event. Spawning a second worker would race the same
+	// branch. Skipped on follow-up flows (suffixed branch is unique).
+	if f.followupSuffix == "" {
+		if prior, err := f.o.db.FindActiveJobByIssue(f.ev.IssueID, f.ev.SessionID); err != nil {
+			f.o.logger.Warn("active_job_check_failed",
+				"err", err, "issue", f.ev.IssueID)
+		} else if prior != nil {
+			return f.markActiveSessionDuplicate(prior.AgentSessionID)
+		}
+	}
+
+	// Open-PR-by-human short-circuit. A human may have opened a PR for the
+	// same deterministic branch while admiral was queued or offline. We
+	// detect this by checking for an open PR on the branch authored by
+	// someone other than admiral. If found, short-circuit so we don't
+	// create a duplicate PR. Skipped on follow-up flows (suffixed branch
+	// is intentionally unique).
+	if f.followupSuffix == "" && f.o.ghUser != "" {
+		if url, author, found, err := f.o.gh.FindOpenPRForBranch(f.ctx, f.repoDir, f.branch); err != nil {
+			f.o.logger.Warn("open_pr_check_failed",
+				"err", err, "branch", f.branch)
+		} else if found && author != f.o.ghUser {
+			return f.markOpenPRByOther(url, author)
+		}
+	}
+
 	f.worktreePath = filepath.Join(
 		absWorktreeRootWithRepo(f.o.cfg, f.repoDir),
 		worktreeName,
@@ -838,6 +871,66 @@ func (f *flow) creatorMention() string {
 		return ""
 	}
 	return "@" + handle + " "
+}
+
+// markActiveSessionDuplicate is the short-circuit path when another
+// autopilot session for the same Linear issue is still in flight. The new
+// session is recorded as CANCELLED (so it doesn't sit forever in
+// RECEIVED), a courtesy reply is posted on the new thread, and no
+// worktree is created. The prior session is left untouched — it owns the
+// work.
+func (f *flow) markActiveSessionDuplicate(priorSessionID string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateCancelled
+		j.Branch = f.branch
+		j.Error = "duplicate_active_session: prior session " + priorSessionID
+		j.FinishedAt = now
+	}); err != nil {
+		f.o.logger.Warn("mark_active_session_duplicate_update_failed",
+			"err", err, "session", f.ev.SessionID)
+	}
+
+	body := fmt.Sprintf(
+		"%sadmiral is already working on this issue (session `%s`). Not dispatching a duplicate. Wait for it to finish, or cancel the prior session and re-mention with /rerun.",
+		f.creatorMention(), priorSessionID)
+	if err := f.postActivityWithRetry(linear.Response(body)); err != nil {
+		f.o.logger.Warn("mark_active_session_duplicate_post_failed",
+			"err", err, "session", f.ev.SessionID)
+	}
+	f.o.logger.Info("autopilot_active_session_duplicate",
+		"issue", f.ev.IssueIdentifier, "session", f.ev.SessionID,
+		"prior_session", priorSessionID)
+	return nil
+}
+
+// markOpenPRByOther is the short-circuit path when a human has already opened
+// a PR for the deterministic branch. It posts a courtesy Linear response,
+// marks the job DONE pointing at the existing PR, and skips worktree creation
+// entirely. Returns nil so flow.run() treats the job as cleanly finished.
+func (f *flow) markOpenPRByOther(prURL, author string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateDone
+		j.PRURL = prURL
+		j.Branch = f.branch
+		j.FinishedAt = now
+	}); err != nil {
+		f.o.logger.Warn("mark_open_pr_by_other_update_failed",
+			"err", err, "session", f.ev.SessionID)
+	}
+
+	body := fmt.Sprintf(
+		"%sOpen PR already exists at %s by @%s — admiral is not duplicating work. Re-mention me with /rerun after that PR is merged or closed if you still need follow-up.",
+		f.creatorMention(), prURL, author)
+	if err := f.postActivityWithRetry(linear.Response(body)); err != nil {
+		f.o.logger.Warn("mark_open_pr_by_other_post_failed",
+			"err", err, "session", f.ev.SessionID)
+	}
+	f.o.logger.Info("autopilot_open_pr_by_other",
+		"issue", f.ev.IssueIdentifier, "session", f.ev.SessionID,
+		"pr", prURL, "author", author)
+	return nil
 }
 
 func (f *flow) markFailed(runErr error) {

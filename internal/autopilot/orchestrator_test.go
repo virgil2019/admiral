@@ -305,6 +305,10 @@ type mockStore struct {
 	LatestTimedOutJob    *store.AutopilotJob
 	LatestTimedOutJobErr error
 
+	// FindActiveJobByIssue
+	ActiveJob    *store.AutopilotJob
+	ActiveJobErr error
+
 	// For UpdateAutopilotJob tracking
 	LastUpdatedJob *store.AutopilotJob
 
@@ -373,6 +377,10 @@ func (m *mockStore) GetLatestTimedOutJobByIssue(issueID string) (*store.Autopilo
 	return m.LatestTimedOutJob, m.LatestTimedOutJobErr
 }
 
+func (m *mockStore) FindActiveJobByIssue(issueID, excludeSessionID string) (*store.AutopilotJob, error) {
+	return m.ActiveJob, m.ActiveJobErr
+}
+
 func (m *mockStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
 	return m.Repo, m.RepoErr
 }
@@ -386,10 +394,15 @@ type fakeGhProbe struct {
 		URL, SHA string
 	}
 	stateByURL    map[string]string
-	mergedErr     error
-	stateErr      error
-	mergedCalls   int32
-	stateCalls    int32
+	openPRByBranch map[string]struct {
+		URL, Author string
+	}
+	mergedErr    error
+	stateErr     error
+	openPRErr    error
+	mergedCalls  int32
+	stateCalls   int32
+	openPRCalls  int32
 }
 
 func (f *fakeGhProbe) FindMergedPRForBranch(_ context.Context, _, branch string) (string, string, bool, error) {
@@ -409,6 +422,17 @@ func (f *fakeGhProbe) PRState(_ context.Context, prURL string) (string, error) {
 		return "", f.stateErr
 	}
 	return f.stateByURL[prURL], nil
+}
+
+func (f *fakeGhProbe) FindOpenPRForBranch(_ context.Context, _, branch string) (string, string, bool, error) {
+	atomic.AddInt32(&f.openPRCalls, 1)
+	if f.openPRErr != nil {
+		return "", "", false, f.openPRErr
+	}
+	if v, ok := f.openPRByBranch[branch]; ok {
+		return v.URL, v.Author, true, nil
+	}
+	return "", "", false, nil
 }
 
 func TestHandleCommand_StatusIdle(t *testing.T) {
@@ -1666,6 +1690,281 @@ func TestFlowExecute_DoesNotShortCircuit_OnFollowupSuffix(t *testing.T) {
 	_ = f.execute()
 	if atomic.LoadInt32(&gh.mergedCalls) != 0 {
 		t.Errorf("FindMergedPRForBranch must not run on follow-up flows; got %d calls", gh.mergedCalls)
+	}
+}
+
+// GEO-47 — flow.execute short-circuits when the deterministic branch for
+// the issue already has an open PR authored by a human (not admiral).
+// Observable: job lands DONE with pr_url set, no worktree created,
+// Linear thread receives "PR already exists" notice.
+// GEO-47 — when a non-terminal autopilot job for the same issue is
+// already in flight, a fresh dispatch is short-circuited to CANCELLED.
+// No worktree, no claude run, prior session is left untouched.
+func TestFlowExecute_ShortCircuits_WhenActiveSessionExists(t *testing.T) {
+	repoDir := t.TempDir()
+	mlc := &mockLinearClient{
+		GetIssueResult: &linear.Issue{
+			ID:         "issue-active",
+			Identifier: "ACT-1",
+			ProjectID:  "proj-test",
+			TeamID:     "team-test",
+		},
+	}
+	priorSession := "prior-session-uuid"
+	ms := &mockStore{
+		Repo: &store.Repo{
+			ProjectID:   "proj-test",
+			ProjectName: "TestProject",
+			RepoDir:     repoDir,
+			BaseBranch:  "main",
+			Enabled:     true,
+		},
+		ActiveJob: &store.AutopilotJob{
+			AgentSessionID:  priorSession,
+			IssueID:         "issue-active",
+			IssueIdentifier: "ACT-1",
+			State:           store.JobStateExecuting,
+		},
+		LastUpdatedJob: &store.AutopilotJob{},
+	}
+	gh := &fakeGhProbe{}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:     ms,
+		lc:     mlc,
+		gh:     gh,
+		ghUser: "admiral",
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-new",
+		IssueID:         "issue-active",
+		IssueIdentifier: "ACT-1",
+		Action:          linear.ActionCreated,
+	}
+	f := newFlow(o, context.Background(), ev)
+
+	if err := f.execute(); err != nil {
+		t.Fatalf("execute returned err: %v", err)
+	}
+
+	// New session was marked CANCELLED with the prior session id surfaced.
+	if ms.LastUpdatedJob.State != store.JobStateCancelled {
+		t.Errorf("autopilot_jobs.state = %q, want CANCELLED", ms.LastUpdatedJob.State)
+	}
+	if !strings.Contains(ms.LastUpdatedJob.Error, priorSession) {
+		t.Errorf("autopilot_jobs.error should reference prior session %q, got: %q", priorSession, ms.LastUpdatedJob.Error)
+	}
+	// Linear thread reply names the prior session.
+	if !strings.Contains(mlc.GetPostedBody(), priorSession) {
+		t.Errorf("expected prior session id in posted body, got: %s", mlc.GetPostedBody())
+	}
+	if !strings.Contains(mlc.GetPostedBody(), "already working on this issue") {
+		t.Errorf("expected duplicate-dispatch notice in posted body, got: %s", mlc.GetPostedBody())
+	}
+	// Open-PR check should NOT fire — active-session short-circuit runs first.
+	if got := atomic.LoadInt32(&gh.openPRCalls); got != 0 {
+		t.Errorf("FindOpenPRForBranch should not be called when active session exists; got %d calls", got)
+	}
+	// No worktree was created.
+	worktreesDir := filepath.Join(repoDir, ".worktrees")
+	if entries, err := os.ReadDir(worktreesDir); err == nil && len(entries) > 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("expected no worktree to be created; found %v", names)
+	}
+}
+
+func TestFlowExecute_ShortCircuits_WhenOpenPRByAnotherAuthor(t *testing.T) {
+	repoDir := t.TempDir()
+	mlc := &mockLinearClient{
+		GetIssueResult: &linear.Issue{
+			ID:         "issue-human-pr",
+			Identifier: "HUM-1",
+			ProjectID:  "proj-test",
+			TeamID:     "team-test",
+		},
+	}
+	ms := &mockStore{
+		Repo: &store.Repo{
+			ProjectID:   "proj-test",
+			ProjectName: "TestProject",
+			RepoDir:     repoDir,
+			BaseBranch:  "main",
+			Enabled:     true,
+		},
+		LastUpdatedJob: &store.AutopilotJob{},
+	}
+	gh := &fakeGhProbe{
+		openPRByBranch: map[string]struct {
+			URL, Author string
+		}{
+			"linear/hum-1": {URL: "https://github.com/x/y/pull/99", Author: "georgexu"},
+		},
+	}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:     ms,
+		lc:     mlc,
+		gh:     gh,
+		ghUser: "admiral", // not "georgexu"
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-human-pr",
+		IssueID:         "issue-human-pr",
+		IssueIdentifier: "HUM-1",
+		Action:          linear.ActionCreated,
+	}
+	f := newFlow(o, context.Background(), ev)
+
+	if err := f.execute(); err != nil {
+		t.Fatalf("execute returned err: %v", err)
+	}
+
+	// gh probe must have been hit exactly once for the deterministic branch.
+	if got := atomic.LoadInt32(&gh.openPRCalls); got != 1 {
+		t.Errorf("FindOpenPRForBranch calls: got %d, want 1", got)
+	}
+	// Job landed in DONE with the existing PR URL.
+	if ms.LastUpdatedJob.State != store.JobStateDone {
+		t.Errorf("autopilot_jobs.state = %q, want DONE", ms.LastUpdatedJob.State)
+	}
+	if ms.LastUpdatedJob.PRURL != "https://github.com/x/y/pull/99" {
+		t.Errorf("autopilot_jobs.pr_url = %q, want the human PR URL", ms.LastUpdatedJob.PRURL)
+	}
+	// Linear thread receives "PR already exists" notice.
+	if !strings.Contains(mlc.GetPostedBody(), "Open PR already exists") {
+		t.Errorf("expected 'Open PR already exists' in posted body, got: %s", mlc.GetPostedBody())
+	}
+	if !strings.Contains(mlc.GetPostedBody(), "https://github.com/x/y/pull/99") {
+		t.Errorf("expected PR URL in posted body, got: %s", mlc.GetPostedBody())
+	}
+	// No worktree was created.
+	worktreesDir := filepath.Join(repoDir, ".worktrees")
+	if entries, err := os.ReadDir(worktreesDir); err == nil && len(entries) > 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("expected no worktree to be created; found %v", names)
+	}
+}
+
+// GEO-47 — when the open PR is authored by admiral itself, the check
+// does NOT short-circuit (admiral may be retrying and should resume).
+func TestFlowExecute_DoesNotShortCircuit_WhenOpenPRByAdmiral(t *testing.T) {
+	repoDir := t.TempDir()
+	mlc := &mockLinearClient{
+		GetIssueResult: &linear.Issue{
+			ID:         "issue-admiral-pr",
+			Identifier: "ADM-1",
+			ProjectID:  "proj-test",
+			TeamID:     "team-test",
+		},
+	}
+	ms := &mockStore{
+		Repo: &store.Repo{
+			ProjectID:   "proj-test",
+			ProjectName: "TestProject",
+			RepoDir:     repoDir,
+			BaseBranch:  "main",
+			Enabled:     true,
+		},
+	}
+	gh := &fakeGhProbe{
+		openPRByBranch: map[string]struct {
+			URL, Author string
+		}{
+			"linear/adm-1": {URL: "https://github.com/x/y/pull/55", Author: "admiral"},
+		},
+	}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:     ms,
+		lc:     mlc,
+		gh:     gh,
+		ghUser: "admiral",
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-admiral-pr",
+		IssueID:         "issue-admiral-pr",
+		IssueIdentifier: "ADM-1",
+		Action:          linear.ActionCreated,
+	}
+	f := newFlow(o, context.Background(), ev)
+
+	// Should not short-circuit; execute() will fail at worktree creation
+	// (no real remote) but that's fine — we're checking the open-PR check
+	// was NOT the reason for stopping.
+	_ = f.execute()
+
+	// openPR should still be called, but no short-circuit occurred.
+	if got := atomic.LoadInt32(&gh.openPRCalls); got != 1 {
+		t.Errorf("FindOpenPRForBranch calls: got %d, want 1", got)
+	}
+	// Job should NOT be marked DONE with the existing PR (no short-circuit).
+	if ms.LastUpdatedJob != nil && ms.LastUpdatedJob.PRURL == "https://github.com/x/y/pull/55" {
+		t.Errorf("admiral-authored PR should NOT have short-circuited; got pr_url=%q", ms.LastUpdatedJob.PRURL)
+	}
+	// No "PR already exists" message should have been posted.
+	if strings.Contains(mlc.GetPostedBody(), "Open PR already exists") {
+		t.Errorf("did not expect 'Open PR already exists' for admiral-authored PR; got: %s", mlc.GetPostedBody())
+	}
+}
+
+// GEO-47 — when there is no open PR for the deterministic branch,
+// the check passes through and the flow continues normally.
+func TestFlowExecute_DoesNotShortCircuit_WhenNoOpenPR(t *testing.T) {
+	repoDir := t.TempDir()
+	mlc := &mockLinearClient{
+		GetIssueResult: &linear.Issue{
+			ID:         "issue-no-pr",
+			Identifier: "NPR-1",
+			ProjectID:  "proj-test",
+			TeamID:     "team-test",
+		},
+	}
+	ms := &mockStore{
+		Repo: &store.Repo{
+			ProjectID:   "proj-test",
+			ProjectName: "TestProject",
+			RepoDir:     repoDir,
+			BaseBranch:  "main",
+			Enabled:     true,
+		},
+	}
+	gh := &fakeGhProbe{} // no open PRs at all
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:     ms,
+		lc:     mlc,
+		gh:     gh,
+		ghUser: "admiral",
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-no-pr",
+		IssueID:         "issue-no-pr",
+		IssueIdentifier: "NPR-1",
+		Action:          linear.ActionCreated,
+	}
+	f := newFlow(o, context.Background(), ev)
+
+	// Should not short-circuit; execute() fails at worktree creation
+	// (no real remote) but that's fine.
+	_ = f.execute()
+
+	// openPR was called (confirming the check ran).
+	if got := atomic.LoadInt32(&gh.openPRCalls); got != 1 {
+		t.Errorf("FindOpenPRForBranch calls: got %d, want 1", got)
+	}
+	// No short-circuit message posted.
+	if strings.Contains(mlc.GetPostedBody(), "Open PR already exists") {
+		t.Errorf("did not expect 'Open PR already exists' when no PR exists; got: %s", mlc.GetPostedBody())
 	}
 }
 
