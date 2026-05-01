@@ -54,6 +54,7 @@ type Orchestrator struct {
 	cfg    *config.Autopilot
 	lc     linearClientInterface
 	db     storeInterface
+	gh     ghProbe
 	logger *slog.Logger
 
 	// workflowStatesByTeam caches workflow states per team, keyed by teamID.
@@ -62,7 +63,13 @@ type Orchestrator struct {
 }
 
 func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
-	o := &Orchestrator{cfg: cfg, lc: lc, db: db, logger: logger}
+	o := &Orchestrator{
+		cfg:    cfg,
+		lc:     lc,
+		db:     db,
+		gh:     newGhCLIProbe(cfg.GhBin),
+		logger: logger,
+	}
 	// Ensure job_streams_dir exists on startup.
 	if err := os.MkdirAll(cfg.JobStreamsDir, 0o755); err != nil {
 		logger.Warn("job_streams_dir_mkdir", "dir", cfg.JobStreamsDir, "err", err)
@@ -124,26 +131,66 @@ func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
 		}
 	}
 
-	// Check if this issue was already completed in a previous session.
-	// If so, post the prior PR URL into the new thread and don't re-spawn claude.
+	// Prior-DONE dispatch (GEO-38). When this issue already has a DONE row
+	// in admiral's local DB, the user is following up on completed work.
+	// We branch on the prior PR's lifecycle:
+	//
+	//   OPEN + claude_session_id present  → resume the same session, append
+	//                                       commits to the live PR.
+	//   OPEN + claude_session_id missing  → legacy row, can't resume; respond
+	//                                       once and stop. The user can open
+	//                                       a fresh issue for new work.
+	//   MERGED / CLOSED                   → fresh follow-up flow on a new
+	//                                       branch (the original is gone or
+	//                                       finalized; reusing it is wrong).
+	//   gh unreachable / unknown          → fall through to fresh flow rather
+	//                                       than block the user.
 	if ev.IssueID != "" {
 		prior, err := o.db.GetLatestDoneJobByIssue(ev.IssueID)
 		if err != nil {
 			o.logger.Warn("get_latest_done_job_failed", "err", err, "issue", ev.IssueID)
 		} else if prior != nil && prior.PRURL != "" {
-			o.logger.Info("autopilot_short_circuit_already_done",
-				"session", ev.SessionID,
-				"issue", ev.IssueIdentifier,
-				"prior_pr", prior.PRURL)
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			body := fmt.Sprintf(
-				"This issue was already completed.\n\nPR: %s\n\n"+
-					"If you want additional changes, please open a new issue or "+
-					"wait for follow-up support (#15).",
-				prior.PRURL)
-			_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
-			return
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			state, stateErr := o.gh.PRState(ctx, prior.PRURL)
+			cancel()
+			if stateErr != nil {
+				o.logger.Warn("pr_state_check_failed",
+					"err", stateErr, "pr", prior.PRURL,
+					"action", "falling through to fresh flow")
+			}
+			switch state {
+			case "OPEN":
+				if prior.ClaudeSessionID != "" {
+					o.logger.Info("autopilot_followup_resume",
+						"session", ev.SessionID, "issue", ev.IssueIdentifier,
+						"prior_pr", prior.PRURL,
+						"prior_claude_session", prior.ClaudeSessionID)
+					go o.runFollowupResume(ev, prior)
+					return
+				}
+				o.logger.Info("autopilot_followup_legacy_session",
+					"session", ev.SessionID, "issue", ev.IssueIdentifier,
+					"prior_pr", prior.PRURL)
+				replyCtx, replyCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer replyCancel()
+				body := fmt.Sprintf(
+					"This issue has an open PR (%s) but the original session was created before resume support landed, so I can't continue from where it left off. Open a new issue with the changes you'd like — I'll start fresh.",
+					prior.PRURL)
+				_ = o.lc.PostAgentActivity(replyCtx, ev.SessionID, linear.Response(body))
+				return
+			case "MERGED", "CLOSED":
+				// Fall through to fresh flow with a follow-up branch.
+				o.logger.Info("autopilot_followup_fresh_after_merged_or_closed",
+					"session", ev.SessionID, "issue", ev.IssueIdentifier,
+					"prior_pr", prior.PRURL, "prior_state", state)
+				go o.runFollowup(ev, prior)
+				return
+			default:
+				// "" (unlocatable) or other unknown — log and fall through.
+				o.logger.Warn("pr_state_unhandled",
+					"state", state, "pr", prior.PRURL,
+					"action", "falling through to fresh flow")
+			}
 		}
 	}
 
@@ -225,6 +272,121 @@ func (o *Orchestrator) handlePrompted(ev linear.AgentEvent) {
 	}()
 }
 
+// runFollowup spawns a fresh flow for a Linear event whose issue already
+// has a prior DONE job whose PR is MERGED or CLOSED. The fresh flow uses a
+// follow-up branch name (suffix derived from the new session ID) so it
+// doesn't collide with the original (already-merged) branch in admiral's
+// local refs or the .worktrees dir. Otherwise identical to run().
+func (o *Orchestrator) runFollowup(ev linear.AgentEvent, prior *store.AutopilotJob) {
+	ctx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
+	defer cancel()
+
+	claimed, err := o.db.ClaimAutopilotJob(ev.SessionID, ev.IssueID, ev.IssueIdentifier)
+	if err != nil {
+		o.logger.Error("claim_followup_job_failed", "err", err, "session", ev.SessionID)
+		return
+	}
+	if !claimed {
+		o.logger.Info("followup_session_already_claimed",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		return
+	}
+
+	flow := newFlow(o, ctx, ev)
+	flow.followupSuffix = followupSuffix(ev.SessionID)
+	if err := flow.execute(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) ||
+			strings.Contains(err.Error(), "signal: killed") ||
+			strings.Contains(err.Error(), "signal: terminated") {
+			flow.markTimedOut(err)
+		} else {
+			flow.markFailed(err)
+		}
+		return
+	}
+	o.logger.Info("autopilot_followup_done",
+		"issue", ev.IssueIdentifier, "session", ev.SessionID, "pr", flow.prURL,
+		"prior_pr", prior.PRURL)
+}
+
+// runFollowupResume spawns a resume flow for a Linear event whose issue
+// has a prior DONE job whose PR is OPEN. claude --resume reuses the prior
+// session id and pushes additional commits to the same branch (and
+// therefore the same PR). After the resume, the new session's row is
+// marked DONE pointing at the same artifacts so future prompted events on
+// this thread can be looked up via GetAutopilotJob(ev.SessionID).
+func (o *Orchestrator) runFollowupResume(ev linear.AgentEvent, prior *store.AutopilotJob) {
+	ctx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
+	defer cancel()
+
+	claimed, err := o.db.ClaimAutopilotJob(ev.SessionID, ev.IssueID, ev.IssueIdentifier)
+	if err != nil {
+		o.logger.Error("claim_followup_resume_job_failed", "err", err, "session", ev.SessionID)
+		return
+	}
+	if !claimed {
+		o.logger.Info("followup_resume_session_already_claimed",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		return
+	}
+
+	resumeFlow := newResumeFlow(o, ctx, ev, prior)
+	// Hydrate the same per-flow context that flow.execute would normally
+	// resolve from the issue + repos table — executeResume's helpers
+	// (ensureWorktree, git fetch) need repoDir set.
+	if issue, err := o.lc.GetIssue(ctx, ev.IssueID); err == nil {
+		resumeFlow.teamID = issue.TeamID
+		if repo, err := o.db.GetRepoByProjectID(issue.ProjectID); err == nil && repo != nil {
+			resumeFlow.repoDir = repo.RepoDir
+			resumeFlow.baseBranch = repo.BaseBranch
+		}
+	}
+
+	if err := resumeFlow.executeResume(); err != nil {
+		o.logger.Error("autopilot_followup_resume_failed",
+			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
+		resumeFlow.markFailed(err)
+		return
+	}
+
+	// executeResume updated prior.AgentSessionID's row → DONE (idempotent;
+	// it was already DONE). Now also mark the new session's row DONE
+	// pointing at the same artifacts so handlePrompted can resolve future
+	// follow-ups via GetAutopilotJob(ev.SessionID).
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := o.db.UpdateAutopilotJob(ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateDone
+		j.PRURL = prior.PRURL
+		j.WorktreePath = prior.WorktreePath
+		j.Branch = prior.Branch
+		j.ClaudeSessionID = prior.ClaudeSessionID
+		j.FinishedAt = now
+	}); err != nil {
+		o.logger.Warn("followup_resume_new_session_mark_done_failed",
+			"err", err, "session", ev.SessionID)
+	}
+
+	o.logger.Info("autopilot_followup_resume_done",
+		"issue", ev.IssueIdentifier, "session", ev.SessionID, "pr", prior.PRURL)
+}
+
+// followupSuffix derives a deterministic, short, fs-safe suffix from a
+// Linear agent session id. The first 8 hex chars of a UUID are unique
+// enough across a single workspace and stable across event retries, so
+// retries land on the same branch.
+func followupSuffix(sessionID string) string {
+	clean := sanitizeForPath(sessionID)
+	if len(clean) == 0 {
+		return "followup"
+	}
+	if len(clean) > 8 {
+		clean = clean[:8]
+	}
+	return "followup-" + clean
+}
+
 func (o *Orchestrator) run(ev linear.AgentEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
@@ -271,6 +433,13 @@ type flow struct {
 	teamID          string
 	repoDir        string
 	baseBranch     string
+
+	// followupSuffix, when non-empty, is appended to the deterministic
+	// branch name and worktree path so a follow-up after a merged PR
+	// doesn't collide with the (possibly still-cached) original branch.
+	// Set by handleCreated for the GEO-38 fresh-follow-up path; empty for
+	// the normal first run.
+	followupSuffix string
 }
 
 func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
@@ -334,11 +503,36 @@ func (f *flow) execute() error {
 	}
 	f.repoDir = repo.RepoDir
 	f.baseBranch = repo.BaseBranch
-
+	worktreeName := "linear-" + sanitizeForPath(issue.Identifier)
 	f.branch = branchName(issue)
+	if f.followupSuffix != "" {
+		// Append a unique suffix so a fresh-follow-up flow (after a merged
+		// or closed prior PR) doesn't collide with the still-tracked
+		// original branch / worktree dir.
+		suf := sanitizeForPath(f.followupSuffix)
+		f.branch = f.branch + "-" + suf
+		worktreeName = worktreeName + "-" + suf
+	}
+
+	// Already-merged short-circuit. The deterministic branch name for this
+	// issue may already point to a merged PR — most commonly because a
+	// human authored and merged the PR directly via the GitHub UI while
+	// admiral was offline / queued. We don't want to spawn a worktree and
+	// run claude only to discover there's nothing to change. The check is
+	// best-effort: gh failures fall through to the normal flow. Skipped on
+	// follow-up flows since the suffixed branch is intentionally fresh.
+	if f.followupSuffix == "" {
+		if url, sha, found, err := f.o.gh.FindMergedPRForBranch(f.ctx, f.repoDir, f.branch); err != nil {
+			f.o.logger.Warn("merged_pr_check_failed",
+				"err", err, "branch", f.branch)
+		} else if found {
+			return f.markAlreadyMerged(url, sha)
+		}
+	}
+
 	f.worktreePath = filepath.Join(
 		absWorktreeRootWithRepo(f.o.cfg, f.repoDir),
-		"linear-"+sanitizeForPath(issue.Identifier),
+		worktreeName,
 	)
 	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
 		j.State = store.JobStateExecuting
@@ -588,6 +782,43 @@ func (f *flow) closeStreamFile() {
 	}
 }
 
+// markAlreadyMerged is the success path for the "branch already in main"
+// short-circuit. It posts a courtesy Linear response, marks the autopilot
+// job DONE pointing at the existing PR, and skips worktree creation
+// entirely. Returns nil so flow.run() treats the job as cleanly finished.
+func (f *flow) markAlreadyMerged(prURL, mergeSHA string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateDone
+		j.PRURL = prURL
+		j.Branch = f.branch
+		j.FinishedAt = now
+	}); err != nil {
+		f.o.logger.Warn("mark_already_merged_update_failed",
+			"err", err, "session", f.ev.SessionID)
+	}
+
+	mention := ""
+	if f.ev.CreatorID != "" {
+		mention = "@" + f.ev.CreatorID + " "
+	}
+	shortSHA := mergeSHA
+	if len(shortSHA) > 12 {
+		shortSHA = shortSHA[:12]
+	}
+	body := fmt.Sprintf(
+		"%sAlready merged. Nothing to do.\n\nPR: %s\nMerge: `%s`",
+		mention, prURL, shortSHA)
+	if err := f.postActivityWithRetry(linear.Response(body)); err != nil {
+		f.o.logger.Warn("mark_already_merged_post_failed",
+			"err", err, "session", f.ev.SessionID)
+	}
+	f.o.logger.Info("autopilot_already_merged",
+		"issue", f.ev.IssueIdentifier, "session", f.ev.SessionID,
+		"pr", prURL, "sha", mergeSHA)
+	return nil
+}
+
 func (f *flow) markFailed(runErr error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
@@ -728,12 +959,36 @@ func (f *flow) archiveWorktree() {
 	}
 
 	// 2. Remove the worktree from git registration + filesystem.
+	// 'git worktree remove --force' can fail in subtle ways: another
+	// process still holds a handle to the dir, the directory drifted out
+	// of git's metadata, fs permission flapped, etc. The archive copy
+	// already succeeded so the diff is preserved; if git's cooperative
+	// removal fails we fall back to a hard `os.RemoveAll` + `git worktree
+	// prune` so the active worktrees dir doesn't leak (this was the
+	// failure mode that motivated GEO-37 Bug B). If THAT also fails we
+	// log loudly so a human can investigate.
 	cmd := exec.Command("git", "worktree", "remove", "--force", f.worktreePath)
 	cmd.Dir = f.repoDir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		f.o.logger.Warn("archive_worktree_remove_failed",
-			"err", err, "out", string(out), "path", f.worktreePath)
-		// Archive succeeded; leave dangling worktree for manual cleanup.
+			"err", err, "out", string(out), "path", f.worktreePath,
+			"action", "falling back to os.RemoveAll + git worktree prune")
+		if removeErr := os.RemoveAll(f.worktreePath); removeErr != nil {
+			f.o.logger.Error("archive_worktree_force_remove_failed",
+				"err", removeErr, "path", f.worktreePath,
+				"action", "manual cleanup required — directory will leak")
+		} else {
+			pruneCmd := exec.Command("git", "worktree", "prune")
+			pruneCmd.Dir = f.repoDir
+			if pruneOut, pruneErr := pruneCmd.CombinedOutput(); pruneErr != nil {
+				f.o.logger.Warn("archive_worktree_prune_failed",
+					"err", pruneErr, "out", string(pruneOut),
+					"hint", "git's worktree list may show a stale entry until the next prune")
+			} else {
+				f.o.logger.Info("archive_worktree_force_removed",
+					"path", f.worktreePath)
+			}
+		}
 	}
 
 	// 3. Branch is intentionally NOT deleted — user can checkout later.
