@@ -305,6 +305,10 @@ type mockStore struct {
 	LatestTimedOutJob    *store.AutopilotJob
 	LatestTimedOutJobErr error
 
+	// FindActiveJobByIssue
+	ActiveJob    *store.AutopilotJob
+	ActiveJobErr error
+
 	// For UpdateAutopilotJob tracking
 	LastUpdatedJob *store.AutopilotJob
 
@@ -371,6 +375,10 @@ func (m *mockStore) GetLatestDoneJobByIssue(issueID string) (*store.AutopilotJob
 
 func (m *mockStore) GetLatestTimedOutJobByIssue(issueID string) (*store.AutopilotJob, error) {
 	return m.LatestTimedOutJob, m.LatestTimedOutJobErr
+}
+
+func (m *mockStore) FindActiveJobByIssue(issueID, excludeSessionID string) (*store.AutopilotJob, error) {
+	return m.ActiveJob, m.ActiveJobErr
 }
 
 func (m *mockStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
@@ -1689,6 +1697,86 @@ func TestFlowExecute_DoesNotShortCircuit_OnFollowupSuffix(t *testing.T) {
 // the issue already has an open PR authored by a human (not admiral).
 // Observable: job lands DONE with pr_url set, no worktree created,
 // Linear thread receives "PR already exists" notice.
+// GEO-47 — when a non-terminal autopilot job for the same issue is
+// already in flight, a fresh dispatch is short-circuited to CANCELLED.
+// No worktree, no claude run, prior session is left untouched.
+func TestFlowExecute_ShortCircuits_WhenActiveSessionExists(t *testing.T) {
+	repoDir := t.TempDir()
+	mlc := &mockLinearClient{
+		GetIssueResult: &linear.Issue{
+			ID:         "issue-active",
+			Identifier: "ACT-1",
+			ProjectID:  "proj-test",
+			TeamID:     "team-test",
+		},
+	}
+	priorSession := "prior-session-uuid"
+	ms := &mockStore{
+		Repo: &store.Repo{
+			ProjectID:   "proj-test",
+			ProjectName: "TestProject",
+			RepoDir:     repoDir,
+			BaseBranch:  "main",
+			Enabled:     true,
+		},
+		ActiveJob: &store.AutopilotJob{
+			AgentSessionID:  priorSession,
+			IssueID:         "issue-active",
+			IssueIdentifier: "ACT-1",
+			State:           store.JobStateExecuting,
+		},
+		LastUpdatedJob: &store.AutopilotJob{},
+	}
+	gh := &fakeGhProbe{}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:     ms,
+		lc:     mlc,
+		gh:     gh,
+		ghUser: "admiral",
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-new",
+		IssueID:         "issue-active",
+		IssueIdentifier: "ACT-1",
+		Action:          linear.ActionCreated,
+	}
+	f := newFlow(o, context.Background(), ev)
+
+	if err := f.execute(); err != nil {
+		t.Fatalf("execute returned err: %v", err)
+	}
+
+	// New session was marked CANCELLED with the prior session id surfaced.
+	if ms.LastUpdatedJob.State != store.JobStateCancelled {
+		t.Errorf("autopilot_jobs.state = %q, want CANCELLED", ms.LastUpdatedJob.State)
+	}
+	if !strings.Contains(ms.LastUpdatedJob.Error, priorSession) {
+		t.Errorf("autopilot_jobs.error should reference prior session %q, got: %q", priorSession, ms.LastUpdatedJob.Error)
+	}
+	// Linear thread reply names the prior session.
+	if !strings.Contains(mlc.GetPostedBody(), priorSession) {
+		t.Errorf("expected prior session id in posted body, got: %s", mlc.GetPostedBody())
+	}
+	if !strings.Contains(mlc.GetPostedBody(), "already working on this issue") {
+		t.Errorf("expected duplicate-dispatch notice in posted body, got: %s", mlc.GetPostedBody())
+	}
+	// Open-PR check should NOT fire — active-session short-circuit runs first.
+	if got := atomic.LoadInt32(&gh.openPRCalls); got != 0 {
+		t.Errorf("FindOpenPRForBranch should not be called when active session exists; got %d calls", got)
+	}
+	// No worktree was created.
+	worktreesDir := filepath.Join(repoDir, ".worktrees")
+	if entries, err := os.ReadDir(worktreesDir); err == nil && len(entries) > 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("expected no worktree to be created; found %v", names)
+	}
+}
+
 func TestFlowExecute_ShortCircuits_WhenOpenPRByAnotherAuthor(t *testing.T) {
 	repoDir := t.TempDir()
 	mlc := &mockLinearClient{

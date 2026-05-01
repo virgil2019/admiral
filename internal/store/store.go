@@ -322,6 +322,8 @@ func Open(path string) (*Store, error) {
 }
 
 // Autopilot job state constants. RECEIVED -> EXECUTING -> DONE|FAILED|TIMED_OUT.
+// CANCELLED is set on jobs short-circuited at pre-flight (e.g. duplicate
+// dispatch when another session for the same issue is already active).
 const (
 	JobStateReceived               = "RECEIVED"
 	JobStateExecuting              = "EXECUTING"
@@ -329,6 +331,7 @@ const (
 	JobStateFailed                 = "FAILED"
 	JobStateTimedOut               = "TIMED_OUT"
 	JobStateDoneThreadInconsistent = "DONE_THREAD_INCONSISTENT"
+	JobStateCancelled              = "CANCELLED"
 )
 
 type AutopilotJob struct {
@@ -376,9 +379,9 @@ func (s *Store) AnyAutopilotJobActive() (bool, string, error) {
 	var sessionID string
 	err := s.DB.QueryRow(`
 		SELECT agent_session_id FROM autopilot_jobs
-		WHERE state NOT IN (?, ?, ?, ?)
+		WHERE state NOT IN (?, ?, ?, ?, ?)
 		ORDER BY started_at ASC LIMIT 1
-	`, JobStateDone, JobStateFailed, JobStateTimedOut, JobStateDoneThreadInconsistent).Scan(&sessionID)
+	`, JobStateDone, JobStateFailed, JobStateTimedOut, JobStateDoneThreadInconsistent, JobStateCancelled).Scan(&sessionID)
 	if err == sql.ErrNoRows {
 		return false, "", nil
 	}
@@ -386,6 +389,40 @@ func (s *Store) AnyAutopilotJobActive() (bool, string, error) {
 		return false, "", err
 	}
 	return true, sessionID, nil
+}
+
+// FindActiveJobByIssue returns the most recent non-terminal autopilot_jobs
+// row for the given Linear issue, excluding the row identified by
+// excludeSessionID (typically the caller's own session, which has just been
+// claimed via ClaimAutopilotJob and would otherwise match itself).
+//
+// Returns (nil, nil) when no such row exists. Used by the pre-flight
+// duplicate-dispatch short-circuit (GEO-47): if a prior session for the
+// same issue is still in flight, the new dispatch is cancelled.
+func (s *Store) FindActiveJobByIssue(issueID, excludeSessionID string) (*AutopilotJob, error) {
+	var j AutopilotJob
+	err := s.DB.QueryRow(`
+		SELECT agent_session_id, issue_id, issue_identifier, state,
+		       COALESCE(worktree_path,''), COALESCE(branch,''),
+		       COALESCE(pr_url,''), COALESCE(error,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(stream_log_path,''),
+		       COALESCE(claude_session_id,'')
+		FROM autopilot_jobs
+		WHERE issue_id=?
+		  AND agent_session_id != ?
+		  AND state NOT IN (?, ?, ?, ?, ?)
+		ORDER BY started_at DESC
+		LIMIT 1
+	`, issueID, excludeSessionID,
+		JobStateDone, JobStateFailed, JobStateTimedOut, JobStateDoneThreadInconsistent, JobStateCancelled,
+	).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+		&j.StreamLogPath, &j.ClaudeSessionID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &j, err
 }
 
 func (s *Store) UpdateAutopilotJob(sessionID string, fn func(*AutopilotJob)) error {
