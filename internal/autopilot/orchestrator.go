@@ -442,13 +442,19 @@ type flow struct {
 	followupSuffix string
 }
 
-func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
-	return &flow{o: o, ctx: ctx, ev: ev}
+func (f *flow) creatorMention() string {
+	handle := f.ev.CreatorDisplayName
+	if handle == "" {
+		handle = f.ev.CreatorName
+	}
+	if handle == "" {
+		return ""
+	}
+	return "@" + handle + " "
 }
 
-// newResumeFlow creates a flow for resuming an existing session.
-func newResumeFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent, job *store.AutopilotJob) *flow {
-	return &flow{o: o, ctx: ctx, ev: ev, job: job}
+func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
+	return &flow{o: o, ctx: ctx, ev: ev}
 }
 
 func (f *flow) postActivity(a linear.AgentActivity) {
@@ -456,6 +462,10 @@ func (f *flow) postActivity(a linear.AgentActivity) {
 		f.o.logger.Warn("post_activity_failed",
 			"session", f.ev.SessionID, "type", a.Type, "err", err)
 	}
+}
+
+func newResumeFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent, job *store.AutopilotJob) *flow {
+	return &flow{o: o, ctx: ctx, ev: ev, job: job}
 }
 
 // postActivityWithRetry posts the activity with up to 3 retries using exponential
@@ -595,10 +605,7 @@ func (f *flow) execute() error {
 	}
 
 	// Build mention prefix for the creator.
-	mention := ""
-	if f.ev.CreatorID != "" {
-		mention = "@" + f.ev.CreatorID + " "
-	}
+	mention := f.creatorMention()
 	var doneBody string
 	if isNoop {
 		doneBody = fmt.Sprintf(
@@ -808,10 +815,7 @@ func (f *flow) markAlreadyMerged(prURL, mergeSHA string) error {
 			"err", err, "session", f.ev.SessionID)
 	}
 
-	mention := ""
-	if f.ev.CreatorID != "" {
-		mention = "@" + f.ev.CreatorID + " "
-	}
+	mention := f.creatorMention()
 	shortSHA := mergeSHA
 	if len(shortSHA) > 12 {
 		shortSHA = shortSHA[:12]
@@ -839,10 +843,7 @@ func (f *flow) markFailed(runErr error) {
 	// Use a fresh short ctx in case the parent is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	mention := ""
-	if f.ev.CreatorID != "" {
-		mention = "@" + f.ev.CreatorID + " "
-	}
+	mention := f.creatorMention()
 	body := mention + "admiral failed: " + truncate(runErr.Error(), 1500)
 	if f.worktreePath != "" {
 		body += "\n\nWorktree: `" + f.worktreePath + "`"
@@ -875,10 +876,7 @@ func (f *flow) markTimedOut(runErr error) {
 	// Use a fresh short ctx in case the parent is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	mention := ""
-	if f.ev.CreatorID != "" {
-		mention = "@" + f.ev.CreatorID + " "
-	}
+	mention := f.creatorMention()
 	truncatedSession := f.claudeSessionID
 	if len(truncatedSession) > 8 {
 		truncatedSession = truncatedSession[:8]

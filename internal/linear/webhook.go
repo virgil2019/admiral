@@ -39,8 +39,10 @@ type AgentEvent struct {
 	// UserMessage is set on action=prompted: the user's follow-up text in
 	// the agent thread.
 	UserMessage string
-	CreatorID   string
-	WebhookID   string
+	CreatorID          string
+	CreatorDisplayName string
+	CreatorName        string
+	WebhookID          string
 }
 
 // AgentHandler is invoked once per accepted (signature-verified, recognized
@@ -77,7 +79,9 @@ type rawAgentSession struct {
 		Title      string `json:"title"`
 	} `json:"issue"`
 	Creator *struct {
-		ID string `json:"id"`
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		DisplayName string `json:"displayName"`
 	} `json:"creator"`
 }
 
@@ -195,6 +199,8 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 	if session.Creator != nil {
 		ev.CreatorID = session.Creator.ID
+		ev.CreatorDisplayName = session.Creator.DisplayName
+		ev.CreatorName = session.Creator.Name
 	}
 	switch action {
 	case ActionCreated:
