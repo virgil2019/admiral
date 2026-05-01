@@ -289,6 +289,74 @@ func (f *flow) postActivity(a linear.AgentActivity) {
 	}
 }
 
+// isBranchMergedToBase checks whether the flow's branch is already merged into
+// the base branch (e.g. origin/main). It returns the merged commit ref if so,
+// or "" if not merged. This uses `git merge-base --is-ancestor` so it does not
+// require checking out anything — just a local probe of the git object graph.
+func (f *flow) isBranchMergedToBase() (string, error) {
+	if f.branch == "" || f.repoDir == "" || f.baseBranch == "" {
+		return "", nil
+	}
+	// Fetch the base branch to ensure we have the latest — the issue may have
+	// been merged by a human while this job sat in the queue.
+	if err := runCmd(f.ctx, f.repoDir, "git", "fetch", "origin", f.baseBranch); err != nil {
+		return "", fmt.Errorf("git fetch origin %s: %w", f.baseBranch, err)
+	}
+	// Check if the branch (or any ref pointing to it) is an ancestor of the
+	// base branch. We try the local branch first; if it doesn't exist, fall
+	// back to origin/<branch>.
+	branchRefs := []string{f.branch, "origin/" + f.branch}
+	for _, ref := range branchRefs {
+		out, err := captureCmd(f.ctx, f.repoDir,
+			"git", "merge-base", "--is-ancestor", ref, "origin/"+f.baseBranch)
+		if err == nil {
+			// merge-base succeeded: ref is an ancestor of base → already merged.
+			hash, hErr := captureCmd(f.ctx, f.repoDir, "git", "rev-parse", ref)
+			if hErr == nil {
+				return strings.TrimSpace(hash), nil
+			}
+			return strings.TrimSpace(out), nil
+		}
+	}
+	return "", nil
+}
+
+// markAlreadyMerged handles the already-merged shortcut: posts a courtesy
+// Linear response, marks the job DONE, and skips worktree creation entirely.
+func (f *flow) markAlreadyMerged(mergedRef string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	updErr := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateDone
+		j.PRURL = "https://github.com/" + mergedRef
+		j.FinishedAt = now
+	})
+	if updErr != nil {
+		f.o.logger.Warn("mark_already_merged_update_failed",
+			"err", updErr, "session", f.ev.SessionID)
+	}
+
+	mention := ""
+	if f.ev.CreatorID != "" {
+		mention = "@" + f.ev.CreatorID + " "
+	}
+	shortRef := mergedRef
+	if len(shortRef) > 12 {
+		shortRef = shortRef[:12]
+	}
+	body := fmt.Sprintf(
+		"%sAlready merged in %s. Nothing to do — this issue was completed outside admiral.",
+		mention, shortRef)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.Response(body)); err != nil {
+		f.o.logger.Warn("mark_already_merged_post_failed",
+			"err", err, "session", f.ev.SessionID)
+	}
+	f.o.logger.Info("autopilot_already_merged",
+		"issue", f.ev.IssueIdentifier, "session", f.ev.SessionID, "ref", mergedRef)
+	return nil
+}
+
 // postActivityWithRetry posts the activity with up to 3 retries using exponential
 // backoff. If all attempts fail, it returns the last error.
 func (f *flow) postActivityWithRetry(a linear.AgentActivity) error {
@@ -334,6 +402,18 @@ func (f *flow) execute() error {
 	}
 	f.repoDir = repo.RepoDir
 	f.baseBranch = repo.BaseBranch
+
+	// Already-merged short-circuit. The issue may have been closed out by
+	// a human-authored PR, or by a different admiral instance. Either way
+	// admiral has nothing useful to add — post a courtesy comment and
+	// finish DONE without spawning claude.
+	mergedRef, err := f.isBranchMergedToBase()
+	if err != nil {
+		f.o.logger.Warn("is_branch_merged_check_failed",
+			"err", err, "branch", f.branch, "base", f.baseBranch)
+	} else if mergedRef != "" {
+		return f.markAlreadyMerged(mergedRef)
+	}
 
 	f.branch = branchName(issue)
 	f.worktreePath = filepath.Join(
