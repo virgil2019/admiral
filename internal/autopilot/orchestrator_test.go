@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -306,6 +307,22 @@ type mockStore struct {
 
 	// For UpdateAutopilotJob tracking
 	LastUpdatedJob *store.AutopilotJob
+
+	// Repo to return from GetRepoByProjectID; if RepoErr is non-nil it is
+	// returned instead.
+	Repo    *store.Repo
+	RepoErr error
+
+	// ClaimAutopilotJob recorder. Each call appends the session id; tests
+	// inspect this to verify dispatch decisions that spawn goroutines
+	// (runFollowup / runFollowupResume) actually claim a row.
+	mu                sync.Mutex
+	ClaimedSessionIDs []string
+
+	// UpdatedSessionIDs records every session id passed to
+	// UpdateAutopilotJob, in call order. Useful for asserting the
+	// markAlreadyMerged path updated the new session.
+	UpdatedSessionIDs []string
 }
 
 func (m *mockStore) AnyAutopilotJobActive() (bool, string, error) {
@@ -324,6 +341,9 @@ func (m *mockStore) GetAutopilotJob(sessionID string) (*store.AutopilotJob, erro
 }
 
 func (m *mockStore) UpdateAutopilotJob(sessionID string, fn func(*store.AutopilotJob)) error {
+	m.mu.Lock()
+	m.UpdatedSessionIDs = append(m.UpdatedSessionIDs, sessionID)
+	m.mu.Unlock()
 	if m.LastUpdatedJob != nil {
 		fn(m.LastUpdatedJob)
 	}
@@ -331,7 +351,18 @@ func (m *mockStore) UpdateAutopilotJob(sessionID string, fn func(*store.Autopilo
 }
 
 func (m *mockStore) ClaimAutopilotJob(sessionID, issueID, identifier string) (bool, error) {
+	m.mu.Lock()
+	m.ClaimedSessionIDs = append(m.ClaimedSessionIDs, sessionID)
+	m.mu.Unlock()
 	return true, nil
+}
+
+func (m *mockStore) ClaimedSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.ClaimedSessionIDs))
+	copy(out, m.ClaimedSessionIDs)
+	return out
 }
 
 func (m *mockStore) GetLatestDoneJobByIssue(issueID string) (*store.AutopilotJob, error) {
@@ -343,7 +374,41 @@ func (m *mockStore) GetLatestTimedOutJobByIssue(issueID string) (*store.Autopilo
 }
 
 func (m *mockStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
-	return nil, nil
+	return m.Repo, m.RepoErr
+}
+
+// fakeGhProbe is a deterministic ghProbe for tests. Configure the maps
+// keyed on branch name (for FindMergedPRForBranch) and PR url (for
+// PRState); missing keys yield "not found" / "" respectively. Set the
+// *Err fields to simulate transport failures.
+type fakeGhProbe struct {
+	mergedByBranch map[string]struct {
+		URL, SHA string
+	}
+	stateByURL    map[string]string
+	mergedErr     error
+	stateErr      error
+	mergedCalls   int32
+	stateCalls    int32
+}
+
+func (f *fakeGhProbe) FindMergedPRForBranch(_ context.Context, _, branch string) (string, string, bool, error) {
+	atomic.AddInt32(&f.mergedCalls, 1)
+	if f.mergedErr != nil {
+		return "", "", false, f.mergedErr
+	}
+	if v, ok := f.mergedByBranch[branch]; ok {
+		return v.URL, v.SHA, true, nil
+	}
+	return "", "", false, nil
+}
+
+func (f *fakeGhProbe) PRState(_ context.Context, prURL string) (string, error) {
+	atomic.AddInt32(&f.stateCalls, 1)
+	if f.stateErr != nil {
+		return "", f.stateErr
+	}
+	return f.stateByURL[prURL], nil
 }
 
 func TestHandleCommand_StatusIdle(t *testing.T) {
@@ -643,79 +708,283 @@ func TestDrainStreamJSON_EmitsStructuredEvents(t *testing.T) {
 	}
 }
 
-// handleCreated short-circuit tests
+// handleCreated dispatch tests (GEO-38).
+//
+// When an issue already has a DONE row in admiral's DB and the user
+// re-mentions admiral, Linear sends a fresh ActionCreated event. The
+// dispatch decision branches on the prior PR's GitHub state:
+//
+//   OPEN + has claude_session_id   → resume (runFollowupResume)
+//   OPEN + no claude_session_id    → respond "legacy session"
+//   MERGED / CLOSED                → fresh follow-up (runFollowup)
+//   gh error / unknown state       → fall through to fresh flow (run)
+//
+// Tests below cover each branch by inspecting observable side effects:
+//   - synchronous reply body (mockLinearClient.PostedBody)
+//   - which sessions were claimed (mockStore.ClaimedSessionIDs)
 
-func TestHandleCreated_ShortCircuits_WhenPriorDoneWithPR(t *testing.T) {
-	mlc := &mockLinearClient{}
-	ms := &mockStore{
-		LatestDoneJob: &store.AutopilotJob{
-			IssueID:    "issue-abc",
-			PRURL:      "https://github.com/x/y/pull/42",
-			State:      store.JobStateDone,
-			StartedAt:  time.Now().Add(-1 * time.Hour).Format(time.RFC3339),
-			FinishedAt: time.Now().Add(-30 * time.Minute).Format(time.RFC3339),
-		},
+func newTestOrchestrator(t *testing.T, ms *mockStore, mlc *mockLinearClient, gh ghProbe) *Orchestrator {
+	t.Helper()
+	if ms.Repo == nil {
+		ms.Repo = &store.Repo{
+			ProjectID:   "proj-test",
+			ProjectName: "TestProject",
+			RepoDir:     t.TempDir(),
+			BaseBranch:  "main",
+			Enabled:     true,
+		}
 	}
-	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
-	ev := linear.AgentEvent{
-		SessionID:      "new-session",
-		IssueID:        "issue-abc",
-		IssueIdentifier: "ABC-1",
-		Action:         linear.ActionCreated,
+	if mlc.GetIssueResult == nil {
+		mlc.GetIssueResult = &linear.Issue{
+			ID:         "issue-test",
+			Identifier: "TEST-1",
+			ProjectID:  "proj-test",
+			TeamID:     "team-test",
+		}
 	}
-
-	o.handleCreated(ev)
-
-	if !strings.Contains(mlc.PostedBody, "https://github.com/x/y/pull/42") {
-		t.Errorf("expected prior PR URL in response, got: %s", mlc.PostedBody)
-	}
-	if !strings.Contains(mlc.PostedBody, "already completed") {
-		t.Errorf("expected 'already completed' in response, got: %s", mlc.PostedBody)
+	return &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60},
+		db:     ms,
+		lc:     mlc,
+		gh:     gh,
+		logger: slog.Default(),
 	}
 }
 
-func TestHandleCreated_DoesNotShortCircuit_WhenPriorFailed(t *testing.T) {
-	mlc := &mockLinearClient{}
-	ms := &mockStore{
-		Active:      false,
-		GetJob:      nil,
-		GetJobErr:   nil,
-		LatestDoneJob: nil, // no DONE job, only FAILED would be in DB
+// TestHandleCreated_PriorDone_PROpenWithSession spawns a follow-up resume.
+// Observable: ev.SessionID gets claimed (runFollowupResume claims first thing).
+func TestHandleCreated_PriorDone_PROpenWithSession_Resumes(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"), // halt the goroutine fast
 	}
-	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
+	ms := &mockStore{
+		LatestDoneJob: &store.AutopilotJob{
+			AgentSessionID:  "old-session",
+			IssueID:         "issue-abc",
+			PRURL:           "https://github.com/x/y/pull/42",
+			ClaudeSessionID: "claude-sess-xyz",
+			State:           store.JobStateDone,
+		},
+	}
+	gh := &fakeGhProbe{
+		stateByURL: map[string]string{
+			"https://github.com/x/y/pull/42": "OPEN",
+		},
+	}
+	o := newTestOrchestrator(t, ms, mlc, gh)
 	ev := linear.AgentEvent{
 		SessionID:       "new-session",
-		IssueID:         "issue-fail",
-		IssueIdentifier: "FAIL-1",
+		IssueID:         "issue-abc",
+		IssueIdentifier: "ABC-1",
 		Action:          linear.ActionCreated,
 	}
 
 	o.handleCreated(ev)
 
-	// Wait briefly for goroutine to start
-	time.Sleep(50 * time.Millisecond)
+	// runFollowupResume runs in a goroutine; let it claim the session.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ms.ClaimedSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
-	// handleCreated should NOT have short-circuited (would have returned before spawning)
-	// so PostedBody should NOT contain the short-circuit msg
-	if strings.Contains(mlc.GetPostedBody(), "already completed") {
-		t.Errorf("expected no 'already completed' for FAILED-only issue, got: %s", mlc.GetPostedBody())
+	claims := ms.ClaimedSnapshot()
+	if len(claims) != 1 || claims[0] != "new-session" {
+		t.Fatalf("expected runFollowupResume to claim new-session, got claims=%v", claims)
+	}
+	// PR-state was checked synchronously in handleCreated.
+	if atomic.LoadInt32(&gh.stateCalls) != 1 {
+		t.Errorf("expected exactly 1 PRState call, got %d", gh.stateCalls)
+	}
+	// No "legacy session" message (this is the resume path).
+	if strings.Contains(mlc.GetPostedBody(), "created before resume support") {
+		t.Errorf("did not expect the legacy-session message; got: %s", mlc.GetPostedBody())
 	}
 }
 
-func TestHandleCreated_DoesNotShortCircuit_WhenPriorDoneNoPR(t *testing.T) {
+// TestHandleCreated_PriorDone_PROpenNoSession_RespondsLegacy is the
+// synchronous "legacy row" path — admiral can't resume without a
+// claude_session_id, so it posts an explanation and stops.
+func TestHandleCreated_PriorDone_PROpenNoSession_RespondsLegacy(t *testing.T) {
 	mlc := &mockLinearClient{}
 	ms := &mockStore{
 		LatestDoneJob: &store.AutopilotJob{
-			IssueID:    "issue-nopr",
-			PRURL:      "", // empty PRURL — abnormal recovery path
-			State:      store.JobStateDone,
-			StartedAt:  time.Now().Add(-1 * time.Hour).Format(time.RFC3339),
-			FinishedAt: time.Now().Add(-30 * time.Minute).Format(time.RFC3339),
+			IssueID:         "issue-legacy",
+			PRURL:           "https://github.com/x/y/pull/13",
+			ClaudeSessionID: "", // legacy: no session id captured
+			State:           store.JobStateDone,
 		},
 	}
-	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
+	gh := &fakeGhProbe{
+		stateByURL: map[string]string{
+			"https://github.com/x/y/pull/13": "OPEN",
+		},
+	}
+	o := newTestOrchestrator(t, ms, mlc, gh)
 	ev := linear.AgentEvent{
 		SessionID:       "new-session",
+		IssueID:         "issue-legacy",
+		IssueIdentifier: "LEG-1",
+		Action:          linear.ActionCreated,
+	}
+
+	o.handleCreated(ev)
+
+	if !strings.Contains(mlc.GetPostedBody(), "created before resume support") {
+		t.Errorf("expected legacy-session message, got: %s", mlc.GetPostedBody())
+	}
+	if !strings.Contains(mlc.GetPostedBody(), "https://github.com/x/y/pull/13") {
+		t.Errorf("expected prior PR URL in legacy message, got: %s", mlc.GetPostedBody())
+	}
+	if got := ms.ClaimedSnapshot(); len(got) != 0 {
+		t.Errorf("legacy path must not claim a job; got claims=%v", got)
+	}
+}
+
+// TestHandleCreated_PriorDone_PRMerged_SpawnsFreshFollowup verifies that
+// a merged prior PR routes to runFollowup (fresh branch) rather than the
+// resume path or a refusal.
+func TestHandleCreated_PriorDone_PRMerged_SpawnsFreshFollowup(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
+	}
+	ms := &mockStore{
+		LatestDoneJob: &store.AutopilotJob{
+			IssueID:         "issue-merged",
+			PRURL:           "https://github.com/x/y/pull/99",
+			ClaudeSessionID: "claude-sess-merged",
+			State:           store.JobStateDone,
+		},
+	}
+	gh := &fakeGhProbe{
+		stateByURL: map[string]string{
+			"https://github.com/x/y/pull/99": "MERGED",
+		},
+	}
+	o := newTestOrchestrator(t, ms, mlc, gh)
+	ev := linear.AgentEvent{
+		SessionID:       "new-session-merged",
+		IssueID:         "issue-merged",
+		IssueIdentifier: "MRG-1",
+		Action:          linear.ActionCreated,
+	}
+
+	o.handleCreated(ev)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ms.ClaimedSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	claims := ms.ClaimedSnapshot()
+	if len(claims) != 1 || claims[0] != "new-session-merged" {
+		t.Fatalf("expected runFollowup to claim new-session-merged; got %v", claims)
+	}
+	if strings.Contains(mlc.GetPostedBody(), "created before resume support") {
+		t.Errorf("did not expect legacy-session message for merged path")
+	}
+}
+
+// TestHandleCreated_PriorDone_PRClosed_SpawnsFreshFollowup mirrors the
+// merged path for a closed-without-merge prior PR.
+func TestHandleCreated_PriorDone_PRClosed_SpawnsFreshFollowup(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
+	}
+	ms := &mockStore{
+		LatestDoneJob: &store.AutopilotJob{
+			IssueID:         "issue-closed",
+			PRURL:           "https://github.com/x/y/pull/77",
+			ClaudeSessionID: "claude-sess-closed",
+			State:           store.JobStateDone,
+		},
+	}
+	gh := &fakeGhProbe{
+		stateByURL: map[string]string{
+			"https://github.com/x/y/pull/77": "CLOSED",
+		},
+	}
+	o := newTestOrchestrator(t, ms, mlc, gh)
+	ev := linear.AgentEvent{
+		SessionID:       "new-session-closed",
+		IssueID:         "issue-closed",
+		IssueIdentifier: "CLS-1",
+		Action:          linear.ActionCreated,
+	}
+
+	o.handleCreated(ev)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ms.ClaimedSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	claims := ms.ClaimedSnapshot()
+	if len(claims) != 1 || claims[0] != "new-session-closed" {
+		t.Fatalf("expected runFollowup to claim new-session-closed; got %v", claims)
+	}
+}
+
+// TestHandleCreated_PriorDone_GhUnreachable_FallsThroughFresh verifies the
+// fail-open behavior: if gh PRState errors, dispatch falls through to a
+// fresh flow rather than blocking.
+func TestHandleCreated_PriorDone_GhUnreachable_FallsThroughFresh(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
+	}
+	ms := &mockStore{
+		LatestDoneJob: &store.AutopilotJob{
+			IssueID: "issue-ghdown",
+			PRURL:   "https://github.com/x/y/pull/55",
+			State:   store.JobStateDone,
+		},
+	}
+	gh := &fakeGhProbe{stateErr: fmt.Errorf("transport: dial tcp: refused")}
+	o := newTestOrchestrator(t, ms, mlc, gh)
+	ev := linear.AgentEvent{
+		SessionID:       "new-session-ghdown",
+		IssueID:         "issue-ghdown",
+		IssueIdentifier: "GHD-1",
+		Action:          linear.ActionCreated,
+	}
+
+	o.handleCreated(ev)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ms.ClaimedSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "new-session-ghdown" {
+		t.Fatalf("expected gh-error to fall through to a claim, got %v", got)
+	}
+}
+
+// TestHandleCreated_PriorDone_NoPRURL_SkipsCheck makes sure the dispatch
+// short-circuits before touching gh when prior is malformed (no PRURL).
+func TestHandleCreated_PriorDone_NoPRURL_SkipsCheck(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
+	}
+	ms := &mockStore{
+		LatestDoneJob: &store.AutopilotJob{
+			IssueID: "issue-nopr",
+			PRURL:   "", // malformed
+			State:   store.JobStateDone,
+		},
+	}
+	gh := &fakeGhProbe{}
+	o := newTestOrchestrator(t, ms, mlc, gh)
+	ev := linear.AgentEvent{
+		SessionID:       "new-session-nopr",
 		IssueID:         "issue-nopr",
 		IssueIdentifier: "NOPR-1",
 		Action:          linear.ActionCreated,
@@ -723,38 +992,41 @@ func TestHandleCreated_DoesNotShortCircuit_WhenPriorDoneNoPR(t *testing.T) {
 
 	o.handleCreated(ev)
 
-	// Wait for goroutine to at least start
-	time.Sleep(50 * time.Millisecond)
-
-	// Should NOT short-circuit because PRURL is empty (abnormal recovery case)
-	if strings.Contains(mlc.GetPostedBody(), "already completed") {
-		t.Errorf("expected no short-circuit when PRURL is empty, got: %s", mlc.GetPostedBody())
+	if atomic.LoadInt32(&gh.stateCalls) != 0 {
+		t.Errorf("PRState should not be called when prior.PRURL is empty; got %d calls", gh.stateCalls)
 	}
 }
 
-func TestHandleCreated_DoesNotShortCircuit_WhenNoHistory(t *testing.T) {
-	mlc := &mockLinearClient{}
-	ms := &mockStore{
-		Active:         false,
-		LatestDoneJob:   nil, // no history at all
-		LatestDoneJobErr: nil,
+// TestHandleCreated_NoPriorDone_FallsThroughToFreshFlow verifies the
+// no-prior path doesn't hit gh and proceeds straight to claim.
+func TestHandleCreated_NoPriorDone_FallsThroughToFreshFlow(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
 	}
-	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
+	ms := &mockStore{LatestDoneJob: nil}
+	gh := &fakeGhProbe{}
+	o := newTestOrchestrator(t, ms, mlc, gh)
 	ev := linear.AgentEvent{
-		SessionID:       "new-session",
-		IssueID:         "issue-never",
-		IssueIdentifier: "NEVER-1",
+		SessionID:       "fresh",
+		IssueID:         "issue-fresh",
+		IssueIdentifier: "FRS-1",
 		Action:          linear.ActionCreated,
 	}
 
 	o.handleCreated(ev)
 
-	// Wait for goroutine to at least start
-	time.Sleep(50 * time.Millisecond)
-
-	// Should NOT short-circuit because there's no prior history
-	if strings.Contains(mlc.GetPostedBody(), "already completed") {
-		t.Errorf("expected no short-circuit for unknown issue, got: %s", mlc.GetPostedBody())
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ms.ClaimedSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&gh.stateCalls) != 0 {
+		t.Errorf("PRState shouldn't run with no prior; got %d calls", gh.stateCalls)
+	}
+	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "fresh" {
+		t.Errorf("expected fresh path to claim 'fresh'; got %v", got)
 	}
 }
 
@@ -1233,5 +1505,224 @@ func TestRunClaudeResume_ArgsCorrect(t *testing.T) {
 	}
 	if f.ev.SessionID != "session-resume-test" {
 		t.Errorf("SessionID = %q, want %q", f.ev.SessionID, "session-resume-test")
+	}
+}
+
+// GEO-37 Bug A — flow.execute short-circuits when the deterministic branch
+// for the issue already has a merged PR (work was completed externally).
+// PR #66's earlier attempt at this fix had a fatal order-of-operations
+// bug where f.branch was empty at check time; this test would have caught
+// it instantly because the fake gh is keyed on the branch name.
+func TestFlowExecute_ShortCircuits_WhenBranchAlreadyMerged(t *testing.T) {
+	repoDir := t.TempDir()
+	mlc := &mockLinearClient{
+		GetIssueResult: &linear.Issue{
+			ID:         "issue-merged",
+			Identifier: "ABC-1",
+			ProjectID:  "proj-test",
+			TeamID:     "team-test",
+		},
+	}
+	ms := &mockStore{
+		Repo: &store.Repo{
+			ProjectID:   "proj-test",
+			ProjectName: "TestProject",
+			RepoDir:     repoDir,
+			BaseBranch:  "main",
+			Enabled:     true,
+		},
+		LastUpdatedJob: &store.AutopilotJob{},
+	}
+	gh := &fakeGhProbe{
+		mergedByBranch: map[string]struct {
+			URL, SHA string
+		}{
+			// branchName(issue) of "ABC-1" = "linear/abc-1"
+			"linear/abc-1": {URL: "https://github.com/x/y/pull/777", SHA: "abc1234567890def"},
+		},
+	}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:     ms,
+		lc:     mlc,
+		gh:     gh,
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-merged-check",
+		IssueID:         "issue-merged",
+		IssueIdentifier: "ABC-1",
+		Action:          linear.ActionCreated,
+	}
+	f := newFlow(o, context.Background(), ev)
+
+	if err := f.execute(); err != nil {
+		t.Fatalf("execute returned err: %v", err)
+	}
+
+	// gh probe must have been hit exactly once for the deterministic branch.
+	if got := atomic.LoadInt32(&gh.mergedCalls); got != 1 {
+		t.Errorf("FindMergedPRForBranch calls: got %d, want 1", got)
+	}
+	// markAlreadyMerged should have updated the new session row to DONE.
+	if ms.LastUpdatedJob.State != store.JobStateDone {
+		t.Errorf("autopilot_jobs.state = %q, want DONE", ms.LastUpdatedJob.State)
+	}
+	if ms.LastUpdatedJob.PRURL != "https://github.com/x/y/pull/777" {
+		t.Errorf("autopilot_jobs.pr_url = %q, want the merged PR URL", ms.LastUpdatedJob.PRURL)
+	}
+	if ms.LastUpdatedJob.Branch != "linear/abc-1" {
+		t.Errorf("autopilot_jobs.branch = %q, want linear/abc-1", ms.LastUpdatedJob.Branch)
+	}
+	// The Linear thread should mention "Already merged" + the PR URL.
+	if !strings.Contains(mlc.GetPostedBody(), "Already merged") {
+		t.Errorf("expected 'Already merged' in posted body, got: %s", mlc.GetPostedBody())
+	}
+	if !strings.Contains(mlc.GetPostedBody(), "https://github.com/x/y/pull/777") {
+		t.Errorf("expected PR URL in posted body, got: %s", mlc.GetPostedBody())
+	}
+	// No worktree was created.
+	worktreesDir := filepath.Join(repoDir, ".worktrees")
+	if entries, err := os.ReadDir(worktreesDir); err == nil && len(entries) > 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("expected no worktree to be created; found %v", names)
+	}
+}
+
+// TestFlowExecute_DoesNotShortCircuit_OnFollowupSuffix verifies that the
+// merged-branch check is intentionally skipped on follow-up flows — those
+// flows generate a fresh suffixed branch on purpose and shouldn't be
+// confused with prior merged work.
+func TestFlowExecute_DoesNotShortCircuit_OnFollowupSuffix(t *testing.T) {
+	repoDir := t.TempDir()
+	mlc := &mockLinearClient{
+		GetIssueResult: &linear.Issue{
+			Identifier: "ABC-1", ProjectID: "proj-test", TeamID: "team-test",
+		},
+	}
+	ms := &mockStore{
+		Repo: &store.Repo{ProjectID: "proj-test", RepoDir: repoDir, BaseBranch: "main", Enabled: true},
+	}
+	gh := &fakeGhProbe{
+		mergedByBranch: map[string]struct {
+			URL, SHA string
+		}{
+			"linear/abc-1": {URL: "https://github.com/x/y/pull/777", SHA: "deadbeef"},
+		},
+	}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:     ms,
+		lc:     mlc,
+		gh:     gh,
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "follow-session",
+		IssueID:         "issue-merged",
+		IssueIdentifier: "ABC-1",
+		Action:          linear.ActionCreated,
+	}
+	f := newFlow(o, context.Background(), ev)
+	f.followupSuffix = "followup-deadbeef"
+
+	// We don't care about the rest of execute; just assert the merged check
+	// was NOT hit because the follow-up suffix marks this as fresh work.
+	_ = f.execute()
+	if atomic.LoadInt32(&gh.mergedCalls) != 0 {
+		t.Errorf("FindMergedPRForBranch must not run on follow-up flows; got %d calls", gh.mergedCalls)
+	}
+}
+
+// GEO-37 Bug B — archiveWorktree's force-removal fallback: when
+// `git worktree remove` can't clean up (e.g. because the path was never
+// a real worktree, only a stray dir), the fallback must still os.RemoveAll
+// the path so the active .worktrees dir doesn't leak.
+func TestArchiveWorktree_FallbackRemovesNonGitDir(t *testing.T) {
+	repoDir := t.TempDir()
+	worktreePath := filepath.Join(repoDir, ".worktrees", "linear-stray")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("mkdir stray dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, "leftover.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write leftover: %v", err)
+	}
+
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{},
+		logger: slog.Default(),
+	}
+	f := &flow{
+		o:            o,
+		ev:           linear.AgentEvent{IssueIdentifier: "STRAY-1"},
+		worktreePath: worktreePath,
+		repoDir:      repoDir,
+		branch:       "linear/stray-1",
+	}
+
+	f.archiveWorktree()
+
+	// 1. Archive directory exists with the leftover file.
+	archiveRoot := filepath.Join(repoDir, ".worktrees-archive")
+	entries, err := os.ReadDir(archiveRoot)
+	if err != nil {
+		t.Fatalf("read archive root: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one archive entry, got %d", len(entries))
+	}
+	archived := filepath.Join(archiveRoot, entries[0].Name(), "leftover.txt")
+	if got, err := os.ReadFile(archived); err != nil || string(got) != "hi" {
+		t.Errorf("archived file content/missing: %v / %q", err, got)
+	}
+
+	// 2. Original worktree path is gone — the critical Bug B assertion.
+	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
+		t.Errorf("expected original worktree path to be removed; stat err = %v", err)
+	}
+}
+
+// TestArchiveWorktree_NoOpWhenPathEmpty guards against accidentally archiving
+// the repo root when worktreePath wasn't set on the flow (e.g. early-exit
+// paths in execute()).
+func TestArchiveWorktree_NoOpWhenPathEmpty(t *testing.T) {
+	repoDir := t.TempDir()
+	o := &Orchestrator{cfg: &config.Autopilot{}, logger: slog.Default()}
+	f := &flow{
+		o:            o,
+		ev:           linear.AgentEvent{IssueIdentifier: "X"},
+		worktreePath: "",
+		repoDir:      repoDir,
+	}
+	f.cleanupWorktree(cleanupArchive)
+
+	if _, err := os.Stat(filepath.Join(repoDir, ".worktrees-archive")); !os.IsNotExist(err) {
+		t.Errorf("archive root should not be created when worktreePath is empty; stat err = %v", err)
+	}
+}
+
+// TestFollowupSuffix verifies the suffix derivation is stable across
+// retries (so a re-delivered webhook reuses the same branch instead of
+// leaking a new one each time) and survives unusual session id shapes.
+func TestFollowupSuffix(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+	}{
+		{"5d093c17-09b4-43da-9111-b05e48467e1a", "followup-5d093c17"},
+		{"abcdef", "followup-abcdef"},
+		{"", "followup"},
+		{"!!!", "followup"},
+	} {
+		got := followupSuffix(tc.in)
+		if got != tc.want {
+			t.Errorf("followupSuffix(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+		// Stable across calls.
+		if again := followupSuffix(tc.in); again != got {
+			t.Errorf("followupSuffix(%q) not stable: %q vs %q", tc.in, got, again)
+		}
 	}
 }
