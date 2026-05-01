@@ -594,11 +594,7 @@ func (f *flow) execute() error {
 		return fmt.Errorf("update job to DONE: %w", err)
 	}
 
-	// Build mention prefix for the creator.
-	mention := ""
-	if f.ev.CreatorID != "" {
-		mention = "@" + f.ev.CreatorID + " "
-	}
+	mention := f.creatorMention()
 	var doneBody string
 	if isNoop {
 		doneBody = fmt.Sprintf(
@@ -808,10 +804,7 @@ func (f *flow) markAlreadyMerged(prURL, mergeSHA string) error {
 			"err", err, "session", f.ev.SessionID)
 	}
 
-	mention := ""
-	if f.ev.CreatorID != "" {
-		mention = "@" + f.ev.CreatorID + " "
-	}
+	mention := f.creatorMention()
 	shortSHA := mergeSHA
 	if len(shortSHA) > 12 {
 		shortSHA = shortSHA[:12]
@@ -829,6 +822,24 @@ func (f *flow) markAlreadyMerged(prURL, mergeSHA string) error {
 	return nil
 }
 
+// creatorMention returns the "@<handle> " prefix used to ping the agent
+// session creator on Linear thread replies. Linear's mention syntax is
+// `@<displayName>` (the user's handle); using the user UUID does not
+// trigger a notification. Falls back through DisplayName → Name → "" so
+// we always emit something when the webhook payload omits a field, and
+// returns "" when no human-readable identifier is known (in which case
+// callers prepend nothing).
+func (f *flow) creatorMention() string {
+	handle := f.ev.CreatorDisplayName
+	if handle == "" {
+		handle = f.ev.CreatorName
+	}
+	if handle == "" {
+		return ""
+	}
+	return "@" + handle + " "
+}
+
 func (f *flow) markFailed(runErr error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
@@ -839,10 +850,7 @@ func (f *flow) markFailed(runErr error) {
 	// Use a fresh short ctx in case the parent is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	mention := ""
-	if f.ev.CreatorID != "" {
-		mention = "@" + f.ev.CreatorID + " "
-	}
+	mention := f.creatorMention()
 	body := mention + "admiral failed: " + truncate(runErr.Error(), 1500)
 	if f.worktreePath != "" {
 		body += "\n\nWorktree: `" + f.worktreePath + "`"
@@ -875,10 +883,7 @@ func (f *flow) markTimedOut(runErr error) {
 	// Use a fresh short ctx in case the parent is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	mention := ""
-	if f.ev.CreatorID != "" {
-		mention = "@" + f.ev.CreatorID + " "
-	}
+	mention := f.creatorMention()
 	truncatedSession := f.claudeSessionID
 	if len(truncatedSession) > 8 {
 		truncatedSession = truncatedSession[:8]
