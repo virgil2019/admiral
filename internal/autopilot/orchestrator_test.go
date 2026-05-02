@@ -198,6 +198,43 @@ func TestExtractCommand(t *testing.T) {
 	}
 }
 
+func TestParseMentionCommand(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantName string
+		wantRem  string
+		wantOK   bool
+	}{
+		// /rerun variants
+		{`/rerun`, "rerun", "", true},
+		{`/RERUN`, "rerun", "", true},
+		{`/rerun extra notes`, "rerun", "extra notes", true},
+		{"/rerun\nmore content", "rerun", "", true},
+		{"/rerun note1\nnote2", "rerun", "note1", true},
+		// /fix (not yet implemented — parser still recognizes it)
+		{`/fix something broke`, "fix", "something broke", true},
+		// leading whitespace
+		{`  /rerun`, "rerun", "", true},
+		{"  \n  /rerun extra", "rerun", "extra", true},
+		// bare text — no command
+		{"hello", "", "", false},
+		{"", "", "", false},
+		{"  hello", "", "", false},
+		{"\nhello", "", "", false},
+		{"please fix this", "", "", false},
+		// first non-empty line not starting with /
+		{"line one\n/rerun", "", "", false},
+		{"  \n  \n/rerun", "rerun", "", true}, // /rerun on second line is still the first content
+	}
+	for _, c := range cases {
+		name, rem, ok := parseMentionCommand(c.in)
+		if name != c.wantName || rem != c.wantRem || ok != c.wantOK {
+			t.Errorf("parseMentionCommand(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.in, name, rem, ok, c.wantName, c.wantRem, c.wantOK)
+		}
+	}
+}
+
 func TestRelativeTime(t *testing.T) {
 	now := time.Now()
 	cases := []struct {
@@ -317,6 +354,10 @@ type mockStore struct {
 	Repo    *store.Repo
 	RepoErr error
 
+	// ListJobsByIssueAndStates override
+	ListJobsByIssueAndStatesResult []store.AutopilotJob
+	ListJobsByIssueAndStatesErr    error
+
 	// ClaimAutopilotJob recorder. Each call appends the session id; tests
 	// inspect this to verify dispatch decisions that spawn goroutines
 	// (runFollowup / runFollowupResume) actually claim a row.
@@ -383,6 +424,10 @@ func (m *mockStore) FindActiveJobByIssue(issueID, excludeSessionID string) (*sto
 
 func (m *mockStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
 	return m.Repo, m.RepoErr
+}
+
+func (m *mockStore) ListJobsByIssueAndStates(issueID string, states []string) ([]store.AutopilotJob, error) {
+	return m.ListJobsByIssueAndStatesResult, m.ListJobsByIssueAndStatesErr
 }
 
 // fakeGhProbe is a deterministic ghProbe for tests. Configure the maps
@@ -1389,14 +1434,14 @@ func TestHandlePrompted_NoHistory(t *testing.T) {
 		SessionID:       "session-no-history",
 		IssueIdentifier: "GEO-NOHIST-1",
 		Action:          linear.ActionPrompted,
-		UserMessage:     "please fix this",
+		UserMessage:     "/help", // /help bypasses bare-mention check
 	}
 
 	o.handlePrompted(ev)
 
 	time.Sleep(50 * time.Millisecond)
-	if !strings.Contains(mlc.GetPostedBody(), "don't have history") {
-		t.Errorf("expected 'don't have history' stub reply, got: %s", mlc.GetPostedBody())
+	if !strings.Contains(mlc.GetPostedBody(), "Available commands") {
+		t.Errorf("expected '/help' response, got: %s", mlc.GetPostedBody())
 	}
 }
 
@@ -1414,14 +1459,16 @@ func TestHandlePrompted_NoClaudeSessionID(t *testing.T) {
 		SessionID:       "session-old",
 		IssueIdentifier: "GEO-OLD-1",
 		Action:          linear.ActionPrompted,
-		UserMessage:     "please fix this",
+		UserMessage:     "/help", // /help bypasses bare-mention check
 	}
 
 	o.handlePrompted(ev)
 
 	time.Sleep(50 * time.Millisecond)
-	if !strings.Contains(mlc.GetPostedBody(), "before resume support") {
-		t.Errorf("expected 'before resume support' stub reply, got: %s", mlc.GetPostedBody())
+	// /help posts the available commands, not the "before resume support" message.
+	// The NoClaudeSessionID path is only reached via /help (not /status which has its own handling).
+	if !strings.Contains(mlc.GetPostedBody(), "Available commands") {
+		t.Errorf("expected '/help' response, got: %s", mlc.GetPostedBody())
 	}
 }
 
@@ -1463,6 +1510,122 @@ func TestHandlePrompted_ResumeSpawn(t *testing.T) {
 	if strings.Contains(mlc.GetPostedBody(), "don't have history") ||
 		strings.Contains(mlc.GetPostedBody(), "before resume support") {
 		t.Errorf("expected no stub reply for valid resume, got: %s", mlc.GetPostedBody())
+	}
+}
+
+// TestHandleCreated_BareMention_Rejected verifies that an @mention with no
+// leading /command is rejected: job is CANCELLED with bare_mention reason,
+// help text is posted, and no job is claimed.
+func TestHandleCreated_BareMention_Rejected(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		LastUpdatedJob: &store.AutopilotJob{}, // must be non-nil for UpdateAutopilotJob to call fn
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "session-bare",
+		IssueID:         "issue-bare",
+		IssueIdentifier: "BAR-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "please do something", // no leading /command
+	}
+
+	o.handleCreated(ev)
+
+	// Job must be cancelled with bare_mention.
+	ms.mu.Lock()
+	cancelled := ms.LastUpdatedJob != nil && ms.LastUpdatedJob.State == store.JobStateCancelled
+	ms.mu.Unlock()
+	if !cancelled {
+		t.Errorf("expected job to be CANCELLED, got state=%v",
+			func() string { ms.mu.Lock(); defer ms.mu.Unlock(); if ms.LastUpdatedJob == nil { return "<nil>" }; return ms.LastUpdatedJob.State }())
+	}
+
+	// Help text must be posted.
+	if !strings.Contains(mlc.GetPostedBody(), "does not respond to bare @mentions") {
+		t.Errorf("expected bare mention help text in posted body, got: %s", mlc.GetPostedBody())
+	}
+
+	// No job should have been claimed.
+	if got := ms.ClaimedSnapshot(); len(got) != 0 {
+		t.Errorf("expected no job claimed for bare mention; got %v", got)
+	}
+}
+
+// TestHandleCreated_UnknownCommand_Rejected verifies that an @mention with
+// an unknown /command is rejected with unknown_command reason.
+func TestHandleCreated_UnknownCommand_Rejected(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		LastUpdatedJob: &store.AutopilotJob{},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "session-unknown",
+		IssueID:         "issue-unknown",
+		IssueIdentifier: "UNK-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "/foobar extra args",
+	}
+
+	o.handleCreated(ev)
+
+	// Job must be cancelled with unknown_command.
+	ms.mu.Lock()
+	cancelled := ms.LastUpdatedJob != nil && ms.LastUpdatedJob.State == store.JobStateCancelled
+	ms.mu.Unlock()
+	if !cancelled {
+		t.Errorf("expected job to be CANCELLED, got state=%v",
+			func() string { ms.mu.Lock(); defer ms.mu.Unlock(); if ms.LastUpdatedJob == nil { return "<nil>" }; return ms.LastUpdatedJob.State }())
+	}
+
+	// Unknown command reply must be posted.
+	if !strings.Contains(mlc.GetPostedBody(), "did not recognize") {
+		t.Errorf("expected 'did not recognize' in posted body, got: %s", mlc.GetPostedBody())
+	}
+}
+
+// TestHandlePrompted_BareMention_Rejected verifies that a prompted event
+// (in-thread follow-up) with no leading /command is rejected.
+func TestHandlePrompted_BareMention_Rejected(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		GetJob: &store.AutopilotJob{
+			AgentSessionID:  "session-prompted",
+			IssueID:         "issue-prompted",
+			ClaudeSessionID: "claude-session-xyz",
+			State:           store.JobStateDone,
+		},
+		LastUpdatedJob: &store.AutopilotJob{},
+	}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
+		db:     ms,
+		lc:     mlc,
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-prompted",
+		IssueID:         "issue-prompted",
+		IssueIdentifier: "GEO-PROMPT-1",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "change v1 to v2", // no leading /command
+	}
+
+	o.handlePrompted(ev)
+
+	// Job must be cancelled with bare_mention.
+	ms.mu.Lock()
+	cancelled := ms.LastUpdatedJob != nil && ms.LastUpdatedJob.State == store.JobStateCancelled
+	ms.mu.Unlock()
+	if !cancelled {
+		t.Errorf("expected job to be CANCELLED, got state=%v",
+			func() string { ms.mu.Lock(); defer ms.mu.Unlock(); if ms.LastUpdatedJob == nil { return "<nil>" }; return ms.LastUpdatedJob.State }())
+	}
+
+	// Help text must be posted.
+	if !strings.Contains(mlc.GetPostedBody(), "does not respond to bare @mentions") {
+		t.Errorf("expected bare mention help text in posted body, got: %s", mlc.GetPostedBody())
 	}
 }
 

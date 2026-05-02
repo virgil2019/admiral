@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -552,6 +553,47 @@ func (s *Store) GetLatestTimedOutJobByIssue(issueID string) (*AutopilotJob, erro
 		return nil, nil
 	}
 	return &j, err
+}
+
+// ListJobsByIssueAndStates returns all autopilot jobs for the given issue ID
+// whose state is in states. Ordered by started_at DESC.
+func (s *Store) ListJobsByIssueAndStates(issueID string, states []string) ([]AutopilotJob, error) {
+	if len(states) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.Repeat(",?", len(states)-1)
+	query := fmt.Sprintf(`
+		SELECT agent_session_id, issue_id, issue_identifier, state,
+		       COALESCE(worktree_path,''), COALESCE(branch,''),
+		       COALESCE(pr_url,''), COALESCE(error,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(stream_log_path,''),
+		       COALESCE(claude_session_id,'')
+		FROM autopilot_jobs
+		WHERE issue_id=? AND state IN (?%s)
+		ORDER BY started_at DESC
+	`, placeholders)
+	args := make([]any, 0, len(states)+1)
+	args = append(args, issueID)
+	for _, st := range states {
+		args = append(args, st)
+	}
+	rows, err := s.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AutopilotJob
+	for rows.Next() {
+		var j AutopilotJob
+		if err := rows.Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+			&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+			&j.StreamLogPath, &j.ClaudeSessionID); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
 }
 
 // ListAutopilotJobs returns jobs matching the given filters, ordered by started_at desc.
