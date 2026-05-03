@@ -156,6 +156,96 @@ ALTER TABLE linear_oauth ADD COLUMN auth_error_at   TEXT;
 ALTER TABLE linear_oauth ADD COLUMN notified_at     TEXT;
 `
 
+// migration0010 introduces admiral_tasks — the issue-keyed task model
+// (GEO-50). One live row per Linear issue. The legacy autopilot_jobs
+// table stays in place as audit log; lookups in PR-B will switch to
+// admiral_tasks. PR-A only adds the schema; nothing yet writes to it
+// outside the backfill in migration0012.
+const migration0010 = `
+CREATE TABLE IF NOT EXISTS admiral_tasks (
+  issue_id              TEXT PRIMARY KEY,
+  issue_identifier      TEXT,
+  state                 TEXT NOT NULL,
+  attempt_n             INTEGER NOT NULL DEFAULT 1,
+  branch                TEXT,
+  worktree_path         TEXT,
+  pr_url                TEXT,
+  claude_session_id     TEXT,
+  last_event_session_id TEXT,
+  started_at            TEXT NOT NULL,
+  finished_at           TEXT,
+  error                 TEXT,
+  stream_log_path       TEXT
+);
+CREATE INDEX IF NOT EXISTS admiral_tasks_state_started
+  ON admiral_tasks(state, started_at);
+`
+
+// migration0011 introduces admiral_task_history — append-only log of
+// superseded admiral_tasks rows (after /rerun in the new model). Empty
+// at install time; PR-B populates it on /rerun. Read by /rerun protocol
+// to compute the next attempt_n + cross-link old PRs.
+const migration0011 = `
+CREATE TABLE IF NOT EXISTS admiral_task_history (
+  history_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  issue_id              TEXT NOT NULL,
+  attempt_n             INTEGER NOT NULL,
+  state                 TEXT NOT NULL,
+  branch                TEXT,
+  worktree_path         TEXT,
+  pr_url                TEXT,
+  claude_session_id     TEXT,
+  agent_session_ids     TEXT,
+  started_at            TEXT NOT NULL,
+  finished_at           TEXT,
+  error                 TEXT,
+  stream_log_path       TEXT,
+  superseded_at         TEXT NOT NULL,
+  superseded_reason     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS admiral_task_history_issue_attempt
+  ON admiral_task_history(issue_id, attempt_n);
+`
+
+// migration0012 backfills admiral_tasks from autopilot_jobs: for each
+// issue_id with prior activity, the row with the latest started_at
+// becomes the live admiral_tasks row. Older rows stay in autopilot_jobs
+// only — admiral_task_history starts empty (it captures supersessions
+// going forward, not historic state we never had a "rerun" event for).
+//
+// Idempotency: ON CONFLICT(issue_id) DO NOTHING — re-applying this
+// migration on a partially-backfilled DB is safe.
+const migration0012 = `
+INSERT INTO admiral_tasks (
+  issue_id, issue_identifier, state, attempt_n, branch, worktree_path,
+  pr_url, claude_session_id, last_event_session_id, started_at,
+  finished_at, error, stream_log_path
+)
+SELECT
+  j.issue_id,
+  j.issue_identifier,
+  j.state,
+  1,
+  j.branch,
+  j.worktree_path,
+  j.pr_url,
+  j.claude_session_id,
+  j.agent_session_id,
+  j.started_at,
+  j.finished_at,
+  j.error,
+  j.stream_log_path
+FROM autopilot_jobs j
+INNER JOIN (
+  SELECT issue_id, MAX(started_at) AS max_started
+  FROM autopilot_jobs
+  WHERE issue_id != ''
+  GROUP BY issue_id
+) latest ON j.issue_id = latest.issue_id AND j.started_at = latest.max_started
+WHERE j.issue_id != ''
+ON CONFLICT(issue_id) DO NOTHING;
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -171,6 +261,9 @@ var migrations = []migration{
 	{7, migration0007},
 	{8, migration0008},
 	{9, migration0009},
+	{10, migration0010},
+	{11, migration0011},
+	{12, migration0012},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -638,6 +731,171 @@ func (s *Store) ListAutopilotJobs(status, issueID string, since *time.Time, limi
 			return nil, err
 		}
 		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// --- admiral_tasks (GEO-50, issue-keyed task model) ---
+//
+// PR-A only ships the schema + Store CRUD methods. Dispatch (handleCreated /
+// handlePrompted) still writes to autopilot_jobs in this PR. PR-B will
+// switch lookups to admiral_tasks and dual-write through both tables.
+
+// AdmiralTask is the live task row for a Linear issue under the new
+// issue-keyed model. One row per issue. After /rerun the row is moved to
+// admiral_task_history and a new live row is inserted with attempt_n+1.
+type AdmiralTask struct {
+	IssueID            string
+	IssueIdentifier    string // denormalized "GEO-50" style identifier for log/UI
+	State              string
+	AttemptN           int
+	Branch             string
+	WorktreePath       string
+	PRURL              string
+	ClaudeSessionID    string
+	LastEventSessionID string // most recent Linear AgentSession.id (used for PostAgentActivity)
+	StartedAt          string
+	FinishedAt         string
+	Error              string
+	StreamLogPath      string
+}
+
+// AdmiralTaskHistory is one entry in the supersession log for an issue.
+type AdmiralTaskHistory struct {
+	HistoryID        int64
+	IssueID          string
+	AttemptN         int
+	State            string
+	Branch           string
+	WorktreePath     string
+	PRURL            string
+	ClaudeSessionID  string
+	AgentSessionIDs  string // JSON array; populated when supersession packs multiple sessions in one row
+	StartedAt        string
+	FinishedAt       string
+	Error            string
+	StreamLogPath    string
+	SupersededAt     string
+	SupersededReason string
+}
+
+// GetAdmiralTaskByIssue returns the live task row for an issue, or
+// (nil, nil) when no task has been claimed yet.
+func (s *Store) GetAdmiralTaskByIssue(issueID string) (*AdmiralTask, error) {
+	var t AdmiralTask
+	err := s.DB.QueryRow(`
+		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(last_event_session_id,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,'')
+		FROM admiral_tasks WHERE issue_id=?
+	`, issueID).Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
+		&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
+		&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
+		&t.Error, &t.StreamLogPath)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
+// ClaimAdmiralTask inserts a new task row for issueID iff no row exists.
+// Mirror of ClaimAutopilotJob but keyed on issue_id and reserving the
+// initial attempt_n=1. Returns (true, nil) when the caller now owns the
+// task; (false, nil) when a row already exists for that issue.
+func (s *Store) ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.DB.Exec(`
+		INSERT OR IGNORE INTO admiral_tasks(
+			issue_id, issue_identifier, state, attempt_n,
+			last_event_session_id, started_at
+		) VALUES(?, ?, ?, 1, ?, ?)
+	`, issueID, identifier, JobStateReceived, lastEventSessionID, now)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// UpdateAdmiralTask loads the task row for issueID, applies fn, writes
+// back. Atomic via single transaction. Returns sql.ErrNoRows if the row
+// is missing — callers should ClaimAdmiralTask first.
+func (s *Store) UpdateAdmiralTask(issueID string, fn func(*AdmiralTask)) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var t AdmiralTask
+	err = tx.QueryRow(`
+		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(last_event_session_id,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,'')
+		FROM admiral_tasks WHERE issue_id=?
+	`, issueID).Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
+		&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
+		&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
+		&t.Error, &t.StreamLogPath)
+	if err != nil {
+		return err
+	}
+	fn(&t)
+	_, err = tx.Exec(`
+		UPDATE admiral_tasks
+		SET issue_identifier=?, state=?, attempt_n=?, branch=?, worktree_path=?,
+		    pr_url=?, claude_session_id=?, last_event_session_id=?,
+		    finished_at=?, error=?, stream_log_path=?
+		WHERE issue_id=?
+	`, nullIfEmpty(t.IssueIdentifier), t.State, t.AttemptN,
+		nullIfEmpty(t.Branch), nullIfEmpty(t.WorktreePath),
+		nullIfEmpty(t.PRURL), nullIfEmpty(t.ClaudeSessionID),
+		nullIfEmpty(t.LastEventSessionID),
+		nullIfEmpty(t.FinishedAt), nullIfEmpty(t.Error),
+		nullIfEmpty(t.StreamLogPath), issueID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ListAdmiralTaskHistoryByIssue returns supersession history for an
+// issue, ordered by attempt_n ascending (oldest first).
+func (s *Store) ListAdmiralTaskHistoryByIssue(issueID string) ([]AdmiralTaskHistory, error) {
+	rows, err := s.DB.Query(`
+		SELECT history_id, issue_id, attempt_n, state,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(agent_session_ids,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,''),
+		       superseded_at, superseded_reason
+		FROM admiral_task_history
+		WHERE issue_id=?
+		ORDER BY attempt_n ASC
+	`, issueID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AdmiralTaskHistory
+	for rows.Next() {
+		var h AdmiralTaskHistory
+		if err := rows.Scan(&h.HistoryID, &h.IssueID, &h.AttemptN, &h.State,
+			&h.Branch, &h.WorktreePath, &h.PRURL, &h.ClaudeSessionID,
+			&h.AgentSessionIDs, &h.StartedAt, &h.FinishedAt,
+			&h.Error, &h.StreamLogPath, &h.SupersededAt, &h.SupersededReason); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
 	}
 	return out, rows.Err()
 }
