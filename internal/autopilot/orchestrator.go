@@ -219,10 +219,7 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	case "rerun":
 		o.dispatchRerun(ev, task, remainder)
 	case "fix":
-		// /fix is parser-recognized but not yet runnable (GEO-49 / PR-C).
-		o.logger.Info("autopilot_reject_fix_not_implemented",
-			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		o.postReply(ev.SessionID, fixNotImplementedHelp)
+		o.dispatchFix(ev, task, remainder)
 	case "status", "help":
 		o.handleCommand(ev, cmdName)
 	default:
@@ -301,70 +298,118 @@ func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, task *store.AdmiralTa
 	go o.runWithAttempt(rerunEv, newAttempt)
 }
 
-// runFollowup spawns a fresh flow for a Linear event whose issue already
-// has a prior DONE job whose PR is MERGED or CLOSED. The fresh flow uses a
-// follow-up branch name (suffix derived from the new session ID) so it
-// doesn't collide with the original (already-merged) branch in admiral's
-// local refs or the .worktrees dir. Otherwise identical to run().
-func (o *Orchestrator) runFollowup(ev linear.AgentEvent, prior *store.AutopilotJob) {
-	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
-	defer cancel()
+// dispatchFix handles /fix on an existing admiral_tasks row. State machine:
+//
+//	RECEIVED / EXECUTING (in-flight) → reject "currently processing"
+//	FAILED / TIMED_OUT / CANCELLED   → reject + suggest /rerun
+//	DONE                             → resume the prior claude session,
+//	  push fix commits onto the same branch, no new PR. Same admiral_tasks
+//	  row stays — its state cycles DONE → EXECUTING → DONE on success.
+//
+// Requires task.PRURL and task.ClaudeSessionID populated. If either is
+// missing (legacy row pre-claude-session-tracking), reject with help.
+func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask, description string) {
+	switch task.State {
+	case store.JobStateReceived, store.JobStateExecuting:
+		o.logger.Info("dispatch_reject_fix_currently_processing",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier,
+			"prior_state", task.State)
+		o.postReply(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
+		return
+	case store.JobStateFailed, store.JobStateTimedOut, store.JobStateCancelled:
+		o.logger.Info("dispatch_reject_fix_terminal_non_done",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier,
+			"prior_state", task.State)
+		o.postReply(ev.SessionID, fmt.Sprintf(
+			"/fix only works on a previous DONE run. The current attempt is %s. Use /rerun to start over.",
+			task.State,
+		))
+		return
+	case store.JobStateDone:
+		// proceed
+	default:
+		o.logger.Warn("dispatch_fix_unhandled_state",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier,
+			"state", task.State)
+		o.postReply(ev.SessionID, fmt.Sprintf("/fix not supported in state %q.", task.State))
+		return
+	}
 
-	claimed, err := o.db.ClaimAutopilotJob(ev.SessionID, ev.IssueID, ev.IssueIdentifier)
-	if err != nil {
-		o.logger.Error("claim_followup_job_failed", "err", err, "session", ev.SessionID)
-		return
-	}
-	if !claimed {
-		o.logger.Info("followup_session_already_claimed",
-			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+	if task.PRURL == "" || task.ClaudeSessionID == "" {
+		o.logger.Info("dispatch_reject_fix_legacy_row",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier,
+			"has_pr", task.PRURL != "", "has_claude", task.ClaudeSessionID != "")
+		o.postReply(ev.SessionID,
+			"/fix needs a prior run with both an open PR and a recoverable claude session, but this task is missing one of those. Use /rerun to start over.")
 		return
 	}
 
-	flow := newFlow(o, ctx, ev)
-	flow.followupSuffix = followupSuffix(ev.SessionID)
-	if err := flow.execute(); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) ||
-			strings.Contains(err.Error(), "signal: killed") ||
-			strings.Contains(err.Error(), "signal: terminated") {
-			flow.markTimedOut(err)
-		} else {
-			flow.markFailed(err)
-		}
+	if description == "" {
+		o.postReply(ev.SessionID,
+			"/fix needs a description of what to change, e.g. `/fix the typo in line 12`.")
 		return
 	}
-	o.logger.Info("autopilot_followup_done",
-		"issue", ev.IssueIdentifier, "session", ev.SessionID, "pr", flow.prURL,
-		"prior_pr", prior.PRURL)
+
+	o.logger.Info("dispatch_fix_starting",
+		"session", ev.SessionID, "issue", ev.IssueIdentifier,
+		"prior_pr", task.PRURL, "attempt_n", task.AttemptN)
+
+	// Reframe the user's text as a correction prompt before the resume
+	// claude run sees it. The original PR url and branch context anchor
+	// claude to the right work product.
+	framed := fmt.Sprintf(
+		"Previous attempt opened %s on branch %s. The user reports the following issue with the previous output:\n\n%s\n\nPlease patch the prior work to address this. Push commits onto the existing branch — do NOT open a new PR.",
+		task.PRURL, task.Branch, description,
+	)
+	fixEv := ev
+	fixEv.UserMessage = framed
+
+	go o.runFix(fixEv, task)
 }
 
-// runFollowupResume spawns a resume flow for a Linear event whose issue
-// has a prior DONE job whose PR is OPEN. claude --resume reuses the prior
-// session id and pushes additional commits to the same branch (and
-// therefore the same PR). After the resume, the new session's row is
-// marked DONE pointing at the same artifacts so future prompted events on
-// this thread can be looked up via GetAutopilotJob(ev.SessionID).
-func (o *Orchestrator) runFollowupResume(ev linear.AgentEvent, prior *store.AutopilotJob) {
+// runFix executes a /fix run: claude --resume on the prior session id,
+// commits pushed to the existing branch, no new PR opened. Mirrors
+// runWithAttempt's lifecycle but reuses the existing admiral_tasks row
+// rather than claiming a new one (attempt_n unchanged).
+func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 	ctx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 
-	claimed, err := o.db.ClaimAutopilotJob(ev.SessionID, ev.IssueID, ev.IssueIdentifier)
-	if err != nil {
-		o.logger.Error("claim_followup_resume_job_failed", "err", err, "session", ev.SessionID)
-		return
-	}
-	if !claimed {
-		o.logger.Info("followup_resume_session_already_claimed",
-			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		return
+	// autopilot_jobs claim is best-effort under the new model. ev.SessionID
+	// is fresh (mention path) or reused (prompted path); either way
+	// admiral_tasks is the truth.
+	if _, err := o.db.ClaimAutopilotJob(ev.SessionID, ev.IssueID, ev.IssueIdentifier); err != nil {
+		o.logger.Warn("claim_fix_audit_log_failed",
+			"err", err, "session", ev.SessionID)
 	}
 
-	resumeFlow := newResumeFlow(o, ctx, ev, prior)
-	// Hydrate the same per-flow context that flow.execute would normally
-	// resolve from the issue + repos table — executeResume's helpers
-	// (ensureWorktree, git fetch) need repoDir set.
+	// Transition admiral_tasks: DONE → EXECUTING. Future events on this
+	// task will see "currently processing" until /fix completes.
+	if err := o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+		t.State = store.JobStateExecuting
+		t.LastEventSessionID = ev.SessionID
+	}); err != nil {
+		o.logger.Warn("fix_admiral_task_to_executing_failed",
+			"err", err, "issue", ev.IssueID)
+	}
+
+	// executeResume operates on a flow.job (*store.AutopilotJob); synthesize
+	// one from the live admiral_tasks row so the resume helpers see the
+	// branch / worktree / claude_session_id they expect. PR-C will fold
+	// admiral_tasks awareness into executeResume directly; for now this
+	// adapter keeps the diff small.
+	syntheticPrior := &store.AutopilotJob{
+		AgentSessionID:  task.LastEventSessionID,
+		IssueID:         task.IssueID,
+		IssueIdentifier: task.IssueIdentifier,
+		State:           store.JobStateDone,
+		WorktreePath:    task.WorktreePath,
+		Branch:          task.Branch,
+		PRURL:           task.PRURL,
+		ClaudeSessionID: task.ClaudeSessionID,
+	}
+	resumeFlow := newResumeFlow(o, ctx, ev, syntheticPrior)
 	if issue, err := o.lc.GetIssue(ctx, ev.IssueID); err == nil {
 		resumeFlow.teamID = issue.TeamID
 		if repo, err := o.db.GetRepoByProjectID(issue.ProjectID); err == nil && repo != nil {
@@ -374,37 +419,29 @@ func (o *Orchestrator) runFollowupResume(ev linear.AgentEvent, prior *store.Auto
 	}
 
 	if err := resumeFlow.executeResume(); err != nil {
-		o.logger.Error("autopilot_followup_resume_failed",
+		o.logger.Error("autopilot_fix_failed",
 			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
+		// markFailed updates admiral_tasks → FAILED (PR-B-v2 dual-write).
 		resumeFlow.markFailed(err)
 		return
 	}
 
-	// executeResume updated prior.AgentSessionID's row → DONE (idempotent;
-	// it was already DONE). Now also mark the new session's row DONE
-	// pointing at the same artifacts so handlePrompted can resolve future
-	// follow-ups via GetAutopilotJob(ev.SessionID).
+	// /fix succeeded: admiral_tasks back to DONE. PRURL / claude_session_id
+	// are unchanged because we reused the prior task.
 	now := time.Now().UTC().Format(time.RFC3339)
-	if err := o.db.UpdateAutopilotJob(ev.SessionID, func(j *store.AutopilotJob) {
-		j.State = store.JobStateDone
-		j.PRURL = prior.PRURL
-		j.WorktreePath = prior.WorktreePath
-		j.Branch = prior.Branch
-		j.ClaudeSessionID = prior.ClaudeSessionID
-		j.FinishedAt = now
+	if err := o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+		t.State = store.JobStateDone
+		t.FinishedAt = now
 	}); err != nil {
-		o.logger.Warn("followup_resume_new_session_mark_done_failed",
-			"err", err, "session", ev.SessionID)
+		o.logger.Warn("fix_admiral_task_to_done_failed",
+			"err", err, "issue", ev.IssueID)
 	}
 
-	o.logger.Info("autopilot_followup_resume_done",
-		"issue", ev.IssueIdentifier, "session", ev.SessionID, "pr", prior.PRURL)
+	o.logger.Info("autopilot_fix_done",
+		"issue", ev.IssueIdentifier, "session", ev.SessionID,
+		"pr", task.PRURL, "attempt_n", task.AttemptN)
 }
 
-// followupSuffix derives a deterministic, short, fs-safe suffix from a
-// Linear agent session id. The first 8 hex chars of a UUID are unique
-// enough across a single workspace and stable across event retries, so
-// retries land on the same branch.
 func followupSuffix(sessionID string) string {
 	clean := sanitizeForPath(sessionID)
 	if len(clean) == 0 {
@@ -1872,12 +1909,7 @@ func parseMentionCommand(text string) (name, remainder string, ok bool) {
 // mentionCommandHelp is the reply sent when a bare @mention is rejected.
 const mentionCommandHelp = `admiral does not respond to bare @mentions. Use one of:
   /rerun <optional notes>     — start over from scratch on this issue
-  /fix <description>          — patch the previous run with these notes (planned, see GEO-49)`
-
-// fixNotImplementedHelp is the reply sent when /fix is invoked. /fix is
-// reserved syntax that the parser recognizes, but the resume-on-existing-PR
-// behavior is not yet implemented; tracked in GEO-49.
-const fixNotImplementedHelp = `/fix is not yet implemented (tracked in GEO-49). Use /rerun for now to restart the task on a fresh branch.`
+  /fix <description>          — patch the previous run on the existing PR with these notes`
 
 // assignFirstHelp is the reply sent when admiral receives an @mention
 // or thread-prompted event for an issue it has never seen before. The
@@ -1908,7 +1940,7 @@ func rerunCurrentlyProcessingHelp(issueIdentifier string) string {
 
 // unknownCommandHelp is the reply sent when an unknown /command is received.
 func unknownCommandHelp(cmd string) string {
-	return fmt.Sprintf("admiral did not recognize %q. Currently supported: /rerun.", cmd)
+	return fmt.Sprintf("admiral did not recognize %q. Currently supported: /rerun, /fix.", cmd)
 }
 
 // postReply is a thin helper used during early-exit rejection paths where no
