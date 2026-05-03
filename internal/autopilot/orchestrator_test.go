@@ -326,6 +326,19 @@ type mockStore struct {
 	HasAnyJobForIssueResult bool
 	HasAnyJobForIssueErr    error
 
+	// admiral_tasks (PR-B-v2)
+	AdmiralTask              *store.AdmiralTask
+	AdmiralTaskErr           error
+	LiveAdmiralTask          *store.AdmiralTask // mutated by UpdateAdmiralTask via fn
+	ClaimAdmiralTaskFresh    *bool              // override return value (nil = default true)
+	ClaimAdmiralTaskErr      error
+	UpdateAdmiralTaskErr     error
+	ClaimedAdmiralIssues     []string
+	UpdatedAdmiralIssues     []string
+	SupersededAdmiralIssues  []string
+	SupersedeErr             error
+	SupersedeNextAttempt     int
+
 	// For UpdateAutopilotJob tracking
 	LastUpdatedJob *store.AutopilotJob
 
@@ -404,6 +417,46 @@ func (m *mockStore) FindActiveJobByIssue(issueID, excludeSessionID string) (*sto
 
 func (m *mockStore) HasAnyAutopilotJobForIssue(issueID string) (bool, error) {
 	return m.HasAnyJobForIssueResult, m.HasAnyJobForIssueErr
+}
+
+// --- admiral_tasks (PR-B-v2) ---
+
+func (m *mockStore) GetAdmiralTaskByIssue(issueID string) (*store.AdmiralTask, error) {
+	return m.AdmiralTask, m.AdmiralTaskErr
+}
+
+func (m *mockStore) ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ClaimedAdmiralIssues = append(m.ClaimedAdmiralIssues, issueID)
+	if m.ClaimAdmiralTaskFresh != nil {
+		return *m.ClaimAdmiralTaskFresh, m.ClaimAdmiralTaskErr
+	}
+	return true, m.ClaimAdmiralTaskErr
+}
+
+func (m *mockStore) UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask)) error {
+	m.mu.Lock()
+	m.UpdatedAdmiralIssues = append(m.UpdatedAdmiralIssues, issueID)
+	m.mu.Unlock()
+	if m.LiveAdmiralTask != nil {
+		fn(m.LiveAdmiralTask)
+	}
+	return m.UpdateAdmiralTaskErr
+}
+
+func (m *mockStore) MoveAdmiralTaskToHistoryAndClaimNew(issueID, reason, identifier, lastEventSessionID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SupersededAdmiralIssues = append(m.SupersededAdmiralIssues, issueID)
+	if m.SupersedeErr != nil {
+		return 0, m.SupersedeErr
+	}
+	m.SupersedeNextAttempt++
+	if m.SupersedeNextAttempt < 2 {
+		m.SupersedeNextAttempt = 2
+	}
+	return m.SupersedeNextAttempt, nil
 }
 
 func (m *mockStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
@@ -1133,7 +1186,7 @@ func TestHandlePrompted_NoHistory(t *testing.T) {
 	ms := &mockStore{
 		GetJob:                  nil,
 		GetJobErr:               nil,
-		HasAnyJobForIssueResult: true,
+		AdmiralTask: &store.AdmiralTask{State: store.JobStateDone},
 	}
 	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
 	ev := linear.AgentEvent{
@@ -1160,7 +1213,7 @@ func TestHandlePrompted_NoClaudeSessionID(t *testing.T) {
 			IssueID:         "issue-old",
 			ClaudeSessionID: "", // empty — pre-#13 job
 		},
-		HasAnyJobForIssueResult: true,
+		AdmiralTask: &store.AdmiralTask{State: store.JobStateDone},
 	}
 	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
 	ev := linear.AgentEvent{
@@ -1228,7 +1281,7 @@ func TestHandlePrompted_ResumeSpawn(t *testing.T) {
 // separately by TestDispatch_FirstTimeMention_RequestsAssign.)
 func TestHandleCreated_BareMention_Rejected(t *testing.T) {
 	mlc := &mockLinearClient{}
-	ms := &mockStore{HasAnyJobForIssueResult: true} // issue is known to admiral
+	ms := &mockStore{AdmiralTask: &store.AdmiralTask{State: store.JobStateDone}} // issue is known to admiral
 	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
 	ev := linear.AgentEvent{
 		SessionID:       "session-bare",
@@ -1261,7 +1314,7 @@ func TestHandleCreated_BareMention_Rejected(t *testing.T) {
 // DB row touched.
 func TestHandleCreated_UnknownCommand_Rejected(t *testing.T) {
 	mlc := &mockLinearClient{}
-	ms := &mockStore{HasAnyJobForIssueResult: true}
+	ms := &mockStore{AdmiralTask: &store.AdmiralTask{State: store.JobStateDone}}
 	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
 	ev := linear.AgentEvent{
 		SessionID:       "session-unknown",
@@ -1292,7 +1345,7 @@ func TestHandleCreated_UnknownCommand_Rejected(t *testing.T) {
 // implemented" reply. No DB row touched.
 func TestHandleCreated_FixCommand_RepliesNotImplemented(t *testing.T) {
 	mlc := &mockLinearClient{}
-	ms := &mockStore{HasAnyJobForIssueResult: true}
+	ms := &mockStore{AdmiralTask: &store.AdmiralTask{State: store.JobStateDone}}
 	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
 	ev := linear.AgentEvent{
 		SessionID:       "session-fix",
@@ -1333,7 +1386,7 @@ func TestHandlePrompted_BareMention_PreservesDoneState(t *testing.T) {
 			ClaudeSessionID: "claude-session-xyz",
 			State:           store.JobStateDone,
 		},
-		HasAnyJobForIssueResult: true,
+		AdmiralTask: &store.AdmiralTask{State: store.JobStateDone},
 	}
 	o := &Orchestrator{
 		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
@@ -1362,50 +1415,10 @@ func TestHandlePrompted_BareMention_PreservesDoneState(t *testing.T) {
 	}
 }
 
-// TestHandlePrompted_RerunRejected_PreservesState verifies /rerun via
-// thread is rejected with a redirect reply pointing at the @mention path,
-// and the existing DONE row is not modified. Pending GEO-50.
-func TestHandlePrompted_RerunRejected_PreservesState(t *testing.T) {
-	mlc := &mockLinearClient{}
-	ms := &mockStore{
-		GetJob: &store.AutopilotJob{
-			AgentSessionID:  "session-prompted",
-			IssueID:         "issue-prompted",
-			ClaudeSessionID: "claude-session-xyz",
-			State:           store.JobStateDone,
-		},
-		HasAnyJobForIssueResult: true,
-	}
-	o := &Orchestrator{
-		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
-		db:     ms,
-		lc:     mlc,
-		logger: slog.Default(),
-	}
-	ev := linear.AgentEvent{
-		SessionID:       "session-prompted",
-		IssueID:         "issue-prompted",
-		IssueIdentifier: "GEO-PROMPT-1",
-		Action:          linear.ActionPrompted,
-		UserMessage:     "/rerun please redo",
-	}
-
-	o.HandleAgentEvent(ev)
-
-	body := mlc.GetPostedBody()
-	if !strings.Contains(body, "/rerun via thread message is not yet supported") {
-		t.Errorf("expected /rerun-in-thread limitation message, got: %s", body)
-	}
-	if !strings.Contains(body, "GEO-50") {
-		t.Errorf("expected reply to reference GEO-50 tracker, got: %s", body)
-	}
-	ms.mu.Lock()
-	updates := append([]string(nil), ms.UpdatedSessionIDs...)
-	ms.mu.Unlock()
-	if len(updates) != 0 {
-		t.Errorf("prompted /rerun must not touch the DONE row; got UpdateAutopilotJob calls for %v", updates)
-	}
-}
+// (TestHandlePrompted_RerunRejected_PreservesState was removed in PR-B-v2.
+// /rerun via thread now works — covered by TestDispatch_RerunInPrompted_NowSupersedes
+// at the bottom of this file. The PR-B-v1 redirect-to-mention reply no
+// longer fires.)
 
 // TestHandlePrompted_FixRejected_PreservesState verifies /fix via thread
 // is rejected with the "not yet implemented" reply and the existing DONE
@@ -1419,7 +1432,7 @@ func TestHandlePrompted_FixRejected_PreservesState(t *testing.T) {
 			ClaudeSessionID: "claude-session-xyz",
 			State:           store.JobStateDone,
 		},
-		HasAnyJobForIssueResult: true,
+		AdmiralTask: &store.AdmiralTask{State: store.JobStateDone},
 	}
 	o := &Orchestrator{
 		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
@@ -1461,7 +1474,7 @@ func TestHandlePrompted_UnknownCommand_PreservesState(t *testing.T) {
 			ClaudeSessionID: "claude-session-xyz",
 			State:           store.JobStateDone,
 		},
-		HasAnyJobForIssueResult: true,
+		AdmiralTask: &store.AdmiralTask{State: store.JobStateDone},
 	}
 	o := &Orchestrator{
 		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
@@ -2234,18 +2247,23 @@ func TestDispatch_FirstTimePrompted_RequestsAssign(t *testing.T) {
 }
 
 // TestDispatch_RepeatAssign_Rejected verifies that a second assign
-// event on an issue with prior admiral activity is rejected with the
-// "task already exists" reply, no claim.
+// event on an issue that already has a live admiral_tasks row is
+// rejected with the "task already exists" reply, no claim.
 func TestDispatch_RepeatAssign_Rejected(t *testing.T) {
 	mlc := &mockLinearClient{}
-	ms := &mockStore{HasAnyJobForIssueResult: true}
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:  "issue-known",
+			State:    store.JobStateDone,
+			AttemptN: 1,
+		},
+	}
 	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
 	ev := linear.AgentEvent{
 		SessionID:       "sess-reassign",
 		IssueID:         "issue-known",
 		IssueIdentifier: "KNW-1",
 		Action:          linear.ActionCreated,
-		// PromptContext empty → assign signal
 	}
 
 	o.HandleAgentEvent(ev)
@@ -2260,15 +2278,15 @@ func TestDispatch_RepeatAssign_Rejected(t *testing.T) {
 }
 
 // TestDispatch_RerunWhileActive_Rejected verifies that /rerun is
-// rejected when the issue has an active (non-terminal) prior session.
+// rejected when the live admiral_tasks row is in a non-terminal state
+// (RECEIVED / EXECUTING).
 func TestDispatch_RerunWhileActive_Rejected(t *testing.T) {
 	mlc := &mockLinearClient{}
 	ms := &mockStore{
-		HasAnyJobForIssueResult: true,
-		ActiveJob: &store.AutopilotJob{
-			AgentSessionID: "prior-active-session",
-			IssueID:        "issue-busy",
-			State:          store.JobStateExecuting,
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:  "issue-busy",
+			State:    store.JobStateExecuting,
+			AttemptN: 1,
 		},
 	}
 	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
@@ -2286,21 +2304,71 @@ func TestDispatch_RerunWhileActive_Rejected(t *testing.T) {
 	if !strings.Contains(body, "currently processing") {
 		t.Errorf("expected currently-processing reply, got: %s", body)
 	}
-	if !strings.Contains(body, "prior-active-session") {
-		t.Errorf("expected prior session id in reply, got: %s", body)
+	if !strings.Contains(body, "BUSY-1") {
+		t.Errorf("expected issue identifier in reply, got: %s", body)
 	}
-	if got := ms.ClaimedSnapshot(); len(got) != 0 {
-		t.Errorf("rerun-while-active must not claim; got %v", got)
+	if got := ms.SupersededAdmiralIssues; len(got) != 0 {
+		t.Errorf("rerun-while-active must not supersede admiral_tasks; got %v", got)
 	}
 }
 
-// TestDispatch_RerunInPrompted_RedirectsToMention verifies that /rerun
-// via thread (prompted) is rejected with the redirect-to-mention reply
-// (the prompted SessionID-reuse limitation predates GEO-50 fixes; full
-// support arrives in PR-B-v2 with admiral_tasks integration).
-func TestDispatch_RerunInPrompted_RedirectsToMention(t *testing.T) {
-	mlc := &mockLinearClient{}
-	ms := &mockStore{HasAnyJobForIssueResult: true}
+// TestDispatch_RerunOnDone_Supersedes verifies the happy /rerun path:
+// existing live task in DONE state → supersede to history + claim
+// fresh attempt_n+1 + spawn run.
+func TestDispatch_RerunOnDone_Supersedes(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
+	}
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:  "issue-done",
+			State:    store.JobStateDone,
+			AttemptN: 1,
+			PRURL:    "https://github.com/x/y/pull/1",
+		},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-rerun",
+		IssueID:         "issue-done",
+		IssueIdentifier: "DONE-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "/rerun fix the typo",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	// Wait for the goroutine to run + claim.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ms.ClaimedSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ms.SupersededAdmiralIssues; len(got) != 1 || got[0] != "issue-done" {
+		t.Errorf("expected supersession on issue-done; got %v", got)
+	}
+	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "sess-rerun" {
+		t.Errorf("expected fresh autopilot_jobs claim with new session id; got %v", got)
+	}
+}
+
+// TestDispatch_RerunInPrompted_NowSupersedes verifies that under the
+// admiral_tasks-keyed model, /rerun via thread (prompted) works the
+// same as /rerun via @mention: live task is superseded and a fresh
+// run spawned. The PR-B-v1 redirect-to-mention message is gone.
+func TestDispatch_RerunInPrompted_NowSupersedes(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
+	}
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:  "issue-thread",
+			State:    store.JobStateDone,
+			AttemptN: 1,
+		},
+	}
 	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
 	ev := linear.AgentEvent{
 		SessionID:       "sess-thread-rerun",
@@ -2312,11 +2380,14 @@ func TestDispatch_RerunInPrompted_RedirectsToMention(t *testing.T) {
 
 	o.HandleAgentEvent(ev)
 
-	body := mlc.GetPostedBody()
-	if !strings.Contains(body, "/rerun via thread message is not yet supported") {
-		t.Errorf("expected /rerun-in-prompted redirect, got: %s", body)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ms.SupersededAdmiralIssues) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if !strings.Contains(body, "GEO-50") {
-		t.Errorf("expected reply to reference GEO-50, got: %s", body)
+	if got := ms.SupersededAdmiralIssues; len(got) != 1 || got[0] != "issue-thread" {
+		t.Errorf("expected /rerun-in-thread to supersede admiral_tasks row; got %v", got)
 	}
 }

@@ -31,6 +31,14 @@ import (
 )
 
 // storeInterface abstracts the store methods used by the orchestrator.
+//
+// admiral_tasks methods (PR-B-v2 source of truth for issue-level state):
+//
+//	GetAdmiralTaskByIssue, ClaimAdmiralTask, UpdateAdmiralTask,
+//	MoveAdmiralTaskToHistoryAndClaimNew
+//
+// autopilot_jobs methods are kept for the audit-log dual-write in
+// flow.execute and for legacy queries; PR-C will drop the unused ones.
 type storeInterface interface {
 	AnyAutopilotJobActive() (bool, string, error)
 	GetLastAutopilotJob() (*store.AutopilotJob, error)
@@ -43,6 +51,11 @@ type storeInterface interface {
 	GetRepoByProjectID(projectID string) (*store.Repo, error)
 	ListJobsByIssueAndStates(issueID string, states []string) ([]store.AutopilotJob, error)
 	HasAnyAutopilotJobForIssue(issueID string) (bool, error)
+
+	GetAdmiralTaskByIssue(issueID string) (*store.AdmiralTask, error)
+	ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error)
+	UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask)) error
+	MoveAdmiralTaskToHistoryAndClaimNew(issueID, reason, identifier, lastEventSessionID string) (int, error)
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -131,11 +144,10 @@ func (o *Orchestrator) HandleAgentEvent(ev linear.AgentEvent) {
 // modifying state. The two-path handleCreated/handlePrompted split is
 // gone — same rules apply to both.
 //
-// PR-B-v1 reads autopilot_jobs to determine "first-time vs follow-up"
-// (any prior row counts). The new admiral_tasks table from PR-A is not
-// yet read here — that cutover is the next sub-step (PR-B-v2). The
-// dispatch logic is identical either way; only the lookup source
-// changes.
+// PR-B-v2: admiral_tasks is now the source of truth. The live task row
+// for an issue (if any) drives all dispatch decisions including
+// state-aware /rerun. autopilot_jobs is still written by flow.execute
+// as audit log; PR-C drops that write.
 //
 // Also gone: GEO-38's auto-resume on follow-up @mention, GEO-37's
 // timed-out auto-resume. Both behaviors are subsumed by explicit
@@ -161,31 +173,33 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	}
 	isAssignSignal := ev.Action == linear.ActionCreated && text == ""
 
-	// "Has admiral seen this issue before?" — any prior autopilot_jobs row
-	// for this issue, in any state. PR-B-v2 will switch this lookup to
-	// admiral_tasks once dual-write is in place; the dispatch logic doesn't
-	// change.
-	hasPrior, err := o.db.HasAnyAutopilotJobForIssue(ev.IssueID)
+	task, err := o.db.GetAdmiralTaskByIssue(ev.IssueID)
 	if err != nil {
 		o.logger.Error("dispatch_lookup_failed", "err", err, "issue", ev.IssueID)
 		return
 	}
-	isFirstTime := !hasPrior
 
-	if isFirstTime {
+	if task == nil {
+		// First-time event for this issue.
 		if isAssignSignal {
-			// First-time assign: dispatch the task.
-			go o.run(ev)
+			o.dispatchFreshAssign(ev)
 			return
 		}
-		// First-time @mention or prompted without prior assign: reject.
 		o.logger.Info("dispatch_reject_no_task",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
 		o.postReply(ev.SessionID, assignFirstHelp)
 		return
 	}
 
-	// Issue already known.
+	// Live task exists. Update last_event_session_id so future replies
+	// land on the current Linear session even if the user opened a new
+	// AgentSession for this comment.
+	if task.LastEventSessionID != ev.SessionID {
+		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+			t.LastEventSessionID = ev.SessionID
+		})
+	}
+
 	if isAssignSignal {
 		o.logger.Info("dispatch_reject_repeat_assign",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
@@ -193,7 +207,6 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 		return
 	}
 
-	// Parse /command from text.
 	cmdName, remainder, ok := parseMentionCommand(text)
 	if !ok {
 		o.logger.Info("dispatch_reject_bare",
@@ -204,7 +217,7 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 
 	switch cmdName {
 	case "rerun":
-		o.dispatchRerun(ev, remainder)
+		o.dispatchRerun(ev, task, remainder)
 	case "fix":
 		// /fix is parser-recognized but not yet runnable (GEO-49 / PR-C).
 		o.logger.Info("autopilot_reject_fix_not_implemented",
@@ -219,42 +232,73 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	}
 }
 
-// dispatchRerun handles /rerun on an existing task. State machine:
-//   - in-flight (active session) → reject "currently processing"
-//   - terminal states (DONE/FAILED/TIMED_OUT/CANCELLED) → handleRerun
-//     marks prior rows superseded and dispatches a fresh run
-//
-// Note: under the current SessionID-keyed autopilot_jobs schema /rerun
-// works correctly only when triggered via @mention (Linear hands us a
-// fresh SessionID for the new comment). /rerun via thread (prompted)
-// reuses the original SessionID, ClaimAutopilotJob no-ops, the fresh
-// dispatch silently fails. PR-B-v2 will fix this by keying state on
-// issue_id (admiral_tasks). Until then, prompted /rerun is rejected
-// here with a redirect message rather than silently failing.
-func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, notes string) {
-	if ev.Action == linear.ActionPrompted {
-		o.logger.Info("autopilot_reject_rerun_in_prompted",
-			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		o.postReply(ev.SessionID, rerunInPromptedNotSupportedHelp)
+// dispatchFreshAssign claims a fresh admiral_tasks row for the issue
+// and spawns the run goroutine. ClaimAdmiralTask is idempotent — a
+// race that loses the claim simply skips o.run, the winner runs.
+func (o *Orchestrator) dispatchFreshAssign(ev linear.AgentEvent) {
+	fresh, err := o.db.ClaimAdmiralTask(ev.IssueID, ev.IssueIdentifier, ev.SessionID)
+	if err != nil {
+		o.logger.Error("claim_admiral_task_failed",
+			"err", err, "issue", ev.IssueID)
 		return
 	}
+	if !fresh {
+		o.logger.Info("dispatch_race_claim_lost",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		return
+	}
+	go o.run(ev)
+}
 
-	active, err := o.db.FindActiveJobByIssue(ev.IssueID, ev.SessionID)
-	if err != nil {
-		o.logger.Warn("active_job_check_failed_in_rerun",
-			"err", err, "issue", ev.IssueID)
-	} else if active != nil {
+// dispatchRerun handles /rerun on an existing admiral_tasks row.
+// State machine:
+//
+//	RECEIVED / EXECUTING (in-flight) → reject "currently processing"
+//	DONE / FAILED / TIMED_OUT / CANCELLED → supersede the live row
+//	  (atomic move to history + claim a fresh attempt_n+1 row), spawn
+//	  a fresh run on a new branch named linear/<id>-rerun-<N>.
+//
+// Works for both @mention (created) and thread (prompted) triggers
+// because admiral_tasks is keyed by issue_id, not by Linear's reused
+// AgentSession.id. The new run gets a synthesised audit row id for
+// autopilot_jobs (still SessionID-keyed for now); thread replies use
+// ev.SessionID via PostAgentActivity as before.
+func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, task *store.AdmiralTask, notes string) {
+	switch task.State {
+	case store.JobStateReceived, store.JobStateExecuting:
 		o.logger.Info("dispatch_reject_rerun_currently_processing",
 			"session", ev.SessionID,
 			"issue", ev.IssueIdentifier,
-			"prior_session", active.AgentSessionID)
-		o.postReply(ev.SessionID, rerunCurrentlyProcessingHelp(active.AgentSessionID))
+			"prior_state", task.State,
+			"attempt_n", task.AttemptN)
+		o.postReply(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
 		return
 	}
 
-	// All prior rows for this issue are in terminal states. Mark them
-	// superseded (handleRerun's existing logic) and dispatch fresh.
-	o.handleRerun(ev, notes)
+	newAttempt, err := o.db.MoveAdmiralTaskToHistoryAndClaimNew(
+		ev.IssueID, "superseded_by_rerun", ev.IssueIdentifier, ev.SessionID,
+	)
+	if err != nil {
+		o.logger.Error("rerun_supersede_failed",
+			"err", err, "issue", ev.IssueID)
+		o.postReply(ev.SessionID, "Internal error processing /rerun. Try again or assign the issue manually.")
+		return
+	}
+	o.logger.Info("dispatch_rerun_superseded",
+		"session", ev.SessionID,
+		"issue", ev.IssueIdentifier,
+		"new_attempt_n", newAttempt,
+		"prior_pr", task.PRURL)
+
+	// Fold rerun notes into PromptContext so the fresh claude run sees
+	// what the user actually wants this time.
+	rerunEv := ev
+	if notes != "" {
+		rerunEv.PromptContext = notes
+	} else {
+		rerunEv.PromptContext = ""
+	}
+	go o.runWithAttempt(rerunEv, newAttempt)
 }
 
 // runFollowup spawns a fresh flow for a Linear event whose issue already
@@ -373,22 +417,40 @@ func followupSuffix(sessionID string) string {
 }
 
 func (o *Orchestrator) run(ev linear.AgentEvent) {
+	o.runWithAttempt(ev, 1)
+}
+
+// runWithAttempt is the rerun-aware variant of run. attemptN > 1 names
+// the branch as linear/<id>-rerun-<N> so the new run does not collide
+// with prior PRs. attemptN == 1 is the original first-time path.
+//
+// The autopilot_jobs row is keyed by ev.SessionID; for /rerun via @mention
+// Linear gives a fresh SessionID and Claim succeeds. For /rerun via thread
+// (prompted), ev.SessionID is reused — the existing autopilot_jobs row
+// stays in its old state but admiral_tasks is the source of truth, so
+// the run still proceeds correctly. PR-C will drop the autopilot_jobs
+// dual-write entirely.
+func (o *Orchestrator) runWithAttempt(ev linear.AgentEvent, attemptN int) {
 	ctx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 
+	// autopilot_jobs claim is best-effort under the new model — admiral_tasks
+	// is the truth. A duplicate ev.SessionID (prompted /rerun) means
+	// ClaimAutopilotJob returns false; we keep going regardless.
 	claimed, err := o.db.ClaimAutopilotJob(ev.SessionID, ev.IssueID, ev.IssueIdentifier)
 	if err != nil {
 		o.logger.Error("claim_job_failed", "err", err, "session", ev.SessionID)
 		return
 	}
 	if !claimed {
-		o.logger.Info("session_already_claimed",
-			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		return
+		o.logger.Info("autopilot_jobs_claim_skipped_duplicate_session",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier,
+			"reason", "audit-log-only-under-admiral_tasks-truth")
 	}
 
 	flow := newFlow(o, ctx, ev)
+	flow.attemptN = attemptN
 	if err := flow.execute(); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) ||
 			strings.Contains(err.Error(), "signal: killed") ||
@@ -400,7 +462,8 @@ func (o *Orchestrator) run(ev linear.AgentEvent) {
 		return
 	}
 	o.logger.Info("autopilot_done",
-		"issue", ev.IssueIdentifier, "session", ev.SessionID, "pr", flow.prURL)
+		"issue", ev.IssueIdentifier, "session", ev.SessionID,
+		"pr", flow.prURL, "attempt_n", attemptN)
 }
 
 // flow carries the per-job state across the run() steps.
@@ -419,6 +482,12 @@ type flow struct {
 	repoDir        string
 	baseBranch     string
 
+	// attemptN is the admiral_tasks attempt counter for this run.
+	// attemptN == 1 → first run on linear/<id>.
+	// attemptN  > 1 → /rerun, branch becomes linear/<id>-rerun-<N>.
+	// Set by Orchestrator.runWithAttempt before flow.execute.
+	attemptN int
+
 	// followupSuffix, when non-empty, is appended to the deterministic
 	// branch name and worktree path so a follow-up after a merged PR
 	// doesn't collide with the (possibly still-cached) original branch.
@@ -434,6 +503,21 @@ func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
 // newResumeFlow creates a flow for resuming an existing session.
 func newResumeFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent, job *store.AutopilotJob) *flow {
 	return &flow{o: o, ctx: ctx, ev: ev, job: job}
+}
+
+// persistAdmiralTask updates the live admiral_tasks row for the issue.
+// Failures are logged but do not abort the flow — admiral_tasks is the
+// source of truth for dispatch but flow.execute can still complete its
+// autopilot_jobs path even if the admiral_tasks write transiently
+// fails (next event will reconcile by reading whatever sticks).
+func (f *flow) persistAdmiralTask(fn func(*store.AdmiralTask)) {
+	if f.ev.IssueID == "" {
+		return
+	}
+	if err := f.o.db.UpdateAdmiralTask(f.ev.IssueID, fn); err != nil {
+		f.o.logger.Warn("update_admiral_task_failed",
+			"err", err, "issue", f.ev.IssueID)
+	}
 }
 
 func (f *flow) postActivity(a linear.AgentActivity) {
@@ -490,6 +574,15 @@ func (f *flow) execute() error {
 	f.baseBranch = repo.BaseBranch
 	worktreeName := "linear-" + sanitizeForPath(issue.Identifier)
 	f.branch = branchName(issue)
+	// /rerun: append `-rerun-<N>` to both branch and worktree so a new
+	// attempt does not collide with the prior PR's branch on the remote.
+	// attemptN is set by Orchestrator.runWithAttempt; default 1 means
+	// no suffix.
+	if f.attemptN > 1 {
+		suf := fmt.Sprintf("rerun-%d", f.attemptN)
+		f.branch = f.branch + "-" + suf
+		worktreeName = worktreeName + "-" + suf
+	}
 	if f.followupSuffix != "" {
 		// Append a unique suffix so a fresh-follow-up flow (after a merged
 		// or closed prior PR) doesn't collide with the still-tracked
@@ -556,6 +649,12 @@ func (f *flow) execute() error {
 	}); err != nil {
 		return fmt.Errorf("update job to EXECUTING: %w", err)
 	}
+	// Mirror to admiral_tasks — source of truth for dispatch (GEO-50).
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateExecuting
+		t.WorktreePath = f.worktreePath
+		t.Branch = f.branch
+	})
 
 	// Update Linear issue status to "started" asynchronously (non-blocking).
 	if f.o.cfg.UpdateIssueStatus != nil && *f.o.cfg.UpdateIssueStatus && f.teamID != "" {
@@ -601,13 +700,21 @@ func (f *flow) execute() error {
 	}
 	f.prURL = prURL
 
+	now := time.Now().UTC().Format(time.RFC3339)
 	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
 		j.State = store.JobStateDone
 		j.PRURL = prURL
-		j.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+		j.FinishedAt = now
 	}); err != nil {
 		return fmt.Errorf("update job to DONE: %w", err)
 	}
+	// Mirror to admiral_tasks — source of truth for dispatch (GEO-50).
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateDone
+		t.PRURL = prURL
+		t.ClaudeSessionID = f.claudeSessionID
+		t.FinishedAt = now
+	})
 
 	mention := f.creatorMention()
 	var doneBody string
@@ -625,6 +732,9 @@ func (f *flow) execute() error {
 			"session", f.ev.SessionID, "err", err)
 		_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
 			j.State = store.JobStateDoneThreadInconsistent
+		})
+		f.persistAdmiralTask(func(t *store.AdmiralTask) {
+			t.State = store.JobStateDoneThreadInconsistent
 		})
 		// Add PR body footer as fallback signal.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -818,6 +928,12 @@ func (f *flow) markAlreadyMerged(prURL, mergeSHA string) error {
 		f.o.logger.Warn("mark_already_merged_update_failed",
 			"err", err, "session", f.ev.SessionID)
 	}
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateDone
+		t.PRURL = prURL
+		t.Branch = f.branch
+		t.FinishedAt = now
+	})
 
 	mention := f.creatorMention()
 	shortSHA := mergeSHA
@@ -872,6 +988,9 @@ func (f *flow) markActiveSessionDuplicate(priorSessionID string) error {
 		f.o.logger.Warn("mark_active_session_duplicate_update_failed",
 			"err", err, "session", f.ev.SessionID)
 	}
+	// Note: we do NOT update admiral_tasks here. The active prior session
+	// owns the live admiral_tasks row and is mid-execute; mutating it from
+	// this duplicate path would corrupt the prior run's state.
 
 	body := fmt.Sprintf(
 		"%sadmiral is already working on this issue (session `%s`). Not dispatching a duplicate. Wait for it to finish, or cancel the prior session and re-mention with /rerun.",
@@ -901,6 +1020,12 @@ func (f *flow) markOpenPRByOther(prURL, author string) error {
 		f.o.logger.Warn("mark_open_pr_by_other_update_failed",
 			"err", err, "session", f.ev.SessionID)
 	}
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateDone
+		t.PRURL = prURL
+		t.Branch = f.branch
+		t.FinishedAt = now
+	})
 
 	body := fmt.Sprintf(
 		"%sOpen PR already exists at %s by @%s — admiral is not duplicating work. Re-mention me with /rerun after that PR is merged or closed if you still need follow-up.",
@@ -921,6 +1046,11 @@ func (f *flow) markFailed(runErr error) {
 		j.State = store.JobStateFailed
 		j.Error = runErr.Error()
 		j.FinishedAt = now
+	})
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateFailed
+		t.Error = runErr.Error()
+		t.FinishedAt = now
 	})
 	// Use a fresh short ctx in case the parent is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -954,6 +1084,11 @@ func (f *flow) markTimedOut(runErr error) {
 		j.State = store.JobStateTimedOut
 		j.Error = runErr.Error()
 		j.FinishedAt = now
+	})
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateTimedOut
+		t.Error = runErr.Error()
+		t.FinishedAt = now
 	})
 	// Use a fresh short ctx in case the parent is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1744,14 +1879,6 @@ const mentionCommandHelp = `admiral does not respond to bare @mentions. Use one 
 // behavior is not yet implemented; tracked in GEO-49.
 const fixNotImplementedHelp = `/fix is not yet implemented (tracked in GEO-49). Use /rerun for now to restart the task on a fresh branch.`
 
-// rerunInPromptedNotSupportedHelp is the reply sent when /rerun is invoked
-// from inside an existing agent thread (prompted event). Under the current
-// SessionID-keyed store this would silently no-op because handleRerun's
-// fresh dispatch can't claim a row with the reused SessionID. The fix
-// requires the issue-keyed task model (GEO-50). Until that lands, redirect
-// users to the @mention path which gets a fresh SessionID from Linear.
-const rerunInPromptedNotSupportedHelp = `/rerun via thread message is not yet supported (tracked in GEO-50). Please re-mention me with /rerun in a new comment on the issue.`
-
 // assignFirstHelp is the reply sent when admiral receives an @mention
 // or thread-prompted event for an issue it has never seen before. The
 // new model (GEO-50) requires assign as the explicit kickoff signal —
@@ -1765,14 +1892,17 @@ const assignFirstHelp = `Issue not assigned to admiral. Assign the issue to me f
 const repeatAssignHelp = `Task already exists for this issue. Use /rerun in a comment or thread to start over, or /fix <description> to patch the current PR (planned, see GEO-49).`
 
 // rerunCurrentlyProcessingHelp builds the reply sent when /rerun is
-// requested on an issue that already has an active (non-terminal)
-// autopilot session. admiral runs are serial per issue; the user
+// requested on an issue whose live admiral_tasks row is still in a
+// non-terminal state. admiral runs are serial per issue; the user
 // either waits for the current run to finish or cancels it before
 // starting a new one.
-func rerunCurrentlyProcessingHelp(priorSessionID string) string {
+func rerunCurrentlyProcessingHelp(issueIdentifier string) string {
+	if issueIdentifier == "" {
+		return "Cannot /rerun: admiral is currently processing this issue. Wait for it to finish before retrying."
+	}
 	return fmt.Sprintf(
-		"Cannot /rerun: admiral is currently processing this issue (session `%s`). Wait for it to finish, or cancel the prior session before retrying.",
-		priorSessionID,
+		"Cannot /rerun: admiral is currently processing %s. Wait for it to finish before retrying.",
+		issueIdentifier,
 	)
 }
 
