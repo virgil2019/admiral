@@ -648,6 +648,27 @@ func (s *Store) GetLatestTimedOutJobByIssue(issueID string) (*AutopilotJob, erro
 	return &j, err
 }
 
+// HasAnyAutopilotJobForIssue reports whether autopilot_jobs has at least
+// one row for the given issue, regardless of state. Used by the GEO-50
+// dispatch to decide whether an event is "first-time" or a follow-up.
+func (s *Store) HasAnyAutopilotJobForIssue(issueID string) (bool, error) {
+	if issueID == "" {
+		return false, nil
+	}
+	var n int
+	err := s.DB.QueryRow(
+		`SELECT 1 FROM autopilot_jobs WHERE issue_id=? LIMIT 1`,
+		issueID,
+	).Scan(&n)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ListJobsByIssueAndStates returns all autopilot jobs for the given issue ID
 // whose state is in states. Ordered by started_at DESC.
 func (s *Store) ListJobsByIssueAndStates(issueID string, states []string) ([]AutopilotJob, error) {
@@ -865,6 +886,74 @@ func (s *Store) UpdateAdmiralTask(issueID string, fn func(*AdmiralTask)) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// MoveAdmiralTaskToHistoryAndClaimNew atomically moves the live
+// admiral_tasks row for issueID into admiral_task_history (with the
+// given supersession reason) and inserts a fresh live row with
+// attempt_n incremented by one. Used by /rerun in the unified
+// dispatch (GEO-50). Returns the new attempt_n on success.
+//
+// Caller must ensure the old row exists. If it doesn't the function
+// returns sql.ErrNoRows.
+func (s *Store) MoveAdmiralTaskToHistoryAndClaimNew(issueID, reason, identifier, lastEventSessionID string) (int, error) {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	var t AdmiralTask
+	err = tx.QueryRow(`
+		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(last_event_session_id,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,'')
+		FROM admiral_tasks WHERE issue_id=?
+	`, issueID).Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
+		&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
+		&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
+		&t.Error, &t.StreamLogPath)
+	if err != nil {
+		return 0, err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := tx.Exec(`
+		INSERT INTO admiral_task_history(
+			issue_id, attempt_n, state, branch, worktree_path, pr_url,
+			claude_session_id, agent_session_ids, started_at, finished_at,
+			error, stream_log_path, superseded_at, superseded_reason
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, t.IssueID, t.AttemptN, t.State,
+		nullIfEmpty(t.Branch), nullIfEmpty(t.WorktreePath), nullIfEmpty(t.PRURL),
+		nullIfEmpty(t.ClaudeSessionID), nullIfEmpty(t.LastEventSessionID),
+		t.StartedAt, nullIfEmpty(t.FinishedAt),
+		nullIfEmpty(t.Error), nullIfEmpty(t.StreamLogPath),
+		now, reason); err != nil {
+		return 0, fmt.Errorf("insert history: %w", err)
+	}
+
+	if _, err := tx.Exec(`DELETE FROM admiral_tasks WHERE issue_id=?`, issueID); err != nil {
+		return 0, fmt.Errorf("delete old live: %w", err)
+	}
+	newAttempt := t.AttemptN + 1
+	if _, err := tx.Exec(`
+		INSERT INTO admiral_tasks(
+			issue_id, issue_identifier, state, attempt_n,
+			last_event_session_id, started_at
+		) VALUES(?, ?, ?, ?, ?, ?)
+	`, issueID, identifier, JobStateReceived, newAttempt,
+		nullIfEmpty(lastEventSessionID), now); err != nil {
+		return 0, fmt.Errorf("insert new live: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return newAttempt, nil
 }
 
 // ListAdmiralTaskHistoryByIssue returns supersession history for an

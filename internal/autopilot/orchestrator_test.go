@@ -322,6 +322,10 @@ type mockStore struct {
 	ActiveJob    *store.AutopilotJob
 	ActiveJobErr error
 
+	// HasAnyAutopilotJobForIssue
+	HasAnyJobForIssueResult bool
+	HasAnyJobForIssueErr    error
+
 	// For UpdateAutopilotJob tracking
 	LastUpdatedJob *store.AutopilotJob
 
@@ -396,6 +400,10 @@ func (m *mockStore) GetLatestTimedOutJobByIssue(issueID string) (*store.Autopilo
 
 func (m *mockStore) FindActiveJobByIssue(issueID, excludeSessionID string) (*store.AutopilotJob, error) {
 	return m.ActiveJob, m.ActiveJobErr
+}
+
+func (m *mockStore) HasAnyAutopilotJobForIssue(issueID string) (bool, error) {
+	return m.HasAnyJobForIssueResult, m.HasAnyJobForIssueErr
 }
 
 func (m *mockStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
@@ -796,285 +804,6 @@ func newTestOrchestrator(t *testing.T, ms *mockStore, mlc *mockLinearClient, gh 
 	}
 }
 
-// TestHandleCreated_PriorDone_PROpenWithSession spawns a follow-up resume.
-// Observable: ev.SessionID gets claimed (runFollowupResume claims first thing).
-func TestHandleCreated_PriorDone_PROpenWithSession_Resumes(t *testing.T) {
-	mlc := &mockLinearClient{
-		GetIssueErr: fmt.Errorf("synthetic short-circuit"), // halt the goroutine fast
-	}
-	ms := &mockStore{
-		LatestDoneJob: &store.AutopilotJob{
-			AgentSessionID:  "old-session",
-			IssueID:         "issue-abc",
-			PRURL:           "https://github.com/x/y/pull/42",
-			ClaudeSessionID: "claude-sess-xyz",
-			State:           store.JobStateDone,
-		},
-	}
-	gh := &fakeGhProbe{
-		stateByURL: map[string]string{
-			"https://github.com/x/y/pull/42": "OPEN",
-		},
-	}
-	o := newTestOrchestrator(t, ms, mlc, gh)
-	ev := linear.AgentEvent{
-		SessionID:       "new-session",
-		IssueID:         "issue-abc",
-		IssueIdentifier: "ABC-1",
-		Action:          linear.ActionCreated,
-	}
-
-	o.handleCreated(ev)
-
-	// runFollowupResume runs in a goroutine; let it claim the session.
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if len(ms.ClaimedSnapshot()) > 0 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	claims := ms.ClaimedSnapshot()
-	if len(claims) != 1 || claims[0] != "new-session" {
-		t.Fatalf("expected runFollowupResume to claim new-session, got claims=%v", claims)
-	}
-	// PR-state was checked synchronously in handleCreated.
-	if atomic.LoadInt32(&gh.stateCalls) != 1 {
-		t.Errorf("expected exactly 1 PRState call, got %d", gh.stateCalls)
-	}
-	// No "legacy session" message (this is the resume path).
-	if strings.Contains(mlc.GetPostedBody(), "created before resume support") {
-		t.Errorf("did not expect the legacy-session message; got: %s", mlc.GetPostedBody())
-	}
-}
-
-// TestHandleCreated_PriorDone_PROpenNoSession_RespondsLegacy is the
-// synchronous "legacy row" path — admiral can't resume without a
-// claude_session_id, so it posts an explanation and stops.
-func TestHandleCreated_PriorDone_PROpenNoSession_RespondsLegacy(t *testing.T) {
-	mlc := &mockLinearClient{}
-	ms := &mockStore{
-		LatestDoneJob: &store.AutopilotJob{
-			IssueID:         "issue-legacy",
-			PRURL:           "https://github.com/x/y/pull/13",
-			ClaudeSessionID: "", // legacy: no session id captured
-			State:           store.JobStateDone,
-		},
-	}
-	gh := &fakeGhProbe{
-		stateByURL: map[string]string{
-			"https://github.com/x/y/pull/13": "OPEN",
-		},
-	}
-	o := newTestOrchestrator(t, ms, mlc, gh)
-	ev := linear.AgentEvent{
-		SessionID:       "new-session",
-		IssueID:         "issue-legacy",
-		IssueIdentifier: "LEG-1",
-		Action:          linear.ActionCreated,
-	}
-
-	o.handleCreated(ev)
-
-	if !strings.Contains(mlc.GetPostedBody(), "created before resume support") {
-		t.Errorf("expected legacy-session message, got: %s", mlc.GetPostedBody())
-	}
-	if !strings.Contains(mlc.GetPostedBody(), "https://github.com/x/y/pull/13") {
-		t.Errorf("expected prior PR URL in legacy message, got: %s", mlc.GetPostedBody())
-	}
-	if got := ms.ClaimedSnapshot(); len(got) != 0 {
-		t.Errorf("legacy path must not claim a job; got claims=%v", got)
-	}
-}
-
-// TestHandleCreated_PriorDone_PRMerged_SpawnsFreshFollowup verifies that
-// a merged prior PR routes to runFollowup (fresh branch) rather than the
-// resume path or a refusal.
-func TestHandleCreated_PriorDone_PRMerged_SpawnsFreshFollowup(t *testing.T) {
-	mlc := &mockLinearClient{
-		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
-	}
-	ms := &mockStore{
-		LatestDoneJob: &store.AutopilotJob{
-			IssueID:         "issue-merged",
-			PRURL:           "https://github.com/x/y/pull/99",
-			ClaudeSessionID: "claude-sess-merged",
-			State:           store.JobStateDone,
-		},
-	}
-	gh := &fakeGhProbe{
-		stateByURL: map[string]string{
-			"https://github.com/x/y/pull/99": "MERGED",
-		},
-	}
-	o := newTestOrchestrator(t, ms, mlc, gh)
-	ev := linear.AgentEvent{
-		SessionID:       "new-session-merged",
-		IssueID:         "issue-merged",
-		IssueIdentifier: "MRG-1",
-		Action:          linear.ActionCreated,
-	}
-
-	o.handleCreated(ev)
-
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if len(ms.ClaimedSnapshot()) > 0 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	claims := ms.ClaimedSnapshot()
-	if len(claims) != 1 || claims[0] != "new-session-merged" {
-		t.Fatalf("expected runFollowup to claim new-session-merged; got %v", claims)
-	}
-	if strings.Contains(mlc.GetPostedBody(), "created before resume support") {
-		t.Errorf("did not expect legacy-session message for merged path")
-	}
-}
-
-// TestHandleCreated_PriorDone_PRClosed_SpawnsFreshFollowup mirrors the
-// merged path for a closed-without-merge prior PR.
-func TestHandleCreated_PriorDone_PRClosed_SpawnsFreshFollowup(t *testing.T) {
-	mlc := &mockLinearClient{
-		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
-	}
-	ms := &mockStore{
-		LatestDoneJob: &store.AutopilotJob{
-			IssueID:         "issue-closed",
-			PRURL:           "https://github.com/x/y/pull/77",
-			ClaudeSessionID: "claude-sess-closed",
-			State:           store.JobStateDone,
-		},
-	}
-	gh := &fakeGhProbe{
-		stateByURL: map[string]string{
-			"https://github.com/x/y/pull/77": "CLOSED",
-		},
-	}
-	o := newTestOrchestrator(t, ms, mlc, gh)
-	ev := linear.AgentEvent{
-		SessionID:       "new-session-closed",
-		IssueID:         "issue-closed",
-		IssueIdentifier: "CLS-1",
-		Action:          linear.ActionCreated,
-	}
-
-	o.handleCreated(ev)
-
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if len(ms.ClaimedSnapshot()) > 0 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	claims := ms.ClaimedSnapshot()
-	if len(claims) != 1 || claims[0] != "new-session-closed" {
-		t.Fatalf("expected runFollowup to claim new-session-closed; got %v", claims)
-	}
-}
-
-// TestHandleCreated_PriorDone_GhUnreachable_FallsThroughFresh verifies the
-// fail-open behavior: if gh PRState errors, dispatch falls through to a
-// fresh flow rather than blocking.
-func TestHandleCreated_PriorDone_GhUnreachable_FallsThroughFresh(t *testing.T) {
-	mlc := &mockLinearClient{
-		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
-	}
-	ms := &mockStore{
-		LatestDoneJob: &store.AutopilotJob{
-			IssueID: "issue-ghdown",
-			PRURL:   "https://github.com/x/y/pull/55",
-			State:   store.JobStateDone,
-		},
-	}
-	gh := &fakeGhProbe{stateErr: fmt.Errorf("transport: dial tcp: refused")}
-	o := newTestOrchestrator(t, ms, mlc, gh)
-	ev := linear.AgentEvent{
-		SessionID:       "new-session-ghdown",
-		IssueID:         "issue-ghdown",
-		IssueIdentifier: "GHD-1",
-		Action:          linear.ActionCreated,
-	}
-
-	o.handleCreated(ev)
-
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if len(ms.ClaimedSnapshot()) > 0 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "new-session-ghdown" {
-		t.Fatalf("expected gh-error to fall through to a claim, got %v", got)
-	}
-}
-
-// TestHandleCreated_PriorDone_NoPRURL_SkipsCheck makes sure the dispatch
-// short-circuits before touching gh when prior is malformed (no PRURL).
-func TestHandleCreated_PriorDone_NoPRURL_SkipsCheck(t *testing.T) {
-	mlc := &mockLinearClient{
-		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
-	}
-	ms := &mockStore{
-		LatestDoneJob: &store.AutopilotJob{
-			IssueID: "issue-nopr",
-			PRURL:   "", // malformed
-			State:   store.JobStateDone,
-		},
-	}
-	gh := &fakeGhProbe{}
-	o := newTestOrchestrator(t, ms, mlc, gh)
-	ev := linear.AgentEvent{
-		SessionID:       "new-session-nopr",
-		IssueID:         "issue-nopr",
-		IssueIdentifier: "NOPR-1",
-		Action:          linear.ActionCreated,
-	}
-
-	o.handleCreated(ev)
-
-	if atomic.LoadInt32(&gh.stateCalls) != 0 {
-		t.Errorf("PRState should not be called when prior.PRURL is empty; got %d calls", gh.stateCalls)
-	}
-}
-
-// TestHandleCreated_NoPriorDone_FallsThroughToFreshFlow verifies the
-// no-prior path doesn't hit gh and proceeds straight to claim.
-func TestHandleCreated_NoPriorDone_FallsThroughToFreshFlow(t *testing.T) {
-	mlc := &mockLinearClient{
-		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
-	}
-	ms := &mockStore{LatestDoneJob: nil}
-	gh := &fakeGhProbe{}
-	o := newTestOrchestrator(t, ms, mlc, gh)
-	ev := linear.AgentEvent{
-		SessionID:       "fresh",
-		IssueID:         "issue-fresh",
-		IssueIdentifier: "FRS-1",
-		Action:          linear.ActionCreated,
-	}
-
-	o.handleCreated(ev)
-
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if len(ms.ClaimedSnapshot()) > 0 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if atomic.LoadInt32(&gh.stateCalls) != 0 {
-		t.Errorf("PRState shouldn't run with no prior; got %d calls", gh.stateCalls)
-	}
-	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "fresh" {
-		t.Errorf("expected fresh path to claim 'fresh'; got %v", got)
-	}
-}
-
 // cleanupWorktree tests
 
 func TestCleanupWorktree_WorktreeNotExists(t *testing.T) {
@@ -1402,18 +1131,20 @@ func TestStateIDByType_NotFound(t *testing.T) {
 func TestHandlePrompted_NoHistory(t *testing.T) {
 	mlc := &mockLinearClient{}
 	ms := &mockStore{
-		GetJob:    nil,
-		GetJobErr: nil,
+		GetJob:                  nil,
+		GetJobErr:               nil,
+		HasAnyJobForIssueResult: true,
 	}
 	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
 	ev := linear.AgentEvent{
 		SessionID:       "session-no-history",
+		IssueID:         "issue-nohist-1",
 		IssueIdentifier: "GEO-NOHIST-1",
 		Action:          linear.ActionPrompted,
 		UserMessage:     "/help", // /help bypasses bare-mention check
 	}
 
-	o.handlePrompted(ev)
+	o.HandleAgentEvent(ev)
 
 	time.Sleep(50 * time.Millisecond)
 	if !strings.Contains(mlc.GetPostedBody(), "Available commands") {
@@ -1429,16 +1160,18 @@ func TestHandlePrompted_NoClaudeSessionID(t *testing.T) {
 			IssueID:         "issue-old",
 			ClaudeSessionID: "", // empty — pre-#13 job
 		},
+		HasAnyJobForIssueResult: true,
 	}
 	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}
 	ev := linear.AgentEvent{
 		SessionID:       "session-old",
+		IssueID:         "issue-old",
 		IssueIdentifier: "GEO-OLD-1",
 		Action:          linear.ActionPrompted,
 		UserMessage:     "/help", // /help bypasses bare-mention check
 	}
 
-	o.handlePrompted(ev)
+	o.HandleAgentEvent(ev)
 
 	time.Sleep(50 * time.Millisecond)
 	// /help posts the available commands, not the "before resume support" message.
@@ -1476,7 +1209,7 @@ func TestHandlePrompted_ResumeSpawn(t *testing.T) {
 		UserMessage:     "change v1 to v2",
 	}
 
-	o.handlePrompted(ev)
+	o.HandleAgentEvent(ev)
 
 	// Should not immediately post any response (goroutine runs async)
 	// Give it time to at least start the goroutine
@@ -1489,13 +1222,13 @@ func TestHandlePrompted_ResumeSpawn(t *testing.T) {
 	}
 }
 
-// TestHandleCreated_BareMention_Rejected verifies an @mention with no
-// leading /command posts the help reply and does NOT claim a job. No DB
-// row is written: the new SessionID has not been claimed yet, and the
-// rejection is observability-only (logged via slog).
+// TestHandleCreated_BareMention_Rejected verifies that an @mention with
+// no leading /command on an EXISTING task posts the help reply and does
+// not modify state. (First-time @mention with no prior assign is covered
+// separately by TestDispatch_FirstTimeMention_RequestsAssign.)
 func TestHandleCreated_BareMention_Rejected(t *testing.T) {
 	mlc := &mockLinearClient{}
-	ms := &mockStore{}
+	ms := &mockStore{HasAnyJobForIssueResult: true} // issue is known to admiral
 	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
 	ev := linear.AgentEvent{
 		SessionID:       "session-bare",
@@ -1505,7 +1238,7 @@ func TestHandleCreated_BareMention_Rejected(t *testing.T) {
 		PromptContext:   "please do something", // no leading /command
 	}
 
-	o.handleCreated(ev)
+	o.HandleAgentEvent(ev)
 
 	// Help text must be posted.
 	if !strings.Contains(mlc.GetPostedBody(), "does not respond to bare @mentions") {
@@ -1524,10 +1257,11 @@ func TestHandleCreated_BareMention_Rejected(t *testing.T) {
 }
 
 // TestHandleCreated_UnknownCommand_Rejected verifies an @mention with an
-// unknown /command is rejected with help text and no DB row touched.
+// unknown /command on an existing task is rejected with help text and no
+// DB row touched.
 func TestHandleCreated_UnknownCommand_Rejected(t *testing.T) {
 	mlc := &mockLinearClient{}
-	ms := &mockStore{}
+	ms := &mockStore{HasAnyJobForIssueResult: true}
 	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
 	ev := linear.AgentEvent{
 		SessionID:       "session-unknown",
@@ -1537,7 +1271,7 @@ func TestHandleCreated_UnknownCommand_Rejected(t *testing.T) {
 		PromptContext:   "/foobar extra args",
 	}
 
-	o.handleCreated(ev)
+	o.HandleAgentEvent(ev)
 
 	if !strings.Contains(mlc.GetPostedBody(), "did not recognize") {
 		t.Errorf("expected 'did not recognize' in posted body, got: %s", mlc.GetPostedBody())
@@ -1554,12 +1288,11 @@ func TestHandleCreated_UnknownCommand_Rejected(t *testing.T) {
 }
 
 // TestHandleCreated_FixCommand_RepliesNotImplemented verifies an @mention
-// with /fix gets the explicit "/fix is not yet implemented" reply (instead
-// of the previously-buggy unknown_command reply that listed /fix as
-// supported). No DB row is touched.
+// with /fix on an existing task gets the explicit "/fix is not yet
+// implemented" reply. No DB row touched.
 func TestHandleCreated_FixCommand_RepliesNotImplemented(t *testing.T) {
 	mlc := &mockLinearClient{}
-	ms := &mockStore{}
+	ms := &mockStore{HasAnyJobForIssueResult: true}
 	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
 	ev := linear.AgentEvent{
 		SessionID:       "session-fix",
@@ -1569,7 +1302,7 @@ func TestHandleCreated_FixCommand_RepliesNotImplemented(t *testing.T) {
 		PromptContext:   "/fix change v1 to v2",
 	}
 
-	o.handleCreated(ev)
+	o.HandleAgentEvent(ev)
 
 	body := mlc.GetPostedBody()
 	if !strings.Contains(body, "/fix is not yet implemented") {
@@ -1600,6 +1333,7 @@ func TestHandlePrompted_BareMention_PreservesDoneState(t *testing.T) {
 			ClaudeSessionID: "claude-session-xyz",
 			State:           store.JobStateDone,
 		},
+		HasAnyJobForIssueResult: true,
 	}
 	o := &Orchestrator{
 		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
@@ -1615,7 +1349,7 @@ func TestHandlePrompted_BareMention_PreservesDoneState(t *testing.T) {
 		UserMessage:     "change v1 to v2", // no leading /command
 	}
 
-	o.handlePrompted(ev)
+	o.HandleAgentEvent(ev)
 
 	if !strings.Contains(mlc.GetPostedBody(), "does not respond to bare @mentions") {
 		t.Errorf("expected bare mention help text in posted body, got: %s", mlc.GetPostedBody())
@@ -1640,6 +1374,7 @@ func TestHandlePrompted_RerunRejected_PreservesState(t *testing.T) {
 			ClaudeSessionID: "claude-session-xyz",
 			State:           store.JobStateDone,
 		},
+		HasAnyJobForIssueResult: true,
 	}
 	o := &Orchestrator{
 		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
@@ -1655,7 +1390,7 @@ func TestHandlePrompted_RerunRejected_PreservesState(t *testing.T) {
 		UserMessage:     "/rerun please redo",
 	}
 
-	o.handlePrompted(ev)
+	o.HandleAgentEvent(ev)
 
 	body := mlc.GetPostedBody()
 	if !strings.Contains(body, "/rerun via thread message is not yet supported") {
@@ -1684,6 +1419,7 @@ func TestHandlePrompted_FixRejected_PreservesState(t *testing.T) {
 			ClaudeSessionID: "claude-session-xyz",
 			State:           store.JobStateDone,
 		},
+		HasAnyJobForIssueResult: true,
 	}
 	o := &Orchestrator{
 		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
@@ -1699,7 +1435,7 @@ func TestHandlePrompted_FixRejected_PreservesState(t *testing.T) {
 		UserMessage:     "/fix change v1 to v2",
 	}
 
-	o.handlePrompted(ev)
+	o.HandleAgentEvent(ev)
 
 	body := mlc.GetPostedBody()
 	if !strings.Contains(body, "/fix is not yet implemented") {
@@ -1725,6 +1461,7 @@ func TestHandlePrompted_UnknownCommand_PreservesState(t *testing.T) {
 			ClaudeSessionID: "claude-session-xyz",
 			State:           store.JobStateDone,
 		},
+		HasAnyJobForIssueResult: true,
 	}
 	o := &Orchestrator{
 		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
@@ -1740,7 +1477,7 @@ func TestHandlePrompted_UnknownCommand_PreservesState(t *testing.T) {
 		UserMessage:     "/foobar baz",
 	}
 
-	o.handlePrompted(ev)
+	o.HandleAgentEvent(ev)
 
 	if !strings.Contains(mlc.GetPostedBody(), "did not recognize") {
 		t.Errorf("expected 'did not recognize' reply, got: %s", mlc.GetPostedBody())
@@ -2391,5 +2128,195 @@ func TestClassifyGhCreateError(t *testing.T) {
 				t.Errorf("classifyGhCreateError(%q) = %d, want %d", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// ---- GEO-50 dispatch tests (PR-B-v1) ----
+
+// TestDispatch_FirstTimeAssign_DispatchesTask verifies that an assign
+// event (Action=created, no PromptContext) for an issue admiral has
+// never seen before claims the autopilot_jobs row.
+func TestDispatch_FirstTimeAssign_DispatchesTask(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"), // halt o.run early
+	}
+	ms := &mockStore{} // HasAnyJobForIssueResult defaults to false
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-fresh",
+		IssueID:         "issue-fresh",
+		IssueIdentifier: "FRESH-1",
+		Action:          linear.ActionCreated,
+		// PromptContext intentionally empty → assign signal
+	}
+
+	o.HandleAgentEvent(ev)
+
+	// Wait for goroutine to claim the job.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ms.ClaimedSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "sess-fresh" {
+		t.Errorf("first-time assign should claim the session; got %v", got)
+	}
+	// First-time assign goes straight to o.run; any reply on this thread
+	// is the failure message from the synthetic GetIssueErr we used to
+	// halt the flow early. The important thing is dispatch did NOT post
+	// any of its rejection messages.
+	body := mlc.GetPostedBody()
+	for _, marker := range []string{
+		"Issue not assigned to admiral",
+		"Task already exists",
+		"does not respond to bare @mentions",
+		"did not recognize",
+	} {
+		if strings.Contains(body, marker) {
+			t.Errorf("first-time assign should not post rejection reply containing %q; got: %s", marker, body)
+		}
+	}
+}
+
+// TestDispatch_FirstTimeMention_RequestsAssign verifies that an @mention
+// or prompted event for an issue admiral has never seen is rejected with
+// the "assign first" reply, no claim, no DB write.
+func TestDispatch_FirstTimeMention_RequestsAssign(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{} // unknown issue
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-stray",
+		IssueID:         "issue-stray",
+		IssueIdentifier: "STRAY-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "@admiral please look at this", // non-empty → mention, not assign
+	}
+
+	o.HandleAgentEvent(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "Issue not assigned to admiral") {
+		t.Errorf("expected assign-first reply, got: %s", body)
+	}
+	if got := ms.ClaimedSnapshot(); len(got) != 0 {
+		t.Errorf("first-time mention must not claim; got %v", got)
+	}
+	ms.mu.Lock()
+	updates := append([]string(nil), ms.UpdatedSessionIDs...)
+	ms.mu.Unlock()
+	if len(updates) != 0 {
+		t.Errorf("first-time mention rejection must not write autopilot_jobs; got %v", updates)
+	}
+}
+
+// TestDispatch_FirstTimePrompted_RequestsAssign mirrors the @mention
+// case for a prompted (thread) event with no prior task.
+func TestDispatch_FirstTimePrompted_RequestsAssign(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-thread",
+		IssueID:         "issue-thread",
+		IssueIdentifier: "THR-1",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "/rerun please",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	if !strings.Contains(mlc.GetPostedBody(), "Issue not assigned to admiral") {
+		t.Errorf("expected assign-first reply on prompted with no prior task, got: %s", mlc.GetPostedBody())
+	}
+}
+
+// TestDispatch_RepeatAssign_Rejected verifies that a second assign
+// event on an issue with prior admiral activity is rejected with the
+// "task already exists" reply, no claim.
+func TestDispatch_RepeatAssign_Rejected(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{HasAnyJobForIssueResult: true}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-reassign",
+		IssueID:         "issue-known",
+		IssueIdentifier: "KNW-1",
+		Action:          linear.ActionCreated,
+		// PromptContext empty → assign signal
+	}
+
+	o.HandleAgentEvent(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "Task already exists") {
+		t.Errorf("expected repeat-assign reply, got: %s", body)
+	}
+	if got := ms.ClaimedSnapshot(); len(got) != 0 {
+		t.Errorf("repeat assign must not claim a new job; got %v", got)
+	}
+}
+
+// TestDispatch_RerunWhileActive_Rejected verifies that /rerun is
+// rejected when the issue has an active (non-terminal) prior session.
+func TestDispatch_RerunWhileActive_Rejected(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		HasAnyJobForIssueResult: true,
+		ActiveJob: &store.AutopilotJob{
+			AgentSessionID: "prior-active-session",
+			IssueID:        "issue-busy",
+			State:          store.JobStateExecuting,
+		},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-rerun-busy",
+		IssueID:         "issue-busy",
+		IssueIdentifier: "BUSY-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "/rerun",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "currently processing") {
+		t.Errorf("expected currently-processing reply, got: %s", body)
+	}
+	if !strings.Contains(body, "prior-active-session") {
+		t.Errorf("expected prior session id in reply, got: %s", body)
+	}
+	if got := ms.ClaimedSnapshot(); len(got) != 0 {
+		t.Errorf("rerun-while-active must not claim; got %v", got)
+	}
+}
+
+// TestDispatch_RerunInPrompted_RedirectsToMention verifies that /rerun
+// via thread (prompted) is rejected with the redirect-to-mention reply
+// (the prompted SessionID-reuse limitation predates GEO-50 fixes; full
+// support arrives in PR-B-v2 with admiral_tasks integration).
+func TestDispatch_RerunInPrompted_RedirectsToMention(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{HasAnyJobForIssueResult: true}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-thread-rerun",
+		IssueID:         "issue-thread",
+		IssueIdentifier: "THR-2",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "/rerun please redo",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "/rerun via thread message is not yet supported") {
+		t.Errorf("expected /rerun-in-prompted redirect, got: %s", body)
+	}
+	if !strings.Contains(body, "GEO-50") {
+		t.Errorf("expected reply to reference GEO-50, got: %s", body)
 	}
 }
