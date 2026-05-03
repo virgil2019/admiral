@@ -129,11 +129,17 @@ func (o *Orchestrator) HandleAgentEvent(ev linear.AgentEvent) {
 func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
 	// Assign path (no PromptContext): unconditional dispatch per GEO-47.
 	// Mention path (PromptContext non-empty): require a leading /command.
+	//
+	// Rejection paths never write to autopilot_jobs. The new SessionID has
+	// not been claimed yet, so there is no row to update; calling cancelJob
+	// here would be a silent no-op in production. Audit trail for rejected
+	// mentions is via logs (slog), not DB rows.
 	if ev.PromptContext != "" {
 		name, remainder, ok := parseMentionCommand(ev.PromptContext)
 		if !ok {
 			// Bare mention: reject, do not dispatch.
-			o.cancelJob(ev.SessionID, "bare_mention")
+			o.logger.Info("autopilot_reject_bare_mention",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier)
 			o.postReply(ev.SessionID, mentionCommandHelp)
 			return
 		}
@@ -143,15 +149,17 @@ func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
 			return
 		case "fix":
 			// /fix is defined but not yet implemented (GEO-49).
-			o.cancelJob(ev.SessionID, "unknown_command")
-			o.postReply(ev.SessionID, unknownCommandHelp("/fix"))
+			o.logger.Info("autopilot_reject_fix_not_implemented",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier)
+			o.postReply(ev.SessionID, fixNotImplementedHelp)
 			return
 		case "status", "help":
 			// Existing command handlers for mention context.
 			o.handleCommand(ev, name)
 			return
 		default:
-			o.cancelJob(ev.SessionID, "unknown_command")
+			o.logger.Info("autopilot_reject_unknown_command",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier, "command", "/"+name)
 			o.postReply(ev.SessionID, unknownCommandHelp("/"+name))
 			return
 		}
@@ -262,31 +270,44 @@ func (o *Orchestrator) handlePrompted(ev linear.AgentEvent) {
 		"session", ev.SessionID, "msg_len", len(ev.UserMessage))
 
 	// Require a leading /command for prompted events.
+	//
+	// Rejection paths here MUST NOT write to autopilot_jobs. In the prompted
+	// path ev.SessionID is reused from the original AgentSession (Linear
+	// reuses session.id across all prompted events on the same thread), so
+	// cancelJob would overwrite the prior DONE/FAILED row's state and erase
+	// historical work. Audit trail goes via slog only.
 	if ev.UserMessage != "" {
 		name, _, ok := parseMentionCommand(ev.UserMessage)
 		if !ok {
-			// Bare mention: reject, do not dispatch a resume.
-			o.cancelJob(ev.SessionID, "bare_mention")
+			o.logger.Info("autopilot_reject_bare_prompted",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier)
 			o.postReply(ev.SessionID, mentionCommandHelp)
 			return
 		}
 		switch name {
 		case "rerun":
-			// /rerun on a prompted session: re-dispatch fresh, superseding this session.
-			o.cancelJob(ev.SessionID, "superseded_by_rerun")
-			o.handleRerun(ev, "")
+			// /rerun via thread is broken under the current SessionID-keyed
+			// store: handleRerun would call ClaimAutopilotJob on the existing
+			// SessionID and silently no-op. Until GEO-50 lands the
+			// issue-keyed task model, redirect users to the @mention path
+			// (which gets a fresh SessionID from Linear and works).
+			o.logger.Info("autopilot_reject_rerun_in_prompted",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier)
+			o.postReply(ev.SessionID, rerunInPromptedNotSupportedHelp)
 			return
 		case "fix":
 			// /fix not implemented yet (GEO-49).
-			o.cancelJob(ev.SessionID, "unknown_command")
-			o.postReply(ev.SessionID, unknownCommandHelp("/fix"))
+			o.logger.Info("autopilot_reject_fix_not_implemented",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier)
+			o.postReply(ev.SessionID, fixNotImplementedHelp)
 			return
 		case "status", "help":
 			// Existing command handlers.
 			o.handleCommand(ev, name)
 			return
 		default:
-			o.cancelJob(ev.SessionID, "unknown_command")
+			o.logger.Info("autopilot_reject_unknown_command",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier, "command", "/"+name)
 			o.postReply(ev.SessionID, unknownCommandHelp("/"+name))
 			return
 		}
@@ -1810,22 +1831,24 @@ func parseMentionCommand(text string) (name, remainder string, ok bool) {
 // mentionCommandHelp is the reply sent when a bare @mention is rejected.
 const mentionCommandHelp = `admiral does not respond to bare @mentions. Use one of:
   /rerun <optional notes>     — start over from scratch on this issue
-  /fix <description>          — patch the previous run with these notes (see GEO-49)`
+  /fix <description>          — patch the previous run with these notes (planned, see GEO-49)`
+
+// fixNotImplementedHelp is the reply sent when /fix is invoked. /fix is
+// reserved syntax that the parser recognizes, but the resume-on-existing-PR
+// behavior is not yet implemented; tracked in GEO-49.
+const fixNotImplementedHelp = `/fix is not yet implemented (tracked in GEO-49). Use /rerun for now to restart the task on a fresh branch.`
+
+// rerunInPromptedNotSupportedHelp is the reply sent when /rerun is invoked
+// from inside an existing agent thread (prompted event). Under the current
+// SessionID-keyed store this would silently no-op because handleRerun's
+// fresh dispatch can't claim a row with the reused SessionID. The fix
+// requires the issue-keyed task model (GEO-50). Until that lands, redirect
+// users to the @mention path which gets a fresh SessionID from Linear.
+const rerunInPromptedNotSupportedHelp = `/rerun via thread message is not yet supported (tracked in GEO-50). Please re-mention me with /rerun in a new comment on the issue.`
 
 // unknownCommandHelp is the reply sent when an unknown /command is received.
 func unknownCommandHelp(cmd string) string {
-	return fmt.Sprintf("admiral did not recognize %q. Supported: /rerun, /fix", cmd)
-}
-
-// cancelJob marks the session as CANCELLED with the given reason (stored in
-// the error field to preserve diagnostic context without a schema change).
-func (o *Orchestrator) cancelJob(sessionID, reason string) {
-	now := time.Now().UTC().Format(time.RFC3339)
-	_ = o.db.UpdateAutopilotJob(sessionID, func(j *store.AutopilotJob) {
-		j.State = store.JobStateCancelled
-		j.Error = reason
-		j.FinishedAt = now
-	})
+	return fmt.Sprintf("admiral did not recognize %q. Currently supported: /rerun.", cmd)
 }
 
 // postReply is a thin helper used during early-exit rejection paths where no
@@ -1834,24 +1857,6 @@ func (o *Orchestrator) postReply(sessionID, body string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.Response(body))
-}
-
-// extractCommand returns the command word (without leading /) if the first
-// non-empty line of text looks like /xxx, otherwise empty string.
-func extractCommand(text string) string {
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "/") {
-			parts := strings.SplitN(line, " ", 2)
-			cmd := strings.TrimSpace(parts[0])
-			return strings.ToLower(strings.TrimPrefix(cmd, "/"))
-		}
-		break // first non-empty line not starting with /, no command
-	}
-	return ""
 }
 
 const availableCommandsHelp = `Available commands:
