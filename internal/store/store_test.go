@@ -646,6 +646,93 @@ func TestMigration0012_BackfillsLatestPerIssue(t *testing.T) {
 	}
 }
 
+func TestMoveAdmiralTaskToHistoryAndClaimNew(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.ClaimAdmiralTask("issue-R", "GEO-R", "s-1"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := s.UpdateAdmiralTask("issue-R", func(t *AdmiralTask) {
+		t.State = JobStateDone
+		t.Branch = "linear/geo-r"
+		t.PRURL = "https://github.com/x/y/pull/1"
+		t.ClaudeSessionID = "claude-1"
+		t.FinishedAt = "2026-05-03T10:00:00Z"
+	}); err != nil {
+		t.Fatalf("update to DONE: %v", err)
+	}
+
+	newN, err := s.MoveAdmiralTaskToHistoryAndClaimNew("issue-R", "superseded_by_rerun", "GEO-R", "s-2")
+	if err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+	if newN != 2 {
+		t.Errorf("new attempt_n: got %d want 2", newN)
+	}
+
+	live, _ := s.GetAdmiralTaskByIssue("issue-R")
+	if live == nil {
+		t.Fatal("live row missing after supersede")
+	}
+	if live.AttemptN != 2 || live.State != JobStateReceived {
+		t.Errorf("live: attempt_n=%d state=%q", live.AttemptN, live.State)
+	}
+	if live.LastEventSessionID != "s-2" {
+		t.Errorf("live last_event_session_id: %q", live.LastEventSessionID)
+	}
+	if live.PRURL != "" || live.Branch != "" {
+		t.Errorf("live row should start clean; got branch=%q pr=%q", live.Branch, live.PRURL)
+	}
+
+	hist, err := s.ListAdmiralTaskHistoryByIssue("issue-R")
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	if len(hist) != 1 {
+		t.Fatalf("history rows: got %d want 1", len(hist))
+	}
+	h := hist[0]
+	if h.AttemptN != 1 || h.State != JobStateDone {
+		t.Errorf("history attempt: got n=%d state=%q", h.AttemptN, h.State)
+	}
+	if h.PRURL != "https://github.com/x/y/pull/1" || h.Branch != "linear/geo-r" {
+		t.Errorf("history fields lost: %+v", h)
+	}
+	if h.SupersededReason != "superseded_by_rerun" {
+		t.Errorf("supersede reason: %q", h.SupersededReason)
+	}
+	if h.SupersededAt == "" {
+		t.Errorf("supersede timestamp empty")
+	}
+
+	if err := s.UpdateAdmiralTask("issue-R", func(t *AdmiralTask) {
+		t.State = JobStateDone
+	}); err != nil {
+		t.Fatalf("set new live to DONE: %v", err)
+	}
+	newN2, err := s.MoveAdmiralTaskToHistoryAndClaimNew("issue-R", "superseded_by_rerun", "GEO-R", "s-3")
+	if err != nil {
+		t.Fatalf("second supersede: %v", err)
+	}
+	if newN2 != 3 {
+		t.Errorf("second new attempt_n: got %d want 3", newN2)
+	}
+	hist2, _ := s.ListAdmiralTaskHistoryByIssue("issue-R")
+	if len(hist2) != 2 {
+		t.Errorf("history after 2 supersessions: got %d rows want 2", len(hist2))
+	}
+	if hist2[0].AttemptN != 1 || hist2[1].AttemptN != 2 {
+		t.Errorf("history attempts not in order: got %d, %d", hist2[0].AttemptN, hist2[1].AttemptN)
+	}
+}
+
+func TestMoveAdmiralTaskToHistoryAndClaimNew_NoLiveRow(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.MoveAdmiralTaskToHistoryAndClaimNew("issue-missing", "rerun", "GEO-X", "s-1")
+	if err == nil {
+		t.Errorf("expected error superseding missing live row; got nil")
+	}
+}
+
 // TestMigration0012_SkipsEmptyIssueID verifies the backfill ignores
 // autopilot_jobs rows with empty issue_id (legacy/test fixtures may have
 // these). admiral_tasks PK is issue_id NOT NULL — empty would either

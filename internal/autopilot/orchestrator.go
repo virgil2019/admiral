@@ -42,6 +42,7 @@ type storeInterface interface {
 	FindActiveJobByIssue(issueID, excludeSessionID string) (*store.AutopilotJob, error)
 	GetRepoByProjectID(projectID string) (*store.Repo, error)
 	ListJobsByIssueAndStates(issueID string, states []string) ([]store.AutopilotJob, error)
+	HasAnyAutopilotJobForIssue(issueID string) (bool, error)
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -116,239 +117,144 @@ func (o *Orchestrator) stateIDByType(ctx context.Context, teamID, stateType stri
 // HandleAgentEvent is wired up as the linear.AgentHandler. Returns quickly:
 // the actual run happens on a background goroutine.
 func (o *Orchestrator) HandleAgentEvent(ev linear.AgentEvent) {
-	switch ev.Action {
-	case linear.ActionCreated:
-		o.handleCreated(ev)
-	case linear.ActionPrompted:
-		o.handlePrompted(ev)
-	default:
+	if ev.Action != linear.ActionCreated && ev.Action != linear.ActionPrompted {
 		o.logger.Warn("autopilot_unknown_action", "action", ev.Action)
+		return
 	}
+	o.dispatch(ev)
 }
 
-func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
-	// Assign path (no PromptContext): unconditional dispatch per GEO-47.
-	// Mention path (PromptContext non-empty): require a leading /command.
-	//
-	// Rejection paths never write to autopilot_jobs. The new SessionID has
-	// not been claimed yet, so there is no row to update; calling cancelJob
-	// here would be a silent no-op in production. Audit trail for rejected
-	// mentions is via logs (slog), not DB rows.
-	if ev.PromptContext != "" {
-		name, remainder, ok := parseMentionCommand(ev.PromptContext)
-		if !ok {
-			// Bare mention: reject, do not dispatch.
-			o.logger.Info("autopilot_reject_bare_mention",
-				"session", ev.SessionID, "issue", ev.IssueIdentifier)
-			o.postReply(ev.SessionID, mentionCommandHelp)
-			return
-		}
-		switch name {
-		case "rerun":
-			o.handleRerun(ev, remainder)
-			return
-		case "fix":
-			// /fix is defined but not yet implemented (GEO-49).
-			o.logger.Info("autopilot_reject_fix_not_implemented",
-				"session", ev.SessionID, "issue", ev.IssueIdentifier)
-			o.postReply(ev.SessionID, fixNotImplementedHelp)
-			return
-		case "status", "help":
-			// Existing command handlers for mention context.
-			o.handleCommand(ev, name)
-			return
-		default:
-			o.logger.Info("autopilot_reject_unknown_command",
-				"session", ev.SessionID, "issue", ev.IssueIdentifier, "command", "/"+name)
-			o.postReply(ev.SessionID, unknownCommandHelp("/"+name))
-			return
-		}
+// dispatch is the unified entry point per the GEO-50 model. admiral
+// treats each Linear issue as a single task: at most one live row per
+// issue. Events on the issue either initiate the task (first-time
+// assign) or send a /command to it; everything else is rejected without
+// modifying state. The two-path handleCreated/handlePrompted split is
+// gone — same rules apply to both.
+//
+// PR-B-v1 reads autopilot_jobs to determine "first-time vs follow-up"
+// (any prior row counts). The new admiral_tasks table from PR-A is not
+// yet read here — that cutover is the next sub-step (PR-B-v2). The
+// dispatch logic is identical either way; only the lookup source
+// changes.
+//
+// Also gone: GEO-38's auto-resume on follow-up @mention, GEO-37's
+// timed-out auto-resume. Both behaviors are subsumed by explicit
+// /rerun (start fresh) or /fix (resume current PR; coming in GEO-49).
+// admiral no longer guesses what the user meant — they say it.
+func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
+	o.logger.Info("dispatch",
+		"session", ev.SessionID,
+		"issue", ev.IssueIdentifier,
+		"action", ev.Action)
+
+	if ev.IssueID == "" {
+		o.logger.Warn("dispatch_skip_no_issue_id", "session", ev.SessionID)
+		return
 	}
 
-	// Prior-DONE dispatch (GEO-38). When this issue already has a DONE row
-	// in admiral's local DB, the user is following up on completed work.
-	// We branch on the prior PR's lifecycle:
-	//
-	//   OPEN + claude_session_id present  → resume the same session, append
-	//                                       commits to the live PR.
-	//   OPEN + claude_session_id missing  → legacy row, can't resume; respond
-	//                                       once and stop. The user can open
-	//                                       a fresh issue for new work.
-	//   MERGED / CLOSED                   → fresh follow-up flow on a new
-	//                                       branch (the original is gone or
-	//                                       finalized; reusing it is wrong).
-	//   gh unreachable / unknown          → fall through to fresh flow rather
-	//                                       than block the user.
-	if ev.IssueID != "" {
-		prior, err := o.db.GetLatestDoneJobByIssue(ev.IssueID)
-		if err != nil {
-			o.logger.Warn("get_latest_done_job_failed", "err", err, "issue", ev.IssueID)
-		} else if prior != nil && prior.PRURL != "" {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			state, stateErr := o.gh.PRState(ctx, prior.PRURL)
-			cancel()
-			if stateErr != nil {
-				o.logger.Warn("pr_state_check_failed",
-					"err", stateErr, "pr", prior.PRURL,
-					"action", "falling through to fresh flow")
-			}
-			switch state {
-			case "OPEN":
-				if prior.ClaudeSessionID != "" {
-					o.logger.Info("autopilot_followup_resume",
-						"session", ev.SessionID, "issue", ev.IssueIdentifier,
-						"prior_pr", prior.PRURL,
-						"prior_claude_session", prior.ClaudeSessionID)
-					go o.runFollowupResume(ev, prior)
-					return
-				}
-				o.logger.Info("autopilot_followup_legacy_session",
-					"session", ev.SessionID, "issue", ev.IssueIdentifier,
-					"prior_pr", prior.PRURL)
-				replyCtx, replyCancel := context.WithTimeout(context.Background(), 15*time.Second)
-				defer replyCancel()
-				body := fmt.Sprintf(
-					"This issue has an open PR (%s) but the original session was created before resume support landed, so I can't continue from where it left off. Open a new issue with the changes you'd like — I'll start fresh.",
-					prior.PRURL)
-				_ = o.lc.PostAgentActivity(replyCtx, ev.SessionID, linear.Response(body))
-				return
-			case "MERGED", "CLOSED":
-				// Fall through to fresh flow with a follow-up branch.
-				o.logger.Info("autopilot_followup_fresh_after_merged_or_closed",
-					"session", ev.SessionID, "issue", ev.IssueIdentifier,
-					"prior_pr", prior.PRURL, "prior_state", state)
-				go o.runFollowup(ev, prior)
-				return
-			default:
-				// "" (unlocatable) or other unknown — log and fall through.
-				o.logger.Warn("pr_state_unhandled",
-					"state", state, "pr", prior.PRURL,
-					"action", "falling through to fresh flow")
-			}
-		}
+	// User-typed text relevant to this event. created carries it in
+	// PromptContext (mention text); prompted carries it in UserMessage
+	// (thread reply). assign-only created has empty text.
+	text := ev.PromptContext
+	if text == "" && ev.Action == linear.ActionPrompted {
+		text = ev.UserMessage
 	}
+	isAssignSignal := ev.Action == linear.ActionCreated && text == ""
 
-	// Check if this issue has a TIMED_OUT job that can be resumed.
-	if ev.IssueID != "" {
-		timedOut, err := o.db.GetLatestTimedOutJobByIssue(ev.IssueID)
-		if err != nil {
-			o.logger.Warn("get_latest_timed_out_job_failed", "err", err, "issue", ev.IssueID)
-		} else if timedOut != nil && timedOut.ClaudeSessionID != "" {
-			o.logger.Info("autopilot_resuming_timed_out_job",
-				"session", ev.SessionID,
-				"issue", ev.IssueIdentifier,
-				"prior_session", timedOut.AgentSessionID,
-				"claude_session", timedOut.ClaudeSessionID)
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(),
-					time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
-				defer cancel()
-				resumeFlow := newResumeFlow(o, ctx, ev, timedOut)
-				if err := resumeFlow.executeResume(); err != nil {
-					o.logger.Error("autopilot_resume_timed_out_failed",
-						"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
-					resumeFlow.markFailed(err)
-					return
-				}
-				o.logger.Info("autopilot_resume_timed_out_done",
-					"issue", ev.IssueIdentifier, "session", ev.SessionID, "pr", resumeFlow.prURL)
-			}()
-			return
-		}
-	}
-
-	// Per-session FIFO is guaranteed by the DB-level lock in ClaimNextPendingEvent,
-	// so we can spawn directly without any in-process lock.
-	go o.run(ev)
-}
-
-// handlePrompted handles follow-up messages in an existing agent thread
-// by resuming the previous claude session on the original PR/branch.
-// It also enforces the /command contract: bare prompted messages are rejected.
-func (o *Orchestrator) handlePrompted(ev linear.AgentEvent) {
-	o.logger.Info("autopilot_prompted",
-		"session", ev.SessionID, "msg_len", len(ev.UserMessage))
-
-	// Require a leading /command for prompted events.
-	//
-	// Rejection paths here MUST NOT write to autopilot_jobs. In the prompted
-	// path ev.SessionID is reused from the original AgentSession (Linear
-	// reuses session.id across all prompted events on the same thread), so
-	// cancelJob would overwrite the prior DONE/FAILED row's state and erase
-	// historical work. Audit trail goes via slog only.
-	if ev.UserMessage != "" {
-		name, _, ok := parseMentionCommand(ev.UserMessage)
-		if !ok {
-			o.logger.Info("autopilot_reject_bare_prompted",
-				"session", ev.SessionID, "issue", ev.IssueIdentifier)
-			o.postReply(ev.SessionID, mentionCommandHelp)
-			return
-		}
-		switch name {
-		case "rerun":
-			// /rerun via thread is broken under the current SessionID-keyed
-			// store: handleRerun would call ClaimAutopilotJob on the existing
-			// SessionID and silently no-op. Until GEO-50 lands the
-			// issue-keyed task model, redirect users to the @mention path
-			// (which gets a fresh SessionID from Linear and works).
-			o.logger.Info("autopilot_reject_rerun_in_prompted",
-				"session", ev.SessionID, "issue", ev.IssueIdentifier)
-			o.postReply(ev.SessionID, rerunInPromptedNotSupportedHelp)
-			return
-		case "fix":
-			// /fix not implemented yet (GEO-49).
-			o.logger.Info("autopilot_reject_fix_not_implemented",
-				"session", ev.SessionID, "issue", ev.IssueIdentifier)
-			o.postReply(ev.SessionID, fixNotImplementedHelp)
-			return
-		case "status", "help":
-			// Existing command handlers.
-			o.handleCommand(ev, name)
-			return
-		default:
-			o.logger.Info("autopilot_reject_unknown_command",
-				"session", ev.SessionID, "issue", ev.IssueIdentifier, "command", "/"+name)
-			o.postReply(ev.SessionID, unknownCommandHelp("/"+name))
-			return
-		}
-	}
-
-	job, err := o.db.GetAutopilotJob(ev.SessionID)
+	// "Has admiral seen this issue before?" — any prior autopilot_jobs row
+	// for this issue, in any state. PR-B-v2 will switch this lookup to
+	// admiral_tasks once dual-write is in place; the dispatch logic doesn't
+	// change.
+	hasPrior, err := o.db.HasAnyAutopilotJobForIssue(ev.IssueID)
 	if err != nil {
-		o.logger.Error("get_job_for_prompted_failed", "err", err, "session", ev.SessionID)
+		o.logger.Error("dispatch_lookup_failed", "err", err, "issue", ev.IssueID)
 		return
 	}
-	if job == nil || job.IssueID == "" {
-		o.logger.Warn("prompted_without_history", "session", ev.SessionID)
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(
-			"I don't have history for this session — please start a fresh issue."))
-		return
-	}
-	if job.ClaudeSessionID == "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(
-			"This session was created before resume support. Please open a new issue."))
-		return
-	}
+	isFirstTime := !hasPrior
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(),
-			time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
-		defer cancel()
-
-		resumeFlow := newResumeFlow(o, ctx, ev, job)
-		if err := resumeFlow.executeResume(); err != nil {
-			o.logger.Error("autopilot_resume_failed",
-				"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
-			resumeFlow.markFailed(err)
+	if isFirstTime {
+		if isAssignSignal {
+			// First-time assign: dispatch the task.
+			go o.run(ev)
 			return
 		}
-		o.logger.Info("autopilot_resume_done",
-			"issue", ev.IssueIdentifier, "session", ev.SessionID, "pr", resumeFlow.prURL)
-	}()
+		// First-time @mention or prompted without prior assign: reject.
+		o.logger.Info("dispatch_reject_no_task",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postReply(ev.SessionID, assignFirstHelp)
+		return
+	}
+
+	// Issue already known.
+	if isAssignSignal {
+		o.logger.Info("dispatch_reject_repeat_assign",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postReply(ev.SessionID, repeatAssignHelp)
+		return
+	}
+
+	// Parse /command from text.
+	cmdName, remainder, ok := parseMentionCommand(text)
+	if !ok {
+		o.logger.Info("dispatch_reject_bare",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postReply(ev.SessionID, mentionCommandHelp)
+		return
+	}
+
+	switch cmdName {
+	case "rerun":
+		o.dispatchRerun(ev, remainder)
+	case "fix":
+		// /fix is parser-recognized but not yet runnable (GEO-49 / PR-C).
+		o.logger.Info("autopilot_reject_fix_not_implemented",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postReply(ev.SessionID, fixNotImplementedHelp)
+	case "status", "help":
+		o.handleCommand(ev, cmdName)
+	default:
+		o.logger.Info("autopilot_reject_unknown_command",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier, "command", "/"+cmdName)
+		o.postReply(ev.SessionID, unknownCommandHelp("/"+cmdName))
+	}
+}
+
+// dispatchRerun handles /rerun on an existing task. State machine:
+//   - in-flight (active session) → reject "currently processing"
+//   - terminal states (DONE/FAILED/TIMED_OUT/CANCELLED) → handleRerun
+//     marks prior rows superseded and dispatches a fresh run
+//
+// Note: under the current SessionID-keyed autopilot_jobs schema /rerun
+// works correctly only when triggered via @mention (Linear hands us a
+// fresh SessionID for the new comment). /rerun via thread (prompted)
+// reuses the original SessionID, ClaimAutopilotJob no-ops, the fresh
+// dispatch silently fails. PR-B-v2 will fix this by keying state on
+// issue_id (admiral_tasks). Until then, prompted /rerun is rejected
+// here with a redirect message rather than silently failing.
+func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, notes string) {
+	if ev.Action == linear.ActionPrompted {
+		o.logger.Info("autopilot_reject_rerun_in_prompted",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postReply(ev.SessionID, rerunInPromptedNotSupportedHelp)
+		return
+	}
+
+	active, err := o.db.FindActiveJobByIssue(ev.IssueID, ev.SessionID)
+	if err != nil {
+		o.logger.Warn("active_job_check_failed_in_rerun",
+			"err", err, "issue", ev.IssueID)
+	} else if active != nil {
+		o.logger.Info("dispatch_reject_rerun_currently_processing",
+			"session", ev.SessionID,
+			"issue", ev.IssueIdentifier,
+			"prior_session", active.AgentSessionID)
+		o.postReply(ev.SessionID, rerunCurrentlyProcessingHelp(active.AgentSessionID))
+		return
+	}
+
+	// All prior rows for this issue are in terminal states. Mark them
+	// superseded (handleRerun's existing logic) and dispatch fresh.
+	o.handleRerun(ev, notes)
 }
 
 // runFollowup spawns a fresh flow for a Linear event whose issue already
@@ -1845,6 +1751,30 @@ const fixNotImplementedHelp = `/fix is not yet implemented (tracked in GEO-49). 
 // requires the issue-keyed task model (GEO-50). Until that lands, redirect
 // users to the @mention path which gets a fresh SessionID from Linear.
 const rerunInPromptedNotSupportedHelp = `/rerun via thread message is not yet supported (tracked in GEO-50). Please re-mention me with /rerun in a new comment on the issue.`
+
+// assignFirstHelp is the reply sent when admiral receives an @mention
+// or thread-prompted event for an issue it has never seen before. The
+// new model (GEO-50) requires assign as the explicit kickoff signal —
+// admiral does not auto-dispatch on stray mentions.
+const assignFirstHelp = `Issue not assigned to admiral. Assign the issue to me first to dispatch the task; @mentions and thread messages without prior assign are not actionable.`
+
+// repeatAssignHelp is the reply sent when an assign event arrives for
+// an issue that already has prior admiral activity. New runs require
+// /rerun (start over) or /fix (patch the existing PR) instead of a
+// second assign.
+const repeatAssignHelp = `Task already exists for this issue. Use /rerun in a comment or thread to start over, or /fix <description> to patch the current PR (planned, see GEO-49).`
+
+// rerunCurrentlyProcessingHelp builds the reply sent when /rerun is
+// requested on an issue that already has an active (non-terminal)
+// autopilot session. admiral runs are serial per issue; the user
+// either waits for the current run to finish or cancels it before
+// starting a new one.
+func rerunCurrentlyProcessingHelp(priorSessionID string) string {
+	return fmt.Sprintf(
+		"Cannot /rerun: admiral is currently processing this issue (session `%s`). Wait for it to finish, or cancel the prior session before retrying.",
+		priorSessionID,
+	)
+}
 
 // unknownCommandHelp is the reply sent when an unknown /command is received.
 func unknownCommandHelp(cmd string) string {
