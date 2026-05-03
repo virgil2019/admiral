@@ -41,6 +41,7 @@ type storeInterface interface {
 	GetLatestTimedOutJobByIssue(issueID string) (*store.AutopilotJob, error)
 	FindActiveJobByIssue(issueID, excludeSessionID string) (*store.AutopilotJob, error)
 	GetRepoByProjectID(projectID string) (*store.Repo, error)
+	ListJobsByIssueAndStates(issueID string, states []string) ([]store.AutopilotJob, error)
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -126,10 +127,40 @@ func (o *Orchestrator) HandleAgentEvent(ev linear.AgentEvent) {
 }
 
 func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
-	// Check for command mode: first line of PromptContext starts with /
+	// Assign path (no PromptContext): unconditional dispatch per GEO-47.
+	// Mention path (PromptContext non-empty): require a leading /command.
+	//
+	// Rejection paths never write to autopilot_jobs. The new SessionID has
+	// not been claimed yet, so there is no row to update; calling cancelJob
+	// here would be a silent no-op in production. Audit trail for rejected
+	// mentions is via logs (slog), not DB rows.
 	if ev.PromptContext != "" {
-		if cmd := extractCommand(ev.PromptContext); cmd != "" {
-			o.handleCommand(ev, cmd)
+		name, remainder, ok := parseMentionCommand(ev.PromptContext)
+		if !ok {
+			// Bare mention: reject, do not dispatch.
+			o.logger.Info("autopilot_reject_bare_mention",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier)
+			o.postReply(ev.SessionID, mentionCommandHelp)
+			return
+		}
+		switch name {
+		case "rerun":
+			o.handleRerun(ev, remainder)
+			return
+		case "fix":
+			// /fix is defined but not yet implemented (GEO-49).
+			o.logger.Info("autopilot_reject_fix_not_implemented",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier)
+			o.postReply(ev.SessionID, fixNotImplementedHelp)
+			return
+		case "status", "help":
+			// Existing command handlers for mention context.
+			o.handleCommand(ev, name)
+			return
+		default:
+			o.logger.Info("autopilot_reject_unknown_command",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier, "command", "/"+name)
+			o.postReply(ev.SessionID, unknownCommandHelp("/"+name))
 			return
 		}
 	}
@@ -233,9 +264,54 @@ func (o *Orchestrator) handleCreated(ev linear.AgentEvent) {
 
 // handlePrompted handles follow-up messages in an existing agent thread
 // by resuming the previous claude session on the original PR/branch.
+// It also enforces the /command contract: bare prompted messages are rejected.
 func (o *Orchestrator) handlePrompted(ev linear.AgentEvent) {
 	o.logger.Info("autopilot_prompted",
 		"session", ev.SessionID, "msg_len", len(ev.UserMessage))
+
+	// Require a leading /command for prompted events.
+	//
+	// Rejection paths here MUST NOT write to autopilot_jobs. In the prompted
+	// path ev.SessionID is reused from the original AgentSession (Linear
+	// reuses session.id across all prompted events on the same thread), so
+	// cancelJob would overwrite the prior DONE/FAILED row's state and erase
+	// historical work. Audit trail goes via slog only.
+	if ev.UserMessage != "" {
+		name, _, ok := parseMentionCommand(ev.UserMessage)
+		if !ok {
+			o.logger.Info("autopilot_reject_bare_prompted",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier)
+			o.postReply(ev.SessionID, mentionCommandHelp)
+			return
+		}
+		switch name {
+		case "rerun":
+			// /rerun via thread is broken under the current SessionID-keyed
+			// store: handleRerun would call ClaimAutopilotJob on the existing
+			// SessionID and silently no-op. Until GEO-50 lands the
+			// issue-keyed task model, redirect users to the @mention path
+			// (which gets a fresh SessionID from Linear and works).
+			o.logger.Info("autopilot_reject_rerun_in_prompted",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier)
+			o.postReply(ev.SessionID, rerunInPromptedNotSupportedHelp)
+			return
+		case "fix":
+			// /fix not implemented yet (GEO-49).
+			o.logger.Info("autopilot_reject_fix_not_implemented",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier)
+			o.postReply(ev.SessionID, fixNotImplementedHelp)
+			return
+		case "status", "help":
+			// Existing command handlers.
+			o.handleCommand(ev, name)
+			return
+		default:
+			o.logger.Info("autopilot_reject_unknown_command",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier, "command", "/"+name)
+			o.postReply(ev.SessionID, unknownCommandHelp("/"+name))
+			return
+		}
+	}
 
 	job, err := o.db.GetAutopilotJob(ev.SessionID)
 	if err != nil {
@@ -1725,9 +1801,14 @@ func relativeTime(rfc3339 string) string {
 	return fmt.Sprintf("%dd ago", days)
 }
 
-// extractCommand returns the command word (without leading /) if the first
-// non-empty line of text looks like /xxx, otherwise empty string.
-func extractCommand(text string) string {
+// parseMentionCommand inspects the leading non-empty, whitespace-trimmed
+// token of text. Returns (name, remainder, ok) where:
+//   - name is the lowercased command word without leading '/'
+//   - remainder is text after the command line (may be empty)
+//   - ok is true when text starts with a recognised /command
+//
+// Use this for ActionCreated (PromptContext) and ActionPrompted (UserMessage).
+func parseMentionCommand(text string) (name, remainder string, ok bool) {
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -1736,11 +1817,46 @@ func extractCommand(text string) string {
 		if strings.HasPrefix(line, "/") {
 			parts := strings.SplitN(line, " ", 2)
 			cmd := strings.TrimSpace(parts[0])
-			return strings.ToLower(strings.TrimPrefix(cmd, "/"))
+			name = strings.ToLower(strings.TrimPrefix(cmd, "/"))
+			if len(parts) == 2 {
+				remainder = strings.TrimSpace(parts[1])
+			}
+			return name, remainder, true
 		}
-		break // first non-empty line not starting with /, no command
+		break // first non-empty line not starting with /, bare mention
 	}
-	return ""
+	return "", "", false
+}
+
+// mentionCommandHelp is the reply sent when a bare @mention is rejected.
+const mentionCommandHelp = `admiral does not respond to bare @mentions. Use one of:
+  /rerun <optional notes>     — start over from scratch on this issue
+  /fix <description>          — patch the previous run with these notes (planned, see GEO-49)`
+
+// fixNotImplementedHelp is the reply sent when /fix is invoked. /fix is
+// reserved syntax that the parser recognizes, but the resume-on-existing-PR
+// behavior is not yet implemented; tracked in GEO-49.
+const fixNotImplementedHelp = `/fix is not yet implemented (tracked in GEO-49). Use /rerun for now to restart the task on a fresh branch.`
+
+// rerunInPromptedNotSupportedHelp is the reply sent when /rerun is invoked
+// from inside an existing agent thread (prompted event). Under the current
+// SessionID-keyed store this would silently no-op because handleRerun's
+// fresh dispatch can't claim a row with the reused SessionID. The fix
+// requires the issue-keyed task model (GEO-50). Until that lands, redirect
+// users to the @mention path which gets a fresh SessionID from Linear.
+const rerunInPromptedNotSupportedHelp = `/rerun via thread message is not yet supported (tracked in GEO-50). Please re-mention me with /rerun in a new comment on the issue.`
+
+// unknownCommandHelp is the reply sent when an unknown /command is received.
+func unknownCommandHelp(cmd string) string {
+	return fmt.Sprintf("admiral did not recognize %q. Currently supported: /rerun.", cmd)
+}
+
+// postReply is a thin helper used during early-exit rejection paths where no
+// flow has been created yet and therefore no worktree cleanup is needed.
+func (o *Orchestrator) postReply(sessionID, body string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.Response(body))
 }
 
 const availableCommandsHelp = `Available commands:
@@ -1817,6 +1933,62 @@ func (o *Orchestrator) handleCommand(ev linear.AgentEvent, cmd string) {
 		body := fmt.Sprintf("Unknown command: /%s\n\n%s", cmd, availableCommandsHelp)
 		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
 	}
+}
+
+// handleRerun is invoked when an @mention starts with /rerun. It discards
+// prior session state for the issue (marking DONE/FAILED rows as superseded)
+// and spawns a fresh dispatch on the issue.
+func (o *Orchestrator) handleRerun(ev linear.AgentEvent, notes string) {
+	o.logger.Info("handle_rerun",
+		"session", ev.SessionID,
+		"issue", ev.IssueIdentifier,
+		"notes_len", len(notes),
+	)
+
+	// Mark all prior DONE/FAILED/TIMED_OUT jobs for this issue as superseded.
+	supersededStates := []string{store.JobStateDone, store.JobStateFailed, store.JobStateTimedOut}
+	priorJobs, err := o.db.ListJobsByIssueAndStates(ev.IssueID, supersededStates)
+	if err != nil {
+		o.logger.Warn("list_jobs_for_rerun_failed", "err", err, "issue", ev.IssueID)
+	} else if len(priorJobs) > 0 {
+		now := time.Now().UTC().Format(time.RFC3339)
+		for _, j := range priorJobs {
+			if err := o.db.UpdateAutopilotJob(j.AgentSessionID, func(job *store.AutopilotJob) {
+				job.State = store.JobStateCancelled
+				job.Error = "superseded_by_rerun"
+				job.FinishedAt = now
+			}); err != nil {
+				o.logger.Warn("mark_prior_job_superseded_failed",
+					"session", j.AgentSessionID, "err", err)
+			}
+		}
+	}
+
+	// Build the rerun event: strip /rerun from PromptContext so the fresh
+	// flow uses the remainder as the user message. If notes are provided,
+	// prepend them to the original PromptContext (minus the /rerun line).
+	var newPromptCtx string
+	if notes != "" {
+		newPromptCtx = notes
+		if ev.PromptContext != "" {
+			// Append the original comment minus the first /rerun line.
+			lines := strings.SplitN(ev.PromptContext, "\n", 2)
+			if len(lines) > 1 {
+				newPromptCtx = strings.TrimSpace(newPromptCtx) + "\n" + strings.TrimSpace(lines[1])
+			}
+		}
+	} else if ev.PromptContext != "" {
+		lines := strings.SplitN(ev.PromptContext, "\n", 2)
+		if len(lines) > 1 {
+			newPromptCtx = strings.TrimSpace(lines[1])
+		}
+	}
+
+	rerunEv := ev
+	rerunEv.PromptContext = newPromptCtx
+
+	// Claim the new session and spawn the fresh flow.
+	go o.run(rerunEv)
 }
 
 func orDefault(s, def string) string {

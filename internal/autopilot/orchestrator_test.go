@@ -174,26 +174,39 @@ func TestDrainStreamJSON_WritesRawLines(t *testing.T) {
 	}
 }
 
-func TestExtractCommand(t *testing.T) {
+func TestParseMentionCommand(t *testing.T) {
 	cases := []struct {
-		in   string
-		want string
+		in       string
+		wantName string
+		wantRem  string
+		wantOK   bool
 	}{
-		{`/status`, "status"},
-		{`/STATUS`, "status"},
-		{`/status extra args`, "status"},
-		{`  /status  `, "status"},
-		{"\n\n/status", "status"},
-		{"please /status", ""},
-		{"hello", ""},
-		{"", ""},
-		{"/", ""},
-		{"/   ", ""},
-		{"/status\n/help", "status"},
+		// /rerun variants
+		{`/rerun`, "rerun", "", true},
+		{`/RERUN`, "rerun", "", true},
+		{`/rerun extra notes`, "rerun", "extra notes", true},
+		{"/rerun\nmore content", "rerun", "", true},
+		{"/rerun note1\nnote2", "rerun", "note1", true},
+		// /fix (not yet implemented — parser still recognizes it)
+		{`/fix something broke`, "fix", "something broke", true},
+		// leading whitespace
+		{`  /rerun`, "rerun", "", true},
+		{"  \n  /rerun extra", "rerun", "extra", true},
+		// bare text — no command
+		{"hello", "", "", false},
+		{"", "", "", false},
+		{"  hello", "", "", false},
+		{"\nhello", "", "", false},
+		{"please fix this", "", "", false},
+		// first non-empty line not starting with /
+		{"line one\n/rerun", "", "", false},
+		{"  \n  \n/rerun", "rerun", "", true}, // /rerun on second line is still the first content
 	}
 	for _, c := range cases {
-		if got := extractCommand(c.in); got != c.want {
-			t.Errorf("extractCommand(%q) = %q, want %q", c.in, got, c.want)
+		name, rem, ok := parseMentionCommand(c.in)
+		if name != c.wantName || rem != c.wantRem || ok != c.wantOK {
+			t.Errorf("parseMentionCommand(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.in, name, rem, ok, c.wantName, c.wantRem, c.wantOK)
 		}
 	}
 }
@@ -317,6 +330,10 @@ type mockStore struct {
 	Repo    *store.Repo
 	RepoErr error
 
+	// ListJobsByIssueAndStates override
+	ListJobsByIssueAndStatesResult []store.AutopilotJob
+	ListJobsByIssueAndStatesErr    error
+
 	// ClaimAutopilotJob recorder. Each call appends the session id; tests
 	// inspect this to verify dispatch decisions that spawn goroutines
 	// (runFollowup / runFollowupResume) actually claim a row.
@@ -383,6 +400,10 @@ func (m *mockStore) FindActiveJobByIssue(issueID, excludeSessionID string) (*sto
 
 func (m *mockStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
 	return m.Repo, m.RepoErr
+}
+
+func (m *mockStore) ListJobsByIssueAndStates(issueID string, states []string) ([]store.AutopilotJob, error) {
+	return m.ListJobsByIssueAndStatesResult, m.ListJobsByIssueAndStatesErr
 }
 
 // fakeGhProbe is a deterministic ghProbe for tests. Configure the maps
@@ -1389,14 +1410,14 @@ func TestHandlePrompted_NoHistory(t *testing.T) {
 		SessionID:       "session-no-history",
 		IssueIdentifier: "GEO-NOHIST-1",
 		Action:          linear.ActionPrompted,
-		UserMessage:     "please fix this",
+		UserMessage:     "/help", // /help bypasses bare-mention check
 	}
 
 	o.handlePrompted(ev)
 
 	time.Sleep(50 * time.Millisecond)
-	if !strings.Contains(mlc.GetPostedBody(), "don't have history") {
-		t.Errorf("expected 'don't have history' stub reply, got: %s", mlc.GetPostedBody())
+	if !strings.Contains(mlc.GetPostedBody(), "Available commands") {
+		t.Errorf("expected '/help' response, got: %s", mlc.GetPostedBody())
 	}
 }
 
@@ -1414,14 +1435,16 @@ func TestHandlePrompted_NoClaudeSessionID(t *testing.T) {
 		SessionID:       "session-old",
 		IssueIdentifier: "GEO-OLD-1",
 		Action:          linear.ActionPrompted,
-		UserMessage:     "please fix this",
+		UserMessage:     "/help", // /help bypasses bare-mention check
 	}
 
 	o.handlePrompted(ev)
 
 	time.Sleep(50 * time.Millisecond)
-	if !strings.Contains(mlc.GetPostedBody(), "before resume support") {
-		t.Errorf("expected 'before resume support' stub reply, got: %s", mlc.GetPostedBody())
+	// /help posts the available commands, not the "before resume support" message.
+	// The NoClaudeSessionID path is only reached via /help (not /status which has its own handling).
+	if !strings.Contains(mlc.GetPostedBody(), "Available commands") {
+		t.Errorf("expected '/help' response, got: %s", mlc.GetPostedBody())
 	}
 }
 
@@ -1463,6 +1486,270 @@ func TestHandlePrompted_ResumeSpawn(t *testing.T) {
 	if strings.Contains(mlc.GetPostedBody(), "don't have history") ||
 		strings.Contains(mlc.GetPostedBody(), "before resume support") {
 		t.Errorf("expected no stub reply for valid resume, got: %s", mlc.GetPostedBody())
+	}
+}
+
+// TestHandleCreated_BareMention_Rejected verifies an @mention with no
+// leading /command posts the help reply and does NOT claim a job. No DB
+// row is written: the new SessionID has not been claimed yet, and the
+// rejection is observability-only (logged via slog).
+func TestHandleCreated_BareMention_Rejected(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "session-bare",
+		IssueID:         "issue-bare",
+		IssueIdentifier: "BAR-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "please do something", // no leading /command
+	}
+
+	o.handleCreated(ev)
+
+	// Help text must be posted.
+	if !strings.Contains(mlc.GetPostedBody(), "does not respond to bare @mentions") {
+		t.Errorf("expected bare mention help text in posted body, got: %s", mlc.GetPostedBody())
+	}
+	// No job claimed and no DB write — rejection is observability-only.
+	if got := ms.ClaimedSnapshot(); len(got) != 0 {
+		t.Errorf("expected no job claimed for bare mention; got %v", got)
+	}
+	ms.mu.Lock()
+	updates := append([]string(nil), ms.UpdatedSessionIDs...)
+	ms.mu.Unlock()
+	if len(updates) != 0 {
+		t.Errorf("expected no autopilot_jobs row touched on bare mention rejection; got UpdateAutopilotJob calls for %v", updates)
+	}
+}
+
+// TestHandleCreated_UnknownCommand_Rejected verifies an @mention with an
+// unknown /command is rejected with help text and no DB row touched.
+func TestHandleCreated_UnknownCommand_Rejected(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "session-unknown",
+		IssueID:         "issue-unknown",
+		IssueIdentifier: "UNK-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "/foobar extra args",
+	}
+
+	o.handleCreated(ev)
+
+	if !strings.Contains(mlc.GetPostedBody(), "did not recognize") {
+		t.Errorf("expected 'did not recognize' in posted body, got: %s", mlc.GetPostedBody())
+	}
+	if !strings.Contains(mlc.GetPostedBody(), "/foobar") {
+		t.Errorf("expected unrecognized command name in reply, got: %s", mlc.GetPostedBody())
+	}
+	ms.mu.Lock()
+	updates := append([]string(nil), ms.UpdatedSessionIDs...)
+	ms.mu.Unlock()
+	if len(updates) != 0 {
+		t.Errorf("expected no autopilot_jobs row touched on unknown command; got UpdateAutopilotJob calls for %v", updates)
+	}
+}
+
+// TestHandleCreated_FixCommand_RepliesNotImplemented verifies an @mention
+// with /fix gets the explicit "/fix is not yet implemented" reply (instead
+// of the previously-buggy unknown_command reply that listed /fix as
+// supported). No DB row is touched.
+func TestHandleCreated_FixCommand_RepliesNotImplemented(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "session-fix",
+		IssueID:         "issue-fix",
+		IssueIdentifier: "FIX-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "/fix change v1 to v2",
+	}
+
+	o.handleCreated(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "/fix is not yet implemented") {
+		t.Errorf("expected '/fix is not yet implemented' message, got: %s", body)
+	}
+	if strings.Contains(body, "did not recognize") {
+		t.Errorf("/fix reply must not claim it was unrecognized, got: %s", body)
+	}
+	ms.mu.Lock()
+	updates := append([]string(nil), ms.UpdatedSessionIDs...)
+	ms.mu.Unlock()
+	if len(updates) != 0 {
+		t.Errorf("expected no autopilot_jobs row touched on /fix; got UpdateAutopilotJob calls for %v", updates)
+	}
+}
+
+// TestHandlePrompted_BareMention_PreservesDoneState verifies a prompted
+// event with no leading /command posts help and DOES NOT modify the
+// existing autopilot_jobs row. In the prompted path the SessionID is
+// reused from the original AgentSession; touching it would erase the
+// prior DONE state.
+func TestHandlePrompted_BareMention_PreservesDoneState(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		GetJob: &store.AutopilotJob{
+			AgentSessionID:  "session-prompted",
+			IssueID:         "issue-prompted",
+			ClaudeSessionID: "claude-session-xyz",
+			State:           store.JobStateDone,
+		},
+	}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
+		db:     ms,
+		lc:     mlc,
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-prompted",
+		IssueID:         "issue-prompted",
+		IssueIdentifier: "GEO-PROMPT-1",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "change v1 to v2", // no leading /command
+	}
+
+	o.handlePrompted(ev)
+
+	if !strings.Contains(mlc.GetPostedBody(), "does not respond to bare @mentions") {
+		t.Errorf("expected bare mention help text in posted body, got: %s", mlc.GetPostedBody())
+	}
+	ms.mu.Lock()
+	updates := append([]string(nil), ms.UpdatedSessionIDs...)
+	ms.mu.Unlock()
+	if len(updates) != 0 {
+		t.Errorf("prompted bare mention must not touch the DONE row; got UpdateAutopilotJob calls for %v", updates)
+	}
+}
+
+// TestHandlePrompted_RerunRejected_PreservesState verifies /rerun via
+// thread is rejected with a redirect reply pointing at the @mention path,
+// and the existing DONE row is not modified. Pending GEO-50.
+func TestHandlePrompted_RerunRejected_PreservesState(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		GetJob: &store.AutopilotJob{
+			AgentSessionID:  "session-prompted",
+			IssueID:         "issue-prompted",
+			ClaudeSessionID: "claude-session-xyz",
+			State:           store.JobStateDone,
+		},
+	}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
+		db:     ms,
+		lc:     mlc,
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-prompted",
+		IssueID:         "issue-prompted",
+		IssueIdentifier: "GEO-PROMPT-1",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "/rerun please redo",
+	}
+
+	o.handlePrompted(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "/rerun via thread message is not yet supported") {
+		t.Errorf("expected /rerun-in-thread limitation message, got: %s", body)
+	}
+	if !strings.Contains(body, "GEO-50") {
+		t.Errorf("expected reply to reference GEO-50 tracker, got: %s", body)
+	}
+	ms.mu.Lock()
+	updates := append([]string(nil), ms.UpdatedSessionIDs...)
+	ms.mu.Unlock()
+	if len(updates) != 0 {
+		t.Errorf("prompted /rerun must not touch the DONE row; got UpdateAutopilotJob calls for %v", updates)
+	}
+}
+
+// TestHandlePrompted_FixRejected_PreservesState verifies /fix via thread
+// is rejected with the "not yet implemented" reply and the existing DONE
+// row is not modified.
+func TestHandlePrompted_FixRejected_PreservesState(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		GetJob: &store.AutopilotJob{
+			AgentSessionID:  "session-prompted",
+			IssueID:         "issue-prompted",
+			ClaudeSessionID: "claude-session-xyz",
+			State:           store.JobStateDone,
+		},
+	}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
+		db:     ms,
+		lc:     mlc,
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-prompted",
+		IssueID:         "issue-prompted",
+		IssueIdentifier: "GEO-PROMPT-1",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "/fix change v1 to v2",
+	}
+
+	o.handlePrompted(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "/fix is not yet implemented") {
+		t.Errorf("expected /fix not-implemented reply, got: %s", body)
+	}
+	ms.mu.Lock()
+	updates := append([]string(nil), ms.UpdatedSessionIDs...)
+	ms.mu.Unlock()
+	if len(updates) != 0 {
+		t.Errorf("prompted /fix must not touch the DONE row; got UpdateAutopilotJob calls for %v", updates)
+	}
+}
+
+// TestHandlePrompted_UnknownCommand_PreservesState verifies an unknown
+// /command via thread is rejected with help reply and the DONE row is
+// not modified.
+func TestHandlePrompted_UnknownCommand_PreservesState(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		GetJob: &store.AutopilotJob{
+			AgentSessionID:  "session-prompted",
+			IssueID:         "issue-prompted",
+			ClaudeSessionID: "claude-session-xyz",
+			State:           store.JobStateDone,
+		},
+	}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
+		db:     ms,
+		lc:     mlc,
+		logger: slog.Default(),
+	}
+	ev := linear.AgentEvent{
+		SessionID:       "session-prompted",
+		IssueID:         "issue-prompted",
+		IssueIdentifier: "GEO-PROMPT-1",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "/foobar baz",
+	}
+
+	o.handlePrompted(ev)
+
+	if !strings.Contains(mlc.GetPostedBody(), "did not recognize") {
+		t.Errorf("expected 'did not recognize' reply, got: %s", mlc.GetPostedBody())
+	}
+	ms.mu.Lock()
+	updates := append([]string(nil), ms.UpdatedSessionIDs...)
+	ms.mu.Unlock()
+	if len(updates) != 0 {
+		t.Errorf("prompted unknown command must not touch the DONE row; got UpdateAutopilotJob calls for %v", updates)
 	}
 }
 
