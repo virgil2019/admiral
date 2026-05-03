@@ -1340,17 +1340,26 @@ func TestHandleCreated_UnknownCommand_Rejected(t *testing.T) {
 	}
 }
 
-// TestHandleCreated_FixCommand_RepliesNotImplemented verifies an @mention
-// with /fix on an existing task gets the explicit "/fix is not yet
-// implemented" reply. No DB row touched.
-func TestHandleCreated_FixCommand_RepliesNotImplemented(t *testing.T) {
+// TestHandleCreated_FixCommand_LegacyRowRejected verifies /fix on a DONE
+// task that lacks pr_url or claude_session_id is rejected — there's no
+// PR to push onto and no claude session to resume. The user is told to
+// /rerun instead.
+func TestHandleCreated_FixCommand_LegacyRowRejected(t *testing.T) {
 	mlc := &mockLinearClient{}
-	ms := &mockStore{AdmiralTask: &store.AdmiralTask{State: store.JobStateDone}}
+	live := &store.AdmiralTask{
+		IssueID: "issue-fix-legacy",
+		State:   store.JobStateDone,
+		// PRURL and ClaudeSessionID intentionally empty
+	}
+	ms := &mockStore{
+		AdmiralTask:     live,
+		LiveAdmiralTask: live, // same pointer so UpdateAdmiralTask mutates the asserted instance
+	}
 	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
 	ev := linear.AgentEvent{
-		SessionID:       "session-fix",
-		IssueID:         "issue-fix",
-		IssueIdentifier: "FIX-1",
+		SessionID:       "session-fix-legacy",
+		IssueID:         "issue-fix-legacy",
+		IssueIdentifier: "FIX-LEG-1",
 		Action:          linear.ActionCreated,
 		PromptContext:   "/fix change v1 to v2",
 	}
@@ -1358,17 +1367,13 @@ func TestHandleCreated_FixCommand_RepliesNotImplemented(t *testing.T) {
 	o.HandleAgentEvent(ev)
 
 	body := mlc.GetPostedBody()
-	if !strings.Contains(body, "/fix is not yet implemented") {
-		t.Errorf("expected '/fix is not yet implemented' message, got: %s", body)
+	if !strings.Contains(body, "/fix needs a prior run with both an open PR and a recoverable claude session") {
+		t.Errorf("expected legacy-row /fix reject message, got: %s", body)
 	}
-	if strings.Contains(body, "did not recognize") {
-		t.Errorf("/fix reply must not claim it was unrecognized, got: %s", body)
-	}
-	ms.mu.Lock()
-	updates := append([]string(nil), ms.UpdatedSessionIDs...)
-	ms.mu.Unlock()
-	if len(updates) != 0 {
-		t.Errorf("expected no autopilot_jobs row touched on /fix; got UpdateAutopilotJob calls for %v", updates)
+	// State must NOT advance — the only allowed mutation is dispatch's
+	// last_event_session_id refresh.
+	if live.State != store.JobStateDone {
+		t.Errorf("admiral_tasks.state must stay DONE on legacy /fix reject; got %q", live.State)
 	}
 }
 
@@ -1423,16 +1428,18 @@ func TestHandlePrompted_BareMention_PreservesDoneState(t *testing.T) {
 // TestHandlePrompted_FixRejected_PreservesState verifies /fix via thread
 // is rejected with the "not yet implemented" reply and the existing DONE
 // row is not modified.
-func TestHandlePrompted_FixRejected_PreservesState(t *testing.T) {
+func TestHandlePrompted_FixOnLegacyRow_Rejected(t *testing.T) {
+	// /fix on a DONE admiral_tasks row that lacks ClaudeSessionID (e.g.
+	// data backfilled from very old autopilot_jobs without resume support)
+	// is rejected — there's no claude session to --resume.
 	mlc := &mockLinearClient{}
 	ms := &mockStore{
-		GetJob: &store.AutopilotJob{
-			AgentSessionID:  "session-prompted",
-			IssueID:         "issue-prompted",
-			ClaudeSessionID: "claude-session-xyz",
-			State:           store.JobStateDone,
+		AdmiralTask: &store.AdmiralTask{
+			IssueID: "issue-prompted",
+			State:   store.JobStateDone,
+			PRURL:   "https://github.com/x/y/pull/1",
+			// ClaudeSessionID intentionally empty
 		},
-		AdmiralTask: &store.AdmiralTask{State: store.JobStateDone},
 	}
 	o := &Orchestrator{
 		cfg:    &config.Autopilot{RepoDir: t.TempDir()},
@@ -1451,14 +1458,8 @@ func TestHandlePrompted_FixRejected_PreservesState(t *testing.T) {
 	o.HandleAgentEvent(ev)
 
 	body := mlc.GetPostedBody()
-	if !strings.Contains(body, "/fix is not yet implemented") {
-		t.Errorf("expected /fix not-implemented reply, got: %s", body)
-	}
-	ms.mu.Lock()
-	updates := append([]string(nil), ms.UpdatedSessionIDs...)
-	ms.mu.Unlock()
-	if len(updates) != 0 {
-		t.Errorf("prompted /fix must not touch the DONE row; got UpdateAutopilotJob calls for %v", updates)
+	if !strings.Contains(body, "/fix needs a prior run with both an open PR and a recoverable claude session") {
+		t.Errorf("expected legacy-row /fix reject reply, got: %s", body)
 	}
 }
 
@@ -2389,5 +2390,206 @@ func TestDispatch_RerunInPrompted_NowSupersedes(t *testing.T) {
 	}
 	if got := ms.SupersededAdmiralIssues; len(got) != 1 || got[0] != "issue-thread" {
 		t.Errorf("expected /rerun-in-thread to supersede admiral_tasks row; got %v", got)
+	}
+}
+
+// ---- GEO-49 /fix dispatch tests (PR-C) ----
+
+// TestDispatch_FixOnDone_DispatchesResume verifies the happy /fix path:
+// existing live task in DONE with PR url + claude_session_id triggers a
+// resume run. admiral_tasks state transitions DONE → EXECUTING; ev.Session
+// is recorded as last_event_session_id.
+func TestDispatch_FixOnDone_DispatchesResume(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
+	}
+	live := &store.AdmiralTask{
+		IssueID:         "issue-fix",
+		State:           store.JobStateDone,
+		AttemptN:        1,
+		PRURL:           "https://github.com/x/y/pull/42",
+		Branch:          "linear/fix-1",
+		ClaudeSessionID: "claude-fix-session",
+	}
+	ms := &mockStore{
+		AdmiralTask:     live,
+		LiveAdmiralTask: live,
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-fix",
+		IssueID:         "issue-fix",
+		IssueIdentifier: "FIX-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "/fix change v1 to v2 in line 12",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	// Wait for the /fix goroutine to flip state to EXECUTING.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if live.State == store.JobStateExecuting {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if live.State != store.JobStateExecuting {
+		t.Errorf("expected admiral_tasks.state EXECUTING during /fix run; got %q", live.State)
+	}
+	if live.AttemptN != 1 {
+		t.Errorf("/fix must not increment attempt_n; got %d", live.AttemptN)
+	}
+	if got := ms.SupersededAdmiralIssues; len(got) != 0 {
+		t.Errorf("/fix must not supersede admiral_tasks; got %v", got)
+	}
+}
+
+// TestDispatch_FixOnExecuting_Rejected verifies /fix is rejected with
+// "currently processing" when the live task is mid-flight.
+func TestDispatch_FixOnExecuting_Rejected(t *testing.T) {
+	mlc := &mockLinearClient{}
+	live := &store.AdmiralTask{
+		IssueID:         "issue-busy",
+		State:           store.JobStateExecuting,
+		AttemptN:        1,
+		PRURL:           "https://github.com/x/y/pull/1",
+		ClaudeSessionID: "claude-busy",
+	}
+	ms := &mockStore{
+		AdmiralTask:     live,
+		LiveAdmiralTask: live,
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-fix-busy",
+		IssueID:         "issue-busy",
+		IssueIdentifier: "BUSY-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "/fix something",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "currently processing") {
+		t.Errorf("expected currently-processing reply, got: %s", body)
+	}
+	// State must remain EXECUTING — /fix did NOT take over.
+	if live.State != store.JobStateExecuting {
+		t.Errorf("/fix on EXECUTING must not change state; got %q", live.State)
+	}
+}
+
+// TestDispatch_FixOnFailed_SuggestsRerun verifies /fix is rejected on
+// FAILED state with a message suggesting /rerun.
+func TestDispatch_FixOnFailed_SuggestsRerun(t *testing.T) {
+	mlc := &mockLinearClient{}
+	live := &store.AdmiralTask{
+		IssueID:         "issue-failed",
+		State:           store.JobStateFailed,
+		AttemptN:        1,
+		PRURL:           "https://github.com/x/y/pull/2",
+		ClaudeSessionID: "claude-failed",
+	}
+	ms := &mockStore{
+		AdmiralTask:     live,
+		LiveAdmiralTask: live,
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-fix-failed",
+		IssueID:         "issue-failed",
+		IssueIdentifier: "FAIL-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "/fix retry",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "Use /rerun") {
+		t.Errorf("expected suggestion to use /rerun, got: %s", body)
+	}
+	if !strings.Contains(body, "FAILED") {
+		t.Errorf("expected current state name in reply, got: %s", body)
+	}
+}
+
+// TestDispatch_FixWithoutDescription_Rejects verifies /fix without a
+// description (just `/fix` alone) is rejected with help. Without text
+// the resume claude run has nothing to act on.
+func TestDispatch_FixWithoutDescription_Rejects(t *testing.T) {
+	mlc := &mockLinearClient{}
+	live := &store.AdmiralTask{
+		IssueID:         "issue-fix-empty",
+		State:           store.JobStateDone,
+		AttemptN:        1,
+		PRURL:           "https://github.com/x/y/pull/3",
+		ClaudeSessionID: "claude-empty",
+	}
+	ms := &mockStore{
+		AdmiralTask:     live,
+		LiveAdmiralTask: live,
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-fix-empty",
+		IssueID:         "issue-fix-empty",
+		IssueIdentifier: "FIX-EMPTY-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "/fix",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "/fix needs a description") {
+		t.Errorf("expected empty-description reject reply, got: %s", body)
+	}
+	if live.State != store.JobStateDone {
+		t.Errorf("empty /fix must not advance state; got %q", live.State)
+	}
+}
+
+// TestDispatch_FixViaPrompted_DispatchesResume verifies /fix works the
+// same via thread (prompted) as via @mention — admiral_tasks is keyed
+// on issue, so SessionID reuse is no longer a problem.
+func TestDispatch_FixViaPrompted_DispatchesResume(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
+	}
+	live := &store.AdmiralTask{
+		IssueID:         "issue-fix-thread",
+		State:           store.JobStateDone,
+		AttemptN:        1,
+		PRURL:           "https://github.com/x/y/pull/99",
+		Branch:          "linear/fix-thread",
+		ClaudeSessionID: "claude-thread",
+	}
+	ms := &mockStore{
+		AdmiralTask:     live,
+		LiveAdmiralTask: live,
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-fix-thread",
+		IssueID:         "issue-fix-thread",
+		IssueIdentifier: "FIX-THR-1",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "/fix simplify the helper",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if live.State == store.JobStateExecuting {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if live.State != store.JobStateExecuting {
+		t.Errorf("/fix-via-thread must transition admiral_tasks to EXECUTING; got %q", live.State)
 	}
 }
