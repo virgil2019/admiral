@@ -256,3 +256,81 @@ storage:
 		t.Errorf("UpdateIssueStatus: got true, want false")
 	}
 }
+
+func TestLoadAutopilot_DefaultMaxConcurrentRuns(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if cfg.Autopilot.MaxConcurrentRuns != 3 {
+		t.Errorf("MaxConcurrentRuns default: got %d, want 3", cfg.Autopilot.MaxConcurrentRuns)
+	}
+}
+
+func TestLoadAutopilot_MaxConcurrentRuns_FromConfig(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+  max_concurrent_runs: 7
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if cfg.Autopilot.MaxConcurrentRuns != 7 {
+		t.Errorf("MaxConcurrentRuns from config: got %d, want 7", cfg.Autopilot.MaxConcurrentRuns)
+	}
+}
+
+func TestLoadAutopilot_MaxConcurrentRuns_EnvOverride(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+  max_concurrent_runs: 7
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	t.Setenv("ADMIRAL_MAX_CONCURRENT_RUNS", "11")
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if cfg.Autopilot.MaxConcurrentRuns != 11 {
+		t.Errorf("MaxConcurrentRuns env override: got %d, want 11 (env should beat config 7)", cfg.Autopilot.MaxConcurrentRuns)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -104,6 +105,14 @@ type Autopilot struct {
 	// ClaimNextPendingEvent, so increasing this only adds cross-session
 	// parallelism. Default: 3.
 	WorkerCount int `yaml:"worker_count"`
+	// MaxConcurrentRuns caps how many `claude -p` runs can be in flight
+	// simultaneously across all issues (GEO-51). Each issue is still
+	// strictly serial via the GEO-50 admiral_tasks state machine; this
+	// controls cross-issue parallelism. A burst of N webhooks no longer
+	// spawns N parallel claude processes — they queue inside the run
+	// goroutine on a semaphore. Default: 3. Override via the
+	// ADMIRAL_MAX_CONCURRENT_RUNS env var (env takes priority over config).
+	MaxConcurrentRuns int `yaml:"max_concurrent_runs"`
 	// UpdateIssueStatus controls whether admiral updates Linear issue workflow
 	// state on task lifecycle (Backlog → Started → Completed). Default: true.
 	UpdateIssueStatus *bool `yaml:"update_issue_status"`
@@ -297,6 +306,17 @@ func (c *Config) validateAutopilotAndExpand() error {
 	}
 	if c.Autopilot.WorkerCount <= 0 {
 		c.Autopilot.WorkerCount = 3
+	}
+	// MaxConcurrentRuns: env > config > default. Negative or zero falls back
+	// to the default. The semaphore in the orchestrator gates `claude -p`
+	// dispatches against this cap.
+	if envN := os.Getenv("ADMIRAL_MAX_CONCURRENT_RUNS"); envN != "" {
+		if parsed, err := strconv.Atoi(envN); err == nil && parsed > 0 {
+			c.Autopilot.MaxConcurrentRuns = parsed
+		}
+	}
+	if c.Autopilot.MaxConcurrentRuns <= 0 {
+		c.Autopilot.MaxConcurrentRuns = 3
 	}
 	if c.Autopilot.UpdateIssueStatus == nil {
 		trueVal := true
