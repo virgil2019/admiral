@@ -131,10 +131,14 @@ func isTransientHTTPStatus(s int) bool {
 }
 
 // isTransientNetErr returns true for temporary network errors.
+//
+// net.Error.Temporary is deprecated since Go 1.18 (most "temporary"
+// errors are timeouts; the few exceptions are surprising). Timeout()
+// alone is the right contract here.
 func isTransientNetErr(err error) bool {
 	var ne net.Error
 	if errors.As(err, &ne) {
-		return ne.Temporary() || ne.Timeout()
+		return ne.Timeout()
 	}
 	return errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, context.Canceled) ||

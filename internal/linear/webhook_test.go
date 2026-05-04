@@ -3,7 +3,6 @@ package linear
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,17 +14,6 @@ import (
 
 	"github.com/georgehuang/admiral/internal/store"
 )
-
-func newTestDB(t *testing.T) *store.Store {
-	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	s := store.NewForTest(db)
-	return s
-}
 
 func newTestWebhook(t *testing.T, h AgentHandler) *Webhook {
 	t.Helper()

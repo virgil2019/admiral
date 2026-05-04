@@ -1,0 +1,24 @@
+version: "2"
+
+# golangci-lint config for admiral.
+#
+# Initial baseline (GEO-53 / CI/CD M2): the four core govet-grade linters
+# plus unused. errcheck is intentionally OFF for now — admiral has many
+# legacy unchecked errors (deferred *.Close, debug Fprintf to ResponseWriter,
+# best-effort cmd.Run in tests). Cleaning them all up at once would balloon
+# this PR; turn errcheck on in a follow-up after mass-annotating or fixing.
+
+linters:
+  default: none
+  enable:
+    - govet         # detects suspicious constructs (shadow, copylocks, nilfunc, etc.)
+    - ineffassign   # ineffectual assignments
+    - staticcheck   # bug catchers, performance, deprecated API use, simplifications
+    - unused        # unused functions / consts / vars / fields
+
+  exclusions:
+    rules:
+      # Allow embed.FS // go:embed lines longer than 120 chars (rare, harmless).
+      - path: 'embed.go'
+        linters:
+          - lll

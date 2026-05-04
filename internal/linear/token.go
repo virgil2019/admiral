@@ -36,15 +36,15 @@ type TokenStore interface {
 // singleflight: concurrent API calls that all receive 401 will only trigger
 // one refresh, and all callers share the result.
 type TokenRefresher struct {
-	clientID     string
-	clientSecret string
-	store        TokenStore
-	logger       *slog.Logger
+	clientID      string
+	clientSecret  string
+	store         TokenStore
+	logger        *slog.Logger
 	tokenEndpoint string
 
-	mu          sync.Mutex
-	waitCh      chan struct{} // closed when refresh is done
-	sfResult    tokenRefreshResult
+	mu       sync.Mutex
+	waitCh   chan struct{} // closed when refresh is done
+	sfResult tokenRefreshResult
 }
 
 // NewTokenRefresher creates a refresher. refreshAvailable reports whether
@@ -64,10 +64,10 @@ func NewTokenRefresher(clientID, clientSecret string, store TokenStore, logger *
 		}
 	}
 	return &TokenRefresher{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		store:        store,
-		logger:       logger,
+		clientID:      clientID,
+		clientSecret:  clientSecret,
+		store:         store,
+		logger:        logger,
 		tokenEndpoint: tokenEndpoint,
 	}, available
 }
@@ -116,7 +116,7 @@ func (tr *TokenRefresher) RefreshAndRetry(ctx context.Context) (string, error) {
 		newToken, refreshErr := tr.doRefresh(ctx)
 		tr.mu.Lock()
 		tr.sfResult = tokenRefreshResult{newToken, refreshErr}
-		close(ch)  // unblocks all waiters
+		close(ch) // unblocks all waiters
 		tr.waitCh = nil
 		tr.mu.Unlock()
 	}()
@@ -193,7 +193,7 @@ func (tr *TokenRefresher) doRefresh(ctx context.Context) (string, error) {
 	var result struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token,omitempty"`
-		ExpiresIn   int    `json:"expires_in,omitempty"`
+		ExpiresIn    int    `json:"expires_in,omitempty"`
 	}
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return "", fmt.Errorf("parse refresh response: %w", err)
@@ -295,9 +295,11 @@ func isTokenTransientHTTPStatus(s int) bool {
 }
 
 func isTokenTransientNetErr(err error) bool {
+	// net.Error.Temporary deprecated since Go 1.18; Timeout() alone is
+	// the right contract.
 	var ne net.Error
 	if errors.As(err, &ne) {
-		return ne.Temporary() || ne.Timeout()
+		return ne.Timeout()
 	}
 	return errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, context.Canceled) ||

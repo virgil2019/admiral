@@ -1248,7 +1248,7 @@ func (s *Store) KVSet(key, value string) error {
 
 // EventInboxRow represents a queued webhook event awaiting processing.
 type EventInboxRow struct {
-	WebhookID    string
+	WebhookID   string
 	Action      string
 	SessionID   string
 	IssueID     string

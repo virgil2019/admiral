@@ -134,8 +134,8 @@ func (g *ghCLIProbe) FindOpenPRForBranch(ctx context.Context, repoDir, branch st
 		return "", "", false, fmt.Errorf("gh pr list --head %s: %w (output: %s)", branch, err, truncate(out, 200))
 	}
 	var rows []struct {
-		URL         string `json:"url"`
-		Author      struct {
+		URL    string `json:"url"`
+		Author struct {
 			Login string `json:"login"`
 		} `json:"author"`
 		HeadRefName string `json:"headRefName"`

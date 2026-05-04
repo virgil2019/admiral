@@ -22,7 +22,7 @@ type Config struct {
 	EventStream      EventStream `yaml:"event_stream"`
 	Logging          Logging     `yaml:"logging"`
 	Linear           Linear      `yaml:"linear"`
-	Autopilot       Autopilot    `yaml:"autopilot"`
+	Autopilot        Autopilot   `yaml:"autopilot"`
 
 	// Warnings collects non-fatal config notices (e.g. deprecated key
 	// usage). Populated during Load; main.go logs them after open.

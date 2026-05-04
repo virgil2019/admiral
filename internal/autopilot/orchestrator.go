@@ -560,8 +560,8 @@ type flow struct {
 	streamFile      *os.File
 	claudeSessionID string
 	teamID          string
-	repoDir        string
-	baseBranch     string
+	repoDir         string
+	baseBranch      string
 
 	// attemptN is the admiral_tasks attempt counter for this run.
 	// attemptN == 1 → first run on linear/<id>.
@@ -1190,7 +1190,7 @@ func (f *flow) markTimedOut(runErr error) {
 type cleanupMode int
 
 const (
-	cleanupDelete  cleanupMode = iota
+	cleanupDelete cleanupMode = iota
 	cleanupArchive
 )
 
@@ -1504,81 +1504,88 @@ func summarizeToolUse(name string, rawInput json.RawMessage) string {
 	}
 
 	switch name {
-	case "Edit": {
-		var inp struct {
-			FilePath  string `json:"file_path"`
-			OldString string `json:"old_string"`
-			NewString string `json:"new_string"`
+	case "Edit":
+		{
+			var inp struct {
+				FilePath  string `json:"file_path"`
+				OldString string `json:"old_string"`
+				NewString string `json:"new_string"`
+			}
+			if err := json.Unmarshal(rawInput, &inp); err != nil {
+				return truncateString(string(rawInput), 200)
+			}
+			return fmt.Sprintf("file=%s (~%d chars old, ~%d chars new)",
+				inp.FilePath, len(inp.OldString), len(inp.NewString))
 		}
-		if err := json.Unmarshal(rawInput, &inp); err != nil {
-			return truncateString(string(rawInput), 200)
+	case "Write":
+		{
+			var inp struct {
+				FilePath string `json:"file_path"`
+				Content  string `json:"content"`
+			}
+			if err := json.Unmarshal(rawInput, &inp); err != nil {
+				return truncateString(string(rawInput), 200)
+			}
+			return fmt.Sprintf("file=%s (~%d chars)", inp.FilePath, len(inp.Content))
 		}
-		return fmt.Sprintf("file=%s (~%d chars old, ~%d chars new)",
-			inp.FilePath, len(inp.OldString), len(inp.NewString))
-	}
-	case "Write": {
-		var inp struct {
-			FilePath string `json:"file_path"`
-			Content  string `json:"content"`
+	case "Read":
+		{
+			var inp struct {
+				FilePath string `json:"file_path"`
+				Offset   int    `json:"offset,omitempty"`
+			}
+			if err := json.Unmarshal(rawInput, &inp); err != nil {
+				return truncateString(string(rawInput), 200)
+			}
+			if inp.Offset > 0 {
+				return fmt.Sprintf("file=%s offset=%d", inp.FilePath, inp.Offset)
+			}
+			return fmt.Sprintf("file=%s", inp.FilePath)
 		}
-		if err := json.Unmarshal(rawInput, &inp); err != nil {
-			return truncateString(string(rawInput), 200)
+	case "Bash":
+		{
+			var inp struct {
+				Command string `json:"command"`
+			}
+			if err := json.Unmarshal(rawInput, &inp); err != nil {
+				return truncateString(string(rawInput), 200)
+			}
+			return fmt.Sprintf("cmd=%s", truncateString(inp.Command, 200))
 		}
-		return fmt.Sprintf("file=%s (~%d chars)", inp.FilePath, len(inp.Content))
-	}
-	case "Read": {
-		var inp struct {
-			FilePath string `json:"file_path"`
-			Offset   int    `json:"offset,omitempty"`
+	case "TodoWrite":
+		{
+			var inp struct {
+				Todos []struct{} `json:"todos"`
+			}
+			if err := json.Unmarshal(rawInput, &inp); err != nil {
+				return truncateString(string(rawInput), 200)
+			}
+			return fmt.Sprintf("count=%d todos", len(inp.Todos))
 		}
-		if err := json.Unmarshal(rawInput, &inp); err != nil {
-			return truncateString(string(rawInput), 200)
+	case "Grep":
+		{
+			var inp struct {
+				Pattern string `json:"pattern"`
+				Path    string `json:"path,omitempty"`
+			}
+			if err := json.Unmarshal(rawInput, &inp); err != nil {
+				return truncateString(string(rawInput), 200)
+			}
+			if inp.Path != "" {
+				return fmt.Sprintf("pattern=%s path=%s", truncateString(inp.Pattern, 200), inp.Path)
+			}
+			return fmt.Sprintf("pattern=%s", truncateString(inp.Pattern, 200))
 		}
-		if inp.Offset > 0 {
-			return fmt.Sprintf("file=%s offset=%d", inp.FilePath, inp.Offset)
+	case "Glob":
+		{
+			var inp struct {
+				Pattern string `json:"pattern"`
+			}
+			if err := json.Unmarshal(rawInput, &inp); err != nil {
+				return truncateString(string(rawInput), 200)
+			}
+			return fmt.Sprintf("pattern=%s", inp.Pattern)
 		}
-		return fmt.Sprintf("file=%s", inp.FilePath)
-	}
-	case "Bash": {
-		var inp struct {
-			Command string `json:"command"`
-		}
-		if err := json.Unmarshal(rawInput, &inp); err != nil {
-			return truncateString(string(rawInput), 200)
-		}
-		return fmt.Sprintf("cmd=%s", truncateString(inp.Command, 200))
-	}
-	case "TodoWrite": {
-		var inp struct {
-			Todos []struct{} `json:"todos"`
-		}
-		if err := json.Unmarshal(rawInput, &inp); err != nil {
-			return truncateString(string(rawInput), 200)
-		}
-		return fmt.Sprintf("count=%d todos", len(inp.Todos))
-	}
-	case "Grep": {
-		var inp struct {
-			Pattern string `json:"pattern"`
-			Path    string `json:"path,omitempty"`
-		}
-		if err := json.Unmarshal(rawInput, &inp); err != nil {
-			return truncateString(string(rawInput), 200)
-		}
-		if inp.Path != "" {
-			return fmt.Sprintf("pattern=%s path=%s", truncateString(inp.Pattern, 200), inp.Path)
-		}
-		return fmt.Sprintf("pattern=%s", truncateString(inp.Pattern, 200))
-	}
-	case "Glob": {
-		var inp struct {
-			Pattern string `json:"pattern"`
-		}
-		if err := json.Unmarshal(rawInput, &inp); err != nil {
-			return truncateString(string(rawInput), 200)
-		}
-		return fmt.Sprintf("pattern=%s", inp.Pattern)
-	}
 	default:
 		return fmt.Sprintf("input=%s", truncateString(string(rawInput), 200))
 	}
@@ -1749,13 +1756,6 @@ func (f *flow) lookupPR() (string, error) {
 }
 
 // --- helpers ---
-
-func absWorktreeRoot(c *config.Autopilot) string {
-	if filepath.IsAbs(c.WorktreeRoot) {
-		return c.WorktreeRoot
-	}
-	return filepath.Join(c.RepoDir, c.WorktreeRoot)
-}
 
 func absWorktreeRootWithRepo(c *config.Autopilot, repoDir string) string {
 	if filepath.IsAbs(c.WorktreeRoot) {
@@ -2069,62 +2069,6 @@ func (o *Orchestrator) handleCommand(ev linear.AgentEvent, cmd string) {
 		body := fmt.Sprintf("Unknown command: /%s\n\n%s", cmd, availableCommandsHelp)
 		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
 	}
-}
-
-// handleRerun is invoked when an @mention starts with /rerun. It discards
-// prior session state for the issue (marking DONE/FAILED rows as superseded)
-// and spawns a fresh dispatch on the issue.
-func (o *Orchestrator) handleRerun(ev linear.AgentEvent, notes string) {
-	o.logger.Info("handle_rerun",
-		"session", ev.SessionID,
-		"issue", ev.IssueIdentifier,
-		"notes_len", len(notes),
-	)
-
-	// Mark all prior DONE/FAILED/TIMED_OUT jobs for this issue as superseded.
-	supersededStates := []string{store.JobStateDone, store.JobStateFailed, store.JobStateTimedOut}
-	priorJobs, err := o.db.ListJobsByIssueAndStates(ev.IssueID, supersededStates)
-	if err != nil {
-		o.logger.Warn("list_jobs_for_rerun_failed", "err", err, "issue", ev.IssueID)
-	} else if len(priorJobs) > 0 {
-		now := time.Now().UTC().Format(time.RFC3339)
-		for _, j := range priorJobs {
-			if err := o.db.UpdateAutopilotJob(j.AgentSessionID, func(job *store.AutopilotJob) {
-				job.State = store.JobStateCancelled
-				job.Error = "superseded_by_rerun"
-				job.FinishedAt = now
-			}); err != nil {
-				o.logger.Warn("mark_prior_job_superseded_failed",
-					"session", j.AgentSessionID, "err", err)
-			}
-		}
-	}
-
-	// Build the rerun event: strip /rerun from PromptContext so the fresh
-	// flow uses the remainder as the user message. If notes are provided,
-	// prepend them to the original PromptContext (minus the /rerun line).
-	var newPromptCtx string
-	if notes != "" {
-		newPromptCtx = notes
-		if ev.PromptContext != "" {
-			// Append the original comment minus the first /rerun line.
-			lines := strings.SplitN(ev.PromptContext, "\n", 2)
-			if len(lines) > 1 {
-				newPromptCtx = strings.TrimSpace(newPromptCtx) + "\n" + strings.TrimSpace(lines[1])
-			}
-		}
-	} else if ev.PromptContext != "" {
-		lines := strings.SplitN(ev.PromptContext, "\n", 2)
-		if len(lines) > 1 {
-			newPromptCtx = strings.TrimSpace(lines[1])
-		}
-	}
-
-	rerunEv := ev
-	rerunEv.PromptContext = newPromptCtx
-
-	// Claim the new session and spawn the fresh flow.
-	go o.run(rerunEv)
 }
 
 func orDefault(s, def string) string {
