@@ -31,13 +31,13 @@ func must(fsys fs.FS, err error) fs.FS {
 
 // adminServer serves the admin HTTP API (read + write).
 type adminServer struct {
-	db          *store.Store
-	lc          *linear.Client
-	logger      *slog.Logger
-	ghBin       string
-	start       time.Time
-	workers     int
-	adminToken  string
+	db         *store.Store
+	lc         *linear.Client
+	logger     *slog.Logger
+	ghBin      string
+	start      time.Time
+	workers    int
+	adminToken string
 }
 
 // adminRepoResponse is the JSON shape for /admin/repos.
@@ -51,15 +51,15 @@ type adminRepoResponse struct {
 
 // adminJobResponse is the JSON shape for /admin/jobs list.
 type adminJobResponse struct {
-	SessionID        string `json:"session_id"`
-	IssueIdentifier  string `json:"issue_identifier"`
-	State            string `json:"state"`
-	StartedAt        string `json:"started_at"`
-	FinishedAt       string `json:"finished_at,omitempty"`
-	PRURL            string `json:"pr_url,omitempty"`
-	RepoDir          string `json:"repo_dir,omitempty"`
-	StreamLogPath    string `json:"stream_log_path,omitempty"`
-	ClaudeSessionID  string `json:"claude_session_id,omitempty"`
+	SessionID       string `json:"session_id"`
+	IssueIdentifier string `json:"issue_identifier"`
+	State           string `json:"state"`
+	StartedAt       string `json:"started_at"`
+	FinishedAt      string `json:"finished_at,omitempty"`
+	PRURL           string `json:"pr_url,omitempty"`
+	RepoDir         string `json:"repo_dir,omitempty"`
+	StreamLogPath   string `json:"stream_log_path,omitempty"`
+	ClaudeSessionID string `json:"claude_session_id,omitempty"`
 }
 
 // adminLoadResponse is the JSON shape for /admin/load.
@@ -73,9 +73,9 @@ type adminLoadResponse struct {
 // adminHealthResponse is the JSON shape for /admin/health.
 type adminHealthResponse struct {
 	OK               bool `json:"ok"`
-	UptimeS           int  `json:"uptime_s"`
-	DBOK              bool `json:"db_ok"`
-	LinearTokenValid  bool `json:"linear_token_valid"`
+	UptimeS          int  `json:"uptime_s"`
+	DBOK             bool `json:"db_ok"`
+	LinearTokenValid bool `json:"linear_token_valid"`
 }
 
 // --- Write API request/response types ---
@@ -102,16 +102,16 @@ type updateRepoRequest struct {
 
 // checkGhResponse is the body for POST /admin/repos/<team_id>/check_gh.
 type checkGhResponse struct {
-	GHAuthOK        bool   `json:"gh_auth_ok"`
-	CurrentUser     string `json:"current_user,omitempty"`
-	GHStatusOutput  string `json:"gh_status_output,omitempty"`
+	GHAuthOK       bool   `json:"gh_auth_ok"`
+	CurrentUser    string `json:"current_user,omitempty"`
+	GHStatusOutput string `json:"gh_status_output,omitempty"`
 }
 
 // testCloneResponse is the body for POST /admin/repos/<team_id>/test_clone.
 type testCloneResponse struct {
-	OK         bool   `json:"ok"`
-	OriginURL  string `json:"origin_url,omitempty"`
-	Error      string `json:"error,omitempty"`
+	OK        bool   `json:"ok"`
+	OriginURL string `json:"origin_url,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 func newAdminServer(db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken string) *adminServer {
@@ -172,11 +172,11 @@ func (s *adminServer) listJobsHandler(w http.ResponseWriter, r *http.Request) {
 		out = append(out, adminJobResponse{
 			SessionID:       j.AgentSessionID,
 			IssueIdentifier: j.IssueIdentifier,
-			State:          j.State,
-			StartedAt:      j.StartedAt,
-			FinishedAt:     j.FinishedAt,
-			PRURL:          j.PRURL,
-			StreamLogPath:  j.StreamLogPath,
+			State:           j.State,
+			StartedAt:       j.StartedAt,
+			FinishedAt:      j.FinishedAt,
+			PRURL:           j.PRURL,
+			StreamLogPath:   j.StreamLogPath,
 			ClaudeSessionID: j.ClaudeSessionID,
 		})
 	}
@@ -249,9 +249,9 @@ func (s *adminServer) loadHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(adminLoadResponse{
 		Workers:          s.workers,
-		PendingEvents:     pending,
-		ProcessingEvents:  processing,
-		InFlightJobs:      inFlightJobs,
+		PendingEvents:    pending,
+		ProcessingEvents: processing,
+		InFlightJobs:     inFlightJobs,
 	})
 }
 
@@ -262,9 +262,9 @@ func (s *adminServer) healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(adminHealthResponse{
-		OK:              dbOK && linearOK,
-		UptimeS:         int(time.Since(s.start).Seconds()),
-		DBOK:            dbOK,
+		OK:               dbOK && linearOK,
+		UptimeS:          int(time.Since(s.start).Seconds()),
+		DBOK:             dbOK,
 		LinearTokenValid: linearOK,
 	})
 }
@@ -602,7 +602,7 @@ func (s *adminServer) uiHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	data, err := fs.ReadFile(uiFS.(fs.FS), name)
+	data, err := fs.ReadFile(uiFS, name)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -622,12 +622,12 @@ func (s *adminServer) loadCardHandler(w http.ResponseWriter, r *http.Request) {
 		inFlightJobs = 1
 	}
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(fmt.Sprintf(`<div class="card">
+	fmt.Fprintf(w, `<div class="card">
 <div class="stat"><span class="label">Workers</span><span class="value">%d</span></div>
 <div class="stat"><span class="label">Pending</span><span class="value">%d</span></div>
 <div class="stat"><span class="label">Processing</span><span class="value">%d</span></div>
 <div class="stat"><span class="label">In-Flight</span><span class="value">%d</span></div>
-</div>`, s.workers, pending, processing, inFlightJobs)))
+</div>`, s.workers, pending, processing, inFlightJobs)
 }
 
 // recentJobsHandler returns the 5 most recent jobs HTML fragment.
@@ -641,8 +641,8 @@ func (s *adminServer) recentJobsHandler(w http.ResponseWriter, r *http.Request) 
 	var b strings.Builder
 	b.WriteString(`<table><thead><tr><th>ID</th><th>Issue</th><th>State</th><th>Started</th></tr></thead><tbody>`)
 	for _, j := range jobs {
-		b.WriteString(fmt.Sprintf(`<tr><td><a href="/admin/ui/jobs/%s">%s</a></td><td>%s</td><td><span class="badge badge-%s">%s</span></td><td>%s</td></tr>`,
-			j.AgentSessionID, j.AgentSessionID, j.IssueIdentifier, j.State, j.State, j.StartedAt))
+		fmt.Fprintf(&b, `<tr><td><a href="/admin/ui/jobs/%s">%s</a></td><td>%s</td><td><span class="badge badge-%s">%s</span></td><td>%s</td></tr>`,
+			j.AgentSessionID, j.AgentSessionID, j.IssueIdentifier, j.State, j.State, j.StartedAt)
 	}
 	b.WriteString(`</tbody></table>`)
 	w.Write([]byte(b.String()))
@@ -663,12 +663,12 @@ func (s *adminServer) reposTableHandler(w http.ResponseWriter, r *http.Request) 
 		if !r.Enabled {
 			enabled = "No"
 		}
-		b.WriteString(fmt.Sprintf(`<tr>
+		fmt.Fprintf(&b, `<tr>
 <td>%s</td><td>%s</td><td>%s</td><td>%s</td>
 <td>
 <button class="secondary" hx-post="/admin/repos/%s/check_gh" hx-swap="none">Test GH</button>
 <button class="danger" hx-delete="/admin/repos/%s" hx-confirm="Delete %s?" hx-swap="none">Delete</button>
-</td></tr>`, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, r.ProjectID, r.ProjectID, r.ProjectName))
+</td></tr>`, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, r.ProjectID, r.ProjectID, r.ProjectName)
 	}
 	b.WriteString(`</tbody></table>`)
 	w.Write([]byte(b.String()))
@@ -691,8 +691,8 @@ func (s *adminServer) jobsTableHandler(w http.ResponseWriter, r *http.Request) {
 	var b strings.Builder
 	b.WriteString(`<table><thead><tr><th>Session ID</th><th>Issue</th><th>State</th><th>Started</th><th>Finished</th></tr></thead><tbody>`)
 	for _, j := range jobs {
-		b.WriteString(fmt.Sprintf(`<tr><td><a href="/admin/ui/jobs/%s">%s</a></td><td>%s</td><td><span class="badge badge-%s">%s</span></td><td>%s</td><td>%s</td></tr>`,
-			j.AgentSessionID, j.AgentSessionID, j.IssueIdentifier, j.State, j.State, j.StartedAt, j.FinishedAt))
+		fmt.Fprintf(&b, `<tr><td><a href="/admin/ui/jobs/%s">%s</a></td><td>%s</td><td><span class="badge badge-%s">%s</span></td><td>%s</td><td>%s</td></tr>`,
+			j.AgentSessionID, j.AgentSessionID, j.IssueIdentifier, j.State, j.State, j.StartedAt, j.FinishedAt)
 	}
 	b.WriteString(`</tbody></table>`)
 	w.Write([]byte(b.String()))
@@ -716,7 +716,7 @@ func (s *adminServer) jobDetailHandler(w http.ResponseWriter, r *http.Request) {
 	if job.StreamLogPath != "" {
 		streamLink = fmt.Sprintf(`<a href="/admin/jobs/%s/stream">Stream Log</a>`, sessionID)
 	}
-	w.Write([]byte(fmt.Sprintf(`<div class="card">
+	fmt.Fprintf(w, `<div class="card">
 <div class="detail-row"><span class="label">Session ID</span><span class="value">%s</span></div>
 <div class="detail-row"><span class="label">Issue</span><span class="value">%s</span></div>
 <div class="detail-row"><span class="label">State</span><span class="value"><span class="badge badge-%s">%s</span></span></div>
@@ -727,8 +727,9 @@ func (s *adminServer) jobDetailHandler(w http.ResponseWriter, r *http.Request) {
 <div class="detail-row"><span class="label">Finished</span><span class="value">%s</span></div>
 <div class="detail-row"><span class="label">Stream Log</span><span class="value">%s</span></div>
 <div class="detail-row"><span class="label">Error</span><span class="value">%s</span></div>
-</div>`, job.AgentSessionID, job.IssueIdentifier, job.State, job.State, job.PRURL, job.ClaudeSessionID, job.WorktreePath, job.StartedAt, job.FinishedAt, streamLink, job.Error)))
+</div>`, job.AgentSessionID, job.IssueIdentifier, job.State, job.State, job.PRURL, job.ClaudeSessionID, job.WorktreePath, job.StartedAt, job.FinishedAt, streamLink, job.Error)
 }
+
 // adminAuth returns an http.Handler that enforces Bearer token auth.
 // Paths /admin/ui/login and /admin/ui/login.css are always passed through.
 // Cookie auth via "admiral_admin" cookie is also accepted.

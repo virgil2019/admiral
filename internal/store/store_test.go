@@ -596,7 +596,7 @@ func TestMigration0012_BackfillsLatestPerIssue(t *testing.T) {
 		}
 	}
 	insert("s1", "issue-X", "GEO-X", "DONE", "2026-04-28T10:00:00Z")
-	insert("s2", "issue-X", "GEO-X", "DONE", "2026-04-29T10:00:00Z") // middle
+	insert("s2", "issue-X", "GEO-X", "DONE", "2026-04-29T10:00:00Z")   // middle
 	insert("s3", "issue-X", "GEO-X", "FAILED", "2026-04-30T10:00:00Z") // latest
 	insert("s4", "issue-Y", "GEO-Y", "DONE", "2026-04-29T12:00:00Z")
 

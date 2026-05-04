@@ -1,0 +1,31 @@
+name: lint
+
+# CI/CD M2 (GEO-53). Runs gofmt + golangci-lint on every push to main and
+# every PR. Configuration lives in .golangci.yml at the repo root.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: gofmt
+        run: |
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then
+            echo "::error::Files not gofmt'd:"
+            echo "$files"
+            exit 1
+          fi
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest

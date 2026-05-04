@@ -7,10 +7,10 @@ import (
 
 // GhAuthStatus is the result of gh auth status for a given host.
 type GhAuthStatus struct {
-	OK              bool
-	CurrentUser     string
-	StatusOutput    string
-	GHTokenValid    bool
+	OK           bool
+	CurrentUser  string
+	StatusOutput string
+	GHTokenValid bool
 }
 
 // checkGhAuth runs `gh auth status -h <host>` in repoDir to verify the user

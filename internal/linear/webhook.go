@@ -98,11 +98,11 @@ type rawAgentActivity struct {
 // agent webhook URL convention) — main.go also exposes /linear/webhook as
 // an alias.
 type Webhook struct {
-	secret   []byte
-	onAgent  AgentHandler // retained for test compatibility; production uses store enqueue path
-	logger   *slog.Logger
-	store    *store.Store
-	signal   chan<- struct{}
+	secret  []byte
+	onAgent AgentHandler // retained for test compatibility; production uses store enqueue path
+	logger  *slog.Logger
+	store   *store.Store
+	signal  chan<- struct{}
 }
 
 // NewWebhook constructs a receiver. Unlike v0.3 method-A, no admiral user

@@ -156,7 +156,7 @@ func TestDrainStreamJSON_WritesRawLines(t *testing.T) {
 		`{"type":"tool_use","name":"Bash","input":{}}`,
 		`{"type":"result","content":"ok"}`,
 	}
-	r := strings.NewReader(strings.Join(lines, "\n")+"\n")
+	r := strings.NewReader(strings.Join(lines, "\n") + "\n")
 	f.drainStreamJSON(r)
 
 	data, err := os.ReadFile(streamPath)
@@ -249,13 +249,13 @@ type mockLinearClient struct {
 	GetIssueErr    error
 
 	// GetWorkflowStates override
-	WorkflowStates       []linear.WorkflowState
-	GetWorkflowStatesErr error
+	WorkflowStates         []linear.WorkflowState
+	GetWorkflowStatesErr   error
 	GetWorkflowStatesCalls int
 
 	// IssueUpdate override
-	IssueUpdateCalls     []struct{ IssueID, StateID string }
-	IssueUpdateErr       error
+	IssueUpdateCalls []struct{ IssueID, StateID string }
+	IssueUpdateErr   error
 }
 
 func (m *mockLinearClient) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {
@@ -327,17 +327,17 @@ type mockStore struct {
 	HasAnyJobForIssueErr    error
 
 	// admiral_tasks (PR-B-v2)
-	AdmiralTask              *store.AdmiralTask
-	AdmiralTaskErr           error
-	LiveAdmiralTask          *store.AdmiralTask // mutated by UpdateAdmiralTask via fn
-	ClaimAdmiralTaskFresh    *bool              // override return value (nil = default true)
-	ClaimAdmiralTaskErr      error
-	UpdateAdmiralTaskErr     error
-	ClaimedAdmiralIssues     []string
-	UpdatedAdmiralIssues     []string
-	SupersededAdmiralIssues  []string
-	SupersedeErr             error
-	SupersedeNextAttempt     int
+	AdmiralTask             *store.AdmiralTask
+	AdmiralTaskErr          error
+	LiveAdmiralTask         *store.AdmiralTask // mutated by UpdateAdmiralTask via fn
+	ClaimAdmiralTaskFresh   *bool              // override return value (nil = default true)
+	ClaimAdmiralTaskErr     error
+	UpdateAdmiralTaskErr    error
+	ClaimedAdmiralIssues    []string
+	UpdatedAdmiralIssues    []string
+	SupersededAdmiralIssues []string
+	SupersedeErr            error
+	SupersedeNextAttempt    int
 
 	// For UpdateAutopilotJob tracking
 	LastUpdatedJob *store.AutopilotJob
@@ -475,16 +475,16 @@ type fakeGhProbe struct {
 	mergedByBranch map[string]struct {
 		URL, SHA string
 	}
-	stateByURL    map[string]string
+	stateByURL     map[string]string
 	openPRByBranch map[string]struct {
 		URL, Author string
 	}
-	mergedErr    error
-	stateErr     error
-	openPRErr    error
-	mergedCalls  int32
-	stateCalls   int32
-	openPRCalls  int32
+	mergedErr   error
+	stateErr    error
+	openPRErr   error
+	mergedCalls int32
+	stateCalls  int32
+	openPRCalls int32
 }
 
 func (f *fakeGhProbe) FindMergedPRForBranch(_ context.Context, _, branch string) (string, string, bool, error) {
@@ -736,8 +736,8 @@ func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 func (h *captureHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
-func (h *captureHandler) WithAttrs(_ []slog.Attr) slog.Handler        { return h }
-func (h *captureHandler) WithGroup(_ string) slog.Handler             { return h }
+func (h *captureHandler) WithAttrs(_ []slog.Attr) slog.Handler         { return h }
+func (h *captureHandler) WithGroup(_ string) slog.Handler              { return h }
 
 func TestDrainStreamJSON_EmitsStructuredEvents(t *testing.T) {
 	tmp := t.TempDir()
@@ -1184,8 +1184,8 @@ func TestStateIDByType_NotFound(t *testing.T) {
 func TestHandlePrompted_NoHistory(t *testing.T) {
 	mlc := &mockLinearClient{}
 	ms := &mockStore{
-		GetJob:                  nil,
-		GetJobErr:               nil,
+		GetJob:      nil,
+		GetJobErr:   nil,
 		AdmiralTask: &store.AdmiralTask{State: store.JobStateDone},
 	}
 	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: t.TempDir()}, db: ms, lc: mlc, logger: slog.Default()}

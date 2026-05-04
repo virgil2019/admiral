@@ -90,6 +90,6 @@ func ExchangeCode(ctx context.Context, tokenEndpoint, clientID, clientSecret, re
 		AccessToken:  result.AccessToken,
 		RefreshToken: result.RefreshToken,
 		ExpiresIn:    result.ExpiresIn,
-		Scope:       result.Scope,
+		Scope:        result.Scope,
 	}, nil
 }
