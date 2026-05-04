@@ -79,7 +79,8 @@ func TestWebhook_AgentSessionCreated_Mention_Fires(t *testing.T) {
 		"agentSession":{
 			"id":"sess-1",
 			"issue":{"id":"issue-1","identifier":"TST-1","title":"hello"},
-			"creator":{"id":"user-1","name":"Test User","displayName":"test.user"}
+			"creator":{"id":"user-1","name":"Test User","displayName":"test.user"},
+			"sourceComment":{"id":"comment-1"}
 		},
 		"promptContext":"please refactor the auth module"
 	}`)
@@ -100,6 +101,9 @@ func TestWebhook_AgentSessionCreated_Mention_Fires(t *testing.T) {
 	}
 	if got.PromptContext != "please refactor the auth module" {
 		t.Errorf("promptContext: %q", got.PromptContext)
+	}
+	if got.SourceCommentID != "comment-1" {
+		t.Errorf("sourceCommentID: %q (want %q for @mention trigger)", got.SourceCommentID, "comment-1")
 	}
 	if got.CreatorID != "user-1" {
 		t.Errorf("creator id: %q", got.CreatorID)
@@ -132,6 +136,9 @@ func TestWebhook_AgentSessionCreated_Assign_EmptyPromptContext(t *testing.T) {
 	waitWithTimeout(t, &wg, time.Second)
 	if got.PromptContext != "" {
 		t.Errorf("expected empty promptContext on assign, got %q", got.PromptContext)
+	}
+	if got.SourceCommentID != "" {
+		t.Errorf("delegate trigger must have empty SourceCommentID, got %q", got.SourceCommentID)
 	}
 }
 
