@@ -1,11 +1,21 @@
-// Package autopilot is the v0.3 happy-path orchestrator: pick up a Linear
+// Package autopilot is the orchestrator: pick up a Linear
 // AgentSessionEvent, create a worktree, run `claude -p`, ensure a PR was
 // opened, post agent activities back into the Linear agent thread.
 //
-// Concurrency: single-flight. Only one job runs at a time. A second
-// AgentSessionEvent that arrives while a job is in flight is rejected with
-// a short "busy" response activity into the new session and dropped.
-// v0.3 does not queue.
+// Concurrency model (post-GEO-50 + GEO-51):
+//
+//   - Per-issue: strictly serial. The dispatch state machine on the live
+//     admiral_tasks row rejects /rerun and /fix when a prior run is still
+//     in flight (RECEIVED / EXECUTING).
+//   - Cross-issue: bounded parallelism via the runSlots semaphore. The
+//     ceiling is autopilot.max_concurrent_runs (default 3, override via
+//     ADMIRAL_MAX_CONCURRENT_RUNS env). When the ceiling is full the
+//     spawn goroutine blocks on acquire — events are not rejected; they
+//     wait in a goroutine each.
+//   - Webhook → run handoff: worker.drain claims one events_inbox row at
+//     a time, calls HandleAgentEvent (which spawns and returns), then
+//     claims the next. The semaphore inside the run goroutines does the
+//     real backpressure.
 package autopilot
 
 import (
@@ -74,25 +84,53 @@ type Orchestrator struct {
 	logger *slog.Logger
 	ghUser string // login of the configured gh user (for open-PR author comparison)
 
+	// runSlots gates how many `claude -p` runs can be live concurrently
+	// across all issues (GEO-51). Acquired in runWithAttempt and runFix,
+	// released on return. Capacity = cfg.MaxConcurrentRuns (default 3).
+	// A buffered chan struct{} is the idiomatic Go counted-semaphore.
+	runSlots chan struct{}
+
 	// workflowStatesByTeam caches workflow states per team, keyed by teamID.
 	workflowStatesByTeam map[string][]linear.WorkflowState
 	workflowStatesMu     sync.Mutex
 }
 
 func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
+	slots := cfg.MaxConcurrentRuns
+	if slots <= 0 {
+		// Defensive: config defaulting normally pins this to 3, but if a
+		// caller constructs Autopilot{} directly we still want a sane cap.
+		slots = 3
+	}
 	o := &Orchestrator{
-		cfg:    cfg,
-		lc:     lc,
-		db:     db,
-		gh:     newGhCLIProbe(cfg.GhBin),
-		logger: logger,
-		ghUser: cfg.GhUser,
+		cfg:      cfg,
+		lc:       lc,
+		db:       db,
+		gh:       newGhCLIProbe(cfg.GhBin),
+		logger:   logger,
+		ghUser:   cfg.GhUser,
+		runSlots: make(chan struct{}, slots),
 	}
 	// Ensure job_streams_dir exists on startup.
 	if err := os.MkdirAll(cfg.JobStreamsDir, 0o755); err != nil {
 		logger.Warn("job_streams_dir_mkdir", "dir", cfg.JobStreamsDir, "err", err)
 	}
 	return o
+}
+
+// acquireRunSlot blocks until a slot is available in the runSlots
+// semaphore. Returns a release func the caller must invoke (typically
+// via defer) when the run finishes — even on error or panic.
+//
+// A nil runSlots (e.g. tests that construct Orchestrator directly
+// instead of via New) skips the bound and returns a no-op release.
+// Production always has a bounded chan.
+func (o *Orchestrator) acquireRunSlot() func() {
+	if o.runSlots == nil {
+		return func() {}
+	}
+	o.runSlots <- struct{}{}
+	return func() { <-o.runSlots }
 }
 
 // stateIDByType returns the workflow state ID for the given type in the given
@@ -372,6 +410,9 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 // runWithAttempt's lifecycle but reuses the existing admiral_tasks row
 // rather than claiming a new one (attempt_n unchanged).
 func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
+	release := o.acquireRunSlot()
+	defer release()
+
 	ctx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
@@ -468,6 +509,9 @@ func (o *Orchestrator) run(ev linear.AgentEvent) {
 // the run still proceeds correctly. PR-C will drop the autopilot_jobs
 // dual-write entirely.
 func (o *Orchestrator) runWithAttempt(ev linear.AgentEvent, attemptN int) {
+	release := o.acquireRunSlot()
+	defer release()
+
 	ctx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()

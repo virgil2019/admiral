@@ -2593,3 +2593,94 @@ func TestDispatch_FixViaPrompted_DispatchesResume(t *testing.T) {
 		t.Errorf("/fix-via-thread must transition admiral_tasks to EXECUTING; got %q", live.State)
 	}
 }
+
+// ---- GEO-51 concurrency cap tests ----
+
+// TestAcquireRunSlot_BlocksWhenFull verifies the semaphore actually
+// gates: with capacity 1, the second acquireRunSlot call blocks until
+// the first release runs.
+func TestAcquireRunSlot_BlocksWhenFull(t *testing.T) {
+	o := &Orchestrator{
+		runSlots: make(chan struct{}, 1),
+		logger:   slog.Default(),
+	}
+	release1 := o.acquireRunSlot()
+
+	acquired := make(chan struct{})
+	go func() {
+		release2 := o.acquireRunSlot()
+		close(acquired)
+		release2()
+	}()
+
+	// Second acquire must NOT make progress while slot is held.
+	select {
+	case <-acquired:
+		t.Fatal("acquireRunSlot returned while semaphore was full")
+	case <-time.After(50 * time.Millisecond):
+		// expected: still blocked
+	}
+
+	// Release the first slot — second acquire should now unblock.
+	release1()
+	select {
+	case <-acquired:
+		// expected
+	case <-time.After(2 * time.Second):
+		t.Fatal("acquireRunSlot did not unblock within 2s after release")
+	}
+}
+
+// TestAcquireRunSlot_NilSlotsIsNoOp verifies that an Orchestrator
+// constructed without runSlots (e.g. test code that bypasses New())
+// does not deadlock on acquireRunSlot. The release returned is a
+// no-op and the function returns immediately.
+func TestAcquireRunSlot_NilSlotsIsNoOp(t *testing.T) {
+	o := &Orchestrator{logger: slog.Default()} // runSlots intentionally nil
+
+	done := make(chan struct{})
+	go func() {
+		release := o.acquireRunSlot()
+		release()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// expected
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("acquireRunSlot blocked even though runSlots is nil")
+	}
+}
+
+// TestRunSlots_CapacityFromConfig verifies New() sizes the semaphore
+// from cfg.MaxConcurrentRuns and falls back to 3 when zero.
+func TestRunSlots_CapacityFromConfig(t *testing.T) {
+	cases := []struct {
+		name      string
+		configVal int
+		wantCap   int
+	}{
+		{"explicit 1", 1, 1},
+		{"explicit 5", 5, 5},
+		{"zero falls back to 3", 0, 3},
+		{"negative falls back to 3", -7, 3},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tmpDB := t.TempDir() + "/test.db"
+			s, err := store.Open(tmpDB)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			defer s.Close()
+			cfg := &config.Autopilot{
+				MaxConcurrentRuns: c.configVal,
+				JobStreamsDir:     t.TempDir(),
+			}
+			o := New(cfg, nil, s, slog.Default())
+			if got := cap(o.runSlots); got != c.wantCap {
+				t.Errorf("runSlots capacity: got %d, want %d", got, c.wantCap)
+			}
+		})
+	}
+}
