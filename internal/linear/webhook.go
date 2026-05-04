@@ -32,10 +32,17 @@ type AgentEvent struct {
 	IssueID         string
 	IssueIdentifier string
 	IssueTitle      string
-	// PromptContext is set on action=created. For mention triggers it's the
+	// PromptContext is set on action=created. For @mention triggers it's the
 	// comment text; for raw assignment it's empty; for delegate-to-agent
-	// it's whatever the user typed in the prompt input.
+	// it's whatever the user typed in the prompt input. Use SourceCommentID
+	// (not text emptiness) to distinguish @mention from delegate.
 	PromptContext string
+	// SourceCommentID is set on action=created when the AgentSession was
+	// opened via an @mention inside an existing comment. Empty when the
+	// session was opened via delegation (assign-to-agent), regardless of
+	// whether the user typed an initial prompt. This is the protocol-level
+	// signal admiral uses to disambiguate the two trigger paths.
+	SourceCommentID string
 	// UserMessage is set on action=prompted: the user's follow-up text in
 	// the agent thread.
 	UserMessage string
@@ -88,6 +95,12 @@ type rawAgentSession struct {
 		Name        string `json:"name"`
 		DisplayName string `json:"displayName"`
 	} `json:"creator"`
+	// SourceComment is set when the session was opened from an @mention
+	// inside a comment. Null on delegate triggers — this is what admiral
+	// uses to tell the two paths apart.
+	SourceComment *struct {
+		ID string `json:"id"`
+	} `json:"sourceComment"`
 }
 
 type rawAgentActivity struct {
@@ -206,6 +219,9 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		ev.CreatorID = session.Creator.ID
 		ev.CreatorName = session.Creator.Name
 		ev.CreatorDisplayName = session.Creator.DisplayName
+	}
+	if session.SourceComment != nil {
+		ev.SourceCommentID = session.SourceComment.ID
 	}
 	switch action {
 	case ActionCreated:

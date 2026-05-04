@@ -1294,6 +1294,7 @@ func TestHandleCreated_BareMention_Rejected(t *testing.T) {
 		IssueID:         "issue-bare",
 		IssueIdentifier: "BAR-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-bare",
 		PromptContext:   "please do something", // no leading /command
 	}
 
@@ -1330,6 +1331,7 @@ func TestHandleCreated_UnknownCommand_Rejected(t *testing.T) {
 		IssueID:         "issue-unknown",
 		IssueIdentifier: "UNK-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-unknown",
 		PromptContext:   "/foobar extra args",
 	}
 
@@ -1373,6 +1375,7 @@ func TestHandleCreated_FixCommand_LegacyRowRejected(t *testing.T) {
 		IssueID:         "issue-fix-legacy",
 		IssueIdentifier: "FIX-LEG-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-fix-legacy",
 		PromptContext:   "/fix change v1 to v2",
 	}
 
@@ -2162,8 +2165,8 @@ func TestClassifyGhCreateError(t *testing.T) {
 
 // ---- GEO-50 dispatch tests (PR-B-v1) ----
 
-// TestDispatch_FirstTimeAssign_DispatchesTask verifies that an assign
-// event (Action=created, no PromptContext) for an issue admiral has
+// TestDispatch_FirstTimeAssign_DispatchesTask verifies that a delegate
+// event (Action=created, no SourceCommentID) for an issue admiral has
 // never seen before claims the autopilot_jobs row.
 func TestDispatch_FirstTimeAssign_DispatchesTask(t *testing.T) {
 	mlc := &mockLinearClient{
@@ -2176,7 +2179,8 @@ func TestDispatch_FirstTimeAssign_DispatchesTask(t *testing.T) {
 		IssueID:         "issue-fresh",
 		IssueIdentifier: "FRESH-1",
 		Action:          linear.ActionCreated,
-		// PromptContext intentionally empty → assign signal
+		// SourceCommentID empty → delegate, not @mention.
+		// PromptContext also empty → user assigned without typing a prompt.
 	}
 
 	o.HandleAgentEvent(ev)
@@ -2209,6 +2213,46 @@ func TestDispatch_FirstTimeAssign_DispatchesTask(t *testing.T) {
 	}
 }
 
+// TestDispatch_FirstTimeAssignWithPrompt_DispatchesTask is the GEO-60
+// regression: a delegate event (created, no SourceCommentID) carries an
+// initial prompt in PromptContext. Pre-fix, dispatch checked text
+// emptiness and wrongly classified this as @mention, then rejected with
+// assignFirstHelp. Post-fix it must claim like any other delegate.
+// PromptContext propagation through buildPrompt is covered separately by
+// TestBuildPrompt_MentionWithContext.
+func TestDispatch_FirstTimeAssignWithPrompt_DispatchesTask(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
+	}
+	ms := &mockStore{}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-fresh-prompt",
+		IssueID:         "issue-fresh-prompt",
+		IssueIdentifier: "FRESH-PROMPT-1",
+		Action:          linear.ActionCreated,
+		// SourceCommentID empty → delegate, even though PromptContext is set.
+		PromptContext: "please refactor the module while you're at it",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ms.ClaimedSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "sess-fresh-prompt" {
+		t.Errorf("delegate-with-prompt should claim like a bare delegate; got %v", got)
+	}
+	body := mlc.GetPostedBody()
+	if strings.Contains(body, "Issue not assigned to admiral") {
+		t.Errorf("delegate-with-prompt must not post assign-first rejection; got: %s", body)
+	}
+}
+
 // TestDispatch_FirstTimeMention_RequestsAssign verifies that an @mention
 // or prompted event for an issue admiral has never seen is rejected with
 // the "assign first" reply, no claim, no DB write.
@@ -2221,7 +2265,8 @@ func TestDispatch_FirstTimeMention_RequestsAssign(t *testing.T) {
 		IssueID:         "issue-stray",
 		IssueIdentifier: "STRAY-1",
 		Action:          linear.ActionCreated,
-		PromptContext:   "@admiral please look at this", // non-empty → mention, not assign
+		SourceCommentID: "comment-stray", // non-empty → @mention, not delegate
+		PromptContext:   "@admiral please look at this",
 	}
 
 	o.HandleAgentEvent(ev)
@@ -2317,6 +2362,7 @@ func TestDispatch_RerunWhileActive_Rejected(t *testing.T) {
 		IssueID:         "issue-busy",
 		IssueIdentifier: "BUSY-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-rerun-busy",
 		PromptContext:   "/rerun",
 	}
 
@@ -2355,6 +2401,7 @@ func TestDispatch_RerunOnDone_Supersedes(t *testing.T) {
 		IssueID:         "issue-done",
 		IssueIdentifier: "DONE-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-rerun-done",
 		PromptContext:   "/rerun fix the typo",
 	}
 
@@ -2442,6 +2489,7 @@ func TestDispatch_FixOnDone_DispatchesResume(t *testing.T) {
 		IssueID:         "issue-fix",
 		IssueIdentifier: "FIX-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-fix-resume",
 		PromptContext:   "/fix change v1 to v2 in line 12",
 	}
 
@@ -2487,6 +2535,7 @@ func TestDispatch_FixOnExecuting_Rejected(t *testing.T) {
 		IssueID:         "issue-busy",
 		IssueIdentifier: "BUSY-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-fix-busy",
 		PromptContext:   "/fix something",
 	}
 
@@ -2523,6 +2572,7 @@ func TestDispatch_FixOnFailed_SuggestsRerun(t *testing.T) {
 		IssueID:         "issue-failed",
 		IssueIdentifier: "FAIL-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-fix-failed",
 		PromptContext:   "/fix retry",
 	}
 
@@ -2559,6 +2609,7 @@ func TestDispatch_FixWithoutDescription_Rejects(t *testing.T) {
 		IssueID:         "issue-fix-empty",
 		IssueIdentifier: "FIX-EMPTY-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-fix-empty",
 		PromptContext:   "/fix",
 	}
 

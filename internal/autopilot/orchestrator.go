@@ -203,13 +203,18 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	}
 
 	// User-typed text relevant to this event. created carries it in
-	// PromptContext (mention text); prompted carries it in UserMessage
-	// (thread reply). assign-only created has empty text.
+	// PromptContext (delegate prompt or @mention comment text); prompted
+	// carries it in UserMessage (thread reply).
 	text := ev.PromptContext
 	if text == "" && ev.Action == linear.ActionPrompted {
 		text = ev.UserMessage
 	}
-	isAssignSignal := ev.Action == linear.ActionCreated && text == ""
+	// Delegate vs @mention: a created event with no SourceCommentID is a
+	// delegate (assign-to-agent), regardless of whether the user typed an
+	// initial prompt. SourceCommentID set means the session was opened
+	// from an @mention inside a comment — parse it as a command on a live
+	// task, or reject as "assign first" if there's no live task yet.
+	isDelegate := ev.Action == linear.ActionCreated && ev.SourceCommentID == ""
 
 	task, err := o.db.GetAdmiralTaskByIssue(ev.IssueID)
 	if err != nil {
@@ -219,7 +224,7 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 
 	if task == nil {
 		// First-time event for this issue.
-		if isAssignSignal {
+		if isDelegate {
 			o.dispatchFreshAssign(ev)
 			return
 		}
@@ -238,7 +243,7 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 		})
 	}
 
-	if isAssignSignal {
+	if isDelegate {
 		o.logger.Info("dispatch_reject_repeat_assign",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
 		o.postRejection(ev.SessionID, repeatAssignHelp)
