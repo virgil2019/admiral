@@ -3,7 +3,6 @@ package linear
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,17 +14,6 @@ import (
 
 	"github.com/georgehuang/admiral/internal/store"
 )
-
-func newTestDB(t *testing.T) *store.Store {
-	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	s := store.NewForTest(db)
-	return s
-}
 
 func newTestWebhook(t *testing.T, h AgentHandler) *Webhook {
 	t.Helper()
@@ -91,7 +79,7 @@ func TestWebhook_AgentSessionCreated_Mention_Fires(t *testing.T) {
 		"agentSession":{
 			"id":"sess-1",
 			"issue":{"id":"issue-1","identifier":"TST-1","title":"hello"},
-			"creator":{"id":"user-1"}
+			"creator":{"id":"user-1","name":"Test User","displayName":"test.user"}
 		},
 		"promptContext":"please refactor the auth module"
 	}`)
@@ -114,7 +102,13 @@ func TestWebhook_AgentSessionCreated_Mention_Fires(t *testing.T) {
 		t.Errorf("promptContext: %q", got.PromptContext)
 	}
 	if got.CreatorID != "user-1" {
-		t.Errorf("creator: %q", got.CreatorID)
+		t.Errorf("creator id: %q", got.CreatorID)
+	}
+	if got.CreatorName != "Test User" {
+		t.Errorf("creator name: %q", got.CreatorName)
+	}
+	if got.CreatorDisplayName != "test.user" {
+		t.Errorf("creator displayName: %q", got.CreatorDisplayName)
 	}
 }
 

@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login — Admiral</title>
+<link rel="stylesheet" href="/admin/ui/login.css">
+</head>
+<body>
+<div class="login-container">
+  <h1>Admiral Admin</h1>
+  <p>Enter your admin token to continue.</p>
+  <form method="POST" action="/admin/ui/login">
+    <input type="password" name="token" placeholder="Admin token" required autocomplete="current-password">
+    <button type="submit">Sign In</button>
+  </form>
+  <p id="error" class="error hidden"></p>
+</div>
+<script>
+// Server redirects here with ?error=invalid when the submitted token is rejected.
+const params = new URLSearchParams(window.location.search);
+if (params.get('error') === 'invalid') {
+  const errEl = document.getElementById('error');
+  errEl.textContent = 'Invalid token.';
+  errEl.classList.remove('hidden');
+}
+</script>
+</body>
+</html>

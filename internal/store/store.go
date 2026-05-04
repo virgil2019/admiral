@@ -119,6 +119,262 @@ const migration0006 = `
 ALTER TABLE autopilot_jobs ADD COLUMN claude_session_id TEXT;
 `
 
+const migration0007 = `
+CREATE TABLE IF NOT EXISTS repos (
+  team_id          TEXT PRIMARY KEY,
+  team_name        TEXT NOT NULL,
+  repo_dir         TEXT NOT NULL,
+  base_branch      TEXT NOT NULL DEFAULT 'main',
+  enabled          INTEGER NOT NULL DEFAULT 1,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
+);
+`
+
+// migration0008 switches repo routing from Linear team_id to Linear project_id.
+// The team_id field cannot be reinterpreted as a project_id (different UUID
+// namespace), so the table is dropped and reseeded from config on next boot.
+const migration0008 = `
+DROP TABLE IF EXISTS repos;
+CREATE TABLE repos (
+  project_id   TEXT PRIMARY KEY,
+  project_name TEXT NOT NULL,
+  repo_dir     TEXT NOT NULL,
+  base_branch  TEXT NOT NULL DEFAULT 'main',
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+);
+`
+
+// migration0009 adds OAuth circuit-breaker state to linear_oauth so the
+// daemon can detect a permanently-revoked refresh token, stop retrying
+// against Linear, and dedupe the user-facing alert.
+const migration0009 = `
+ALTER TABLE linear_oauth ADD COLUMN auth_error      TEXT;
+ALTER TABLE linear_oauth ADD COLUMN auth_error_at   TEXT;
+ALTER TABLE linear_oauth ADD COLUMN notified_at     TEXT;
+`
+
+// migration0010 introduces admiral_tasks — the issue-keyed task model
+// (GEO-50). One live row per Linear issue. The legacy autopilot_jobs
+// table stays in place as audit log; lookups in PR-B will switch to
+// admiral_tasks. PR-A only adds the schema; nothing yet writes to it
+// outside the backfill in migration0012.
+const migration0010 = `
+CREATE TABLE IF NOT EXISTS admiral_tasks (
+  issue_id              TEXT PRIMARY KEY,
+  issue_identifier      TEXT,
+  state                 TEXT NOT NULL,
+  attempt_n             INTEGER NOT NULL DEFAULT 1,
+  branch                TEXT,
+  worktree_path         TEXT,
+  pr_url                TEXT,
+  claude_session_id     TEXT,
+  last_event_session_id TEXT,
+  started_at            TEXT NOT NULL,
+  finished_at           TEXT,
+  error                 TEXT,
+  stream_log_path       TEXT
+);
+CREATE INDEX IF NOT EXISTS admiral_tasks_state_started
+  ON admiral_tasks(state, started_at);
+`
+
+// migration0011 introduces admiral_task_history — append-only log of
+// superseded admiral_tasks rows (after /rerun in the new model). Empty
+// at install time; PR-B populates it on /rerun. Read by /rerun protocol
+// to compute the next attempt_n + cross-link old PRs.
+const migration0011 = `
+CREATE TABLE IF NOT EXISTS admiral_task_history (
+  history_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  issue_id              TEXT NOT NULL,
+  attempt_n             INTEGER NOT NULL,
+  state                 TEXT NOT NULL,
+  branch                TEXT,
+  worktree_path         TEXT,
+  pr_url                TEXT,
+  claude_session_id     TEXT,
+  agent_session_ids     TEXT,
+  started_at            TEXT NOT NULL,
+  finished_at           TEXT,
+  error                 TEXT,
+  stream_log_path       TEXT,
+  superseded_at         TEXT NOT NULL,
+  superseded_reason     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS admiral_task_history_issue_attempt
+  ON admiral_task_history(issue_id, attempt_n);
+`
+
+// migration0012 backfills admiral_tasks from autopilot_jobs: for each
+// issue_id with prior activity, the row with the latest started_at
+// becomes the live admiral_tasks row. Older rows stay in autopilot_jobs
+// only — admiral_task_history starts empty (it captures supersessions
+// going forward, not historic state we never had a "rerun" event for).
+//
+// Idempotency: ON CONFLICT(issue_id) DO NOTHING — re-applying this
+// migration on a partially-backfilled DB is safe.
+const migration0012 = `
+INSERT INTO admiral_tasks (
+  issue_id, issue_identifier, state, attempt_n, branch, worktree_path,
+  pr_url, claude_session_id, last_event_session_id, started_at,
+  finished_at, error, stream_log_path
+)
+SELECT
+  j.issue_id,
+  j.issue_identifier,
+  j.state,
+  1,
+  j.branch,
+  j.worktree_path,
+  j.pr_url,
+  j.claude_session_id,
+  j.agent_session_id,
+  j.started_at,
+  j.finished_at,
+  j.error,
+  j.stream_log_path
+FROM autopilot_jobs j
+INNER JOIN (
+  SELECT issue_id, MAX(started_at) AS max_started
+  FROM autopilot_jobs
+  WHERE issue_id != ''
+  GROUP BY issue_id
+) latest ON j.issue_id = latest.issue_id AND j.started_at = latest.max_started
+WHERE j.issue_id != ''
+ON CONFLICT(issue_id) DO NOTHING;
+`
+
+type migration struct {
+	Version int
+	SQL     string
+}
+
+var migrations = []migration{
+	{1, migration0001},
+	{2, migration0002},
+	{3, migration0003},
+	{4, migration0004},
+	{5, migration0005},
+	{6, migration0006},
+	{7, migration0007},
+	{8, migration0008},
+	{9, migration0009},
+	{10, migration0010},
+	{11, migration0011},
+	{12, migration0012},
+}
+
+func tableExists(db *sql.DB, name string) bool {
+	var n int
+	db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&n)
+	return n > 0
+}
+
+func columnExists(db *sql.DB, table, column string) bool {
+	var n int
+	db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`,
+		table, column,
+	).Scan(&n)
+	return n > 0
+}
+
+func loadAppliedVersions(db *sql.DB) (map[int]bool, error) {
+	rows, err := db.Query(`SELECT version FROM schema_migrations`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int]bool)
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out[v] = true
+	}
+	return out, rows.Err()
+}
+
+func backfillMigrations(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+
+	if !tableExists(db, "sessions") {
+		return nil
+	}
+
+	for _, v := range []int{1, 2, 3, 4, 5, 6} {
+		applied := false
+		switch v {
+		case 1:
+			applied = tableExists(db, "sessions")
+		case 2:
+			applied = tableExists(db, "autopilot_jobs")
+		case 3:
+			applied = tableExists(db, "linear_oauth")
+		case 4:
+			applied = columnExists(db, "autopilot_jobs", "stream_log_path")
+		case 5:
+			applied = tableExists(db, "events_inbox")
+		case 6:
+			applied = columnExists(db, "autopilot_jobs", "claude_session_id")
+		}
+		if applied {
+			_, err := db.Exec(
+				`INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`,
+				v, time.Now().UTC().Format(time.RFC3339),
+			)
+			if err != nil {
+				return fmt.Errorf("backfill version %d: %w", v, err)
+			}
+		}
+	}
+	return nil
+}
+
+func applyMigrations(db *sql.DB) error {
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version INTEGER PRIMARY KEY,
+			applied_at TEXT NOT NULL
+		)`); err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	if err := backfillMigrations(db); err != nil {
+		return err
+	}
+
+	applied, err := loadAppliedVersions(db)
+	if err != nil {
+		return err
+	}
+
+	for _, m := range migrations {
+		if applied[m.Version] {
+			continue
+		}
+		if _, err := db.Exec(m.SQL); err != nil {
+			return fmt.Errorf("apply migration %d: %w", m.Version, err)
+		}
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`,
+			m.Version, time.Now().UTC().Format(time.RFC3339),
+		); err != nil {
+			return fmt.Errorf("record migration %d: %w", m.Version, err)
+		}
+	}
+	return nil
+}
+
 type Store struct {
 	DB *sql.DB
 }
@@ -153,45 +409,23 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(`PRAGMA busy_timeout=5000;`); err != nil {
 		return nil, fmt.Errorf("set busy_timeout: %w", err)
 	}
-	if _, err := db.Exec(migration0001); err != nil {
-		return nil, fmt.Errorf("apply migration 0001: %w", err)
-	}
-	if _, err := db.Exec(migration0002); err != nil {
-		return nil, fmt.Errorf("apply migration 0002: %w", err)
-	}
-	if _, err := db.Exec(migration0003); err != nil {
-		return nil, fmt.Errorf("apply migration 0003: %w", err)
-	}
-	if _, err := db.Exec(migration0004); err != nil {
-		// SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. On a
-		// pre-existing DB where this migration already ran, re-applying
-		// returns "duplicate column name". Treat as no-op.
-		if !strings.Contains(err.Error(), "duplicate column name") {
-			return nil, fmt.Errorf("apply migration 0004: %w", err)
-		}
-	}
-	if _, err := db.Exec(migration0005); err != nil {
-		// CREATE TABLE IF NOT EXISTS is inherently idempotent, but
-		// on a freshly-initialized DB this should not fail.
-		return nil, fmt.Errorf("apply migration 0005: %w", err)
-	}
-	if _, err := db.Exec(migration0006); err != nil {
-		// SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. On a
-		// pre-existing DB where this migration already ran, re-applying
-		// returns "duplicate column name". Treat as no-op.
-		if !strings.Contains(err.Error(), "duplicate column name") {
-			return nil, fmt.Errorf("apply migration 0006: %w", err)
-		}
+	if err := applyMigrations(db); err != nil {
+		return nil, fmt.Errorf("migrations: %w", err)
 	}
 	return &Store{DB: db}, nil
 }
 
-// Autopilot job state constants. RECEIVED -> EXECUTING -> DONE|FAILED.
+// Autopilot job state constants. RECEIVED -> EXECUTING -> DONE|FAILED|TIMED_OUT.
+// CANCELLED is set on jobs short-circuited at pre-flight (e.g. duplicate
+// dispatch when another session for the same issue is already active).
 const (
-	JobStateReceived  = "RECEIVED"
-	JobStateExecuting = "EXECUTING"
-	JobStateDone      = "DONE"
-	JobStateFailed    = "FAILED"
+	JobStateReceived               = "RECEIVED"
+	JobStateExecuting              = "EXECUTING"
+	JobStateDone                   = "DONE"
+	JobStateFailed                 = "FAILED"
+	JobStateTimedOut               = "TIMED_OUT"
+	JobStateDoneThreadInconsistent = "DONE_THREAD_INCONSISTENT"
+	JobStateCancelled              = "CANCELLED"
 )
 
 type AutopilotJob struct {
@@ -239,9 +473,9 @@ func (s *Store) AnyAutopilotJobActive() (bool, string, error) {
 	var sessionID string
 	err := s.DB.QueryRow(`
 		SELECT agent_session_id FROM autopilot_jobs
-		WHERE state NOT IN (?, ?)
+		WHERE state NOT IN (?, ?, ?, ?, ?)
 		ORDER BY started_at ASC LIMIT 1
-	`, JobStateDone, JobStateFailed).Scan(&sessionID)
+	`, JobStateDone, JobStateFailed, JobStateTimedOut, JobStateDoneThreadInconsistent, JobStateCancelled).Scan(&sessionID)
 	if err == sql.ErrNoRows {
 		return false, "", nil
 	}
@@ -249,6 +483,40 @@ func (s *Store) AnyAutopilotJobActive() (bool, string, error) {
 		return false, "", err
 	}
 	return true, sessionID, nil
+}
+
+// FindActiveJobByIssue returns the most recent non-terminal autopilot_jobs
+// row for the given Linear issue, excluding the row identified by
+// excludeSessionID (typically the caller's own session, which has just been
+// claimed via ClaimAutopilotJob and would otherwise match itself).
+//
+// Returns (nil, nil) when no such row exists. Used by the pre-flight
+// duplicate-dispatch short-circuit (GEO-47): if a prior session for the
+// same issue is still in flight, the new dispatch is cancelled.
+func (s *Store) FindActiveJobByIssue(issueID, excludeSessionID string) (*AutopilotJob, error) {
+	var j AutopilotJob
+	err := s.DB.QueryRow(`
+		SELECT agent_session_id, issue_id, issue_identifier, state,
+		       COALESCE(worktree_path,''), COALESCE(branch,''),
+		       COALESCE(pr_url,''), COALESCE(error,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(stream_log_path,''),
+		       COALESCE(claude_session_id,'')
+		FROM autopilot_jobs
+		WHERE issue_id=?
+		  AND agent_session_id != ?
+		  AND state NOT IN (?, ?, ?, ?, ?)
+		ORDER BY started_at DESC
+		LIMIT 1
+	`, issueID, excludeSessionID,
+		JobStateDone, JobStateFailed, JobStateTimedOut, JobStateDoneThreadInconsistent, JobStateCancelled,
+	).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+		&j.StreamLogPath, &j.ClaudeSessionID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &j, err
 }
 
 func (s *Store) UpdateAutopilotJob(sessionID string, fn func(*AutopilotJob)) error {
@@ -355,6 +623,372 @@ func (s *Store) GetLatestDoneJobByIssue(issueID string) (*AutopilotJob, error) {
 	return &j, err
 }
 
+// GetLatestTimedOutJobByIssue returns the most recent TIMED_OUT autopilot
+// job for the given Linear issue ID. Used by handleCreated to detect
+// resume scenarios. Returns (nil, nil) when no TIMED_OUT job exists.
+func (s *Store) GetLatestTimedOutJobByIssue(issueID string) (*AutopilotJob, error) {
+	var j AutopilotJob
+	err := s.DB.QueryRow(`
+		SELECT agent_session_id, issue_id, issue_identifier, state,
+		       COALESCE(worktree_path,''), COALESCE(branch,''),
+		       COALESCE(pr_url,''), COALESCE(error,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(stream_log_path,''),
+		       COALESCE(claude_session_id,'')
+		FROM autopilot_jobs
+		WHERE issue_id=? AND state=?
+		ORDER BY started_at DESC
+		LIMIT 1
+	`, issueID, JobStateTimedOut).Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+		&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+		&j.StreamLogPath, &j.ClaudeSessionID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &j, err
+}
+
+// HasAnyAutopilotJobForIssue reports whether autopilot_jobs has at least
+// one row for the given issue, regardless of state. Used by the GEO-50
+// dispatch to decide whether an event is "first-time" or a follow-up.
+func (s *Store) HasAnyAutopilotJobForIssue(issueID string) (bool, error) {
+	if issueID == "" {
+		return false, nil
+	}
+	var n int
+	err := s.DB.QueryRow(
+		`SELECT 1 FROM autopilot_jobs WHERE issue_id=? LIMIT 1`,
+		issueID,
+	).Scan(&n)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ListJobsByIssueAndStates returns all autopilot jobs for the given issue ID
+// whose state is in states. Ordered by started_at DESC.
+func (s *Store) ListJobsByIssueAndStates(issueID string, states []string) ([]AutopilotJob, error) {
+	if len(states) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.Repeat(",?", len(states)-1)
+	query := fmt.Sprintf(`
+		SELECT agent_session_id, issue_id, issue_identifier, state,
+		       COALESCE(worktree_path,''), COALESCE(branch,''),
+		       COALESCE(pr_url,''), COALESCE(error,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(stream_log_path,''),
+		       COALESCE(claude_session_id,'')
+		FROM autopilot_jobs
+		WHERE issue_id=? AND state IN (?%s)
+		ORDER BY started_at DESC
+	`, placeholders)
+	args := make([]any, 0, len(states)+1)
+	args = append(args, issueID)
+	for _, st := range states {
+		args = append(args, st)
+	}
+	rows, err := s.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AutopilotJob
+	for rows.Next() {
+		var j AutopilotJob
+		if err := rows.Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+			&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+			&j.StreamLogPath, &j.ClaudeSessionID); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// ListAutopilotJobs returns jobs matching the given filters, ordered by started_at desc.
+func (s *Store) ListAutopilotJobs(status, issueID string, since *time.Time, limit int) ([]AutopilotJob, error) {
+	query := `
+		SELECT agent_session_id, issue_id, issue_identifier, state,
+		       COALESCE(worktree_path,''), COALESCE(branch,''),
+		       COALESCE(pr_url,''), COALESCE(error,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(stream_log_path,''),
+		       COALESCE(claude_session_id,'')
+		FROM autopilot_jobs WHERE 1=1`
+	args := []any{}
+	if status != "" {
+		query += " AND state=?"
+		args = append(args, status)
+	}
+	if issueID != "" {
+		query += " AND issue_id=?"
+		args = append(args, issueID)
+	}
+	if since != nil {
+		query += " AND started_at>=?"
+		args = append(args, since.UTC().Format(time.RFC3339))
+	}
+	query += " ORDER BY started_at DESC"
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AutopilotJob
+	for rows.Next() {
+		var j AutopilotJob
+		if err := rows.Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+			&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+			&j.StreamLogPath, &j.ClaudeSessionID); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// --- admiral_tasks (GEO-50, issue-keyed task model) ---
+//
+// PR-A only ships the schema + Store CRUD methods. Dispatch (handleCreated /
+// handlePrompted) still writes to autopilot_jobs in this PR. PR-B will
+// switch lookups to admiral_tasks and dual-write through both tables.
+
+// AdmiralTask is the live task row for a Linear issue under the new
+// issue-keyed model. One row per issue. After /rerun the row is moved to
+// admiral_task_history and a new live row is inserted with attempt_n+1.
+type AdmiralTask struct {
+	IssueID            string
+	IssueIdentifier    string // denormalized "GEO-50" style identifier for log/UI
+	State              string
+	AttemptN           int
+	Branch             string
+	WorktreePath       string
+	PRURL              string
+	ClaudeSessionID    string
+	LastEventSessionID string // most recent Linear AgentSession.id (used for PostAgentActivity)
+	StartedAt          string
+	FinishedAt         string
+	Error              string
+	StreamLogPath      string
+}
+
+// AdmiralTaskHistory is one entry in the supersession log for an issue.
+type AdmiralTaskHistory struct {
+	HistoryID        int64
+	IssueID          string
+	AttemptN         int
+	State            string
+	Branch           string
+	WorktreePath     string
+	PRURL            string
+	ClaudeSessionID  string
+	AgentSessionIDs  string // JSON array; populated when supersession packs multiple sessions in one row
+	StartedAt        string
+	FinishedAt       string
+	Error            string
+	StreamLogPath    string
+	SupersededAt     string
+	SupersededReason string
+}
+
+// GetAdmiralTaskByIssue returns the live task row for an issue, or
+// (nil, nil) when no task has been claimed yet.
+func (s *Store) GetAdmiralTaskByIssue(issueID string) (*AdmiralTask, error) {
+	var t AdmiralTask
+	err := s.DB.QueryRow(`
+		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(last_event_session_id,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,'')
+		FROM admiral_tasks WHERE issue_id=?
+	`, issueID).Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
+		&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
+		&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
+		&t.Error, &t.StreamLogPath)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
+// ClaimAdmiralTask inserts a new task row for issueID iff no row exists.
+// Mirror of ClaimAutopilotJob but keyed on issue_id and reserving the
+// initial attempt_n=1. Returns (true, nil) when the caller now owns the
+// task; (false, nil) when a row already exists for that issue.
+func (s *Store) ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.DB.Exec(`
+		INSERT OR IGNORE INTO admiral_tasks(
+			issue_id, issue_identifier, state, attempt_n,
+			last_event_session_id, started_at
+		) VALUES(?, ?, ?, 1, ?, ?)
+	`, issueID, identifier, JobStateReceived, lastEventSessionID, now)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// UpdateAdmiralTask loads the task row for issueID, applies fn, writes
+// back. Atomic via single transaction. Returns sql.ErrNoRows if the row
+// is missing — callers should ClaimAdmiralTask first.
+func (s *Store) UpdateAdmiralTask(issueID string, fn func(*AdmiralTask)) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var t AdmiralTask
+	err = tx.QueryRow(`
+		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(last_event_session_id,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,'')
+		FROM admiral_tasks WHERE issue_id=?
+	`, issueID).Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
+		&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
+		&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
+		&t.Error, &t.StreamLogPath)
+	if err != nil {
+		return err
+	}
+	fn(&t)
+	_, err = tx.Exec(`
+		UPDATE admiral_tasks
+		SET issue_identifier=?, state=?, attempt_n=?, branch=?, worktree_path=?,
+		    pr_url=?, claude_session_id=?, last_event_session_id=?,
+		    finished_at=?, error=?, stream_log_path=?
+		WHERE issue_id=?
+	`, nullIfEmpty(t.IssueIdentifier), t.State, t.AttemptN,
+		nullIfEmpty(t.Branch), nullIfEmpty(t.WorktreePath),
+		nullIfEmpty(t.PRURL), nullIfEmpty(t.ClaudeSessionID),
+		nullIfEmpty(t.LastEventSessionID),
+		nullIfEmpty(t.FinishedAt), nullIfEmpty(t.Error),
+		nullIfEmpty(t.StreamLogPath), issueID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MoveAdmiralTaskToHistoryAndClaimNew atomically moves the live
+// admiral_tasks row for issueID into admiral_task_history (with the
+// given supersession reason) and inserts a fresh live row with
+// attempt_n incremented by one. Used by /rerun in the unified
+// dispatch (GEO-50). Returns the new attempt_n on success.
+//
+// Caller must ensure the old row exists. If it doesn't the function
+// returns sql.ErrNoRows.
+func (s *Store) MoveAdmiralTaskToHistoryAndClaimNew(issueID, reason, identifier, lastEventSessionID string) (int, error) {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	var t AdmiralTask
+	err = tx.QueryRow(`
+		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(last_event_session_id,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,'')
+		FROM admiral_tasks WHERE issue_id=?
+	`, issueID).Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
+		&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
+		&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
+		&t.Error, &t.StreamLogPath)
+	if err != nil {
+		return 0, err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := tx.Exec(`
+		INSERT INTO admiral_task_history(
+			issue_id, attempt_n, state, branch, worktree_path, pr_url,
+			claude_session_id, agent_session_ids, started_at, finished_at,
+			error, stream_log_path, superseded_at, superseded_reason
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, t.IssueID, t.AttemptN, t.State,
+		nullIfEmpty(t.Branch), nullIfEmpty(t.WorktreePath), nullIfEmpty(t.PRURL),
+		nullIfEmpty(t.ClaudeSessionID), nullIfEmpty(t.LastEventSessionID),
+		t.StartedAt, nullIfEmpty(t.FinishedAt),
+		nullIfEmpty(t.Error), nullIfEmpty(t.StreamLogPath),
+		now, reason); err != nil {
+		return 0, fmt.Errorf("insert history: %w", err)
+	}
+
+	if _, err := tx.Exec(`DELETE FROM admiral_tasks WHERE issue_id=?`, issueID); err != nil {
+		return 0, fmt.Errorf("delete old live: %w", err)
+	}
+	newAttempt := t.AttemptN + 1
+	if _, err := tx.Exec(`
+		INSERT INTO admiral_tasks(
+			issue_id, issue_identifier, state, attempt_n,
+			last_event_session_id, started_at
+		) VALUES(?, ?, ?, ?, ?, ?)
+	`, issueID, identifier, JobStateReceived, newAttempt,
+		nullIfEmpty(lastEventSessionID), now); err != nil {
+		return 0, fmt.Errorf("insert new live: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return newAttempt, nil
+}
+
+// ListAdmiralTaskHistoryByIssue returns supersession history for an
+// issue, ordered by attempt_n ascending (oldest first).
+func (s *Store) ListAdmiralTaskHistoryByIssue(issueID string) ([]AdmiralTaskHistory, error) {
+	rows, err := s.DB.Query(`
+		SELECT history_id, issue_id, attempt_n, state,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(agent_session_ids,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,''),
+		       superseded_at, superseded_reason
+		FROM admiral_task_history
+		WHERE issue_id=?
+		ORDER BY attempt_n ASC
+	`, issueID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AdmiralTaskHistory
+	for rows.Next() {
+		var h AdmiralTaskHistory
+		if err := rows.Scan(&h.HistoryID, &h.IssueID, &h.AttemptN, &h.State,
+			&h.Branch, &h.WorktreePath, &h.PRURL, &h.ClaudeSessionID,
+			&h.AgentSessionIDs, &h.StartedAt, &h.FinishedAt,
+			&h.Error, &h.StreamLogPath, &h.SupersededAt, &h.SupersededReason); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil
@@ -409,6 +1043,68 @@ func (s *Store) SaveLinearOAuthToken(accessToken, refreshToken, expiresAt string
 		    updated_at=?
 		WHERE id=1
 	`, accessToken, refreshToken, refreshToken, expiresAt, time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+// AuthErrorState describes the OAuth circuit-breaker state. Reason is empty
+// when auth is healthy; non-empty means refresh hit a permanent failure
+// (invalid_grant / invalid_client) and the user must run admiral-oauth.
+// ErrAt is when the failure was first detected; NotifiedAt is when we last
+// alerted the user (used to dedupe the TG message).
+type AuthErrorState struct {
+	Reason     string
+	ErrAt      string // RFC3339 UTC, empty if healthy
+	NotifiedAt string // RFC3339 UTC, empty if not yet notified
+}
+
+// GetAuthError returns the current auth-error state. Healthy state is
+// (AuthErrorState{}, nil) — caller checks `Reason != ""` to decide.
+func (s *Store) GetAuthError() (AuthErrorState, error) {
+	var st AuthErrorState
+	err := s.DB.QueryRow(`
+		SELECT COALESCE(auth_error,''),
+		       COALESCE(auth_error_at,''),
+		       COALESCE(notified_at,'')
+		FROM linear_oauth WHERE id=1
+	`).Scan(&st.Reason, &st.ErrAt, &st.NotifiedAt)
+	if err == sql.ErrNoRows {
+		return AuthErrorState{}, nil
+	}
+	return st, err
+}
+
+// MarkAuthBroken records a permanent OAuth failure. The first-seen timestamp
+// (auth_error_at) is preserved across repeated calls so callers can tell how
+// long the daemon has been broken.
+func (s *Store) MarkAuthBroken(reason string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.DB.Exec(`
+		UPDATE linear_oauth
+		SET auth_error=?,
+		    auth_error_at=COALESCE(NULLIF(auth_error_at,''), ?)
+		WHERE id=1
+	`, reason, now)
+	return err
+}
+
+// MarkAuthNotified records that the user-facing alert was sent at `at`.
+// Stamping is idempotent — caller decides whether to overwrite (e.g. when
+// re-alerting after a stale window).
+func (s *Store) MarkAuthNotified(at string) error {
+	_, err := s.DB.Exec(`
+		UPDATE linear_oauth SET notified_at=? WHERE id=1
+	`, at)
+	return err
+}
+
+// ClearAuthError marks auth as healthy again. Called after a successful
+// token refresh or a successful admiral-oauth re-bootstrap.
+func (s *Store) ClearAuthError() error {
+	_, err := s.DB.Exec(`
+		UPDATE linear_oauth
+		SET auth_error=NULL, auth_error_at=NULL, notified_at=NULL
+		WHERE id=1
+	`)
 	return err
 }
 
@@ -552,7 +1248,7 @@ func (s *Store) KVSet(key, value string) error {
 
 // EventInboxRow represents a queued webhook event awaiting processing.
 type EventInboxRow struct {
-	WebhookID    string
+	WebhookID   string
 	Action      string
 	SessionID   string
 	IssueID     string
@@ -690,4 +1386,83 @@ func (s *Store) CountPendingEvents() (int, error) {
 		SELECT COUNT(*) FROM events_inbox WHERE status IN ('pending', 'processing')
 	`).Scan(&count)
 	return count, err
+}
+
+// --- repos ---
+
+// Repo holds a Linear project → repo mapping.
+type Repo struct {
+	ProjectID   string
+	ProjectName string
+	RepoDir     string
+	BaseBranch  string
+	Enabled     bool
+}
+
+// ListRepos returns all repos ordered by project_name.
+func (s *Store) ListRepos() ([]Repo, error) {
+	rows, err := s.DB.Query(`
+		SELECT project_id, project_name, repo_dir, base_branch, enabled
+		FROM repos ORDER BY project_name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Repo
+	for rows.Next() {
+		var r Repo
+		var enabled int
+		if err := rows.Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled); err != nil {
+			return nil, err
+		}
+		r.Enabled = enabled == 1
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// GetRepoByProjectID returns the repo for a given Linear project ID.
+// Returns (nil, nil) when no repo is configured for that project.
+func (s *Store) GetRepoByProjectID(projectID string) (*Repo, error) {
+	var r Repo
+	var enabled int
+	err := s.DB.QueryRow(`
+		SELECT project_id, project_name, repo_dir, base_branch, enabled
+		FROM repos WHERE project_id=?
+	`, projectID).Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.Enabled = enabled == 1
+	return &r, nil
+}
+
+// UpsertRepo inserts or replaces a repo.
+func (s *Store) UpsertRepo(r Repo) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	enabled := 0
+	if r.Enabled {
+		enabled = 1
+	}
+	_, err := s.DB.Exec(`
+		INSERT INTO repos(project_id, project_name, repo_dir, base_branch, enabled, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_id) DO UPDATE SET
+			project_name=excluded.project_name,
+			repo_dir=excluded.repo_dir,
+			base_branch=excluded.base_branch,
+			enabled=excluded.enabled,
+			updated_at=excluded.updated_at
+	`, r.ProjectID, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, now, now)
+	return err
+}
+
+// DeleteRepo removes a repo by project_id.
+func (s *Store) DeleteRepo(projectID string) error {
+	_, err := s.DB.Exec(`DELETE FROM repos WHERE project_id=?`, projectID)
+	return err
 }

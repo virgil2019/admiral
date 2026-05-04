@@ -1,8 +1,8 @@
 package bridge
 
 type Whitelist struct {
-	ids     map[int64]struct{}
-	chatID  int64
+	ids    map[int64]struct{}
+	chatID int64
 }
 
 func NewWhitelist(userIDs []int64, chatID int64) *Whitelist {

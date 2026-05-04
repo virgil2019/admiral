@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/georgehuang/admiral/internal/config"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
+	"github.com/georgehuang/admiral/internal/tg"
 )
 
 func main() {
@@ -46,6 +49,12 @@ func main() {
 	// once a token has been stored, so we only seed on first run).
 	if err := seedTokenStore(db, &cfg.Linear, logger); err != nil {
 		logger.Warn("token_store_seed_failed", "err", err)
+	}
+
+	// Seed repos from config if DB is empty (DB takes priority over config
+	// once repos have been stored, so we only seed on first run).
+	if err := seedRepos(db, &cfg.Autopilot, logger); err != nil {
+		logger.Warn("repos_seed_failed", "err", err)
 	}
 
 	// Build Linear client and optionally wire token refresh.
@@ -86,18 +95,50 @@ func main() {
 	n := cfg.Autopilot.WorkerCount
 	logger.Info("admiral-autopilot starting",
 		"listen", cfg.Autopilot.ListenAddr,
-		"repo", cfg.Autopilot.RepoDir,
-		"base_branch", cfg.Autopilot.BaseBranch,
+		"repos", len(cfg.Autopilot.Repos),
 		"claude_bin", cfg.Autopilot.ClaudeBin,
 		"sqlite", cfg.Storage.SQLitePath,
 		"worker_count", n,
 	)
 
+	// Optional Telegram alerter: surfaces a permanent-OAuth-failure to the
+	// user once per outage so the daemon doesn't silently drift while
+	// Linear-side state updates fail. Returns nil when not configured —
+	// the worker logs but doesn't send.
+	alerter := newAuthAlerter(cfg, db, logger)
+
 	// worker pool: N workers consume from events_inbox and dispatch to orchestrator
 	for i := 0; i < n; i++ {
 		w := autopilot.NewWorker(db, orch, logger.With("worker", i), sig)
+		w.AuthAlerter = alerter
 		go w.Run(ctx)
 	}
+
+	// Build admin token: use config/env, or generate a transient token.
+	adminToken := cfg.Autopilot.AdminToken
+	if adminToken == "" {
+		// Generate a random hex token for this run.
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			logger.Error("admin token generation failed", "err", err)
+			os.Exit(1)
+		}
+		adminToken = fmt.Sprintf("%x", b)
+		logger.Info("admin_token_not_set_generated_transient",
+			"token", adminToken,
+			"hint", "set autopilot.admin_token in config or ADMIRAL_ADMIN_TOKEN env to persist")
+	}
+	// Admin API server — token auth (M5); bound to localhost by default.
+	adminAddr := cfg.Autopilot.AdminListenAddr
+	logger.Info("admin server starting",
+		"listen", adminAddr,
+	)
+	go func() {
+		if err := autopilot.ServeAdminHTTP(adminAddr, db, lc, cfg.Autopilot.GhBin, logger, n, adminToken); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("admin server failed", "err", err)
+			cancel()
+		}
+	}()
 
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -162,4 +203,63 @@ func seedTokenStore(db *store.Store, linCfg *config.Linear, logger *slog.Logger)
 	}
 	logger.Info("linear_token_store_seeding_from_config")
 	return db.SaveLinearOAuthToken(linCfg.APIToken, linCfg.RefreshToken, "")
+}
+
+// newAuthAlerter returns the function the worker calls when the Linear
+// OAuth circuit breaker trips. The alert goes to the first user in
+// allowed_tg_user_ids; if BotToken or AllowedTGUserIDs is missing we log
+// once at startup and return nil — the worker still short-circuits its
+// drain loop, the user just won't get a Telegram nudge.
+func newAuthAlerter(cfg *config.Config, db *store.Store, logger *slog.Logger) func(reason string) error {
+	if strings.TrimSpace(cfg.BotToken) == "" || len(cfg.AllowedTGUserIDs) == 0 {
+		logger.Warn("auth_alert_disabled",
+			"reason", "bot_token or allowed_tg_user_ids not set in config; user will not be notified on OAuth failure")
+		return nil
+	}
+	chatID := cfg.AllowedTGUserIDs[0]
+	bot, err := tg.New(cfg.BotToken, chatID, 0)
+	if err != nil {
+		logger.Warn("auth_alert_disabled", "reason", "tg bot init failed", "err", err)
+		return nil
+	}
+	logger.Info("auth_alert_enabled", "chat_id", chatID)
+	return func(reason string) error {
+		queued, _ := db.CountPendingEvents()
+		text := fmt.Sprintf(
+			"⚠️ admiral OAuth has stopped working: %s\n\nRun `admiral-oauth` to re-authorize. %d webhook event(s) queued waiting.",
+			reason, queued)
+		_, sendErr := bot.Send(chatID, text)
+		return sendErr
+	}
+}
+
+// seedRepos writes repos from config into the SQLite store only when the DB
+// repos table is empty (DB takes priority over config once repos have been
+// stored, to avoid overwriting user changes made via future admin APIs).
+func seedRepos(db *store.Store, apCfg *config.Autopilot, logger *slog.Logger) error {
+	existing, err := db.ListRepos()
+	if err != nil {
+		return fmt.Errorf("list repos: %w", err)
+	}
+	if len(existing) > 0 {
+		return nil // DB already has repos — don't overwrite
+	}
+	if len(apCfg.Repos) == 0 {
+		return nil // nothing to seed (validation already enforces non-empty)
+	}
+
+	logger.Info("repos_seeding_from_config", "count", len(apCfg.Repos))
+	for _, r := range apCfg.Repos {
+		repo := store.Repo{
+			ProjectID:   r.ProjectID,
+			ProjectName: r.ProjectName,
+			RepoDir:     r.RepoDir,
+			BaseBranch:  r.BaseBranch,
+			Enabled:     true,
+		}
+		if err := db.UpsertRepo(repo); err != nil {
+			return fmt.Errorf("upsert repo %s: %w", r.ProjectID, err)
+		}
+	}
+	return nil
 }

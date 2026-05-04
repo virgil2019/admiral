@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -21,7 +22,7 @@ type Config struct {
 	EventStream      EventStream `yaml:"event_stream"`
 	Logging          Logging     `yaml:"logging"`
 	Linear           Linear      `yaml:"linear"`
-	Autopilot       Autopilot    `yaml:"autopilot"`
+	Autopilot        Autopilot   `yaml:"autopilot"`
 
 	// Warnings collects non-fatal config notices (e.g. deprecated key
 	// usage). Populated during Load; main.go logs them after open.
@@ -58,6 +59,9 @@ type Linear struct {
 	// Used for automatic token renewal. Optional — if absent, token refresh
 	// is unavailable (v0.3 fallback).
 	RefreshToken string `yaml:"refresh_token"`
+	// RedirectURI is the OAuth callback URL. Must match the value registered
+	// in your Linear OAuth app. Default: "http://127.0.0.1:8080/callback".
+	RedirectURI string `yaml:"redirect_uri"`
 }
 
 // Autopilot configures the worktree + claude -p spawn path used by the
@@ -66,13 +70,14 @@ type Autopilot struct {
 	// ListenAddr is the HTTP bind for the Linear webhook receiver, e.g.
 	// ":8787" or "127.0.0.1:8787". Default: ":8787".
 	ListenAddr string `yaml:"listen_addr"`
-	// RepoDir is the absolute path to the repo whose .worktrees/ directory
-	// admiral creates per-issue worktrees under. Required.
+	// RepoDir is no longer used — repo routing is keyed on Linear project_id
+	// via Repos[]. Field kept for YAML backward-compat (silently ignored).
 	RepoDir string `yaml:"repo_dir"`
 	// WorktreeRoot is the directory worktrees are created beneath; relative
-	// paths resolve against RepoDir. Default: ".worktrees".
+	// paths resolve against the per-repo RepoDir. Default: ".worktrees".
 	WorktreeRoot string `yaml:"worktree_root"`
-	// BaseBranch is the branch new worktrees are forked from. Default: "main".
+	// BaseBranch is no longer used — see Repos[].base_branch. Field kept for
+	// YAML backward-compat (silently ignored).
 	BaseBranch string `yaml:"base_branch"`
 	// ClaudeBin is the absolute path to the `claude` CLI. Default: "claude" (PATH).
 	ClaudeBin string `yaml:"claude_bin"`
@@ -82,6 +87,10 @@ type Autopilot struct {
 	// GhBin is the absolute path to the `gh` CLI used for the PR fallback.
 	// Default: "gh" (PATH).
 	GhBin string `yaml:"gh_bin"`
+	// GhUser is the GitHub username of the account running admiral (used to
+	// distinguish admiral-authored PRs from human-authored ones in the
+	// open-PR short-circuit). Default: the login from `gh auth status`.
+	GhUser string `yaml:"gh_user"`
 	// MaxRunSeconds caps a single claude -p invocation. Default: 1800 (30 min).
 	MaxRunSeconds int `yaml:"max_run_seconds"`
 	// JobStreamsDir is the directory where per-job claude stream-json files
@@ -96,9 +105,44 @@ type Autopilot struct {
 	// ClaimNextPendingEvent, so increasing this only adds cross-session
 	// parallelism. Default: 3.
 	WorkerCount int `yaml:"worker_count"`
+	// MaxConcurrentRuns caps how many `claude -p` runs can be in flight
+	// simultaneously across all issues (GEO-51). Each issue is still
+	// strictly serial via the GEO-50 admiral_tasks state machine; this
+	// controls cross-issue parallelism. A burst of N webhooks no longer
+	// spawns N parallel claude processes — they queue inside the run
+	// goroutine on a semaphore. Default: 3. Override via the
+	// ADMIRAL_MAX_CONCURRENT_RUNS env var (env takes priority over config).
+	MaxConcurrentRuns int `yaml:"max_concurrent_runs"`
 	// UpdateIssueStatus controls whether admiral updates Linear issue workflow
 	// state on task lifecycle (Backlog → Started → Completed). Default: true.
 	UpdateIssueStatus *bool `yaml:"update_issue_status"`
+	// Repos is the list of Linear project → repo mappings. Required: must
+	// contain at least one entry. An incoming Linear issue is routed to the
+	// repo whose project_id matches issue.project.id; issues without a
+	// project assignment are rejected.
+	Repos []RepoConfig `yaml:"repos"`
+	// AdminListenAddr is the HTTP bind for the read-only admin API. Default:
+	// "127.0.0.1:8788" (localhost-only; ssh tunnel required for remote access).
+	// Set to ":8788" to listen on all interfaces (not recommended without
+	// M5 token auth).
+	AdminListenAddr string `yaml:"admin_listen_addr"`
+	// AdminToken is the static bearer token for admin API auth. If not set,
+	// admin server is disabled (v0.5 fail-safe). May also be set via
+	// ADMIRAL_ADMIN_TOKEN env var (env takes priority over config).
+	AdminToken string `yaml:"admin_token"`
+}
+
+// RepoConfig describes a single Linear project → repo mapping.
+type RepoConfig struct {
+	// ProjectID is the Linear project UUID. Required when configured under
+	// autopilot.repos.
+	ProjectID string `yaml:"project_id"`
+	// ProjectName is a human-readable name for the project (log/UI only).
+	ProjectName string `yaml:"project_name"`
+	// RepoDir is the absolute path to the repo on disk.
+	RepoDir string `yaml:"repo_dir"`
+	// BaseBranch is the branch new worktrees are forked from. Default: "main".
+	BaseBranch string `yaml:"base_branch"`
 }
 
 type Launch struct {
@@ -197,19 +241,36 @@ func (c *Config) validateAutopilotAndExpand() error {
 	if strings.TrimSpace(c.Linear.APIBase) == "" {
 		c.Linear.APIBase = "https://api.linear.app/graphql"
 	}
+	if strings.TrimSpace(c.Linear.RedirectURI) == "" {
+		c.Linear.RedirectURI = "http://127.0.0.1:8080/callback"
+	}
 
-	if strings.TrimSpace(c.Autopilot.RepoDir) == "" {
-		return fmt.Errorf("autopilot.repo_dir is required")
-	}
-	c.Autopilot.RepoDir = expandTilde(c.Autopilot.RepoDir)
-	if fi, err := os.Stat(c.Autopilot.RepoDir); err != nil || !fi.IsDir() {
-		return fmt.Errorf("autopilot.repo_dir not a directory: %s", c.Autopilot.RepoDir)
-	}
 	if strings.TrimSpace(c.Autopilot.WorktreeRoot) == "" {
 		c.Autopilot.WorktreeRoot = ".worktrees"
 	}
-	if strings.TrimSpace(c.Autopilot.BaseBranch) == "" {
-		c.Autopilot.BaseBranch = "main"
+	// Multi-repo config: at least one entry required. Routing key is
+	// Linear project_id (each Linear project maps to exactly one repo).
+	if len(c.Autopilot.Repos) == 0 {
+		return fmt.Errorf("autopilot.repos must contain at least one entry")
+	}
+	for i := range c.Autopilot.Repos {
+		r := &c.Autopilot.Repos[i]
+		if strings.TrimSpace(r.ProjectID) == "" {
+			return fmt.Errorf("autopilot.repos[%d].project_id is required", i)
+		}
+		if strings.TrimSpace(r.ProjectName) == "" {
+			return fmt.Errorf("autopilot.repos[%d].project_name is required", i)
+		}
+		if strings.TrimSpace(r.RepoDir) == "" {
+			return fmt.Errorf("autopilot.repos[%d].repo_dir is required", i)
+		}
+		r.RepoDir = expandTilde(r.RepoDir)
+		if fi, err := os.Stat(r.RepoDir); err != nil || !fi.IsDir() {
+			return fmt.Errorf("autopilot.repos[%d].repo_dir not a directory: %s", i, r.RepoDir)
+		}
+		if strings.TrimSpace(r.BaseBranch) == "" {
+			r.BaseBranch = "main"
+		}
 	}
 	if strings.TrimSpace(c.Autopilot.ClaudeBin) == "" {
 		c.Autopilot.ClaudeBin = "claude"
@@ -226,6 +287,16 @@ func (c *Config) validateAutopilotAndExpand() error {
 	if strings.TrimSpace(c.Autopilot.ListenAddr) == "" {
 		c.Autopilot.ListenAddr = ":8787"
 	}
+	if strings.TrimSpace(c.Autopilot.AdminListenAddr) == "" {
+		c.Autopilot.AdminListenAddr = "127.0.0.1:8788"
+	}
+	// AdminToken: env takes priority over config; if neither is set a
+	// transient token is generated at startup (caller logs it). If env
+	// is explicitly empty we treat it as "not set" too.
+	if envTok := os.Getenv("ADMIRAL_ADMIN_TOKEN"); envTok != "" {
+		c.Autopilot.AdminToken = envTok
+	}
+	// Note: we do NOT call expandTilde on AdminToken — it's a secret, not a path.
 	if c.Autopilot.MaxRunSeconds <= 0 {
 		c.Autopilot.MaxRunSeconds = 1800
 	}
@@ -235,6 +306,17 @@ func (c *Config) validateAutopilotAndExpand() error {
 	}
 	if c.Autopilot.WorkerCount <= 0 {
 		c.Autopilot.WorkerCount = 3
+	}
+	// MaxConcurrentRuns: env > config > default. Negative or zero falls back
+	// to the default. The semaphore in the orchestrator gates `claude -p`
+	// dispatches against this cap.
+	if envN := os.Getenv("ADMIRAL_MAX_CONCURRENT_RUNS"); envN != "" {
+		if parsed, err := strconv.Atoi(envN); err == nil && parsed > 0 {
+			c.Autopilot.MaxConcurrentRuns = parsed
+		}
+	}
+	if c.Autopilot.MaxConcurrentRuns <= 0 {
+		c.Autopilot.MaxConcurrentRuns = 3
 	}
 	if c.Autopilot.UpdateIssueStatus == nil {
 		trueVal := true

@@ -77,6 +77,7 @@ linear:
   # If absent, token refresh is unavailable (v0.3 fallback).
   # client_id: "lin_oauth_client_id"
   # client_secret: "lin_oauth_client_secret"
+  # redirect_uri: "http://127.0.0.1:8080/callback"  # must match Linear OAuth app config
   # Refresh token from the initial OAuth flow — stored in SQLite and
   # used automatically when the access token expires.
   # refresh_token: "lin_oauth_refresh_token"
@@ -84,11 +85,39 @@ linear:
 autopilot:
   # HTTP bind address for the webhook receiver. Default: ":8787"
   listen_addr: ":8787"
-  # Repo whose .worktrees/ admiral creates per-issue branches under.
-  repo_dir: "/Users/you/code/your-repo"
+
+  # Admin API/UI HTTP bind. Default: "127.0.0.1:8788" (localhost only).
+  # Change to ":8788" to bind on all interfaces (exposes admin UI externally).
+  admin_listen_addr: "127.0.0.1:8788"
+
+  # Static bearer token for admin API and admin UI login. Required for the
+  # admin server to start. If unset a transient token is generated on each
+  # boot (logged to stderr) — set a persistent value in production.
+  # Can also be set via ADMIRAL_ADMIN_TOKEN env var (env takes priority).
+  # admin_token: "change-me"
+
+  # Repo routing: each Linear *project* maps to exactly one repo. An incoming
+  # Linear issue is routed by its project_id; issues without a project
+  # assigned are rejected (no fallback). If one logical product spans
+  # multiple repos, create one Linear project per repo and let issues live
+  # in the project that matches the repo they touch.
+  #
+  # Tip — finding a project UUID: Linear's web URL only exposes a slug, not
+  # the UUID. Use the GraphQL API (or the Linear MCP `list_projects` tool)
+  # to fetch full UUIDs:
+  #   query { projects { nodes { id name } } }
+  repos:
+    - project_id: "00000000-0000-0000-0000-000000000000"  # Linear project UUID
+      project_name: "Admiral"                              # log/UI only
+      repo_dir: "/home/you/code/your-repo"
+      base_branch: "main"
+    # - project_id: "11111111-1111-1111-1111-111111111111"
+    #   project_name: "AnotherProject"
+    #   repo_dir: "/home/you/code/another-repo"
+    #   base_branch: "main"
+
   # Defaults shown:
   # worktree_root:   ".worktrees"
-  # base_branch:     "main"
   # claude_bin:      "claude"
   # gh_bin:          "gh"
   # autopilot_skill: ""           # claude skill name, e.g. "autopilot"
