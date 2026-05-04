@@ -225,7 +225,7 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 		}
 		o.logger.Info("dispatch_reject_no_task",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		o.postReply(ev.SessionID, assignFirstHelp)
+		o.postRejection(ev.SessionID, assignFirstHelp)
 		return
 	}
 
@@ -241,7 +241,7 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	if isAssignSignal {
 		o.logger.Info("dispatch_reject_repeat_assign",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		o.postReply(ev.SessionID, repeatAssignHelp)
+		o.postRejection(ev.SessionID, repeatAssignHelp)
 		return
 	}
 
@@ -249,7 +249,7 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	if !ok {
 		o.logger.Info("dispatch_reject_bare",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		o.postReply(ev.SessionID, mentionCommandHelp)
+		o.postRejection(ev.SessionID, mentionCommandHelp)
 		return
 	}
 
@@ -263,7 +263,7 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	default:
 		o.logger.Info("autopilot_reject_unknown_command",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier, "command", "/"+cmdName)
-		o.postReply(ev.SessionID, unknownCommandHelp("/"+cmdName))
+		o.postRejection(ev.SessionID, unknownCommandHelp("/"+cmdName))
 	}
 }
 
@@ -306,7 +306,7 @@ func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, task *store.AdmiralTa
 			"issue", ev.IssueIdentifier,
 			"prior_state", task.State,
 			"attempt_n", task.AttemptN)
-		o.postReply(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
+		o.postRejection(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
 		return
 	}
 
@@ -316,7 +316,7 @@ func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, task *store.AdmiralTa
 	if err != nil {
 		o.logger.Error("rerun_supersede_failed",
 			"err", err, "issue", ev.IssueID)
-		o.postReply(ev.SessionID, "Internal error processing /rerun. Try again or assign the issue manually.")
+		o.postRejection(ev.SessionID, "Internal error processing /rerun. Try again or assign the issue manually.")
 		return
 	}
 	o.logger.Info("dispatch_rerun_superseded",
@@ -352,13 +352,13 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 		o.logger.Info("dispatch_reject_fix_currently_processing",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier,
 			"prior_state", task.State)
-		o.postReply(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
+		o.postRejection(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
 		return
 	case store.JobStateFailed, store.JobStateTimedOut, store.JobStateCancelled:
 		o.logger.Info("dispatch_reject_fix_terminal_non_done",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier,
 			"prior_state", task.State)
-		o.postReply(ev.SessionID, fmt.Sprintf(
+		o.postRejection(ev.SessionID, fmt.Sprintf(
 			"/fix only works on a previous DONE run. The current attempt is %s. Use /rerun to start over.",
 			task.State,
 		))
@@ -369,7 +369,7 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 		o.logger.Warn("dispatch_fix_unhandled_state",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier,
 			"state", task.State)
-		o.postReply(ev.SessionID, fmt.Sprintf("/fix not supported in state %q.", task.State))
+		o.postRejection(ev.SessionID, fmt.Sprintf("/fix not supported in state %q.", task.State))
 		return
 	}
 
@@ -377,13 +377,13 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 		o.logger.Info("dispatch_reject_fix_legacy_row",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier,
 			"has_pr", task.PRURL != "", "has_claude", task.ClaudeSessionID != "")
-		o.postReply(ev.SessionID,
+		o.postRejection(ev.SessionID,
 			"/fix needs a prior run with both an open PR and a recoverable claude session, but this task is missing one of those. Use /rerun to start over.")
 		return
 	}
 
 	if description == "" {
-		o.postReply(ev.SessionID,
+		o.postRejection(ev.SessionID,
 			"/fix needs a description of what to change, e.g. `/fix the typo in line 12`.")
 		return
 	}
@@ -1987,12 +1987,14 @@ func unknownCommandHelp(cmd string) string {
 	return fmt.Sprintf("admiral did not recognize %q. Currently supported: /rerun, /fix.", cmd)
 }
 
-// postReply is a thin helper used during early-exit rejection paths where no
-// flow has been created yet and therefore no worktree cleanup is needed.
-func (o *Orchestrator) postReply(sessionID, body string) {
+// postRejection posts an ErrorActivity for early-exit rejection paths where
+// no flow has been created yet. ErrorActivity (vs Response) signals to Linear
+// that the AgentSession ended in failure, so user-visible rejections show as
+// errored sessions rather than completed ones.
+func (o *Orchestrator) postRejection(sessionID, body string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.Response(body))
+	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.ErrorActivity(body))
 }
 
 const availableCommandsHelp = `Available commands:
