@@ -1203,6 +1203,9 @@ func TestHandlePrompted_NoHistory(t *testing.T) {
 	if !strings.Contains(mlc.GetPostedBody(), "Available commands") {
 		t.Errorf("expected '/help' response, got: %s", mlc.GetPostedBody())
 	}
+	if mlc.PostedActivity.Type != linear.ActivityResponse {
+		t.Errorf("/help must post ActivityResponse (info), got %q", mlc.PostedActivity.Type)
+	}
 }
 
 func TestHandlePrompted_NoClaudeSessionID(t *testing.T) {
@@ -1231,6 +1234,9 @@ func TestHandlePrompted_NoClaudeSessionID(t *testing.T) {
 	// The NoClaudeSessionID path is only reached via /help (not /status which has its own handling).
 	if !strings.Contains(mlc.GetPostedBody(), "Available commands") {
 		t.Errorf("expected '/help' response, got: %s", mlc.GetPostedBody())
+	}
+	if mlc.PostedActivity.Type != linear.ActivityResponse {
+		t.Errorf("/help must post ActivityResponse (info), got %q", mlc.PostedActivity.Type)
 	}
 }
 
@@ -1297,6 +1303,9 @@ func TestHandleCreated_BareMention_Rejected(t *testing.T) {
 	if !strings.Contains(mlc.GetPostedBody(), "does not respond to bare @mentions") {
 		t.Errorf("expected bare mention help text in posted body, got: %s", mlc.GetPostedBody())
 	}
+	if mlc.PostedActivity.Type != linear.ActivityError {
+		t.Errorf("rejection must post ActivityError, got %q", mlc.PostedActivity.Type)
+	}
 	// No job claimed and no DB write — rejection is observability-only.
 	if got := ms.ClaimedSnapshot(); len(got) != 0 {
 		t.Errorf("expected no job claimed for bare mention; got %v", got)
@@ -1331,6 +1340,9 @@ func TestHandleCreated_UnknownCommand_Rejected(t *testing.T) {
 	}
 	if !strings.Contains(mlc.GetPostedBody(), "/foobar") {
 		t.Errorf("expected unrecognized command name in reply, got: %s", mlc.GetPostedBody())
+	}
+	if mlc.PostedActivity.Type != linear.ActivityError {
+		t.Errorf("rejection must post ActivityError, got %q", mlc.PostedActivity.Type)
 	}
 	ms.mu.Lock()
 	updates := append([]string(nil), ms.UpdatedSessionIDs...)
@@ -1369,6 +1381,9 @@ func TestHandleCreated_FixCommand_LegacyRowRejected(t *testing.T) {
 	body := mlc.GetPostedBody()
 	if !strings.Contains(body, "/fix needs a prior run with both an open PR and a recoverable claude session") {
 		t.Errorf("expected legacy-row /fix reject message, got: %s", body)
+	}
+	if mlc.PostedActivity.Type != linear.ActivityError {
+		t.Errorf("rejection must post ActivityError, got %q", mlc.PostedActivity.Type)
 	}
 	// State must NOT advance — the only allowed mutation is dispatch's
 	// last_event_session_id refresh.
@@ -2215,6 +2230,9 @@ func TestDispatch_FirstTimeMention_RequestsAssign(t *testing.T) {
 	if !strings.Contains(body, "Issue not assigned to admiral") {
 		t.Errorf("expected assign-first reply, got: %s", body)
 	}
+	if mlc.PostedActivity.Type != linear.ActivityError {
+		t.Errorf("rejection must post ActivityError, got %q", mlc.PostedActivity.Type)
+	}
 	if got := ms.ClaimedSnapshot(); len(got) != 0 {
 		t.Errorf("first-time mention must not claim; got %v", got)
 	}
@@ -2244,6 +2262,9 @@ func TestDispatch_FirstTimePrompted_RequestsAssign(t *testing.T) {
 
 	if !strings.Contains(mlc.GetPostedBody(), "Issue not assigned to admiral") {
 		t.Errorf("expected assign-first reply on prompted with no prior task, got: %s", mlc.GetPostedBody())
+	}
+	if mlc.PostedActivity.Type != linear.ActivityError {
+		t.Errorf("rejection must post ActivityError, got %q", mlc.PostedActivity.Type)
 	}
 }
 
