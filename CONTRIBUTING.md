@@ -44,3 +44,16 @@ self-apply the label — this closes the self-ticking bypass.
 The workflow parses sample PR bodies covering: all-checked / mixed /
 no human-required section / malformed inputs. Tests live alongside the
 workflow file and can be run locally with `act` or in a PR fork.
+
+## Branch protection
+
+The `main` branch is protected. All merges require:
+
+- **Status checks**: the `test` workflow must pass (runs `go test` on every push/PR).
+- **Reviews**: at least 1 human reviewer (no agent reviewers). An agent may
+  prepare a PR but it sits until a human collaborator approves it.
+- **No force-push**: force-pushing to `main` is blocked for everyone.
+- **No branch deletion**: deleting the `main` branch is blocked.
+
+These rules are enforced by GitHub branch protection settings
+(Settings → Branches → Add rule for `main`).
