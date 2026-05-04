@@ -95,12 +95,13 @@ type rawAgentSession struct {
 		Name        string `json:"name"`
 		DisplayName string `json:"displayName"`
 	} `json:"creator"`
-	// SourceComment is set when the session was opened from an @mention
-	// inside a comment. Null on delegate triggers — this is what admiral
-	// uses to tell the two paths apart.
-	SourceComment *struct {
-		ID string `json:"id"`
-	} `json:"sourceComment"`
+	// SourceCommentID is set when the session was opened from an @mention
+	// inside a comment. Empty on delegate triggers — this is what admiral
+	// uses to tell the two paths apart. Linear's webhook payload type
+	// `AgentSessionWebhookPayload` exposes this as a flat scalar
+	// (`sourceCommentId`), distinct from the GraphQL Query type
+	// `AgentSession` which uses a nested `sourceComment: Comment` object.
+	SourceCommentID string `json:"sourceCommentId"`
 }
 
 type rawAgentActivity struct {
@@ -220,9 +221,7 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		ev.CreatorName = session.Creator.Name
 		ev.CreatorDisplayName = session.Creator.DisplayName
 	}
-	if session.SourceComment != nil {
-		ev.SourceCommentID = session.SourceComment.ID
-	}
+	ev.SourceCommentID = session.SourceCommentID
 	switch action {
 	case ActionCreated:
 		ev.PromptContext = firstNonEmpty(p.PromptContext, dataPromptContext(p))
