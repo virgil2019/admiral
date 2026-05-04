@@ -80,7 +80,7 @@ func TestWebhook_AgentSessionCreated_Mention_Fires(t *testing.T) {
 			"id":"sess-1",
 			"issue":{"id":"issue-1","identifier":"TST-1","title":"hello"},
 			"creator":{"id":"user-1","name":"Test User","displayName":"test.user"},
-			"sourceComment":{"id":"comment-1"}
+			"sourceCommentId":"comment-1"
 		},
 		"promptContext":"please refactor the auth module"
 	}`)
