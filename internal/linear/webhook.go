@@ -97,7 +97,10 @@ type rawAgentSession struct {
 	} `json:"creator"`
 	// SourceCommentID is set when the session was opened from an @mention
 	// inside a comment. Empty on delegate triggers — this is what admiral
-	// uses to tell the two paths apart.
+	// uses to tell the two paths apart. Linear's webhook payload type
+	// `AgentSessionWebhookPayload` exposes this as a flat scalar
+	// (`sourceCommentId`), distinct from the GraphQL Query type
+	// `AgentSession` which uses a nested `sourceComment: Comment` object.
 	SourceCommentID string `json:"sourceCommentId"`
 }
 
