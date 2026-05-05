@@ -198,23 +198,23 @@ func (o *Orchestrator) HandleAgentEvent(ev linear.AgentEvent) {
 // /rerun (start fresh) or /fix (resume current PR; coming in GEO-49).
 // admiral no longer guesses what the user meant — they say it.
 func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
+	text := ev.PromptContext
+	if text == "" && ev.Action == linear.ActionPrompted {
+		text = ev.UserMessage
+	}
+
 	o.logger.Info("dispatch",
 		"session", ev.SessionID,
 		"issue", ev.IssueIdentifier,
-		"action", ev.Action)
+		"action", ev.Action,
+		"text_preview", truncate(text, 100),
+	)
 
 	if ev.IssueID == "" {
 		o.logger.Warn("dispatch_skip_no_issue_id", "session", ev.SessionID)
 		return
 	}
 
-	// User-typed text relevant to this event. created carries it in
-	// PromptContext (delegate prompt or @mention comment text); prompted
-	// carries it in UserMessage (thread reply).
-	text := ev.PromptContext
-	if text == "" && ev.Action == linear.ActionPrompted {
-		text = ev.UserMessage
-	}
 	// Delegate vs @mention: a created event with no SourceCommentID is a
 	// delegate (assign-to-agent), regardless of whether the user typed an
 	// initial prompt. SourceCommentID set means the session was opened
