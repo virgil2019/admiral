@@ -7,14 +7,14 @@ import (
 
 func TestAllFinal(t *testing.T) {
 	tests := []struct {
-		name  string
-		runs  []checkRun
-		want  bool
+		name string
+		runs []checkRun
+		want bool
 	}{
 		{
-			name:  "empty runs returns false (no checks yet)",
-			runs:  []checkRun{},
-			want:  false,
+			name: "empty runs returns false (no checks yet)",
+			runs: []checkRun{},
+			want: false,
 		},
 		{
 			name: "all completed returns true",
@@ -144,14 +144,14 @@ func TestFailedChecks(t *testing.T) {
 
 func TestCheckNamesList(t *testing.T) {
 	tests := []struct {
-		name  string
-		runs  []checkRun
-		want  string
+		name string
+		runs []checkRun
+		want string
 	}{
 		{
-			name:  "empty returns empty string",
-			runs:  []checkRun{},
-			want:  "",
+			name: "empty returns empty string",
+			runs: []checkRun{},
+			want: "",
 		},
 		{
 			name: "single check",
