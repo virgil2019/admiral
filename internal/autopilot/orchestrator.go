@@ -97,6 +97,9 @@ type Orchestrator struct {
 	// ciWatcher polls GitHub check runs after a PR is opened and reports
 	// results back into the Linear thread (GEO-54).
 	ciWatcher *CIWatcher
+
+	// replier is the semantic reply layer for Linear AgentSession threads.
+	replier *agentSessionReplier
 }
 
 func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
@@ -116,6 +119,7 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		runSlots: make(chan struct{}, slots),
 		ciWatcher: newCIWatcher(lc, db, logger, cfg.GhBin,
 			cfg.CIWatchPollInterval, cfg.CIWatchTimeout),
+		replier: NewAgentSessionReplier(lc),
 	}
 	// Ensure job_streams_dir exists on startup.
 	if err := os.MkdirAll(cfg.JobStreamsDir, 0o755); err != nil {
@@ -2068,6 +2072,13 @@ func (o *Orchestrator) handleCommand(ev linear.AgentEvent, cmd string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	reply := func(ctx context.Context, sessionID, body string) error {
+		return o.lc.PostAgentActivity(ctx, sessionID, linear.Response(body))
+	}
+	if o.replier != nil {
+		reply = o.replier.Reply
+	}
+
 	switch cmd {
 	case "status":
 		active, sessionID, err := o.db.AnyAutopilotJobActive()
@@ -2093,7 +2104,7 @@ func (o *Orchestrator) handleCommand(ev linear.AgentEvent, cmd string) {
 			} else {
 				body += "  - (job details unavailable)\n"
 			}
-			_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
+			_ = reply(ctx, ev.SessionID, body)
 		} else {
 			// idle state — show last job info
 			lastJob, err := o.db.GetLastAutopilotJob()
@@ -2101,7 +2112,7 @@ func (o *Orchestrator) handleCommand(ev linear.AgentEvent, cmd string) {
 				o.logger.Warn("get_last_autopilot_job_failed", "err", err)
 			}
 			if lastJob == nil {
-				_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response("admiral status: idle\n\n(no previous jobs)"))
+				_ = reply(ctx, ev.SessionID, "admiral status: idle\n\n(no previous jobs)")
 				return
 			}
 			body := "admiral status: idle\n\nLast job:\n"
@@ -2120,13 +2131,13 @@ func (o *Orchestrator) handleCommand(ev linear.AgentEvent, cmd string) {
 				}
 				body += fmt.Sprintf("  - Error: %s\n", errStr)
 			}
-			_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
+			_ = reply(ctx, ev.SessionID, body)
 		}
 	case "help":
-		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(availableCommandsHelp))
+		_ = reply(ctx, ev.SessionID, availableCommandsHelp)
 	default:
 		body := fmt.Sprintf("Unknown command: /%s\n\n%s", cmd, availableCommandsHelp)
-		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
+		_ = reply(ctx, ev.SessionID, body)
 	}
 }
 
