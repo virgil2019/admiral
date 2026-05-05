@@ -26,7 +26,7 @@ type CIWatcher struct {
 // checkRun represents a single GitHub check run.
 type checkRun struct {
 	Name       string `json:"name"`
-	Status     string `json:"status"` // "queued", "in_progress", "completed"
+	Status     string `json:"status"`     // "queued", "in_progress", "completed"
 	Conclusion string `json:"conclusion"` // "success", "failure", "cancelled", "neutral", etc.
 	URL        string `json:"url"`        // Link to the run logs
 }
