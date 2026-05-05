@@ -246,7 +246,7 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	if isDelegate {
 		o.logger.Info("dispatch_reject_repeat_assign",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		o.postRejection(ev.SessionID, repeatAssignHelp)
+		o.replyRejection(ev.SessionID, task.State, repeatAssignHelp)
 		return
 	}
 
@@ -254,7 +254,7 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	if !ok {
 		o.logger.Info("dispatch_reject_bare",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		o.postRejection(ev.SessionID, mentionCommandHelp)
+		o.replyRejection(ev.SessionID, task.State, mentionCommandHelp)
 		return
 	}
 
@@ -268,8 +268,20 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	default:
 		o.logger.Info("autopilot_reject_unknown_command",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier, "command", "/"+cmdName)
-		o.postRejection(ev.SessionID, unknownCommandHelp("/"+cmdName))
+		o.replyRejection(ev.SessionID, task.State, unknownCommandHelp("/"+cmdName))
 	}
+}
+
+// replyRejection chooses between postRejection (ErrorActivity, terminal) and
+// postBusyAck (Thought, non-terminal) based on whether the task is still in
+// flight. Used by dispatch sites that may fire on either a live or terminal
+// task (bare @mention, unknown /command, re-toggled delegate).
+func (o *Orchestrator) replyRejection(sessionID, taskState, body string) {
+	if taskInFlight(taskState) {
+		o.postBusyAck(sessionID, body)
+		return
+	}
+	o.postRejection(sessionID, body)
 }
 
 // dispatchFreshAssign claims a fresh admiral_tasks row for the issue
@@ -311,7 +323,9 @@ func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, task *store.AdmiralTa
 			"issue", ev.IssueIdentifier,
 			"prior_state", task.State,
 			"attempt_n", task.AttemptN)
-		o.postRejection(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
+		// Task is in flight by definition of this case branch — Thought
+		// keeps the live AgentSession alive for the running flow.
+		o.postBusyAck(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
 		return
 	}
 
@@ -357,7 +371,9 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 		o.logger.Info("dispatch_reject_fix_currently_processing",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier,
 			"prior_state", task.State)
-		o.postRejection(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
+		// Task is in flight by definition of this case branch — Thought
+		// keeps the live AgentSession alive for the running flow.
+		o.postBusyAck(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
 		return
 	case store.JobStateFailed, store.JobStateTimedOut, store.JobStateCancelled:
 		o.logger.Info("dispatch_reject_fix_terminal_non_done",
@@ -1996,10 +2012,33 @@ func unknownCommandHelp(cmd string) string {
 // no flow has been created yet. ErrorActivity (vs Response) signals to Linear
 // that the AgentSession ended in failure, so user-visible rejections show as
 // errored sessions rather than completed ones.
+//
+// MUST NOT be used while the issue's admiral_task is still in flight — Linear
+// treats ActivityError as terminal and would mark the live working session as
+// errored, killing the running flow's progress updates. Use postBusyAck for
+// rejection-class responses on in-flight tasks instead.
 func (o *Orchestrator) postRejection(sessionID, body string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.ErrorActivity(body))
+}
+
+// postBusyAck posts a non-terminal Thought activity. Use this for
+// rejection-class responses delivered while the task is in flight (bare
+// @mention, unknown command, re-toggled delegate, /rerun or /fix while busy)
+// — Thought keeps the AgentSession alive so the running flow's subsequent
+// progress posts continue to land in the same Linear thread.
+func (o *Orchestrator) postBusyAck(sessionID, body string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.Thought(body, false))
+}
+
+// taskInFlight reports whether the admiral_task is in a state where its
+// AgentSession is still being driven by a running flow. Rejection-class
+// dispatcher responses must be non-terminal (Thought) when this is true.
+func taskInFlight(state string) bool {
+	return state == store.JobStateReceived || state == store.JobStateExecuting
 }
 
 const availableCommandsHelp = `Available commands:

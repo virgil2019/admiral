@@ -2375,6 +2375,12 @@ func TestDispatch_RerunWhileActive_Rejected(t *testing.T) {
 	if !strings.Contains(body, "BUSY-1") {
 		t.Errorf("expected issue identifier in reply, got: %s", body)
 	}
+	// In-flight rejection must be Thought, not ErrorActivity, so the live
+	// AgentSession isn't terminated and the running flow's progress posts
+	// keep landing.
+	if mlc.PostedActivity.Type != linear.ActivityThought {
+		t.Errorf("rejection on in-flight task must post ActivityThought, got %q", mlc.PostedActivity.Type)
+	}
 	if got := ms.SupersededAdmiralIssues; len(got) != 0 {
 		t.Errorf("rerun-while-active must not supersede admiral_tasks; got %v", got)
 	}
@@ -2545,9 +2551,47 @@ func TestDispatch_FixOnExecuting_Rejected(t *testing.T) {
 	if !strings.Contains(body, "currently processing") {
 		t.Errorf("expected currently-processing reply, got: %s", body)
 	}
+	if mlc.PostedActivity.Type != linear.ActivityThought {
+		t.Errorf("/fix-while-busy must post ActivityThought, got %q", mlc.PostedActivity.Type)
+	}
 	// State must remain EXECUTING — /fix did NOT take over.
 	if live.State != store.JobStateExecuting {
 		t.Errorf("/fix on EXECUTING must not change state; got %q", live.State)
+	}
+}
+
+// TestDispatch_BareCommentWhileExecuting_PostsThought is the GEO-62
+// regression: a thread-reply (or @mention) with no recognized /command
+// arriving while the task is mid-flight must post a Thought activity,
+// NOT an ErrorActivity. ErrorActivity would terminate the live
+// AgentSession in Linear and stop the running flow's progress posts
+// from landing.
+func TestDispatch_BareCommentWhileExecuting_PostsThought(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:  "issue-busy-bare",
+			State:    store.JobStateExecuting,
+			AttemptN: 1,
+		},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-busy-bare",
+		IssueID:         "issue-busy-bare",
+		IssueIdentifier: "BUSY-BARE-1",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "hey what's up", // no /command
+	}
+
+	o.HandleAgentEvent(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "does not respond to bare @mentions") {
+		t.Errorf("expected bare-mention help text, got: %s", body)
+	}
+	if mlc.PostedActivity.Type != linear.ActivityThought {
+		t.Errorf("bare-mention-while-busy must post ActivityThought (non-terminal), got %q", mlc.PostedActivity.Type)
 	}
 }
 
