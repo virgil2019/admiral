@@ -93,6 +93,10 @@ type Orchestrator struct {
 	// workflowStatesByTeam caches workflow states per team, keyed by teamID.
 	workflowStatesByTeam map[string][]linear.WorkflowState
 	workflowStatesMu     sync.Mutex
+
+	// ciWatcher polls GitHub check runs after a PR is opened and reports
+	// results back into the Linear thread (GEO-54).
+	ciWatcher *CIWatcher
 }
 
 func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
@@ -110,6 +114,8 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		logger:   logger,
 		ghUser:   cfg.GhUser,
 		runSlots: make(chan struct{}, slots),
+		ciWatcher: newCIWatcher(lc, db, logger, cfg.GhBin,
+			cfg.CIWatchPollInterval, cfg.CIWatchTimeout),
 	}
 	// Ensure job_streams_dir exists on startup.
 	if err := os.MkdirAll(cfg.JobStreamsDir, 0o755); err != nil {
@@ -801,6 +807,13 @@ func (f *flow) execute() error {
 		t.ClaudeSessionID = f.claudeSessionID
 		t.FinishedAt = now
 	})
+
+	// Spawn CI watcher (non-blocking). Watches GitHub check runs and posts
+	// results to Linear thread. On failure, transitions admiral_tasks to
+	// FAILED with reason "ci_failed" (GEO-54).
+	if !isNoop && prURL != "" && f.o.ciWatcher != nil {
+		f.o.ciWatcher.WatchPR(f.ctx, prURL, f.repoDir, f.ev.SessionID, f.ev.IssueID)
+	}
 
 	mention := f.creatorMention()
 	var doneBody string
