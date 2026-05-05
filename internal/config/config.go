@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -116,6 +117,12 @@ type Autopilot struct {
 	// UpdateIssueStatus controls whether admiral updates Linear issue workflow
 	// state on task lifecycle (Backlog → Started → Completed). Default: true.
 	UpdateIssueStatus *bool `yaml:"update_issue_status"`
+	// CIWatchPollInterval is how often CI watcher polls GitHub check runs.
+	// Default: 30s.
+	CIWatchPollInterval time.Duration `yaml:"ci_watch_poll_interval"`
+	// CIWatchTimeout is how long CI watcher waits for all checks to complete.
+	// Default: 15m.
+	CIWatchTimeout time.Duration `yaml:"ci_watch_timeout"`
 	// Repos is the list of Linear project → repo mappings. Required: must
 	// contain at least one entry. An incoming Linear issue is routed to the
 	// repo whose project_id matches issue.project.id; issues without a
@@ -321,6 +328,12 @@ func (c *Config) validateAutopilotAndExpand() error {
 	if c.Autopilot.UpdateIssueStatus == nil {
 		trueVal := true
 		c.Autopilot.UpdateIssueStatus = &trueVal
+	}
+	if c.Autopilot.CIWatchPollInterval <= 0 {
+		c.Autopilot.CIWatchPollInterval = 30 * time.Second
+	}
+	if c.Autopilot.CIWatchTimeout <= 0 {
+		c.Autopilot.CIWatchTimeout = 15 * time.Minute
 	}
 
 	c.Storage.SQLitePath = expandTilde(c.Storage.SQLitePath)
