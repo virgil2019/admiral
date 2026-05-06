@@ -19,7 +19,7 @@
 
   <h2>Add Repo</h2>
   <form hx-post="/admin/repos" hx-target="#repos-table" hx-swap="innerHTML" class="add-repo-form">
-    <select name="team_id" required hx-get="/admin/ui/_partial/linear_projects_options" hx-trigger="load" hx-swap="innerHTML">
+    <select name="team_id" required hx-get="/admin/ui/_partial/linear_projects_options" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
       <option value="">Loading projects…</option>
     </select>
     <input name="repo_dir" placeholder="/path/to/repo" required>
