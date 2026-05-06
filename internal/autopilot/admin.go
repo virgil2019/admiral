@@ -5,6 +5,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -116,6 +117,21 @@ type testCloneResponse struct {
 
 func newAdminServer(db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken string) *adminServer {
 	return &adminServer{db: db, lc: lc, ghBin: ghBin, logger: logger, start: time.Now(), workers: workers, adminToken: adminToken}
+}
+
+// projectFilterCookie is the name of the cookie that scopes the admin UI
+// (repos table + jobs lists) to a single Linear project. Empty value or
+// missing cookie means "all projects".
+const projectFilterCookie = "admiral_project"
+
+// projectFilter returns the project_id selected by the admin UI's project
+// switcher. Empty string means no filter.
+func projectFilter(r *http.Request) string {
+	c, err := r.Cookie(projectFilterCookie)
+	if err != nil || c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.Value)
 }
 
 // --- Read handlers ---
@@ -276,13 +292,27 @@ func (s *adminServer) createRepoHandler(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	// htmx posts the add-repo form as application/x-www-form-urlencoded; the
+	// JSON path is kept for direct API callers.
+	isForm := strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded")
 	var req createRepoRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
-		return
+	if isForm {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+			return
+		}
+		req.TeamID = r.Form.Get("team_id")
+		req.TeamName = r.Form.Get("team_name")
+		req.RepoDir = r.Form.Get("repo_dir")
+		req.BaseBranch = r.Form.Get("base_branch")
+	} else {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+			return
+		}
 	}
-	if strings.TrimSpace(req.TeamID) == "" || strings.TrimSpace(req.TeamName) == "" || strings.TrimSpace(req.RepoDir) == "" {
-		http.Error(w, `{"error":"team_id, team_name, and repo_dir are required"}`, http.StatusBadRequest)
+	if strings.TrimSpace(req.TeamID) == "" || strings.TrimSpace(req.RepoDir) == "" {
+		http.Error(w, `{"error":"team_id and repo_dir are required"}`, http.StatusBadRequest)
 		return
 	}
 	baseBranch := req.BaseBranch
@@ -296,16 +326,24 @@ func (s *adminServer) createRepoHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Validate team_id exists in Linear (if lc is available)
+	// Validate team_id exists in Linear (if lc is available); reuse the
+	// returned project name when the caller didn't supply one (form path).
 	if s.lc != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
-		_, err := s.lc.GetProject(ctx, req.TeamID)
+		proj, err := s.lc.GetProject(ctx, req.TeamID)
 		if err != nil {
 			s.logger.Warn("create_repo_linear_validation_failed", "team_id", req.TeamID, "err", err)
 			http.Error(w, `{"error":"invalid team_id (project not found in Linear)"}`, http.StatusBadRequest)
 			return
 		}
+		if strings.TrimSpace(req.TeamName) == "" && proj != nil {
+			req.TeamName = proj.Name
+		}
+	}
+	if strings.TrimSpace(req.TeamName) == "" {
+		http.Error(w, `{"error":"team_name is required (Linear lookup unavailable)"}`, http.StatusBadRequest)
+		return
 	}
 
 	repo := store.Repo{
@@ -320,10 +358,134 @@ func (s *adminServer) createRepoHandler(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
+	if isForm {
+		// htmx swap target is the repos table; respond with the same fragment
+		// so the new row appears immediately.
+		s.reposTableHandler(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(createRepoResponse{TeamID: req.TeamID})
 }
+
+// listLinearProjectsHandler returns all Linear projects as JSON for the
+// add-repo form's project picker.
+func (s *adminServer) listLinearProjectsHandler(w http.ResponseWriter, r *http.Request) {
+	if s.lc == nil {
+		http.Error(w, `{"error":"linear client not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	projects, err := s.lc.ListProjects(ctx)
+	if err != nil {
+		s.logger.Warn("admin_list_linear_projects_failed", "err", err)
+		http.Error(w, `{"error":"linear list_projects failed"}`, http.StatusBadGateway)
+		return
+	}
+	type projOut struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	out := make([]projOut, 0, len(projects))
+	for _, p := range projects {
+		out = append(out, projOut{ID: p.ID, Name: p.Name})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+// selectProjectHandler writes the project filter cookie from a form POST and
+// redirects back to the page that submitted (or the dashboard).
+func (s *adminServer) selectProjectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	projectID := strings.TrimSpace(r.Form.Get("project_id"))
+	cookie := &http.Cookie{
+		Name:     projectFilterCookie,
+		Value:    projectID,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}
+	if projectID == "" {
+		// "All projects": clear the cookie.
+		cookie.MaxAge = -1
+	} else {
+		cookie.MaxAge = 30 * 24 * 60 * 60
+	}
+	http.SetCookie(w, cookie)
+	dest := r.Header.Get("Referer")
+	if dest == "" {
+		dest = "/admin/ui/"
+	}
+	// htmx follows the redirect via HX-Redirect for full-page reload, which
+	// re-runs every partial against the new cookie.
+	if r.Header.Get("HX-Request") == "true" {
+		w.Header().Set("HX-Redirect", dest)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	http.Redirect(w, r, dest, http.StatusSeeOther)
+}
+
+// projectSwitcherHandler returns the global project-switcher select element,
+// scoped to currently-configured projects (one per repo row).
+func (s *adminServer) projectSwitcherHandler(w http.ResponseWriter, r *http.Request) {
+	repos, _ := s.db.ListRepos()
+	current := projectFilter(r)
+	w.Header().Set("Content-Type", "text/html")
+	var b strings.Builder
+	b.WriteString(`<form class="project-switcher" hx-post="/admin/ui/select_project" hx-trigger="change">`)
+	b.WriteString(`<label>Project: <select name="project_id">`)
+	selAll := ""
+	if current == "" {
+		selAll = " selected"
+	}
+	fmt.Fprintf(&b, `<option value=""%s>All projects</option>`, selAll)
+	for _, repo := range repos {
+		sel := ""
+		if repo.ProjectID == current {
+			sel = " selected"
+		}
+		fmt.Fprintf(&b, `<option value="%s"%s>%s</option>`, html.EscapeString(repo.ProjectID), sel, html.EscapeString(repo.ProjectName))
+	}
+	b.WriteString(`</select></label></form>`)
+	w.Write([]byte(b.String()))
+}
+
+// linearProjectsOptionsHandler returns <option> tags for the add-repo form,
+// pulling from Linear directly. Errors render as a single disabled option so
+// the form stays usable for the rare case the user has no Linear access.
+func (s *adminServer) linearProjectsOptionsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	if s.lc == nil {
+		w.Write([]byte(`<option value="" disabled>Linear not configured</option>`))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	projects, err := s.lc.ListProjects(ctx)
+	if err != nil {
+		s.logger.Warn("admin_options_linear_failed", "err", err)
+		w.Write([]byte(`<option value="" disabled>Failed to load Linear projects</option>`))
+		return
+	}
+	var b strings.Builder
+	b.WriteString(`<option value="">— select a project —</option>`)
+	for _, p := range projects {
+		fmt.Fprintf(&b, `<option value="%s">%s</option>`, html.EscapeString(p.ID), html.EscapeString(p.Name))
+	}
+	w.Write([]byte(b.String()))
+}
+
 
 func (s *adminServer) updateRepoHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPatch {
@@ -632,7 +794,7 @@ func (s *adminServer) loadCardHandler(w http.ResponseWriter, r *http.Request) {
 
 // recentJobsHandler returns the 5 most recent jobs HTML fragment.
 func (s *adminServer) recentJobsHandler(w http.ResponseWriter, r *http.Request) {
-	jobs, _ := s.db.ListAutopilotJobs("", "", nil, 5)
+	jobs, _ := s.db.ListAutopilotJobsByProject(projectFilter(r), "", "", nil, 5)
 	w.Header().Set("Content-Type", "text/html")
 	if len(jobs) == 0 {
 		w.Write([]byte(`<p>No jobs yet.</p>`))
@@ -650,7 +812,18 @@ func (s *adminServer) recentJobsHandler(w http.ResponseWriter, r *http.Request) 
 
 // reposTableHandler returns the repos table HTML fragment.
 func (s *adminServer) reposTableHandler(w http.ResponseWriter, r *http.Request) {
-	repos, _ := s.db.ListRepos()
+	all, _ := s.db.ListRepos()
+	filter := projectFilter(r)
+	var repos []store.Repo
+	if filter == "" {
+		repos = all
+	} else {
+		for _, repo := range all {
+			if repo.ProjectID == filter {
+				repos = append(repos, repo)
+			}
+		}
+	}
 	w.Header().Set("Content-Type", "text/html")
 	if len(repos) == 0 {
 		w.Write([]byte(`<p>No repos configured.</p>`))
@@ -682,7 +855,7 @@ func (s *adminServer) jobsTableHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	status := r.Form.Get("status")
 	teamID := r.Form.Get("team_id")
-	jobs, _ := s.db.ListAutopilotJobs(status, teamID, nil, 100)
+	jobs, _ := s.db.ListAutopilotJobsByProject(projectFilter(r), status, teamID, nil, 100)
 	w.Header().Set("Content-Type", "text/html")
 	if len(jobs) == 0 {
 		w.Write([]byte(`<p>No jobs found.</p>`))
@@ -808,7 +981,11 @@ func (s *adminServer) serveMux() *http.ServeMux {
 	mux.HandleFunc("/admin/ui/_partial/repos_table", s.reposTableHandler)
 	mux.HandleFunc("/admin/ui/_partial/jobs_table", s.jobsTableHandler)
 	mux.HandleFunc("/admin/ui/_partial/job_detail/", s.jobDetailHandler)
+	mux.HandleFunc("/admin/ui/_partial/project_switcher", s.projectSwitcherHandler)
+	mux.HandleFunc("/admin/ui/_partial/linear_projects_options", s.linearProjectsOptionsHandler)
+	mux.HandleFunc("/admin/ui/select_project", s.selectProjectHandler)
 	// API routes
+	mux.HandleFunc("/admin/linear/projects", s.listLinearProjectsHandler)
 	mux.HandleFunc("/admin/repos", s.reposDispatchHandler)
 	mux.HandleFunc("/admin/repos/", s.reposDispatchHandler)
 	mux.HandleFunc("/admin/jobs", s.listJobsHandler)

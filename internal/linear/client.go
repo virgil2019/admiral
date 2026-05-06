@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -448,6 +449,38 @@ func (c *Client) GetProject(ctx context.Context, id string) (*Project, error) {
 type Project struct {
 	ID   string
 	Name string
+}
+
+// ListProjects returns up to 250 Linear projects ordered by name. Used by the
+// admin UI to populate the project picker when adding a repo.
+func (c *Client) ListProjects(ctx context.Context) ([]Project, error) {
+	const query = `query Projects {
+  projects(first: 250) {
+    nodes {
+      id
+      name
+    }
+  }
+}`
+	var data struct {
+		Projects struct {
+			Nodes []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"nodes"`
+		} `json:"projects"`
+	}
+	if err := c.do(ctx, graphQLRequest{Query: query}, &data); err != nil {
+		return nil, err
+	}
+	out := make([]Project, 0, len(data.Projects.Nodes))
+	for _, n := range data.Projects.Nodes {
+		out = append(out, Project{ID: n.ID, Name: n.Name})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+	})
+	return out, nil
 }
 
 const issueUpdateMutation = `mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {

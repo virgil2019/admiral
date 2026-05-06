@@ -710,6 +710,61 @@ func (s *Store) ListJobsByIssueAndStates(issueID string, states []string) ([]Aut
 	return out, rows.Err()
 }
 
+// ListAutopilotJobsByProject returns jobs whose worktree_path lives under the
+// repo_dir of the given project_id. The link relies on the default config
+// (worktree_root relative to repo_dir, so worktrees nest under repo_dir/) —
+// callers that configure an absolute worktree_root will see no jobs match.
+// projectID == "" is treated as no filter and behaves like ListAutopilotJobs.
+func (s *Store) ListAutopilotJobsByProject(projectID, status, issueID string, since *time.Time, limit int) ([]AutopilotJob, error) {
+	if projectID == "" {
+		return s.ListAutopilotJobs(status, issueID, since, limit)
+	}
+	query := `
+		SELECT j.agent_session_id, j.issue_id, j.issue_identifier, j.state,
+		       COALESCE(j.worktree_path,''), COALESCE(j.branch,''),
+		       COALESCE(j.pr_url,''), COALESCE(j.error,''),
+		       j.started_at, COALESCE(j.finished_at,''),
+		       COALESCE(j.stream_log_path,''),
+		       COALESCE(j.claude_session_id,'')
+		FROM autopilot_jobs j
+		JOIN repos r ON j.worktree_path LIKE rtrim(r.repo_dir, '/') || '/%'
+		WHERE r.project_id=?`
+	args := []any{projectID}
+	if status != "" {
+		query += " AND j.state=?"
+		args = append(args, status)
+	}
+	if issueID != "" {
+		query += " AND j.issue_id=?"
+		args = append(args, issueID)
+	}
+	if since != nil {
+		query += " AND j.started_at>=?"
+		args = append(args, since.UTC().Format(time.RFC3339))
+	}
+	query += " ORDER BY j.started_at DESC"
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AutopilotJob
+	for rows.Next() {
+		var j AutopilotJob
+		if err := rows.Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+			&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+			&j.StreamLogPath, &j.ClaudeSessionID); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 // ListAutopilotJobs returns jobs matching the given filters, ordered by started_at desc.
 func (s *Store) ListAutopilotJobs(status, issueID string, since *time.Time, limit int) ([]AutopilotJob, error) {
 	query := `
