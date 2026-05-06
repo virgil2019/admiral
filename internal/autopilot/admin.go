@@ -292,13 +292,16 @@ func (s *adminServer) createRepoHandler(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
-	// htmx posts the add-repo form as application/x-www-form-urlencoded; the
-	// JSON path is kept for direct API callers.
-	isForm := strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded")
+	// htmx posts the add-repo form; the JSON path is kept for direct API
+	// callers. Detect via the HX-Request header (htmx always sets it) rather
+	// than Content-Type, which can vary by browser/proxy.
+	isForm := r.Header.Get("HX-Request") == "true" ||
+		strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") ||
+		strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data")
 	var req createRepoRequest
 	if isForm {
 		if err := r.ParseForm(); err != nil {
-			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+			http.Error(w, `{"error":"parse form failed"}`, http.StatusBadRequest)
 			return
 		}
 		req.TeamID = r.Form.Get("team_id")
@@ -307,7 +310,7 @@ func (s *adminServer) createRepoHandler(w http.ResponseWriter, r *http.Request) 
 		req.BaseBranch = r.Form.Get("base_branch")
 	} else {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+			http.Error(w, `{"error":"bad json body"}`, http.StatusBadRequest)
 			return
 		}
 	}
