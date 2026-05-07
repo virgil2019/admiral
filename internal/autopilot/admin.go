@@ -1000,7 +1000,12 @@ func (s *adminServer) serveMux() *http.ServeMux {
 
 // reposDispatchHandler dispatches all /admin/repos/* requests.
 func (s *adminServer) reposDispatchHandler(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/admin/repos/")
+	// Strip "/admin/repos" first (handles bare /admin/repos), then a leading
+	// "/" if present (handles /admin/repos/<id>). The earlier single-step
+	// TrimPrefix("/admin/repos/") missed the no-trailing-slash form and
+	// routed POST /admin/repos straight into the malformed-path branch.
+	path := strings.TrimPrefix(r.URL.Path, "/admin/repos")
+	path = strings.TrimPrefix(path, "/")
 	// path is now "" (for GET/POST /admin/repos), or "<projectID>", or "<projectID>/<sub>"
 	if path == "" {
 		// /admin/repos/ — list (GET) or create (POST)
