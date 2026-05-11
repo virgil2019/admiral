@@ -143,7 +143,13 @@ func isTransientNetErr(err error) bool {
 	}
 	return errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, context.Canceled) ||
-		errors.Is(err, io.ErrUnexpectedEOF)
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		// io.EOF surfaces when the Go HTTP transport reuses a pooled
+		// keep-alive connection that the server has already closed; the
+		// next request reads back zero bytes. Retrying on a fresh conn
+		// almost always succeeds and matches what curl/browsers do
+		// transparently.
+		errors.Is(err, io.EOF)
 }
 
 func (c *Client) do(ctx context.Context, req graphQLRequest, out any) error {
