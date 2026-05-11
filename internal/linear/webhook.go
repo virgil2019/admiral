@@ -231,6 +231,15 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		} else if p.Data != nil && p.Data.AgentActivity != nil {
 			ev.UserMessage = p.Data.AgentActivity.Body
 		}
+		if ev.UserMessage == "" {
+			// Diagnostic: Linear should carry the user's follow-up text in
+			// agentActivity.body, but observed deliveries sometimes elide it
+			// or stash it under a different key. Dump the raw payload once
+			// so we can see what Linear actually sent.
+			w.logger.Warn("linear_webhook_prompted_empty_body",
+				"session", session.ID,
+				"raw_body", string(body))
+		}
 	}
 
 	if w.store == nil && w.onAgent == nil {
