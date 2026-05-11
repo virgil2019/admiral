@@ -273,6 +273,8 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 		o.dispatchRerun(ev, task, remainder)
 	case "fix":
 		o.dispatchFix(ev, task, remainder)
+	case "resume":
+		o.dispatchResume(ev, task)
 	case "status", "help":
 		o.handleCommand(ev, cmdName)
 	default:
@@ -512,6 +514,119 @@ func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 	o.logger.Info("autopilot_fix_done",
 		"issue", ev.IssueIdentifier, "session", ev.SessionID,
 		"pr", task.PRURL, "attempt_n", task.AttemptN)
+}
+
+// dispatchResume handles /resume on an existing admiral_tasks row. Only
+// TIMED_OUT is supported — the command exists to continue a run that was
+// killed by the per-task timeout, not to retry FAILED or rerun DONE.
+//
+// Requires task.ClaudeSessionID populated (admiral writes it before launching
+// claude, so any timed-out task will have it) and the prior worktree still on
+// disk. The branch may or may not have an associated PR — /resume creates one
+// after claude finishes if the timed-out run died before it could.
+func (o *Orchestrator) dispatchResume(ev linear.AgentEvent, task *store.AdmiralTask) {
+	switch task.State {
+	case store.JobStateReceived, store.JobStateExecuting:
+		o.logger.Info("dispatch_reject_resume_currently_processing",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier,
+			"prior_state", task.State, "attempt_n", task.AttemptN)
+		o.postBusyAck(ev.SessionID, fmt.Sprintf(
+			"admiral is currently running on this issue (attempt %d). Wait for it to finish before /resume.",
+			task.AttemptN))
+		return
+	case store.JobStateTimedOut:
+		// proceed
+	default:
+		o.replyRejection(ev.SessionID, task.State, fmt.Sprintf(
+			"/resume only works on a TIMED_OUT task. Current state is %q. Use /rerun to start over or /fix <description> to patch the current PR.",
+			task.State))
+		return
+	}
+
+	if task.ClaudeSessionID == "" {
+		o.logger.Info("dispatch_reject_resume_no_session",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postRejection(ev.SessionID,
+			"/resume needs a recoverable claude session id, but this task has none. Use /rerun to start over.")
+		return
+	}
+	if task.WorktreePath == "" {
+		o.logger.Info("dispatch_reject_resume_no_worktree_path",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postRejection(ev.SessionID,
+			"/resume needs the worktree from the prior run, but this task has none. Use /rerun to start over.")
+		return
+	}
+	if _, err := os.Stat(task.WorktreePath); err != nil {
+		o.logger.Info("dispatch_reject_resume_worktree_missing",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier,
+			"worktree", task.WorktreePath, "err", err)
+		o.postRejection(ev.SessionID,
+			"/resume needs the prior worktree on disk, but it was cleaned up. Use /rerun to start over.")
+		return
+	}
+
+	o.logger.Info("dispatch_resume_starting",
+		"session", ev.SessionID, "issue", ev.IssueIdentifier,
+		"prior_pr", task.PRURL, "attempt_n", task.AttemptN)
+
+	go o.runResume(ev, task)
+}
+
+// runResume executes a /resume run: claude --resume on the prior session id
+// inside the existing worktree, then opens (or reuses) a PR. Reuses the
+// existing admiral_tasks row — attempt_n is unchanged because /resume is
+// a continuation of the same attempt, not a new one.
+func (o *Orchestrator) runResume(ev linear.AgentEvent, task *store.AdmiralTask) {
+	release := o.acquireRunSlot()
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
+	defer cancel()
+
+	if _, err := o.db.ClaimAutopilotJob(ev.SessionID, ev.IssueID, ev.IssueIdentifier); err != nil {
+		o.logger.Warn("claim_resume_audit_log_failed",
+			"err", err, "session", ev.SessionID)
+	}
+
+	if err := o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+		t.State = store.JobStateExecuting
+		t.LastEventSessionID = ev.SessionID
+	}); err != nil {
+		o.logger.Warn("resume_admiral_task_to_executing_failed",
+			"err", err, "issue", ev.IssueID)
+	}
+
+	syntheticPrior := &store.AutopilotJob{
+		AgentSessionID:  task.LastEventSessionID,
+		IssueID:         task.IssueID,
+		IssueIdentifier: task.IssueIdentifier,
+		State:           store.JobStateTimedOut,
+		WorktreePath:    task.WorktreePath,
+		Branch:          task.Branch,
+		PRURL:           task.PRURL,
+		ClaudeSessionID: task.ClaudeSessionID,
+	}
+	resumeFlow := newResumeFlow(o, ctx, ev, syntheticPrior)
+	if issue, err := o.lc.GetIssue(ctx, ev.IssueID); err == nil {
+		resumeFlow.teamID = issue.TeamID
+		if repo, err := o.db.GetRepoByProjectID(issue.ProjectID); err == nil && repo != nil {
+			resumeFlow.repoDir = repo.RepoDir
+			resumeFlow.baseBranch = repo.BaseBranch
+		}
+	}
+
+	if err := resumeFlow.executeResumeFromTimeout(); err != nil {
+		o.logger.Error("autopilot_resume_failed",
+			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
+		resumeFlow.markFailed(err)
+		return
+	}
+
+	o.logger.Info("autopilot_resume_done",
+		"issue", ev.IssueIdentifier, "session", ev.SessionID,
+		"pr", resumeFlow.prURL, "attempt_n", task.AttemptN)
 }
 
 func followupSuffix(sessionID string) string {
@@ -916,6 +1031,93 @@ func (f *flow) executeResume() error {
 		j.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 	}); err != nil {
 		return fmt.Errorf("update job to DONE: %w", err)
+	}
+
+	f.cleanupWorktree(cleanupDelete)
+	return nil
+}
+
+// executeResumeFromTimeout continues a timed-out claude session in its
+// original worktree, then opens (or reuses) a PR. Mirrors execute()'s
+// post-claude path but skips fresh-worktree setup — the timed-out attempt
+// already created one, and dispatchResume guarantees it's still on disk.
+func (f *flow) executeResumeFromTimeout() error {
+	f.postActivity(linear.Thought("Resuming previous timed-out session...", true))
+
+	issue, err := f.o.lc.GetIssue(f.ctx, f.ev.IssueID)
+	if err != nil {
+		return fmt.Errorf("fetch issue: %w", err)
+	}
+	f.teamID = issue.TeamID
+	if f.repoDir == "" {
+		repo, err := f.o.db.GetRepoByProjectID(issue.ProjectID)
+		if err != nil || repo == nil {
+			return fmt.Errorf("repo lookup failed for project %s: %w", issue.ProjectID, err)
+		}
+		f.repoDir = repo.RepoDir
+		f.baseBranch = repo.BaseBranch
+	}
+
+	if err := f.ensureWorktree(); err != nil {
+		return fmt.Errorf("ensure worktree: %w", err)
+	}
+
+	f.postActivity(linear.Action("claude_resume",
+		fmt.Sprintf("claude -p --resume in %s", f.worktreePath),
+		""))
+	if err := f.openStreamFile(); err != nil {
+		return fmt.Errorf("open stream file: %w", err)
+	}
+	defer f.closeStreamFile()
+
+	// A non-empty prompt cues claude to continue rather than wait for input.
+	// The actual continuation context lives in the resumed session itself.
+	if err := f.runClaudeResume("Continue from where the previous run was interrupted by timeout."); err != nil {
+		return fmt.Errorf("claude resume: %w", err)
+	}
+
+	f.postActivity(linear.Action("ensure_pr",
+		fmt.Sprintf("gh pr (%s -> %s)", f.branch, f.baseBranch),
+		""))
+	prURL, err := f.ensurePR(issue)
+	isNoop := errors.Is(err, errPRNoCommits)
+	if err != nil && !isNoop {
+		return fmt.Errorf("ensure PR: %w", err)
+	}
+	f.prURL = prURL
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateDone
+		j.PRURL = prURL
+		j.FinishedAt = now
+	}); err != nil {
+		return fmt.Errorf("update job to DONE: %w", err)
+	}
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateDone
+		t.PRURL = prURL
+		t.FinishedAt = now
+	})
+
+	if !isNoop && prURL != "" && f.o.ciWatcher != nil {
+		f.o.ciWatcher.WatchPR(f.ctx, prURL, f.repoDir, f.ev.SessionID, f.ev.IssueID)
+	}
+
+	mention := f.creatorMention()
+	var doneBody string
+	if isNoop {
+		doneBody = fmt.Sprintf(
+			"%sResumed from timeout but produced no new diff.\n\nWorktree: `%s`\nBranch: `%s`",
+			mention, f.worktreePath, f.branch)
+	} else {
+		doneBody = fmt.Sprintf(
+			"%sResumed from timeout. PR: %s\n\nWorktree: `%s`\nBranch: `%s`",
+			mention, prURL, f.worktreePath, f.branch)
+	}
+	if err := f.postActivityWithRetry(linear.Response(doneBody)); err != nil {
+		f.o.logger.Error("final_activity_push_failed",
+			"session", f.ev.SessionID, "err", err)
 	}
 
 	f.cleanupWorktree(cleanupDelete)
@@ -1991,7 +2193,8 @@ func parseMentionCommand(text string) (name, remainder string, ok bool) {
 // mentionCommandHelp is the reply sent when a bare @mention is rejected.
 const mentionCommandHelp = `admiral does not respond to bare @mentions. Use one of:
   /rerun <optional notes>     — start over from scratch on this issue
-  /fix <description>          — patch the previous run on the existing PR with these notes`
+  /fix <description>          — patch the previous run on the existing PR with these notes
+  /resume                     — continue a TIMED_OUT run from where it stopped (same session, same worktree)`
 
 // assignFirstHelp is the reply sent when admiral receives an @mention
 // or thread-prompted event for an issue it has never seen before. The
