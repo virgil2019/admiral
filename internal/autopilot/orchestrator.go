@@ -1194,6 +1194,9 @@ func (f *flow) runClaudeResume(userMessage string) error {
 	}()
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
+		if cctx.Err() != nil {
+			return fmt.Errorf("claude exit: %w: %w", err, context.DeadlineExceeded)
+		}
 		return fmt.Errorf("claude exit: %w", err)
 	}
 	return nil
@@ -1696,6 +1699,9 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	}()
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
+		if cctx.Err() != nil {
+			return fmt.Errorf("claude exit: %w: %w", err, context.DeadlineExceeded)
+		}
 		return fmt.Errorf("claude exit: %w", err)
 	}
 	return nil
