@@ -105,7 +105,26 @@ type rawAgentSession struct {
 }
 
 type rawAgentActivity struct {
-	Body string `json:"body"`
+	// Linear's current schema nests the user's prompt under
+	// agentActivity.content.body (with content.type="prompt"). The legacy
+	// top-level Body is kept for back-compat with older test fixtures.
+	Body    string `json:"body"`
+	Content *struct {
+		Type string `json:"type"`
+		Body string `json:"body"`
+	} `json:"content"`
+}
+
+// userBody returns the user's prompt text, preferring the nested content.body
+// (current Linear schema) and falling back to the legacy top-level body.
+func (a *rawAgentActivity) userBody() string {
+	if a == nil {
+		return ""
+	}
+	if a.Content != nil && a.Content.Body != "" {
+		return a.Content.Body
+	}
+	return a.Body
 }
 
 // Webhook is the HTTP receiver. Mount Handler at /webhook (matches Linear's
@@ -227,18 +246,9 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		ev.PromptContext = firstNonEmpty(p.PromptContext, dataPromptContext(p))
 	case ActionPrompted:
 		if p.AgentActivity != nil {
-			ev.UserMessage = p.AgentActivity.Body
+			ev.UserMessage = p.AgentActivity.userBody()
 		} else if p.Data != nil && p.Data.AgentActivity != nil {
-			ev.UserMessage = p.Data.AgentActivity.Body
-		}
-		if ev.UserMessage == "" {
-			// Diagnostic: Linear should carry the user's follow-up text in
-			// agentActivity.body, but observed deliveries sometimes elide it
-			// or stash it under a different key. Dump the raw payload once
-			// so we can see what Linear actually sent.
-			w.logger.Warn("linear_webhook_prompted_empty_body",
-				"session", session.ID,
-				"raw_body", string(body))
+			ev.UserMessage = p.Data.AgentActivity.userBody()
 		}
 	}
 

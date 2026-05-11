@@ -169,6 +169,32 @@ func TestWebhook_AgentSessionPrompted_CarriesUserMessage(t *testing.T) {
 	}
 }
 
+func TestWebhook_AgentSessionPrompted_CarriesContentBody(t *testing.T) {
+	// Current Linear schema nests the user's prompt under
+	// agentActivity.content.body — see GEO-65 webhook capture.
+	var (
+		wg  sync.WaitGroup
+		got AgentEvent
+	)
+	wg.Add(1)
+	w := newTestWebhook(t, func(e AgentEvent) { got = e; wg.Done() })
+	body := []byte(`{
+		"type":"AgentSessionEvent",
+		"action":"prompted",
+		"agentSession":{"id":"sess-3b","issue":{"id":"issue-3b","identifier":"TST-3B","title":"x"}},
+		"agentActivity":{"content":{"type":"prompt","body":"/rerun"}}
+	}`)
+	sig := SignBody([]byte("test-secret"), body)
+	rec := post(t, w, body, sig)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: %d", rec.Code)
+	}
+	waitWithTimeout(t, &wg, time.Second)
+	if got.UserMessage != "/rerun" {
+		t.Errorf("userMessage: %q", got.UserMessage)
+	}
+}
+
 func TestWebhook_AgentSession_DataEnvelope_Tolerated(t *testing.T) {
 	// Some Linear deliveries nest under data.* — agent.ts handles both
 	// shapes and so do we.
