@@ -530,3 +530,133 @@ func TestClaim_ConcurrentSameSession(t *testing.T) {
 		t.Fatalf("claim after done: expected sess-same, got %v", row4)
 	}
 }
+
+// openWithAllMigrations opens an in-memory DB and runs the production
+// migration applier so schema_migrations stays consistent with prod.
+// New tests that touch columns added after 0005 should use this instead
+// of the legacy migration0001..0005 inline sequence.
+func openWithAllMigrations(t *testing.T) (*sql.DB, *Store) {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := applyMigrations(db); err != nil {
+		t.Fatalf("applyMigrations: %v", err)
+	}
+	return db, NewForTest(db)
+}
+
+func TestEnqueueEventWithSource_Fresh(t *testing.T) {
+	db, s := openWithAllMigrations(t)
+
+	fresh, err := s.EnqueueEventWithSource("github", "wh-gh-1", "review_submitted",
+		"https://github.com/x/y/pull/1", "issue-1", `{"foo":"bar"}`, "rc-100")
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if !fresh {
+		t.Error("expected fresh=true on first insert")
+	}
+	var source string
+	if err := db.QueryRow(`SELECT source FROM events_inbox WHERE webhook_id='wh-gh-1'`).Scan(&source); err != nil {
+		t.Fatalf("query source: %v", err)
+	}
+	if source != "github" {
+		t.Errorf("source: got %q, want 'github'", source)
+	}
+}
+
+func TestEnqueueEventWithSource_DedupByWebhookID(t *testing.T) {
+	_, s := openWithAllMigrations(t)
+
+	if _, err := s.EnqueueEventWithSource("github", "wh-same", "review_submitted",
+		"sess-1", "issue-1", `{}`, "rc-1"); err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	// Same webhook_id, different comment_id — primary dedup still fires.
+	fresh, err := s.EnqueueEventWithSource("github", "wh-same", "review_comment_created",
+		"sess-1", "issue-1", `{}`, "rc-2")
+	if err != nil {
+		t.Fatalf("second enqueue: %v", err)
+	}
+	if fresh {
+		t.Error("expected fresh=false on duplicate webhook_id")
+	}
+}
+
+func TestEnqueueEventWithSource_DedupByCommentID(t *testing.T) {
+	_, s := openWithAllMigrations(t)
+
+	if _, err := s.EnqueueEventWithSource("github", "wh-a", "review_comment_created",
+		"sess-1", "issue-1", `{}`, "rc-shared"); err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	// Different webhook_id but same (source, comment_id) — the partial
+	// unique index rejects the second.
+	fresh, err := s.EnqueueEventWithSource("github", "wh-b", "review_comment_created",
+		"sess-1", "issue-1", `{}`, "rc-shared")
+	if err != nil {
+		t.Fatalf("second enqueue: %v", err)
+	}
+	if fresh {
+		t.Error("expected fresh=false on duplicate (source, comment_id)")
+	}
+}
+
+func TestEnqueueEventWithSource_CrossSourceCommentDoesNotCollide(t *testing.T) {
+	_, s := openWithAllMigrations(t)
+
+	fresh1, err := s.EnqueueEventWithSource("linear", "wh-l", "issueComment",
+		"sess-1", "issue-1", `{}`, "shared-id")
+	if err != nil {
+		t.Fatalf("linear enqueue: %v", err)
+	}
+	fresh2, err := s.EnqueueEventWithSource("github", "wh-g", "review_comment_created",
+		"sess-2", "issue-2", `{}`, "shared-id")
+	if err != nil {
+		t.Fatalf("github enqueue: %v", err)
+	}
+	if !fresh1 || !fresh2 {
+		t.Errorf("expected both fresh=true across sources, got linear=%v github=%v", fresh1, fresh2)
+	}
+}
+
+func TestEnqueueEventWithSource_EmptyCommentID_NoDedup(t *testing.T) {
+	_, s := openWithAllMigrations(t)
+
+	fresh1, err := s.EnqueueEventWithSource("github", "wh-a", "pull_request_review",
+		"sess-1", "issue-1", `{}`, "")
+	if err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	// Different webhook_id, empty comment_id on both — NULL is excluded
+	// from the partial unique index, so the second row inserts cleanly.
+	fresh2, err := s.EnqueueEventWithSource("github", "wh-b", "pull_request_review",
+		"sess-1", "issue-1", `{}`, "")
+	if err != nil {
+		t.Fatalf("second enqueue: %v", err)
+	}
+	if !fresh1 || !fresh2 {
+		t.Errorf("expected both fresh=true with NULL comment_id, got a=%v b=%v", fresh1, fresh2)
+	}
+}
+
+// TestEnqueueEvent_LegacyTagsAsLinear verifies the v1 EnqueueEvent path
+// continues to insert rows that default to source='linear'. This is the
+// backwards-compat contract for existing Linear webhook handlers.
+func TestEnqueueEvent_LegacyTagsAsLinear(t *testing.T) {
+	db, s := openWithAllMigrations(t)
+
+	if _, err := s.EnqueueEvent("wh-legacy", "issueComment", "sess-1", "issue-1", `{}`); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	var source string
+	if err := db.QueryRow(`SELECT source FROM events_inbox WHERE webhook_id='wh-legacy'`).Scan(&source); err != nil {
+		t.Fatalf("query source: %v", err)
+	}
+	if source != "linear" {
+		t.Errorf("source: got %q, want 'linear'", source)
+	}
+}
