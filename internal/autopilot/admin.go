@@ -489,7 +489,6 @@ func (s *adminServer) linearProjectsOptionsHandler(w http.ResponseWriter, r *htt
 	w.Write([]byte(b.String()))
 }
 
-
 func (s *adminServer) updateRepoHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPatch {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
