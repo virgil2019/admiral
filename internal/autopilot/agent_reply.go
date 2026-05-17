@@ -77,31 +77,37 @@ func replyCtx() (context.Context, func()) {
 	return context.WithTimeout(context.Background(), 15*time.Second)
 }
 
-func (r *agentSessionReplier) Ack(ctx context.Context, sessionID, body string) error {
+// The caller's ctx is intentionally not used here — replyCtx() bounds
+// each reply at its own 15s deadline regardless of the caller's parent
+// deadline (see replyCtx doc above). The interface keeps `ctx` in the
+// signature so a future implementation can opt into the parent deadline
+// without breaking callers.
+
+func (r *agentSessionReplier) Ack(_ context.Context, sessionID, body string) error {
 	ctx, cancel := replyCtx()
 	defer cancel()
 	return r.lc.PostAgentActivity(ctx, sessionID, linear.Thought(body, false))
 }
 
-func (r *agentSessionReplier) Reply(ctx context.Context, sessionID, body string) error {
+func (r *agentSessionReplier) Reply(_ context.Context, sessionID, body string) error {
 	ctx, cancel := replyCtx()
 	defer cancel()
 	return r.lc.PostAgentActivity(ctx, sessionID, linear.Response(body))
 }
 
-func (r *agentSessionReplier) Fail(ctx context.Context, sessionID, body string) error {
+func (r *agentSessionReplier) Fail(_ context.Context, sessionID, body string) error {
 	ctx, cancel := replyCtx()
 	defer cancel()
 	return r.lc.PostAgentActivity(ctx, sessionID, linear.ErrorActivity(body))
 }
 
-func (r *agentSessionReplier) Progress(ctx context.Context, sessionID, body string, ephemeral bool) error {
+func (r *agentSessionReplier) Progress(_ context.Context, sessionID, body string, ephemeral bool) error {
 	ctx, cancel := replyCtx()
 	defer cancel()
 	return r.lc.PostAgentActivity(ctx, sessionID, linear.Thought(body, ephemeral))
 }
 
-func (r *agentSessionReplier) RecordAction(ctx context.Context, sessionID, action, parameter, result string) error {
+func (r *agentSessionReplier) RecordAction(_ context.Context, sessionID, action, parameter, result string) error {
 	ctx, cancel := replyCtx()
 	defer cancel()
 	return r.lc.PostAgentActivity(ctx, sessionID, linear.Action(action, parameter, result))
