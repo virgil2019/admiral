@@ -380,8 +380,8 @@ func (m *mockStore) GetAutopilotJob(sessionID string) (*store.AutopilotJob, erro
 
 func (m *mockStore) UpdateAutopilotJob(sessionID string, fn func(*store.AutopilotJob)) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.UpdatedSessionIDs = append(m.UpdatedSessionIDs, sessionID)
-	m.mu.Unlock()
 	if m.LastUpdatedJob != nil {
 		fn(m.LastUpdatedJob)
 	}
@@ -437,12 +437,25 @@ func (m *mockStore) ClaimAdmiralTask(issueID, identifier, lastEventSessionID str
 
 func (m *mockStore) UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask)) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.UpdatedAdmiralIssues = append(m.UpdatedAdmiralIssues, issueID)
-	m.mu.Unlock()
 	if m.LiveAdmiralTask != nil {
 		fn(m.LiveAdmiralTask)
 	}
 	return m.UpdateAdmiralTaskErr
+}
+
+// LiveAdmiralSnapshot returns a copy of LiveAdmiralTask read under m.mu so
+// tests polling for an async state transition from a dispatched goroutine
+// don't race with UpdateAdmiralTask's fn() writes. Returns the zero value
+// when no live task has been configured.
+func (m *mockStore) LiveAdmiralSnapshot() store.AdmiralTask {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.LiveAdmiralTask == nil {
+		return store.AdmiralTask{}
+	}
+	return *m.LiveAdmiralTask
 }
 
 func (m *mockStore) MoveAdmiralTaskToHistoryAndClaimNew(issueID, reason, identifier, lastEventSessionID string) (int, error) {
@@ -2501,19 +2514,22 @@ func TestDispatch_FixOnDone_DispatchesResume(t *testing.T) {
 
 	o.HandleAgentEvent(ev)
 
-	// Wait for the /fix goroutine to flip state to EXECUTING.
+	// Wait for the /fix goroutine to flip state to EXECUTING. Read
+	// LiveAdmiralSnapshot under the store's mutex so the polling loop
+	// doesn't race with UpdateAdmiralTask's fn() writes.
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if live.State == store.JobStateExecuting {
+		if ms.LiveAdmiralSnapshot().State == store.JobStateExecuting {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if live.State != store.JobStateExecuting {
-		t.Errorf("expected admiral_tasks.state EXECUTING during /fix run; got %q", live.State)
+	snap := ms.LiveAdmiralSnapshot()
+	if snap.State != store.JobStateExecuting {
+		t.Errorf("expected admiral_tasks.state EXECUTING during /fix run; got %q", snap.State)
 	}
-	if live.AttemptN != 1 {
-		t.Errorf("/fix must not increment attempt_n; got %d", live.AttemptN)
+	if snap.AttemptN != 1 {
+		t.Errorf("/fix must not increment attempt_n; got %d", snap.AttemptN)
 	}
 	if got := ms.SupersededAdmiralIssues; len(got) != 0 {
 		t.Errorf("/fix must not supersede admiral_tasks; got %v", got)
@@ -2698,15 +2714,18 @@ func TestDispatch_FixViaPrompted_DispatchesResume(t *testing.T) {
 
 	o.HandleAgentEvent(ev)
 
+	// Read state via the locked snapshot helper so this polling loop
+	// doesn't race with UpdateAdmiralTask's fn() writes from the
+	// dispatched /fix goroutine.
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if live.State == store.JobStateExecuting {
+		if ms.LiveAdmiralSnapshot().State == store.JobStateExecuting {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if live.State != store.JobStateExecuting {
-		t.Errorf("/fix-via-thread must transition admiral_tasks to EXECUTING; got %q", live.State)
+	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateExecuting {
+		t.Errorf("/fix-via-thread must transition admiral_tasks to EXECUTING; got %q", got)
 	}
 }
 
