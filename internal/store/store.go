@@ -246,6 +246,18 @@ WHERE j.issue_id != ''
 ON CONFLICT(issue_id) DO NOTHING;
 `
 
+// migration0013 widens events_inbox to support multiple webhook sources
+// (linear, github, …). source defaults to 'linear' so pre-existing rows
+// keep their semantics. comment_id is nullable; the partial unique index
+// gives per-source dedup for sources that carry a comment id (e.g. a
+// GitHub review comment) without constraining linear rows that don't.
+const migration0013 = `
+ALTER TABLE events_inbox ADD COLUMN source TEXT NOT NULL DEFAULT 'linear';
+ALTER TABLE events_inbox ADD COLUMN comment_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS events_inbox_source_comment_idx
+  ON events_inbox(source, comment_id) WHERE comment_id IS NOT NULL;
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -264,6 +276,7 @@ var migrations = []migration{
 	{10, migration0010},
 	{11, migration0011},
 	{12, migration0012},
+	{13, migration0013},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -1316,8 +1329,11 @@ type EventInboxRow struct {
 	LastError   string
 }
 
-// EnqueueEvent inserts a pending row. Returns true when a fresh row was
-// inserted, false when webhook_id already existed (Linear retry / dup).
+// EnqueueEvent inserts a pending row from the Linear source. Returns true
+// when a fresh row was inserted, false when webhook_id already existed
+// (Linear retry / dup). source defaults to 'linear' via the schema, so
+// rows from this function are tagged correctly without explicit mention.
+// New non-Linear callers should use EnqueueEventWithSource.
 func (s *Store) EnqueueEvent(webhookID, action, sessionID, issueID, payloadJSON string) (bool, error) {
 	now := time.Now().UTC()
 	result, err := s.DB.Exec(`
@@ -1330,6 +1346,36 @@ func (s *Store) EnqueueEvent(webhookID, action, sessionID, issueID, payloadJSON 
 		return false, err
 	}
 	// Check if we actually inserted (RowsAffected=0 means conflict)
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// EnqueueEventWithSource inserts a pending row for any webhook source.
+// Returns true when fresh, false on either webhook_id collision (primary
+// dedup) or (source, comment_id) collision (secondary dedup for sources
+// that re-deliver the same comment under a new delivery id). Pass
+// commentID="" to skip comment-based dedup — the partial unique index
+// only constrains rows with a non-NULL comment_id.
+func (s *Store) EnqueueEventWithSource(source, webhookID, action, sessionID, issueID, payloadJSON, commentID string) (bool, error) {
+	now := time.Now().UTC()
+	// Empty commentID maps to SQL NULL so the partial unique index
+	// (WHERE comment_id IS NOT NULL) does not constrain it.
+	var commentArg interface{}
+	if commentID != "" {
+		commentArg = commentID
+	}
+	result, err := s.DB.Exec(`
+		INSERT OR IGNORE INTO events_inbox(
+			webhook_id, action, session_id, issue_id, payload_json,
+			status, attempts, received_at, source, comment_id
+		) VALUES(?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+	`, webhookID, action, sessionID, issueID, payloadJSON, now.Unix(), source, commentArg)
+	if err != nil {
+		return false, err
+	}
 	n, err := result.RowsAffected()
 	if err != nil {
 		return false, err
