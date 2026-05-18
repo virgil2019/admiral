@@ -471,6 +471,7 @@ const (
 	JobStateCancelled              = "CANCELLED"
 	JobStateBlocked                = "BLOCKED"
 	JobStateAwaitingInput          = "AWAITING_INPUT"
+	JobStateAborted                = "ABORTED"
 )
 
 type AutopilotJob struct {
@@ -1809,4 +1810,85 @@ func (s *Store) TransitionAwaitingInputToExecuting(issueID string) (bool, error)
 	}
 	n, err := res.RowsAffected()
 	return n > 0, err
+}
+
+// --- admin: stale awaiting-input job queries ---
+
+// AwaitingInputJob is a denormalised view of a task stuck in AWAITING_INPUT,
+// enriched with the pending question details needed for the admin CLI.
+type AwaitingInputJob struct {
+	IssueID          string
+	IssueIdentifier  string
+	WorktreePath     string
+	Branch           string
+	LastEventSession string // for posting a Linear comment on abort
+	PendingQuestion  string
+	PendingCreatedAt string // RFC3339; age is computed from this
+}
+
+// ListAwaitingInputJobs returns all tasks in AWAITING_INPUT state, optionally
+// filtered to those whose pending question was created more than olderThan ago.
+// Results are sorted oldest-first.
+func (s *Store) ListAwaitingInputJobs(olderThan time.Duration) ([]AwaitingInputJob, error) {
+	cutoff := ""
+	if olderThan > 0 {
+		cutoff = time.Now().UTC().Add(-olderThan).Format(time.RFC3339)
+	}
+	// LEFT JOIN so orphan tasks (pending_question_id is NULL or stale) are
+	// still visible. When a cutoff is set we include:
+	//   - tasks with a linked question older than the cutoff, AND
+	//   - tasks with no linked question at all (orphans — stuck even longer).
+	// Rows where the linked question is newer than the cutoff are excluded.
+	// NULL created_at sorts last (NULLS LAST via the IS NULL trick).
+	query := `
+		SELECT t.issue_id, COALESCE(t.issue_identifier,''),
+		       COALESCE(t.worktree_path,''), COALESCE(t.branch,''),
+		       COALESCE(t.last_event_session_id,''),
+		       COALESCE(pq.question,''), COALESCE(pq.created_at,'')
+		FROM admiral_tasks t
+		LEFT JOIN pending_questions pq ON pq.id = t.pending_question_id
+		WHERE t.state = ?`
+	args := []any{JobStateAwaitingInput}
+	if cutoff != "" {
+		query += " AND (pq.created_at IS NULL OR pq.created_at <= ?)"
+		args = append(args, cutoff)
+	}
+	query += " ORDER BY pq.created_at IS NULL, pq.created_at ASC"
+	rows, err := s.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AwaitingInputJob
+	for rows.Next() {
+		var j AwaitingInputJob
+		if err := rows.Scan(&j.IssueID, &j.IssueIdentifier,
+			&j.WorktreePath, &j.Branch, &j.LastEventSession,
+			&j.PendingQuestion, &j.PendingCreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// AbortAdmiralTask transitions a task from AWAITING_INPUT to ABORTED and
+// cancels its open pending question. Returns false if the task was not in
+// AWAITING_INPUT (already resumed or aborted by another caller).
+func (s *Store) AbortAdmiralTask(issueID string) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.DB.Exec(`
+		UPDATE admiral_tasks
+		SET state=?, pending_question_id=NULL, finished_at=?
+		WHERE issue_id=? AND state=?
+	`, JobStateAborted, now, issueID, JobStateAwaitingInput)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return false, nil
+	}
+	_ = s.CancelOpenPendingQuestionsForIssue(issueID)
+	return true, nil
 }
