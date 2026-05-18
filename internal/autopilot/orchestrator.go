@@ -68,6 +68,9 @@ type storeInterface interface {
 	ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error)
 	UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask)) error
 	MoveAdmiralTaskToHistoryAndClaimNew(issueID, reason, identifier, lastEventSessionID string) (int, error)
+	SetAdmiralTaskBlocked(issueID, blockerIDs string) error
+	GetBlockedAdmiralTasks() ([]store.BlockedTask, error)
+	TransitionBlockedToReceived(issueID string) (bool, error)
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -76,6 +79,7 @@ type linearClientInterface interface {
 	GetIssue(ctx context.Context, id string) (*linear.Issue, error)
 	GetWorkflowStates(ctx context.Context, teamID string) ([]linear.WorkflowState, error)
 	IssueUpdate(ctx context.Context, issueID, stateID string) error
+	GetIssueBlockers(ctx context.Context, issueID string) ([]linear.IssueBlocker, error)
 }
 
 type Orchestrator struct {
@@ -99,6 +103,10 @@ type Orchestrator struct {
 	// ciWatcher polls GitHub check runs after a PR is opened and reports
 	// results back into the Linear thread (GEO-54).
 	ciWatcher *CIWatcher
+
+	// blockerWatcher polls BLOCKED tasks and re-queues them once all their
+	// Linear blocked_by relations are resolved.
+	blockerWatcher *BlockerWatcher
 
 	// replier is the semantic reply layer for Linear AgentSession threads.
 	replier *agentSessionReplier
@@ -127,6 +135,7 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		replier:  NewAgentSessionReplier(lc),
 		prClient: ghpkg.NewClient(cfg.GhToken),
 	}
+	o.blockerWatcher = newBlockerWatcher(o, cfg.BlockerPollInterval)
 	// Ensure job_streams_dir exists on startup.
 	if err := os.MkdirAll(cfg.JobStreamsDir, 0o755); err != nil {
 		logger.Warn("job_streams_dir_mkdir", "dir", cfg.JobStreamsDir, "err", err)
@@ -302,9 +311,16 @@ func (o *Orchestrator) replyRejection(sessionID, taskState, body string) {
 	o.postRejection(sessionID, body)
 }
 
-// dispatchFreshAssign claims a fresh admiral_tasks row for the issue
-// and spawns the run goroutine. ClaimAdmiralTask is idempotent — a
-// race that loses the claim simply skips o.run, the winner runs.
+// StartBlockerWatcher starts the background loop that re-queues BLOCKED tasks
+// once their Linear blocked_by relations are resolved. Call once from main.
+func (o *Orchestrator) StartBlockerWatcher(ctx context.Context) {
+	o.blockerWatcher.Run(ctx)
+}
+
+// dispatchFreshAssign claims a fresh admiral_tasks row for the issue,
+// checks for unresolved Linear blocked_by relations, and either parks the
+// task as BLOCKED (with an automatic re-queue via BlockerWatcher) or spawns
+// the run goroutine immediately.
 func (o *Orchestrator) dispatchFreshAssign(ev linear.AgentEvent) {
 	fresh, err := o.db.ClaimAdmiralTask(ev.IssueID, ev.IssueIdentifier, ev.SessionID)
 	if err != nil {
@@ -317,6 +333,28 @@ func (o *Orchestrator) dispatchFreshAssign(ev linear.AgentEvent) {
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
 		return
 	}
+
+	// Check for unresolved Linear blocked_by relations before spawning.
+	bctx, bcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer bcancel()
+	blockers, err := o.lc.GetIssueBlockers(bctx, ev.IssueID)
+	if err != nil {
+		// Non-fatal: log and proceed without the check so a Linear API
+		// hiccup does not permanently stall the task.
+		o.logger.Warn("blocker_check_failed_proceeding",
+			"issue", ev.IssueIdentifier, "err", err)
+	} else if len(blockers) > 0 {
+		o.logger.Info("dispatch_blocked",
+			"issue", ev.IssueIdentifier, "blockers", blockerIdentifiers(blockers))
+		if setErr := o.db.SetAdmiralTaskBlocked(ev.IssueID, blockerIDsJSON(blockers)); setErr != nil {
+			o.logger.Error("set_blocked_failed", "issue", ev.IssueIdentifier, "err", setErr)
+		}
+		// Use Thought (non-terminal) so the AgentSession stays alive for the
+		// watcher's follow-up "resuming now" post when blockers are resolved.
+		o.postBlockedNotice(ev.SessionID, blockedMessage(blockers))
+		return
+	}
+
 	go o.run(ev)
 }
 
@@ -344,6 +382,12 @@ func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, task *store.AdmiralTa
 		// Task is in flight by definition of this case branch — Thought
 		// keeps the live AgentSession alive for the running flow.
 		o.postBusyAck(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
+		return
+	case store.JobStateBlocked:
+		o.logger.Info("dispatch_reject_rerun_blocked",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		// Thought keeps the session alive; watcher will auto-resume when blockers clear.
+		o.postBusyAck(ev.SessionID, "admiral is waiting for blockers to resolve. Use /status to check; will resume automatically.")
 		return
 	}
 
@@ -392,6 +436,11 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 		// Task is in flight by definition of this case branch — Thought
 		// keeps the live AgentSession alive for the running flow.
 		o.postBusyAck(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
+		return
+	case store.JobStateBlocked:
+		o.logger.Info("dispatch_reject_fix_blocked",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postBusyAck(ev.SessionID, "admiral is waiting for blockers to resolve. Will resume automatically.")
 		return
 	case store.JobStateFailed, store.JobStateTimedOut, store.JobStateCancelled:
 		o.logger.Info("dispatch_reject_fix_terminal_non_done",
@@ -2253,6 +2302,15 @@ func (o *Orchestrator) postRejection(sessionID, body string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.ErrorActivity(body))
+}
+
+// postBlockedNotice posts a non-terminal Thought activity when a task is
+// parked in BLOCKED state. Thought keeps the AgentSession alive so the
+// BlockerWatcher's "resuming now" post lands in the same thread later.
+func (o *Orchestrator) postBlockedNotice(sessionID, body string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.Thought(body, false))
 }
 
 // postBusyAck posts a non-terminal Thought activity. Use this for

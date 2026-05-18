@@ -258,6 +258,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS events_inbox_source_comment_idx
   ON events_inbox(source, comment_id) WHERE comment_id IS NOT NULL;
 `
 
+// migration0014 adds blocker_ids to admiral_tasks for tracking the Linear
+// issue IDs that are blocking a task in BLOCKED state.
+const migration0014 = `
+ALTER TABLE admiral_tasks ADD COLUMN blocker_ids TEXT;
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -277,6 +283,7 @@ var migrations = []migration{
 	{11, migration0011},
 	{12, migration0012},
 	{13, migration0013},
+	{14, migration0014},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -439,6 +446,7 @@ const (
 	JobStateTimedOut               = "TIMED_OUT"
 	JobStateDoneThreadInconsistent = "DONE_THREAD_INCONSISTENT"
 	JobStateCancelled              = "CANCELLED"
+	JobStateBlocked                = "BLOCKED"
 )
 
 type AutopilotJob struct {
@@ -911,6 +919,64 @@ func (s *Store) GetAdmiralTaskByPRURL(prURL string) (*AdmiralTask, error) {
 		return nil, nil
 	}
 	return &t, err
+}
+
+// BlockedTask is the minimal projection of an admiral_tasks row that the
+// blocker watcher needs to re-check and re-queue blocked tasks.
+type BlockedTask struct {
+	IssueID            string
+	IssueIdentifier    string
+	LastEventSessionID string
+	AttemptN           int
+	BlockerIDs         string // JSON array of Linear issue IDs
+}
+
+// SetAdmiralTaskBlocked transitions an existing admiral_tasks row to BLOCKED
+// and records the JSON-encoded list of blocking issue IDs.
+func (s *Store) SetAdmiralTaskBlocked(issueID, blockerIDs string) error {
+	_, err := s.DB.Exec(`
+		UPDATE admiral_tasks SET state=?, blocker_ids=? WHERE issue_id=?
+	`, JobStateBlocked, blockerIDs, issueID)
+	return err
+}
+
+// GetBlockedAdmiralTasks returns all tasks currently in BLOCKED state.
+func (s *Store) GetBlockedAdmiralTasks() ([]BlockedTask, error) {
+	rows, err := s.DB.Query(`
+		SELECT issue_id, COALESCE(issue_identifier,''),
+		       COALESCE(last_event_session_id,''), attempt_n,
+		       COALESCE(blocker_ids,'')
+		FROM admiral_tasks WHERE state=?
+	`, JobStateBlocked)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BlockedTask
+	for rows.Next() {
+		var t BlockedTask
+		if err := rows.Scan(&t.IssueID, &t.IssueIdentifier,
+			&t.LastEventSessionID, &t.AttemptN, &t.BlockerIDs); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// TransitionBlockedToReceived atomically moves a BLOCKED task back to
+// RECEIVED, clearing blocker_ids. Returns true when the row was updated
+// (i.e. it was still BLOCKED), false when another goroutine already
+// changed the state.
+func (s *Store) TransitionBlockedToReceived(issueID string) (bool, error) {
+	res, err := s.DB.Exec(`
+		UPDATE admiral_tasks SET state=?, blocker_ids=NULL WHERE issue_id=? AND state=?
+	`, JobStateReceived, issueID, JobStateBlocked)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // ClaimAdmiralTask inserts a new task row for issueID iff no row exists.

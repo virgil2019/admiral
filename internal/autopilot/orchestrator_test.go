@@ -256,6 +256,10 @@ type mockLinearClient struct {
 	// IssueUpdate override
 	IssueUpdateCalls []struct{ IssueID, StateID string }
 	IssueUpdateErr   error
+
+	// GetIssueBlockers override
+	IssueBlockers    []linear.IssueBlocker
+	IssueBlockersErr error
 }
 
 func (m *mockLinearClient) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {
@@ -298,6 +302,10 @@ func (m *mockLinearClient) GetWorkflowStates(ctx context.Context, teamID string)
 func (m *mockLinearClient) IssueUpdate(ctx context.Context, issueID, stateID string) error {
 	m.IssueUpdateCalls = append(m.IssueUpdateCalls, struct{ IssueID, StateID string }{issueID, stateID})
 	return m.IssueUpdateErr
+}
+
+func (m *mockLinearClient) GetIssueBlockers(_ context.Context, _ string) ([]linear.IssueBlocker, error) {
+	return m.IssueBlockers, m.IssueBlockersErr
 }
 
 // mockStore implements storeInterface for testing.
@@ -363,6 +371,11 @@ type mockStore struct {
 	// UpdateAutopilotJob, in call order. Useful for asserting the
 	// markAlreadyMerged path updated the new session.
 	UpdatedSessionIDs []string
+
+	// Blocker-related fields
+	SetBlockedCalls     []string // issueIDs passed to SetAdmiralTaskBlocked
+	BlockedTasks        []store.BlockedTask
+	TransitionBlockedOK bool
 }
 
 func (m *mockStore) AnyAutopilotJobActive() (bool, string, error) {
@@ -484,6 +497,19 @@ func (m *mockStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
 
 func (m *mockStore) ListJobsByIssueAndStates(issueID string, states []string) ([]store.AutopilotJob, error) {
 	return m.ListJobsByIssueAndStatesResult, m.ListJobsByIssueAndStatesErr
+}
+
+func (m *mockStore) SetAdmiralTaskBlocked(issueID, blockerIDs string) error {
+	m.SetBlockedCalls = append(m.SetBlockedCalls, issueID)
+	return nil
+}
+
+func (m *mockStore) GetBlockedAdmiralTasks() ([]store.BlockedTask, error) {
+	return m.BlockedTasks, nil
+}
+
+func (m *mockStore) TransitionBlockedToReceived(issueID string) (bool, error) {
+	return m.TransitionBlockedOK, nil
 }
 
 // fakeGhProbe is a deterministic ghProbe for tests. Configure the maps
