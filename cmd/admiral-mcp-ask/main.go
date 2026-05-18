@@ -16,8 +16,10 @@
 //   ADMIRAL_LINEAR_SESSION   - Linear agent session ID for PostAgentActivity
 //   ADMIRAL_CLAUDE_SESSION   - Claude session ID (for resume after reply)
 //   ADMIRAL_WORKTREE_PATH    - absolute path to the active git worktree
-//   ADMIRAL_LINEAR_TOKEN     - Linear OAuth access token
-//   ADMIRAL_LINEAR_ENDPOINT  - Linear GraphQL endpoint (default: https://api.linear.app/graphql)
+//   ADMIRAL_LINEAR_ENDPOINT  - Linear GraphQL endpoint (optional; default: https://api.linear.app/graphql)
+//
+// Linear OAuth token is loaded from the DB (not from env) to avoid leaking it
+// into all subprocesses spawned by the claude run.
 package main
 
 import (
@@ -47,7 +49,6 @@ func main() {
 	linearSession := mustEnv("ADMIRAL_LINEAR_SESSION")
 	claudeSession := os.Getenv("ADMIRAL_CLAUDE_SESSION")
 	worktreePath := os.Getenv("ADMIRAL_WORKTREE_PATH")
-	linearToken := mustEnv("ADMIRAL_LINEAR_TOKEN")
 	linearEndpoint := os.Getenv("ADMIRAL_LINEAR_ENDPOINT")
 	if linearEndpoint == "" {
 		linearEndpoint = "https://api.linear.app/graphql"
@@ -59,9 +60,14 @@ func main() {
 	}
 	defer db.Close()
 
+	tok, err := db.GetLinearOAuthToken()
+	if err != nil || tok == nil || tok.AccessToken == "" {
+		log.Fatalf("linear oauth token not found in db: %v", err)
+	}
+
 	s := &server{
 		db:              db,
-		lc:              linear.NewClient(linearEndpoint, linearToken),
+		lc:              linear.NewClient(linearEndpoint, tok.AccessToken),
 		issueID:         issueID,
 		issueIdentifier: issueIdentifier,
 		linearSession:   linearSession,
@@ -225,7 +231,12 @@ func (s *server) handleToolCall(msg rpcMsg) error {
 		return s.respondErr(msg.ID, -32602, "question is required")
 	}
 
-	optJSON, _ := json.Marshal(args.Options)
+	var optJSON []byte
+	if len(args.Options) == 0 {
+		optJSON = []byte("[]")
+	} else {
+		optJSON, _ = json.Marshal(args.Options)
+	}
 	pendingID := uuid.NewString()
 
 	q := store.PendingQuestion{
@@ -242,6 +253,11 @@ func (s *server) handleToolCall(msg rpcMsg) error {
 	if err := s.db.InsertPendingQuestion(q); err != nil {
 		log.Printf("insert pending_question: %v", err)
 		return s.respondErr(msg.ID, -32603, "failed to persist question: "+err.Error())
+	}
+	// Transition task state immediately so a fast Linear reply doesn't race
+	// with the orchestrator's parkAwaitingInput call (M1 fix).
+	if err := s.db.SetAdmiralTaskAwaitingInput(s.issueID, pendingID); err != nil {
+		log.Printf("set awaiting_input: %v", err)
 	}
 
 	body := formatElicitation(args.Question, args.Options)

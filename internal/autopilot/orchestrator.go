@@ -74,7 +74,9 @@ type storeInterface interface {
 
 	InsertPendingQuestion(q store.PendingQuestion) error
 	GetOpenPendingQuestionByIssue(issueID string) (*store.PendingQuestion, error)
+	GetPendingQuestionByID(id string) (*store.PendingQuestion, error)
 	AnswerPendingQuestion(id, answer string) error
+	CancelOpenPendingQuestionsForIssue(issueID string) error
 	SetAdmiralTaskAwaitingInput(issueID, pendingQuestionID string) error
 	TransitionAwaitingInputToExecuting(issueID string) (bool, error)
 }
@@ -406,6 +408,14 @@ func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, task *store.AdmiralTa
 		// Thought keeps the session alive; watcher will auto-resume when blockers clear.
 		o.postBusyAck(ev.SessionID, "admiral is waiting for blockers to resolve. Use /status to check; will resume automatically.")
 		return
+	case store.JobStateAwaitingInput:
+		// Cancel the open pending question so the superseded row doesn't match
+		// a future reply to the new attempt.
+		if err := o.db.CancelOpenPendingQuestionsForIssue(ev.IssueID); err != nil {
+			o.logger.Warn("dispatch_rerun_cancel_pending_q_failed",
+				"err", err, "issue", ev.IssueID)
+		}
+		// Fall through to the normal supersession path below.
 	}
 
 	newAttempt, err := o.db.MoveAdmiralTaskToHistoryAndClaimNew(
@@ -721,17 +731,26 @@ func followupSuffix(sessionID string) string {
 // task is in AWAITING_INPUT state. It matches the reply to the open pending
 // question and re-spawns the claude session with the answer.
 func (o *Orchestrator) dispatchAwaitingReply(ev linear.AgentEvent, task *store.AdmiralTask, reply string) {
-	pq, err := o.db.GetOpenPendingQuestionByIssue(ev.IssueID)
+	// Look up the exact question correlated to this task by ID (not just by
+	// issue) so stale orphaned rows from a prior rerun don't get matched.
+	if task.PendingQuestionID == "" {
+		o.logger.Warn("dispatch_awaiting_reply_no_question_id",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postBusyAck(ev.SessionID, "admiral: no pending question found. Use /rerun to start a new run.")
+		return
+	}
+	pq, err := o.db.GetPendingQuestionByID(task.PendingQuestionID)
 	if err != nil {
 		o.logger.Error("dispatch_awaiting_reply_lookup_failed",
-			"err", err, "issue", ev.IssueID)
+			"err", err, "question_id", task.PendingQuestionID)
 		o.postBusyAck(ev.SessionID, "admiral: internal error looking up the pending question. Try /rerun.")
 		return
 	}
-	if pq == nil {
-		o.logger.Warn("dispatch_awaiting_reply_no_pending_question",
-			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		o.postBusyAck(ev.SessionID, "admiral: no pending question found. Use /rerun to start a new run.")
+	if pq == nil || pq.AnsweredAt != "" {
+		o.logger.Warn("dispatch_awaiting_reply_question_gone",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier,
+			"question_id", task.PendingQuestionID)
+		o.postBusyAck(ev.SessionID, "admiral: pending question not found or already answered. Use /rerun to start a new run.")
 		return
 	}
 
@@ -1401,6 +1420,12 @@ func (f *flow) runClaudeResume(userMessage string) error {
 		"--verbose",
 		"--dangerously-skip-permissions",
 	}
+	if mcpCfgPath, err := f.writeMCPConfig(); err != nil {
+		f.o.logger.Warn("mcp_config_write_failed", "err", err)
+	} else if mcpCfgPath != "" {
+		args = append(args, "--mcp-config", mcpCfgPath)
+		defer os.Remove(mcpCfgPath)
+	}
 	cctx, cancel := context.WithTimeout(f.ctx, time.Duration(f.o.cfg.MaxRunSeconds)*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, f.o.cfg.ClaudeBin, args...)
@@ -1408,6 +1433,12 @@ func (f *flow) runClaudeResume(userMessage string) error {
 	cmd.Env = append(os.Environ(),
 		"CLAUDE_AUTOPILOT_ISSUE="+f.ev.IssueIdentifier,
 		"CLAUDE_AUTOPILOT_SESSION="+f.ev.SessionID,
+		"ADMIRAL_DB_PATH="+f.o.dbPath,
+		"ADMIRAL_ISSUE_ID="+f.ev.IssueID,
+		"ADMIRAL_ISSUE_IDENTIFIER="+f.ev.IssueIdentifier,
+		"ADMIRAL_LINEAR_SESSION="+f.ev.SessionID,
+		"ADMIRAL_CLAUDE_SESSION="+f.job.ClaudeSessionID,
+		"ADMIRAL_WORKTREE_PATH="+f.worktreePath,
 	)
 
 	stdout, err := cmd.StdoutPipe()

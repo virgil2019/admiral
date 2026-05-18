@@ -523,6 +523,10 @@ func (m *mockStore) SetAdmiralTaskAwaitingInput(issueID, pendingQuestionID strin
 func (m *mockStore) TransitionAwaitingInputToExecuting(issueID string) (bool, error) {
 	return true, nil
 }
+func (m *mockStore) GetPendingQuestionByID(id string) (*store.PendingQuestion, error) {
+	return nil, nil
+}
+func (m *mockStore) CancelOpenPendingQuestionsForIssue(issueID string) error { return nil }
 
 // fakeGhProbe is a deterministic ghProbe for tests. Configure the maps
 // keyed on branch name (for FindMergedPRForBranch) and PR url (for

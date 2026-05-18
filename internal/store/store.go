@@ -879,6 +879,7 @@ type AdmiralTask struct {
 	FinishedAt         string
 	Error              string
 	StreamLogPath      string
+	PendingQuestionID  string // non-empty when state=AWAITING_INPUT
 }
 
 // AdmiralTaskHistory is one entry in the supersession log for an issue.
@@ -910,12 +911,13 @@ func (s *Store) GetAdmiralTaskByIssue(issueID string) (*AdmiralTask, error) {
 		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
 		       COALESCE(last_event_session_id,''),
 		       started_at, COALESCE(finished_at,''),
-		       COALESCE(error,''), COALESCE(stream_log_path,'')
+		       COALESCE(error,''), COALESCE(stream_log_path,''),
+		       COALESCE(pending_question_id,'')
 		FROM admiral_tasks WHERE issue_id=?
 	`, issueID).Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
 		&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
 		&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
-		&t.Error, &t.StreamLogPath)
+		&t.Error, &t.StreamLogPath, &t.PendingQuestionID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -933,12 +935,13 @@ func (s *Store) GetAdmiralTaskByPRURL(prURL string) (*AdmiralTask, error) {
 		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
 		       COALESCE(last_event_session_id,''),
 		       started_at, COALESCE(finished_at,''),
-		       COALESCE(error,''), COALESCE(stream_log_path,'')
+		       COALESCE(error,''), COALESCE(stream_log_path,''),
+		       COALESCE(pending_question_id,'')
 		FROM admiral_tasks WHERE pr_url=?
 	`, prURL).Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
 		&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
 		&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
-		&t.Error, &t.StreamLogPath)
+		&t.Error, &t.StreamLogPath, &t.PendingQuestionID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1738,6 +1741,40 @@ func (s *Store) GetOpenPendingQuestionByIssue(issueID string) (*PendingQuestion,
 		return nil, nil
 	}
 	return &q, err
+}
+
+// GetPendingQuestionByID returns a pending question by its UUID, or
+// (nil, nil) when not found. Used by dispatchAwaitingReply to look up
+// the exact question correlated to the task via task.PendingQuestionID.
+func (s *Store) GetPendingQuestionByID(id string) (*PendingQuestion, error) {
+	var q PendingQuestion
+	err := s.DB.QueryRow(`
+		SELECT id, issue_id, COALESCE(issue_identifier,''), claude_session_id,
+		       COALESCE(last_event_session_id,''), COALESCE(worktree_path,''),
+		       question, COALESCE(options_json,'[]'), created_at,
+		       COALESCE(answered_at,''), COALESCE(answer,'')
+		FROM pending_questions WHERE id=?
+	`, id).Scan(&q.ID, &q.IssueID, &q.IssueIdentifier, &q.ClaudeSessionID,
+		&q.LastEventSessionID, &q.WorktreePath,
+		&q.Question, &q.OptionsJSON, &q.CreatedAt,
+		&q.AnsweredAt, &q.Answer)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &q, err
+}
+
+// CancelOpenPendingQuestionsForIssue marks all unanswered questions for an
+// issue as cancelled. Called by dispatchRerun to clean up orphaned questions
+// before superseding the task row.
+func (s *Store) CancelOpenPendingQuestionsForIssue(issueID string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.DB.Exec(`
+		UPDATE pending_questions
+		SET answered_at=?, answer='<superseded>'
+		WHERE issue_id=? AND answered_at IS NULL
+	`, now, issueID)
+	return err
 }
 
 // AnswerPendingQuestion records the user's reply and timestamps it.
