@@ -7,8 +7,64 @@ import (
 	"context"
 	"time"
 
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 )
+
+// Replier is a bound reply target. The destination (Linear session or GitHub
+// PR) is captured at construction; callers do not thread it through each call.
+type Replier interface {
+	// Reply posts a terminal-success message (task done / review addressed).
+	Reply(ctx context.Context, body string) error
+	// Fail posts a terminal-failure message.
+	Fail(ctx context.Context, body string) error
+	// Progress posts a non-terminal status update.
+	Progress(ctx context.Context, body string) error
+}
+
+// linearReplier posts to a Linear AgentSession via AgentSessionReplier.
+type linearReplier struct {
+	r         *agentSessionReplier
+	sessionID string
+}
+
+// NewLinearReplier returns a Replier that targets the given Linear session.
+func NewLinearReplier(lc linearClientPoster, sessionID string) Replier {
+	return &linearReplier{r: &agentSessionReplier{lc: lc}, sessionID: sessionID}
+}
+
+func (l *linearReplier) Reply(ctx context.Context, body string) error {
+	return l.r.Reply(ctx, l.sessionID, body)
+}
+func (l *linearReplier) Fail(ctx context.Context, body string) error {
+	return l.r.Fail(ctx, l.sessionID, body)
+}
+func (l *linearReplier) Progress(ctx context.Context, body string) error {
+	return l.r.Progress(ctx, l.sessionID, body, false)
+}
+
+// githubReplier posts to a GitHub PR via PRClient.PostComment.
+// Reply, Fail, and Progress all post a comment; the distinction lets callers
+// express intent without needing to know the underlying transport.
+type githubReplier struct {
+	client ghpkg.PRClient
+	prURL  string
+}
+
+// NewGitHubReplier returns a Replier that posts comments on the given PR.
+func NewGitHubReplier(client ghpkg.PRClient, prURL string) Replier {
+	return &githubReplier{client: client, prURL: prURL}
+}
+
+func (g *githubReplier) Reply(ctx context.Context, body string) error {
+	return g.client.PostComment(ctx, g.prURL, body)
+}
+func (g *githubReplier) Fail(ctx context.Context, body string) error {
+	return g.client.PostComment(ctx, g.prURL, body)
+}
+func (g *githubReplier) Progress(ctx context.Context, body string) error {
+	return g.client.PostComment(ctx, g.prURL, body)
+}
 
 // AgentSessionReplier is the semantic reply layer for Linear AgentSession
 // threads. It maps business intent (Ack, Reply, Fail, Progress,

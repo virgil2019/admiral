@@ -92,6 +92,11 @@ type Autopilot struct {
 	// distinguish admiral-authored PRs from human-authored ones in the
 	// open-PR short-circuit). Default: the login from `gh auth status`.
 	GhUser string `yaml:"gh_user"`
+	// GhToken is the personal access token admiral uses when posting PR
+	// comments and fetching PR state/diff. Empty inherits host gh auth,
+	// which is acceptable for local runs but not recommended in production
+	// (admiral's bot identity would be ambiguous).
+	GhToken string `yaml:"gh_token"`
 	// MaxRunSeconds caps a single claude -p invocation. Default: 1800 (30 min).
 	MaxRunSeconds int `yaml:"max_run_seconds"`
 	// JobStreamsDir is the directory where per-job claude stream-json files
