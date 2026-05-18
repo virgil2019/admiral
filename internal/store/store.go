@@ -890,6 +890,29 @@ func (s *Store) GetAdmiralTaskByIssue(issueID string) (*AdmiralTask, error) {
 	return &t, err
 }
 
+// GetAdmiralTaskByPRURL returns the live task row whose pr_url matches, or
+// (nil, nil) when no task has that PR. Used by the GitHub review dispatcher
+// to correlate an inbound review event with its originating admiral task.
+func (s *Store) GetAdmiralTaskByPRURL(prURL string) (*AdmiralTask, error) {
+	var t AdmiralTask
+	err := s.DB.QueryRow(`
+		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(last_event_session_id,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,'')
+		FROM admiral_tasks WHERE pr_url=?
+	`, prURL).Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
+		&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
+		&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
+		&t.Error, &t.StreamLogPath)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
 // ClaimAdmiralTask inserts a new task row for issueID iff no row exists.
 // Mirror of ClaimAutopilotJob but keyed on issue_id and reserving the
 // initial attempt_n=1. Returns (true, nil) when the caller now owns the
@@ -1327,6 +1350,7 @@ type EventInboxRow struct {
 	StartedAt   *time.Time
 	FinishedAt  *time.Time
 	LastError   string
+	Source      string // "linear" (default) or "github"
 }
 
 // EnqueueEvent inserts a pending row from the Linear source. Returns true
@@ -1403,7 +1427,8 @@ func (s *Store) ClaimNextPendingEvent() (*EventInboxRow, error) {
 		       status, attempts, received_at,
 		       COALESCE(started_at, 0),
 		       COALESCE(finished_at, 0),
-		       COALESCE(last_error, '')
+		       COALESCE(last_error, ''),
+		       COALESCE(source, 'linear')
 		FROM events_inbox
 		WHERE status = 'pending'
 		  AND session_id NOT IN (
@@ -1414,6 +1439,7 @@ func (s *Store) ClaimNextPendingEvent() (*EventInboxRow, error) {
 	`).Scan(
 		&row.WebhookID, &row.Action, &row.SessionID, &row.IssueID, &row.PayloadJSON,
 		&row.Status, &row.Attempts, &receivedUnix, &startedUnix, &finishedUnix, &row.LastError,
+		&row.Source,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
