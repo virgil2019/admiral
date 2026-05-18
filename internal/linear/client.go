@@ -427,6 +427,69 @@ func (c *Client) GetWorkflowStates(ctx context.Context, teamID string) ([]Workfl
 	return states, nil
 }
 
+// IssueBlocker is a blocking relation as returned by GetIssueBlockers.
+type IssueBlocker struct {
+	IssueID         string
+	IssueIdentifier string
+}
+
+const issueRelationsQuery = `query IssueRelations($id: String!) {
+  issue(id: $id) {
+    relations(first: 50) {
+      nodes {
+        type
+        relatedIssue { id identifier state { name } }
+      }
+    }
+  }
+}`
+
+// GetIssueBlockers returns unresolved blocked_by relations for issueID. A
+// blocker is "unresolved" when its state name is neither "Done" nor
+// "Cancelled". Returns nil when all blockers are resolved or there are none.
+func (c *Client) GetIssueBlockers(ctx context.Context, issueID string) ([]IssueBlocker, error) {
+	var data struct {
+		Issue *struct {
+			Relations struct {
+				Nodes []struct {
+					Type         string `json:"type"`
+					RelatedIssue struct {
+						ID         string `json:"id"`
+						Identifier string `json:"identifier"`
+						State      struct {
+							Name string `json:"name"`
+						} `json:"state"`
+					} `json:"relatedIssue"`
+				} `json:"nodes"`
+			} `json:"relations"`
+		} `json:"issue"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     issueRelationsQuery,
+		Variables: map[string]any{"id": issueID},
+	}, &data); err != nil {
+		return nil, err
+	}
+	if data.Issue == nil {
+		return nil, nil
+	}
+	var out []IssueBlocker
+	for _, n := range data.Issue.Relations.Nodes {
+		if n.Type != "blocked_by" {
+			continue
+		}
+		name := n.RelatedIssue.State.Name
+		if name == "Done" || name == "Cancelled" {
+			continue
+		}
+		out = append(out, IssueBlocker{
+			IssueID:         n.RelatedIssue.ID,
+			IssueIdentifier: n.RelatedIssue.Identifier,
+		})
+	}
+	return out, nil
+}
+
 // GetProject returns the Linear project with the given ID, or an error if
 // the project does not exist or the API call fails.
 func (c *Client) GetProject(ctx context.Context, id string) (*Project, error) {
