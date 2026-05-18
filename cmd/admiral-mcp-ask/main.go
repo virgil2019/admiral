@@ -1,22 +1,23 @@
 // admiral-mcp-ask is a minimal MCP stdio server that provides the ask_user
 // tool for claude runs spawned by admiral-autopilot. When claude calls
 // ask_user, this server:
-//   1. Inserts a pending_question row into the admiral SQLite DB.
-//   2. Posts an elicitation activity to the Linear agent thread.
-//   3. Returns {"status":"pending","pending_id":"<uuid>"} to claude.
+//  1. Inserts a pending_question row into the admiral SQLite DB.
+//  2. Posts an elicitation activity to the Linear agent thread.
+//  3. Returns {"status":"pending","pending_id":"<uuid>"} to claude.
 //
 // Claude's system prompt instructs it to stop work and exit when it receives
 // a pending response, which transitions the admiral_tasks row to AWAITING_INPUT.
 // The orchestrator resumes the claude session once the user replies.
 //
 // Environment variables (all required unless noted):
-//   ADMIRAL_DB_PATH          - path to the SQLite database
-//   ADMIRAL_ISSUE_ID         - Linear issue UUID
-//   ADMIRAL_ISSUE_IDENTIFIER - human-readable identifier (e.g. "GEO-42")
-//   ADMIRAL_LINEAR_SESSION   - Linear agent session ID for PostAgentActivity
-//   ADMIRAL_CLAUDE_SESSION   - Claude session ID (for resume after reply)
-//   ADMIRAL_WORKTREE_PATH    - absolute path to the active git worktree
-//   ADMIRAL_LINEAR_ENDPOINT  - Linear GraphQL endpoint (optional; default: https://api.linear.app/graphql)
+//
+//	ADMIRAL_DB_PATH          - path to the SQLite database
+//	ADMIRAL_ISSUE_ID         - Linear issue UUID
+//	ADMIRAL_ISSUE_IDENTIFIER - human-readable identifier (e.g. "GEO-42")
+//	ADMIRAL_LINEAR_SESSION   - Linear agent session ID for PostAgentActivity
+//	ADMIRAL_CLAUDE_SESSION   - Claude session ID (for resume after reply)
+//	ADMIRAL_WORKTREE_PATH    - absolute path to the active git worktree
+//	ADMIRAL_LINEAR_ENDPOINT  - Linear GraphQL endpoint (optional; default: https://api.linear.app/graphql)
 //
 // Linear OAuth token is loaded from the DB (not from env) to avoid leaking it
 // into all subprocesses spawned by the claude run.

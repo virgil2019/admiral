@@ -4,23 +4,24 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 
-	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/config"
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
 
 // mockPRClient implements github.PRClient for testing.
 type mockPRClient struct {
-	postCommentErr  error
-	postedComments  []string
-	getPRStateVal   string
-	getPRStateErr   error
-	getDiffVal      string
-	getDiffErr      error
+	postCommentErr error
+	postedComments []string
+	getPRStateVal  string
+	getPRStateErr  error
+	getDiffVal     string
+	getDiffErr     error
 }
 
 func (m *mockPRClient) PostComment(_ context.Context, _, body string) error {
@@ -124,6 +125,13 @@ func TestHandleReviewEvent_NoBranch(t *testing.T) {
 // issue to look up) but must not panic and must attempt GetDiff.
 func TestHandleReviewEvent_SpawnsGoroutine(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/10"
+	// Use os.MkdirTemp so cleanup silently ignores "directory not empty" —
+	// runReview's background goroutine may still be writing when the test ends.
+	repoDir, err := os.MkdirTemp("", "TestHandleReviewEvent_SpawnsGoroutine*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(repoDir) })
 	db := &mockStore{
 		AdmiralTaskByPRURL: &store.AdmiralTask{
 			IssueID:         "issue-10",
@@ -131,7 +139,7 @@ func TestHandleReviewEvent_SpawnsGoroutine(t *testing.T) {
 			PRURL:           prURL,
 			Branch:          "linear/geo-10",
 		},
-		Repo: &store.Repo{RepoDir: t.TempDir(), BaseBranch: "main"},
+		Repo: &store.Repo{RepoDir: repoDir, BaseBranch: "main"},
 	}
 	lc := &mockLinearClient{
 		GetIssueResult: &linear.Issue{ID: "issue-10", ProjectID: "proj-1"},
