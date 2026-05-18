@@ -82,6 +82,9 @@ type Autopilot struct {
 	BaseBranch string `yaml:"base_branch"`
 	// ClaudeBin is the absolute path to the `claude` CLI. Default: "claude" (PATH).
 	ClaudeBin string `yaml:"claude_bin"`
+	// McpAskBin is the path to the admiral-mcp-ask binary that provides the
+	// ask_user MCP tool to claude runs. Default: "admiral-mcp-ask" (PATH).
+	McpAskBin string `yaml:"mcp_ask_bin"`
 	// AutopilotSkill is the skill name passed to claude -p (`--skill <name>` or
 	// "/<name>" prefix in the prompt). Default: empty (no skill).
 	AutopilotSkill string `yaml:"autopilot_skill"`
@@ -300,6 +303,9 @@ func (c *Config) validateAutopilotAndExpand() error {
 	}
 	if _, err := exec.LookPath(c.Autopilot.ClaudeBin); err != nil {
 		return fmt.Errorf("autopilot.claude_bin not found: %w", err)
+	}
+	if strings.TrimSpace(c.Autopilot.McpAskBin) == "" {
+		c.Autopilot.McpAskBin = "admiral-mcp-ask"
 	}
 	if strings.TrimSpace(c.Autopilot.GhBin) == "" {
 		c.Autopilot.GhBin = "gh"

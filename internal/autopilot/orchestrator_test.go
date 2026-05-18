@@ -512,6 +512,18 @@ func (m *mockStore) TransitionBlockedToReceived(issueID string) (bool, error) {
 	return m.TransitionBlockedOK, nil
 }
 
+func (m *mockStore) InsertPendingQuestion(q store.PendingQuestion) error { return nil }
+func (m *mockStore) GetOpenPendingQuestionByIssue(issueID string) (*store.PendingQuestion, error) {
+	return nil, nil
+}
+func (m *mockStore) AnswerPendingQuestion(id, answer string) error { return nil }
+func (m *mockStore) SetAdmiralTaskAwaitingInput(issueID, pendingQuestionID string) error {
+	return nil
+}
+func (m *mockStore) TransitionAwaitingInputToExecuting(issueID string) (bool, error) {
+	return true, nil
+}
+
 // fakeGhProbe is a deterministic ghProbe for tests. Configure the maps
 // keyed on branch name (for FindMergedPRForBranch) and PR url (for
 // PRState); missing keys yield "not found" / "" respectively. Set the

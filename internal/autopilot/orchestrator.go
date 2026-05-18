@@ -71,6 +71,12 @@ type storeInterface interface {
 	SetAdmiralTaskBlocked(issueID, blockerIDs string) error
 	GetBlockedAdmiralTasks() ([]store.BlockedTask, error)
 	TransitionBlockedToReceived(issueID string) (bool, error)
+
+	InsertPendingQuestion(q store.PendingQuestion) error
+	GetOpenPendingQuestionByIssue(issueID string) (*store.PendingQuestion, error)
+	AnswerPendingQuestion(id, answer string) error
+	SetAdmiralTaskAwaitingInput(issueID, pendingQuestionID string) error
+	TransitionAwaitingInputToExecuting(issueID string) (bool, error)
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -113,6 +119,10 @@ type Orchestrator struct {
 
 	// prClient is the outbound GitHub PR client used by the review dispatcher.
 	prClient ghpkg.PRClient
+
+	// dbPath is the absolute path to the SQLite file. Passed as
+	// ADMIRAL_DB_PATH to the admiral-mcp-ask subprocess.
+	dbPath string
 }
 
 func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
@@ -126,6 +136,7 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		cfg:      cfg,
 		lc:       lc,
 		db:       db,
+		dbPath:   db.Path,
 		gh:       newGhCLIProbe(cfg.GhBin),
 		logger:   logger,
 		ghUser:   cfg.GhUser,
@@ -277,6 +288,12 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 
 	cmdName, remainder, ok := parseMentionCommand(text)
 	if !ok {
+		// A bare message (no /command) on an AWAITING_INPUT task is the
+		// user's reply to the pending ask_user question.
+		if task.State == store.JobStateAwaitingInput {
+			o.dispatchAwaitingReply(ev, task, text)
+			return
+		}
 		o.logger.Info("dispatch_reject_bare",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
 		o.replyRejection(ev.SessionID, task.State, mentionCommandHelp)
@@ -441,6 +458,11 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 		o.logger.Info("dispatch_reject_fix_blocked",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
 		o.postBusyAck(ev.SessionID, "admiral is waiting for blockers to resolve. Will resume automatically.")
+		return
+	case store.JobStateAwaitingInput:
+		o.logger.Info("dispatch_reject_fix_awaiting_input",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postBusyAck(ev.SessionID, "admiral is waiting for your reply to a question. Reply to the question or use /rerun to start fresh.")
 		return
 	case store.JobStateFailed, store.JobStateTimedOut, store.JobStateCancelled:
 		o.logger.Info("dispatch_reject_fix_terminal_non_done",
@@ -695,6 +717,159 @@ func followupSuffix(sessionID string) string {
 	return "followup-" + clean
 }
 
+// dispatchAwaitingReply handles a bare-text reply from the user when the
+// task is in AWAITING_INPUT state. It matches the reply to the open pending
+// question and re-spawns the claude session with the answer.
+func (o *Orchestrator) dispatchAwaitingReply(ev linear.AgentEvent, task *store.AdmiralTask, reply string) {
+	pq, err := o.db.GetOpenPendingQuestionByIssue(ev.IssueID)
+	if err != nil {
+		o.logger.Error("dispatch_awaiting_reply_lookup_failed",
+			"err", err, "issue", ev.IssueID)
+		o.postBusyAck(ev.SessionID, "admiral: internal error looking up the pending question. Try /rerun.")
+		return
+	}
+	if pq == nil {
+		o.logger.Warn("dispatch_awaiting_reply_no_pending_question",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postBusyAck(ev.SessionID, "admiral: no pending question found. Use /rerun to start a new run.")
+		return
+	}
+
+	if err := o.db.AnswerPendingQuestion(pq.ID, reply); err != nil {
+		o.logger.Error("dispatch_awaiting_reply_answer_failed",
+			"err", err, "question_id", pq.ID)
+		o.postBusyAck(ev.SessionID, "admiral: internal error recording your answer. Try again.")
+		return
+	}
+
+	ok, err := o.db.TransitionAwaitingInputToExecuting(ev.IssueID)
+	if err != nil {
+		o.logger.Error("dispatch_awaiting_reply_transition_failed",
+			"err", err, "issue", ev.IssueID)
+		return
+	}
+	if !ok {
+		o.logger.Warn("dispatch_awaiting_reply_transition_lost",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		return
+	}
+
+	o.logger.Info("dispatch_awaiting_resume",
+		"session", ev.SessionID,
+		"issue", ev.IssueIdentifier,
+		"question_id", pq.ID,
+		"reply_preview", truncate(reply, 80))
+
+	go o.runAwaitingResume(ev, task, pq, reply)
+}
+
+// runAwaitingResume resumes a claude session after the user replied to an
+// ask_user question. It acquires a run slot, calls claude --resume with the
+// answer injected, then opens a PR as usual.
+func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.AdmiralTask, pq *store.PendingQuestion, reply string) {
+	release := o.acquireRunSlot()
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
+	defer cancel()
+
+	if pq.WorktreePath == "" || pq.ClaudeSessionID == "" {
+		o.logger.Error("awaiting_resume_missing_fields",
+			"issue", ev.IssueIdentifier,
+			"worktree", pq.WorktreePath,
+			"claude_session", pq.ClaudeSessionID)
+		o.postBusyAck(ev.SessionID, "admiral: resume failed — missing worktree or claude session. Use /rerun.")
+		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+			t.State = store.JobStateFailed
+			t.Error = "awaiting_resume: missing worktree or claude_session_id"
+		})
+		return
+	}
+
+	// Synthetic autopilot_jobs row so runClaudeResume can access session ID.
+	job := &store.AutopilotJob{
+		AgentSessionID:  ev.SessionID,
+		ClaudeSessionID: pq.ClaudeSessionID,
+		WorktreePath:    pq.WorktreePath,
+		Branch:          task.Branch,
+	}
+	f := newResumeFlow(o, ctx, ev, job)
+	f.worktreePath = pq.WorktreePath
+	f.branch = task.Branch
+	f.claudeSessionID = pq.ClaudeSessionID
+
+	issue, err := o.lc.GetIssue(ctx, ev.IssueID)
+	if err != nil {
+		o.logger.Error("awaiting_resume_fetch_issue_failed",
+			"err", err, "issue", ev.IssueID)
+		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+			t.State = store.JobStateFailed
+			t.Error = fmt.Sprintf("fetch issue: %v", err)
+		})
+		return
+	}
+	if repo, err := o.db.GetRepoByProjectID(issue.ProjectID); err == nil && repo != nil {
+		f.repoDir = repo.RepoDir
+		f.baseBranch = repo.BaseBranch
+	}
+
+	if err := f.openStreamFile(); err != nil {
+		o.logger.Warn("awaiting_resume_stream_open_failed", "err", err)
+	}
+	defer f.closeStreamFile()
+
+	userMsg := fmt.Sprintf(
+		"The user has answered the pending question.\n\nQuestion: %s\nAnswer: %s\n\nContinue from where you left off.",
+		pq.Question, reply)
+	f.postActivity(linear.Action("claude_resume",
+		fmt.Sprintf("claude -p --resume (awaiting-input reply) in %s", f.worktreePath), ""))
+	if err := f.runClaudeResume(userMsg); err != nil {
+		o.logger.Error("awaiting_resume_claude_failed",
+			"issue", ev.IssueIdentifier, "err", err)
+		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+			t.State = store.JobStateFailed
+			t.Error = err.Error()
+		})
+		f.postActivity(linear.ErrorActivity(fmt.Sprintf("claude resume failed: %v", err)))
+		return
+	}
+
+	// claude called ask_user again — park and wait for the next reply.
+	if f.awaitPendingID != "" {
+		_ = f.parkAwaitingInput()
+		return
+	}
+
+	f.postActivity(linear.Action("ensure_pr",
+		fmt.Sprintf("gh pr (%s -> %s)", f.branch, f.baseBranch), ""))
+	prURL, err := f.ensurePR(issue)
+	isNoop := errors.Is(err, errPRNoCommits)
+	if err != nil && !isNoop {
+		o.logger.Error("awaiting_resume_pr_failed",
+			"issue", ev.IssueIdentifier, "err", err)
+		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+			t.State = store.JobStateFailed
+			t.Error = err.Error()
+		})
+		return
+	}
+	f.prURL = prURL
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+		t.State = store.JobStateDone
+		t.PRURL = prURL
+		t.ClaudeSessionID = pq.ClaudeSessionID
+		t.FinishedAt = now
+	})
+	if !isNoop && prURL != "" && o.ciWatcher != nil {
+		o.ciWatcher.WatchPR(ctx, prURL, f.repoDir, ev.SessionID, ev.IssueID)
+	}
+	o.logger.Info("awaiting_resume_done",
+		"issue", ev.IssueIdentifier, "pr", prURL)
+}
+
 func (o *Orchestrator) run(ev linear.AgentEvent) {
 	o.runWithAttempt(ev, 1)
 }
@@ -776,6 +951,12 @@ type flow struct {
 	// Set by handleCreated for the GEO-38 fresh-follow-up path; empty for
 	// the normal first run.
 	followupSuffix string
+
+	// awaitPendingID is set by drainStreamJSON when it detects the
+	// ADMIRAL_AWAIT:<id> marker in claude's output. A non-empty value
+	// means the run called ask_user and parked itself; execute() will
+	// transition the task to AWAITING_INPUT instead of opening a PR.
+	awaitPendingID string
 }
 
 func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
@@ -970,6 +1151,11 @@ func (f *flow) execute() error {
 	defer f.closeStreamFile()
 	if err := f.runClaude(issue); err != nil {
 		return fmt.Errorf("claude run: %w", err)
+	}
+	// ask_user was called: park task as AWAITING_INPUT and return without
+	// opening a PR. The worktree stays on disk for the resume run.
+	if f.awaitPendingID != "" {
+		return f.parkAwaitingInput()
 	}
 
 	f.postActivity(linear.Action("ensure_pr",
@@ -1716,6 +1902,12 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 		// chose this binary on purpose.
 		"--dangerously-skip-permissions",
 	}
+	if mcpCfgPath, err := f.writeMCPConfig(); err != nil {
+		f.o.logger.Warn("mcp_config_write_failed", "err", err)
+	} else if mcpCfgPath != "" {
+		args = append(args, "--mcp-config", mcpCfgPath)
+		defer os.Remove(mcpCfgPath)
+	}
 	cctx, cancel := context.WithTimeout(f.ctx, time.Duration(f.o.cfg.MaxRunSeconds)*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, f.o.cfg.ClaudeBin, args...)
@@ -1727,6 +1919,13 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	cmd.Env = append(os.Environ(),
 		"CLAUDE_AUTOPILOT_ISSUE="+issue.Identifier,
 		"CLAUDE_AUTOPILOT_SESSION="+f.ev.SessionID,
+		// Inherited by admiral-mcp-ask subprocess (via claude's env).
+		"ADMIRAL_DB_PATH="+f.o.dbPath,
+		"ADMIRAL_ISSUE_ID="+f.ev.IssueID,
+		"ADMIRAL_ISSUE_IDENTIFIER="+f.ev.IssueIdentifier,
+		"ADMIRAL_LINEAR_SESSION="+f.ev.SessionID,
+		"ADMIRAL_CLAUDE_SESSION="+claudeSessionID,
+		"ADMIRAL_WORKTREE_PATH="+f.worktreePath,
 	)
 
 	stdout, err := cmd.StdoutPipe()
@@ -1762,6 +1961,56 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	return nil
 }
 
+// writeMCPConfig writes a temporary MCP server config JSON file for the
+// admiral-ask-mcp server and returns its path. Returns ("", nil) when
+// McpAskBin is not found on PATH — the caller omits --mcp-config gracefully.
+func (f *flow) writeMCPConfig() (string, error) {
+	bin, err := exec.LookPath(f.o.cfg.McpAskBin)
+	if err != nil {
+		// MCP ask binary not installed — skip gracefully.
+		return "", nil
+	}
+	cfg := map[string]any{
+		"mcpServers": map[string]any{
+			"admiral-ask": map[string]any{
+				"command": bin,
+				"args":    []string{},
+			},
+		},
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("marshal mcp config: %w", err)
+	}
+	tmp, err := os.CreateTemp("", "admiral-mcp-*.json")
+	if err != nil {
+		return "", fmt.Errorf("create mcp config temp file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("write mcp config: %w", err)
+	}
+	tmp.Close()
+	return tmp.Name(), nil
+}
+
+// parkAwaitingInput transitions the task to AWAITING_INPUT after claude has
+// called ask_user and exited. The worktree is kept on disk so the resume
+// path can continue file edits in the same directory.
+func (f *flow) parkAwaitingInput() error {
+	if err := f.o.db.SetAdmiralTaskAwaitingInput(f.ev.IssueID, f.awaitPendingID); err != nil {
+		return fmt.Errorf("set task awaiting_input: %w", err)
+	}
+	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateAwaitingInput
+	})
+	f.o.logger.Info("task_awaiting_input",
+		"issue", f.ev.IssueIdentifier,
+		"pending_id", f.awaitPendingID)
+	return nil
+}
+
 // streamMsg is the full structure emitted by claude -p stream-json.
 // tool_use events live inside message.content[].type=="tool_use".
 type streamMsg struct {
@@ -1773,12 +2022,13 @@ type streamMsg struct {
 	DurationMs int    `json:"duration_ms,omitempty"`
 	StopReason string `json:"stop_reason,omitempty"`
 
-	// assistant message wrapper (tool_use lives here in Anthropic stream-json)
+	// assistant message wrapper (tool_use and text live here in Anthropic stream-json)
 	Message struct {
 		Content []struct {
 			Type  string          `json:"type"`
 			Name  string          `json:"name,omitempty"`
 			Input json.RawMessage `json:"input,omitempty"`
+			Text  string          `json:"text,omitempty"`
 		} `json:"content,omitempty"`
 	} `json:"message,omitempty"`
 
@@ -1914,7 +2164,7 @@ func (f *flow) drainStreamJSON(r io.Reader) {
 
 		// Emit structured logs for the 3 critical event types.
 
-		// 1. tool_use events (nested inside assistant message.content)
+		// 1. tool_use and text events (nested inside assistant message.content)
 		if msg.Type == "assistant" {
 			for _, c := range msg.Message.Content {
 				if c.Type == "tool_use" {
@@ -1923,6 +2173,13 @@ func (f *flow) drainStreamJSON(r io.Reader) {
 						"issue", f.ev.IssueIdentifier,
 						"tool", c.Name,
 						"summary", summarizeToolUse(c.Name, c.Input))
+				}
+				if c.Type == "text" && f.awaitPendingID == "" {
+					trimmed := strings.TrimSpace(c.Text)
+					if strings.HasPrefix(trimmed, "ADMIRAL_AWAIT:") {
+						f.awaitPendingID = strings.TrimSpace(
+							strings.TrimPrefix(trimmed, "ADMIRAL_AWAIT:"))
+					}
 				}
 			}
 		}
@@ -2159,6 +2416,21 @@ Your final deliverable is a pull request. Do these steps in order:
 Do not skip any step. If you have nothing to change, still create a tiny
 no-op commit (e.g. clarify a comment) so a PR can be opened — admiral's
 flow expects a PR per session.
+
+## Asking the user a question (ask_user MCP tool)
+
+If you genuinely cannot proceed without human input, call the `+"`ask_user`"+` tool
+(provided by the admiral-ask MCP server). It posts your question to the Linear
+thread and returns immediately with {"status":"pending","pending_id":"<id>"}.
+
+When ask_user returns status=pending you MUST:
+1. Stop all further work immediately.
+2. Output exactly one line: `+"`ADMIRAL_AWAIT:<pending_id>`"+` (replace
+   <pending_id> with the id value from the tool result).
+3. Exit — do NOT commit, push, or open a PR.
+
+Admiral will resume this session automatically once the user replies.
+Only use ask_user when truly blocked; never use it as a confirmation step.
 `,
 		branch, baseBranch,
 		i.Identifier, i.Identifier, i.Identifier,
@@ -2325,10 +2597,12 @@ func (o *Orchestrator) postBusyAck(sessionID, body string) {
 }
 
 // taskInFlight reports whether the admiral_task is in a state where its
-// AgentSession is still being driven by a running flow. Rejection-class
-// dispatcher responses must be non-terminal (Thought) when this is true.
+// AgentSession must stay open (non-terminal). Used by replyRejection to
+// choose between terminal ErrorActivity and non-terminal Thought.
 func taskInFlight(state string) bool {
-	return state == store.JobStateReceived || state == store.JobStateExecuting
+	return state == store.JobStateReceived ||
+		state == store.JobStateExecuting ||
+		state == store.JobStateAwaitingInput
 }
 
 const availableCommandsHelp = `Available commands:
