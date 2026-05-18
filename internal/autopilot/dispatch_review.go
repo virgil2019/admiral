@@ -57,29 +57,43 @@ func (o *Orchestrator) HandleReviewEvent(ctx context.Context, row *store.EventIn
 
 	reviewBody := extractReviewBody(row.PayloadJSON, row.Action)
 
-	diff, err := o.prClient.GetDiff(ctx, prURL)
-	if err != nil {
-		o.logger.Warn("review_dispatch_get_diff_failed", "pr", prURL, "err", err)
-		// Non-fatal: proceed without diff context.
-	}
-
 	replier := NewGitHubReplier(o.prClient, prURL)
-	go o.runReview(task, reviewBody, diff, replier)
+	go o.runReview(task, reviewBody, replier)
 }
 
 // runReview is the background goroutine for a GitHub review event. Steps:
 //  1. Resolve the repo directory via the Linear issue.
-//  2. Ensure the worktree exists (rebuild from remote if cleaned up).
-//  3. Run `claude -p` with a review prompt.
-//  4. Push the branch to origin.
-//  5. Post the claude output as a PR comment.
-func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody, diff string, replier Replier) {
+//  2. Fetch the PR diff for context (non-fatal if unavailable).
+//  3. Ensure the worktree exists (rebuild from remote if cleaned up).
+//  4. Run `claude -p` with a review prompt.
+//  5. Push the branch to origin.
+//  6. Post the claude output as a PR comment.
+//
+// Events_inbox lifecycle: the events_inbox row is marked done by the worker
+// immediately after HandleReviewEvent returns — same as the Linear dispatch
+// model where events_inbox tracks delivery only, not task completion. Failures
+// inside runReview are surfaced via the PR comment (best-effort) and logs.
+func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, replier Replier) {
+	defer func() {
+		if r := recover(); r != nil {
+			o.logger.Error("review_run_panic", "pr", task.PRURL, "panic", r)
+		}
+	}()
+
 	release := o.acquireRunSlot()
 	defer release()
 
 	ctx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
+
+	// Fetch the PR diff inside the goroutine so the worker's drain loop is
+	// not blocked by the network call.
+	diff, err := o.prClient.GetDiff(ctx, task.PRURL)
+	if err != nil {
+		o.logger.Warn("review_run_get_diff_failed", "pr", task.PRURL, "err", err)
+		// Non-fatal: proceed without diff context.
+	}
 
 	repoDir, baseBranch, err := o.resolveRepoForReview(ctx, task)
 	if err != nil {
