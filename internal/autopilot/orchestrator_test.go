@@ -329,6 +329,8 @@ type mockStore struct {
 	// admiral_tasks (PR-B-v2)
 	AdmiralTask             *store.AdmiralTask
 	AdmiralTaskErr          error
+	AdmiralTaskByPRURL      *store.AdmiralTask
+	AdmiralTaskByPRURLErr   error
 	LiveAdmiralTask         *store.AdmiralTask // mutated by UpdateAdmiralTask via fn
 	ClaimAdmiralTaskFresh   *bool              // override return value (nil = default true)
 	ClaimAdmiralTaskErr     error
@@ -423,6 +425,10 @@ func (m *mockStore) HasAnyAutopilotJobForIssue(issueID string) (bool, error) {
 
 func (m *mockStore) GetAdmiralTaskByIssue(issueID string) (*store.AdmiralTask, error) {
 	return m.AdmiralTask, m.AdmiralTaskErr
+}
+
+func (m *mockStore) GetAdmiralTaskByPRURL(prURL string) (*store.AdmiralTask, error) {
+	return m.AdmiralTaskByPRURL, m.AdmiralTaskByPRURLErr
 }
 
 func (m *mockStore) ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error) {

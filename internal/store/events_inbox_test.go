@@ -45,7 +45,7 @@ func TestEnqueueEvent_Duplicate(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewForTest(db)
-	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005, migration0013} {
 		if _, err := db.Exec(m); err != nil {
 			t.Fatalf("migration: %v", err)
 		}
@@ -75,7 +75,7 @@ func TestClaimNextPendingEvent_Empty(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewForTest(db)
-	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005, migration0013} {
 		if _, err := db.Exec(m); err != nil {
 			t.Fatalf("migration: %v", err)
 		}
@@ -97,7 +97,7 @@ func TestClaimNextPendingEvent_SinglePending(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewForTest(db)
-	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005, migration0013} {
 		if _, err := db.Exec(m); err != nil {
 			t.Fatalf("migration: %v", err)
 		}
@@ -145,7 +145,7 @@ func TestClaimNextPendingEvent_Concurrent(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewForTest(db)
-	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005, migration0013} {
 		if _, err := db.Exec(m); err != nil {
 			t.Fatalf("migration: %v", err)
 		}
@@ -202,7 +202,7 @@ func TestMarkEventDone(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewForTest(db)
-	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005, migration0013} {
 		if _, err := db.Exec(m); err != nil {
 			t.Fatalf("migration: %v", err)
 		}
@@ -230,7 +230,7 @@ func TestMarkEventFailed_Retry(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewForTest(db)
-	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005, migration0013} {
 		if _, err := db.Exec(m); err != nil {
 			t.Fatalf("migration: %v", err)
 		}
@@ -262,7 +262,7 @@ func TestMarkEventFailed_DeadLetter(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewForTest(db)
-	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005, migration0013} {
 		if _, err := db.Exec(m); err != nil {
 			t.Fatalf("migration: %v", err)
 		}
@@ -290,7 +290,7 @@ func TestCountPendingEvents(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewForTest(db)
-	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005, migration0013} {
 		if _, err := db.Exec(m); err != nil {
 			t.Fatalf("migration: %v", err)
 		}
@@ -323,7 +323,7 @@ func TestEventInboxRow_Timestamps(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewForTest(db)
-	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005, migration0013} {
 		if _, err := db.Exec(m); err != nil {
 			t.Fatalf("migration: %v", err)
 		}
@@ -374,7 +374,7 @@ func TestClaim_PerSessionLock(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewForTest(db)
-	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005, migration0013} {
 		if _, err := db.Exec(m); err != nil {
 			t.Fatalf("migration: %v", err)
 		}
@@ -436,7 +436,7 @@ func TestClaim_ConcurrentWorkers(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewForTest(db)
-	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005, migration0013} {
 		if _, err := db.Exec(m); err != nil {
 			t.Fatalf("migration: %v", err)
 		}
@@ -486,7 +486,7 @@ func TestClaim_ConcurrentSameSession(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewForTest(db)
-	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005} {
+	for _, m := range []string{migration0001, migration0002, migration0003, migration0004, migration0005, migration0013} {
 		if _, err := db.Exec(m); err != nil {
 			t.Fatalf("migration: %v", err)
 		}
