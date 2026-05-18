@@ -107,6 +107,8 @@ func main() {
 	// the worker logs but doesn't send.
 	alerter := newAuthAlerter(cfg, db, logger)
 
+	go orch.StartBlockerWatcher(ctx)
+
 	// worker pool: N workers consume from events_inbox and dispatch to orchestrator
 	for i := 0; i < n; i++ {
 		w := autopilot.NewWorker(db, orch, logger.With("worker", i), sig)

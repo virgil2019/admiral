@@ -300,6 +300,10 @@ func (m *mockLinearClient) IssueUpdate(ctx context.Context, issueID, stateID str
 	return m.IssueUpdateErr
 }
 
+func (m *mockLinearClient) GetIssueBlockers(_ context.Context, _ string) ([]linear.IssueBlocker, error) {
+	return nil, nil // no blockers by default
+}
+
 // mockStore implements storeInterface for testing.
 type mockStore struct {
 	Active     bool
@@ -485,6 +489,12 @@ func (m *mockStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
 func (m *mockStore) ListJobsByIssueAndStates(issueID string, states []string) ([]store.AutopilotJob, error) {
 	return m.ListJobsByIssueAndStatesResult, m.ListJobsByIssueAndStatesErr
 }
+
+func (m *mockStore) SetAdmiralTaskBlocked(issueID, blockerIDs string) error { return nil }
+
+func (m *mockStore) GetBlockedAdmiralTasks() ([]store.BlockedTask, error) { return nil, nil }
+
+func (m *mockStore) TransitionBlockedToReceived(issueID string) (bool, error) { return false, nil }
 
 // fakeGhProbe is a deterministic ghProbe for tests. Configure the maps
 // keyed on branch name (for FindMergedPRForBranch) and PR url (for
