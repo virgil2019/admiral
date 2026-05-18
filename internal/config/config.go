@@ -128,6 +128,9 @@ type Autopilot struct {
 	// CIWatchTimeout is how long CI watcher waits for all checks to complete.
 	// Default: 15m.
 	CIWatchTimeout time.Duration `yaml:"ci_watch_timeout"`
+	// BlockerPollInterval is how often the blocker watcher re-checks tasks that
+	// were blocked on unresolved Linear dependencies. Default: 10m.
+	BlockerPollInterval time.Duration `yaml:"blocker_poll_interval"`
 	// Repos is the list of Linear project → repo mappings. Required: must
 	// contain at least one entry. An incoming Linear issue is routed to the
 	// repo whose project_id matches issue.project.id; issues without a
@@ -339,6 +342,9 @@ func (c *Config) validateAutopilotAndExpand() error {
 	}
 	if c.Autopilot.CIWatchTimeout <= 0 {
 		c.Autopilot.CIWatchTimeout = 15 * time.Minute
+	}
+	if c.Autopilot.BlockerPollInterval <= 0 {
+		c.Autopilot.BlockerPollInterval = 10 * time.Minute
 	}
 
 	c.Storage.SQLitePath = expandTilde(c.Storage.SQLitePath)
