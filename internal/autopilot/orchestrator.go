@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/georgehuang/admiral/internal/config"
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 	"github.com/google/uuid"
@@ -63,6 +64,7 @@ type storeInterface interface {
 	HasAnyAutopilotJobForIssue(issueID string) (bool, error)
 
 	GetAdmiralTaskByIssue(issueID string) (*store.AdmiralTask, error)
+	GetAdmiralTaskByPRURL(prURL string) (*store.AdmiralTask, error)
 	ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error)
 	UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask)) error
 	MoveAdmiralTaskToHistoryAndClaimNew(issueID, reason, identifier, lastEventSessionID string) (int, error)
@@ -100,6 +102,9 @@ type Orchestrator struct {
 
 	// replier is the semantic reply layer for Linear AgentSession threads.
 	replier *agentSessionReplier
+
+	// prClient is the outbound GitHub PR client used by the review dispatcher.
+	prClient ghpkg.PRClient
 }
 
 func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
@@ -119,7 +124,8 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		runSlots: make(chan struct{}, slots),
 		ciWatcher: newCIWatcher(lc, db, logger, cfg.GhBin,
 			cfg.CIWatchPollInterval, cfg.CIWatchTimeout),
-		replier: NewAgentSessionReplier(lc),
+		replier:  NewAgentSessionReplier(lc),
+		prClient: ghpkg.NewClient(cfg.GhToken),
 	}
 	// Ensure job_streams_dir exists on startup.
 	if err := os.MkdirAll(cfg.JobStreamsDir, 0o755); err != nil {
