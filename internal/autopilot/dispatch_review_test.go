@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 
 	ghpkg "github.com/georgehuang/admiral/internal/github"
@@ -204,7 +205,7 @@ func TestBuildReviewPrompt_ContainsKeyParts(t *testing.T) {
 		"Do NOT open a new PR",
 	}
 	for _, want := range checks {
-		if !contains(p, want) {
+		if !strings.Contains(p, want) {
 			t.Errorf("prompt missing %q\n---\n%s", want, p)
 		}
 	}
@@ -212,26 +213,14 @@ func TestBuildReviewPrompt_ContainsKeyParts(t *testing.T) {
 
 func TestBuildReviewPrompt_NoDiff(t *testing.T) {
 	p := buildReviewPrompt("https://github.com/owner/repo/pull/6", "linear/geo-6", "main", "nit", "")
-	if contains(p, "```diff") {
+	if strings.Contains(p, "```diff") {
 		t.Error("expected no diff block when diff is empty")
 	}
 }
 
 func TestBuildReviewPrompt_NoReviewBody(t *testing.T) {
 	p := buildReviewPrompt("https://github.com/owner/repo/pull/7", "linear/geo-7", "main", "", "some diff")
-	if contains(p, "Review comment:") {
+	if strings.Contains(p, "Review comment:") {
 		t.Error("expected no review comment section when body is empty")
 	}
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
-		func() bool {
-			for i := 0; i <= len(s)-len(sub); i++ {
-				if s[i:i+len(sub)] == sub {
-					return true
-				}
-			}
-			return false
-		}())
 }
