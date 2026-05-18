@@ -21,6 +21,7 @@ import (
 
 	"github.com/georgehuang/admiral/internal/autopilot"
 	"github.com/georgehuang/admiral/internal/config"
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 	"github.com/georgehuang/admiral/internal/tg"
@@ -73,12 +74,15 @@ func main() {
 	// webhook uses the enqueue path (store + signal); onAgent is nil
 	wh := linear.NewWebhook(cfg.Linear.WebhookSecret, db, sig, logger, nil)
 
+	ghwh := ghpkg.NewWebhook(cfg.Autopilot.GhWebhookSecret, cfg.Autopilot.GhBotLogin, db, logger)
+
 	mux := http.NewServeMux()
 	// /webhook matches Linear's typical agent webhook URL convention
 	// (the path used in the existing oauth-callback.ts demo). /linear/webhook
 	// is kept as an alias.
 	mux.Handle("/webhook", wh.Handler())
 	mux.Handle("/linear/webhook", wh.Handler())
+	mux.Handle("/github/webhook", ghwh.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})

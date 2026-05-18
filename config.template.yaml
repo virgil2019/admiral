@@ -1,0 +1,42 @@
+bot_token: "123456:ABC-your-tg-bot-token"
+allowed_tg_user_ids: [111222333]
+
+session:
+  tg_chat_id: 111222333
+  team_name: "vibe-bridge-session"
+  cwd: "/Users/georgehuang/Program/vibe-project"
+  provider: "omx"
+  cli_bin_path: "/usr/local/bin/omx"
+
+launch:
+  mode: "pty"
+  pty_command: ["/usr/bin/script", "-q", "/dev/null"]
+  worker_count: 3
+  agent_type: "codex"
+  bootstrap_task: "vibe bridge session"
+
+storage:
+  sqlite_path: "~/.local/share/admiral/bridge.db"
+
+telegram:
+  long_poll_timeout_s: 50
+  api_base: "https://api.telegram.org"
+
+event_stream:
+  # await_timeout_ms is omx-only (await-event long-poll). Ignored for omc.
+  await_timeout_ms: 30000
+  # idle_backoff_ms also drives the omc polling loop tick interval.
+  idle_backoff_ms: 2000
+
+logging:
+  level: "info"
+  file: "~/.local/share/admiral/bridge.log"
+linear:
+  api_token: "lin_oauth_xxxxxxxx"
+  webhook_secret: "lin_wh_xxxxxxxx"
+
+autopilot:
+  listen_addr: ":8787"
+  repo_dir: "/Users/you/code/your-repo"
+  gh_webhook_secret: ""   # GitHub webhook signing secret (leave empty to skip verification in dev)
+  gh_bot_login: ""        # GitHub login of the admiral bot account (used to filter self-triggered events)
