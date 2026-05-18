@@ -349,7 +349,9 @@ func (o *Orchestrator) dispatchFreshAssign(ev linear.AgentEvent) {
 		if setErr := o.db.SetAdmiralTaskBlocked(ev.IssueID, blockerIDsJSON(blockers)); setErr != nil {
 			o.logger.Error("set_blocked_failed", "issue", ev.IssueIdentifier, "err", setErr)
 		}
-		o.postRejection(ev.SessionID, blockedMessage(blockers))
+		// Use Thought (non-terminal) so the AgentSession stays alive for the
+		// watcher's follow-up "resuming now" post when blockers are resolved.
+		o.postBlockedNotice(ev.SessionID, blockedMessage(blockers))
 		return
 	}
 
@@ -380,6 +382,12 @@ func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, task *store.AdmiralTa
 		// Task is in flight by definition of this case branch — Thought
 		// keeps the live AgentSession alive for the running flow.
 		o.postBusyAck(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
+		return
+	case store.JobStateBlocked:
+		o.logger.Info("dispatch_reject_rerun_blocked",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		// Thought keeps the session alive; watcher will auto-resume when blockers clear.
+		o.postBusyAck(ev.SessionID, "admiral is waiting for blockers to resolve. Use /status to check; will resume automatically.")
 		return
 	}
 
@@ -428,6 +436,11 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 		// Task is in flight by definition of this case branch — Thought
 		// keeps the live AgentSession alive for the running flow.
 		o.postBusyAck(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
+		return
+	case store.JobStateBlocked:
+		o.logger.Info("dispatch_reject_fix_blocked",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postBusyAck(ev.SessionID, "admiral is waiting for blockers to resolve. Will resume automatically.")
 		return
 	case store.JobStateFailed, store.JobStateTimedOut, store.JobStateCancelled:
 		o.logger.Info("dispatch_reject_fix_terminal_non_done",
@@ -2289,6 +2302,15 @@ func (o *Orchestrator) postRejection(sessionID, body string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.ErrorActivity(body))
+}
+
+// postBlockedNotice posts a non-terminal Thought activity when a task is
+// parked in BLOCKED state. Thought keeps the AgentSession alive so the
+// BlockerWatcher's "resuming now" post lands in the same thread later.
+func (o *Orchestrator) postBlockedNotice(sessionID, body string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.Thought(body, false))
 }
 
 // postBusyAck posts a non-terminal Thought activity. Use this for

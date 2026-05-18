@@ -18,17 +18,25 @@ type BlockerWatcher struct {
 	orch     *Orchestrator
 	interval time.Duration
 	logger   *slog.Logger
+	// runFn is called to resume a newly-unblocked task. Defaults to
+	// orch.runWithAttempt; overridable in tests.
+	runFn func(linear.AgentEvent, int)
 }
 
 func newBlockerWatcher(orch *Orchestrator, interval time.Duration) *BlockerWatcher {
 	if interval <= 0 {
 		interval = 10 * time.Minute
 	}
-	return &BlockerWatcher{orch: orch, interval: interval, logger: orch.logger}
+	w := &BlockerWatcher{orch: orch, interval: interval, logger: orch.logger}
+	w.runFn = orch.runWithAttempt
+	return w
 }
 
-// Run starts the poll loop. Blocks until ctx is cancelled.
+// Run starts the poll loop. Blocks until ctx is cancelled. An initial check
+// is performed immediately on startup so tasks blocked before a restart are
+// not delayed by a full interval.
 func (w *BlockerWatcher) Run(ctx context.Context) {
+	w.checkAll(ctx)
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 	for {
@@ -47,39 +55,69 @@ func (w *BlockerWatcher) checkAll(ctx context.Context) {
 		w.logger.Error("blocker_watcher_list_failed", "err", err)
 		return
 	}
+	// Rate-limit: re-queue at most MaxConcurrentRuns tasks per tick so a
+	// large backlog doesn't fan out unbounded goroutines at once.
+	limit := w.orch.cfg.MaxConcurrentRuns
+	if limit <= 0 {
+		limit = 3
+	}
+	requeued := 0
 	for _, t := range tasks {
-		w.checkOne(ctx, t)
+		if requeued >= limit {
+			w.logger.Info("blocker_watcher_rate_limited",
+				"remaining", len(tasks)-requeued)
+			break
+		}
+		if w.checkOne(ctx, t) {
+			requeued++
+		}
 	}
 }
 
-func (w *BlockerWatcher) checkOne(ctx context.Context, task store.BlockedTask) {
-	blockers, err := w.orch.lc.GetIssueBlockers(ctx, task.IssueID)
+// checkOne re-checks a single BLOCKED task and re-queues it if all blockers
+// are resolved. Returns true when the task was successfully re-queued.
+func (w *BlockerWatcher) checkOne(ctx context.Context, task store.BlockedTask) bool {
+	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	blockers, err := w.orch.lc.GetIssueBlockers(checkCtx, task.IssueID)
 	if err != nil {
 		w.logger.Warn("blocker_watcher_check_failed",
 			"issue", task.IssueIdentifier, "err", err)
-		return
+		return false
 	}
 	if len(blockers) > 0 {
-		return // still blocked
+		return false // still blocked
 	}
 
 	ok, err := w.orch.db.TransitionBlockedToReceived(task.IssueID)
 	if err != nil {
 		w.logger.Error("blocker_watcher_transition_failed",
 			"issue", task.IssueIdentifier, "err", err)
-		return
+		return false
 	}
 	if !ok {
-		return // another goroutine already transitioned it
+		return false // another goroutine already transitioned it
+	}
+
+	// Re-verify after claiming RECEIVED: a new blocker could have been added
+	// between GetIssueBlockers and the transition.
+	reverifyCtx, rcancel := context.WithTimeout(ctx, 30*time.Second)
+	defer rcancel()
+	if blockers2, err2 := w.orch.lc.GetIssueBlockers(reverifyCtx, task.IssueID); err2 == nil && len(blockers2) > 0 {
+		w.logger.Info("blocker_watcher_reblocked_after_transition",
+			"issue", task.IssueIdentifier, "new_blockers", blockerIdentifiers(blockers2))
+		_ = w.orch.db.SetAdmiralTaskBlocked(task.IssueID, blockerIDsJSON(blockers2))
+		return false
 	}
 
 	w.logger.Info("blocker_watcher_unblocked", "issue", task.IssueIdentifier)
 
 	if task.LastEventSessionID != "" {
-		replyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		replyCtx, replyCancel := context.WithTimeout(ctx, 15*time.Second)
 		_ = w.orch.lc.PostAgentActivity(replyCtx, task.LastEventSessionID,
 			linear.Response("admiral: all blockers resolved — resuming now."))
-		cancel()
+		replyCancel()
 	}
 
 	syntheticEv := linear.AgentEvent{
@@ -88,7 +126,8 @@ func (w *BlockerWatcher) checkOne(ctx context.Context, task store.BlockedTask) {
 		SessionID:       task.LastEventSessionID,
 		Action:          linear.ActionCreated,
 	}
-	go w.orch.runWithAttempt(syntheticEv, task.AttemptN)
+	go w.runFn(syntheticEv, task.AttemptN)
+	return true
 }
 
 // blockerIDsJSON encodes a slice of IssueBlockers as a JSON array of issue IDs.
