@@ -97,6 +97,14 @@ type Autopilot struct {
 	// which is acceptable for local runs but not recommended in production
 	// (admiral's bot identity would be ambiguous).
 	GhToken string `yaml:"gh_token"`
+	// GhWebhookSecret is the HMAC-SHA256 signing secret configured on the
+	// GitHub webhook. Empty disables signature verification (only suitable
+	// for local dev/testing).
+	GhWebhookSecret string `yaml:"gh_webhook_secret"`
+	// GhBotLogin is the GitHub login of the admiral bot account. Used to
+	// filter out self-triggered events so admiral does not respond to its
+	// own PR comments. Empty disables self-filtering.
+	GhBotLogin string `yaml:"gh_bot_login"`
 	// MaxRunSeconds caps a single claude -p invocation. Default: 1800 (30 min).
 	MaxRunSeconds int `yaml:"max_run_seconds"`
 	// JobStreamsDir is the directory where per-job claude stream-json files
