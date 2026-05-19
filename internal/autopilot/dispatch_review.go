@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
 
@@ -22,12 +23,20 @@ import (
 // pull_request_review_comment event types.
 type reviewPayload struct {
 	Review *struct {
-		Body string `json:"body"`
+		Body  string `json:"body"`
+		State string `json:"state"`
 	} `json:"review,omitempty"`
 	Comment *struct {
 		Body string `json:"body"`
 	} `json:"comment,omitempty"`
 }
+
+// GitHub PR review states (lowercase in webhook payloads).
+const (
+	reviewStateApproved         = "approved"
+	reviewStateChangesRequested = "changes_requested"
+	reviewStateCommented        = "commented"
+)
 
 // HandleReviewEvent processes a source='github' event from events_inbox.
 // Called by the worker; returns quickly — the claude run is dispatched to a
@@ -56,6 +65,17 @@ func (o *Orchestrator) HandleReviewEvent(ctx context.Context, row *store.EventIn
 	}
 
 	reviewBody := extractReviewBody(row.PayloadJSON, row.Action)
+	reviewState := extractReviewState(row.PayloadJSON, row.Action)
+
+	// APPROVED with no body has no code feedback to address. Skip the claude
+	// run and just notify the Linear thread that the PR is ready for human
+	// verification. Reviewers who Approve *and* leave inline comments produce
+	// pull_request_review_comment events separately, so that feedback is not
+	// dropped on the floor.
+	if reviewState == reviewStateApproved && reviewBody == "" {
+		go o.postReviewApprovedNotice(task)
+		return
+	}
 
 	replier := NewGitHubReplier(o.prClient, prURL)
 	go o.runReview(task, reviewBody, replier)
@@ -132,6 +152,11 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 		output = "addressed"
 	}
 	_ = replier.Reply(ctx, output)
+
+	// Best-effort: notify the Linear thread that the review has been addressed
+	// so the issue creator knows to come re-review. Failures are logged at
+	// warn level — the PR comment above is the authoritative signal.
+	o.postReviewHandledNotice(task)
 }
 
 // resolveRepoForReview fetches the Linear issue for the task and returns the
@@ -262,6 +287,62 @@ func extractReviewBody(payloadJSON, action string) string {
 		return strings.TrimSpace(p.Review.Body)
 	}
 	return ""
+}
+
+// extractReviewState returns the lowercased review state ("approved",
+// "changes_requested", "commented") for pull_request_review.submitted events.
+// Returns "" for pull_request_review_comment events, which carry no state.
+func extractReviewState(payloadJSON, action string) string {
+	if strings.HasPrefix(action, "pull_request_review_comment") {
+		return ""
+	}
+	var p reviewPayload
+	if err := json.Unmarshal([]byte(payloadJSON), &p); err != nil {
+		return ""
+	}
+	if p.Review == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(p.Review.State))
+}
+
+// postReviewApprovedNotice notifies the Linear thread that an external
+// reviewer approved the PR. No claude run happens — the PR is awaiting human
+// verification + merge.
+func (o *Orchestrator) postReviewApprovedNotice(task *store.AdmiralTask) {
+	body := fmt.Sprintf(
+		"Reviewer approved PR — human verify and merge: %s",
+		task.PRURL,
+	)
+	o.postReviewLinearNotice(task, linear.Response(body))
+}
+
+// postReviewHandledNotice notifies the Linear thread that admiral addressed a
+// reviewer's feedback by pushing follow-up commits. Reviewer is invited to
+// re-review.
+func (o *Orchestrator) postReviewHandledNotice(task *store.AdmiralTask) {
+	body := fmt.Sprintf(
+		"Addressed review feedback — please re-review: %s",
+		task.PRURL,
+	)
+	o.postReviewLinearNotice(task, linear.Response(body))
+}
+
+// postReviewLinearNotice posts a single activity to the Linear agent session
+// recorded on the admiral task. Skips silently when no session id is recorded
+// (e.g. task created by a pre-LastEventSessionID-flow path).
+func (o *Orchestrator) postReviewLinearNotice(task *store.AdmiralTask, a linear.AgentActivity) {
+	if task.LastEventSessionID == "" {
+		o.logger.Info("review_notice_skip_no_session",
+			"pr", task.PRURL, "issue", task.IssueIdentifier)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := o.lc.PostAgentActivity(ctx, task.LastEventSessionID, a); err != nil {
+		o.logger.Warn("review_notice_post_failed",
+			"pr", task.PRURL, "issue", task.IssueIdentifier, "err", err)
+	}
 }
 
 // buildReviewPrompt constructs the prompt passed to claude when addressing a
