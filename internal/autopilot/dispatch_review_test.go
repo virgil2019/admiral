@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/georgehuang/admiral/internal/config"
 	ghpkg "github.com/georgehuang/admiral/internal/github"
@@ -230,5 +231,188 @@ func TestBuildReviewPrompt_NoReviewBody(t *testing.T) {
 	p := buildReviewPrompt("https://github.com/owner/repo/pull/7", "linear/geo-7", "main", "", "some diff")
 	if strings.Contains(p, "Review comment:") {
 		t.Error("expected no review comment section when body is empty")
+	}
+}
+
+// --- review state extraction ---
+
+func TestExtractReviewState_Approved(t *testing.T) {
+	got := extractReviewState(
+		`{"review":{"state":"approved","body":""}}`,
+		"pull_request_review.submitted",
+	)
+	if got != reviewStateApproved {
+		t.Errorf("got %q, want %q", got, reviewStateApproved)
+	}
+}
+
+func TestExtractReviewState_ChangesRequested(t *testing.T) {
+	got := extractReviewState(
+		`{"review":{"state":"changes_requested","body":"fix this"}}`,
+		"pull_request_review.submitted",
+	)
+	if got != reviewStateChangesRequested {
+		t.Errorf("got %q, want %q", got, reviewStateChangesRequested)
+	}
+}
+
+func TestExtractReviewState_Commented(t *testing.T) {
+	got := extractReviewState(
+		`{"review":{"state":"commented","body":"nit"}}`,
+		"pull_request_review.submitted",
+	)
+	if got != reviewStateCommented {
+		t.Errorf("got %q, want %q", got, reviewStateCommented)
+	}
+}
+
+func TestExtractReviewState_InlineCommentReturnsEmpty(t *testing.T) {
+	// pull_request_review_comment events have no review.state concept.
+	got := extractReviewState(
+		`{"comment":{"body":"inline note"}}`,
+		"pull_request_review_comment.created",
+	)
+	if got != "" {
+		t.Errorf("got %q, want empty for inline comment events", got)
+	}
+}
+
+func TestExtractReviewState_Uppercase(t *testing.T) {
+	// Webhook payloads currently use lowercase, but extractReviewState
+	// normalizes to lowercase defensively so callers can always compare
+	// against the constants without a casing footgun.
+	got := extractReviewState(
+		`{"review":{"state":"APPROVED"}}`,
+		"pull_request_review.submitted",
+	)
+	if got != reviewStateApproved {
+		t.Errorf("got %q, want %q", got, reviewStateApproved)
+	}
+}
+
+func TestExtractReviewState_InvalidJSON(t *testing.T) {
+	got := extractReviewState("{bad json", "pull_request_review.submitted")
+	if got != "" {
+		t.Errorf("expected empty on bad JSON, got %q", got)
+	}
+}
+
+// --- approved-state branching ---
+
+// TestHandleReviewEvent_ApprovedSkipsClaude verifies that an approved review
+// with no body posts a Linear notice and does NOT trigger a claude run / PR
+// comment.
+func TestHandleReviewEvent_ApprovedSkipsClaude(t *testing.T) {
+	prURL := "https://github.com/owner/repo/pull/20"
+	db := &mockStore{
+		AdmiralTaskByPRURL: &store.AdmiralTask{
+			IssueID:            "issue-20",
+			IssueIdentifier:    "GEO-20",
+			PRURL:              prURL,
+			Branch:             "linear/geo-20",
+			LastEventSessionID: "sess-20",
+		},
+	}
+	lc := &mockLinearClient{}
+	pr := &mockPRClient{}
+	o := newReviewOrchestrator(db, lc, pr)
+
+	row := &store.EventInboxRow{
+		Source:      "github",
+		WebhookID:   "wh-20",
+		SessionID:   prURL,
+		Action:      "pull_request_review.submitted",
+		PayloadJSON: `{"review":{"state":"approved","body":""}}`,
+	}
+	o.HandleReviewEvent(context.Background(), row)
+
+	// Linear post is in a goroutine — give it a moment to land.
+	time.Sleep(50 * time.Millisecond)
+
+	if len(pr.postedComments) != 0 {
+		t.Errorf("approved review must not trigger PR comment, got %d", len(pr.postedComments))
+	}
+	body := lc.GetPostedBody()
+	if !strings.Contains(body, "human verify") {
+		t.Errorf("Linear notice missing 'human verify' phrasing: %q", body)
+	}
+	if !strings.Contains(body, prURL) {
+		t.Errorf("Linear notice missing PR URL: %q", body)
+	}
+}
+
+// TestHandleReviewEvent_ApprovedWithBody_RunsClaude verifies that an approved
+// review carrying a body (i.e. reviewer left textual feedback alongside the
+// approval) still goes through the claude path — feedback must not be
+// silently dropped just because the state is APPROVED.
+func TestHandleReviewEvent_ApprovedWithBody_RunsClaude(t *testing.T) {
+	prURL := "https://github.com/owner/repo/pull/21"
+	repoDir, err := os.MkdirTemp("", "TestHandleReviewEvent_ApprovedWithBody*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(repoDir) })
+	db := &mockStore{
+		AdmiralTaskByPRURL: &store.AdmiralTask{
+			IssueID:            "issue-21",
+			IssueIdentifier:    "GEO-21",
+			PRURL:              prURL,
+			Branch:             "linear/geo-21",
+			LastEventSessionID: "sess-21",
+		},
+		Repo: &store.Repo{RepoDir: repoDir, BaseBranch: "main"},
+	}
+	lc := &mockLinearClient{GetIssueResult: &linear.Issue{ID: "issue-21", ProjectID: "proj-1"}}
+	pr := &mockPRClient{}
+	o := newReviewOrchestrator(db, lc, pr)
+
+	row := &store.EventInboxRow{
+		Source:      "github",
+		WebhookID:   "wh-21",
+		SessionID:   prURL,
+		Action:      "pull_request_review.submitted",
+		PayloadJSON: `{"review":{"state":"approved","body":"LGTM but rename foo"}}`,
+	}
+	// Must not short-circuit to the approved-notice path.
+	o.HandleReviewEvent(context.Background(), row)
+	// Give the goroutine time to settle. If the approved-notice path were
+	// (incorrectly) taken, GetPostedBody would carry the "human verify"
+	// phrasing. The claude-run path will fail in the goroutine on the synthetic
+	// repo, but that failure path does not post that string.
+	time.Sleep(50 * time.Millisecond)
+	if body := lc.GetPostedBody(); strings.Contains(body, "human verify") {
+		t.Errorf("approved+body must not post the approved-notice; got %q", body)
+	}
+}
+
+// --- Linear notice helper ---
+
+func TestPostReviewLinearNotice_SkipsOnEmptySession(t *testing.T) {
+	lc := &mockLinearClient{}
+	o := newReviewOrchestrator(&mockStore{}, lc, &mockPRClient{})
+	task := &store.AdmiralTask{
+		PRURL:              "https://github.com/owner/repo/pull/30",
+		LastEventSessionID: "", // no session — should be a no-op
+	}
+	o.postReviewLinearNotice(task, linear.Response("hello"))
+	if lc.GetPostedBody() != "" {
+		t.Errorf("expected no Linear post on empty session id, got %q", lc.GetPostedBody())
+	}
+}
+
+func TestPostReviewHandledNotice_PostsExpectedBody(t *testing.T) {
+	lc := &mockLinearClient{}
+	o := newReviewOrchestrator(&mockStore{}, lc, &mockPRClient{})
+	task := &store.AdmiralTask{
+		PRURL:              "https://github.com/owner/repo/pull/31",
+		LastEventSessionID: "sess-31",
+	}
+	o.postReviewHandledNotice(task)
+	body := lc.GetPostedBody()
+	if !strings.Contains(body, "re-review") {
+		t.Errorf("handled notice missing 're-review': %q", body)
+	}
+	if !strings.Contains(body, task.PRURL) {
+		t.Errorf("handled notice missing PR URL: %q", body)
 	}
 }
