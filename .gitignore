@@ -1,10 +1,11 @@
 /bridge.db
 /*.db
 /bin/
-/admiral
+/admiral*
 *.log
 .DS_Store
 config.yaml
 .omc/
 .omx/
 .task.md
+.env
