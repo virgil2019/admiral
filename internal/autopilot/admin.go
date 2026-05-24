@@ -43,11 +43,12 @@ type adminServer struct {
 
 // adminRepoResponse is the JSON shape for /admin/repos.
 type adminRepoResponse struct {
-	TeamID     string `json:"team_id"`
-	TeamName   string `json:"project_name"`
-	RepoDir    string `json:"repo_dir"`
-	BaseBranch string `json:"base_branch"`
-	Enabled    bool   `json:"enabled"`
+	TeamID          string `json:"team_id"`
+	TeamName        string `json:"project_name"`
+	RepoDir         string `json:"repo_dir"`
+	BaseBranch      string `json:"base_branch"`
+	Enabled         bool   `json:"enabled"`
+	AutoPickEnabled bool   `json:"auto_pick_enabled"`
 }
 
 // adminJobResponse is the JSON shape for /admin/jobs list.
@@ -96,9 +97,10 @@ type createRepoResponse struct {
 
 // updateRepoRequest is the body for PATCH /admin/repos/<team_id>.
 type updateRepoRequest struct {
-	RepoDir    *string `json:"repo_dir,omitempty"`
-	BaseBranch *string `json:"base_branch,omitempty"`
-	Enabled    *bool   `json:"enabled,omitempty"`
+	RepoDir         *string `json:"repo_dir,omitempty"`
+	BaseBranch      *string `json:"base_branch,omitempty"`
+	Enabled         *bool   `json:"enabled,omitempty"`
+	AutoPickEnabled *bool   `json:"auto_pick_enabled,omitempty"`
 }
 
 // checkGhResponse is the body for POST /admin/repos/<team_id>/check_gh.
@@ -146,11 +148,12 @@ func (s *adminServer) listReposHandler(w http.ResponseWriter, r *http.Request) {
 	out := make([]adminRepoResponse, 0, len(repos))
 	for _, r := range repos {
 		out = append(out, adminRepoResponse{
-			TeamID:     r.ProjectID,
-			TeamName:   r.ProjectName,
-			RepoDir:    r.RepoDir,
-			BaseBranch: r.BaseBranch,
-			Enabled:    r.Enabled,
+			TeamID:          r.ProjectID,
+			TeamName:        r.ProjectName,
+			RepoDir:         r.RepoDir,
+			BaseBranch:      r.BaseBranch,
+			Enabled:         r.Enabled,
+			AutoPickEnabled: r.AutoPickEnabled,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -533,6 +536,9 @@ func (s *adminServer) updateRepoHandler(w http.ResponseWriter, r *http.Request) 
 	if req.Enabled != nil {
 		updated.Enabled = *req.Enabled
 	}
+	if req.AutoPickEnabled != nil {
+		updated.AutoPickEnabled = *req.AutoPickEnabled
+	}
 
 	if err := s.db.UpsertRepo(updated); err != nil {
 		s.logger.Warn("admin_update_repo_failed", "err", err)
@@ -542,12 +548,53 @@ func (s *adminServer) updateRepoHandler(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(adminRepoResponse{
-		TeamID:     updated.ProjectID,
-		TeamName:   updated.ProjectName,
-		RepoDir:    updated.RepoDir,
-		BaseBranch: updated.BaseBranch,
-		Enabled:    updated.Enabled,
+		TeamID:          updated.ProjectID,
+		TeamName:        updated.ProjectName,
+		RepoDir:         updated.RepoDir,
+		BaseBranch:      updated.BaseBranch,
+		Enabled:         updated.Enabled,
+		AutoPickEnabled: updated.AutoPickEnabled,
 	})
+}
+
+// toggleAutoPickHandler flips a repo's auto_pick_enabled flag and
+// returns the refreshed repos table fragment. Used by the htmx button
+// in repos.html so the operator gets one-click control without typing
+// JSON. POST /admin/repos/<project_id>/auto_pick.
+func (s *adminServer) toggleAutoPickHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	projectID := strings.TrimPrefix(r.URL.Path, "/admin/repos/")
+	projectID = strings.TrimSuffix(projectID, "/auto_pick")
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		http.Error(w, `{"error":"project_id required"}`, http.StatusBadRequest)
+		return
+	}
+	existing, err := s.db.GetRepoByProjectID(projectID)
+	if err != nil {
+		s.logger.Warn("admin_toggle_auto_pick_db_err", "err", err)
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	if existing == nil {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	updated := *existing
+	updated.AutoPickEnabled = !existing.AutoPickEnabled
+	if err := s.db.UpsertRepo(updated); err != nil {
+		s.logger.Warn("admin_toggle_auto_pick_failed", "err", err)
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	s.logger.Info("repo_auto_pick_toggled",
+		"project_id", projectID,
+		"auto_pick_enabled", updated.AutoPickEnabled,
+	)
+	s.reposTableHandler(w, r)
 }
 
 func (s *adminServer) deleteRepoHandler(w http.ResponseWriter, r *http.Request) {
@@ -832,18 +879,29 @@ func (s *adminServer) reposTableHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var b strings.Builder
-	b.WriteString(`<table><thead><tr><th>Project</th><th>Repo Dir</th><th>Branch</th><th>Enabled</th><th>Actions</th></tr></thead><tbody>`)
+	b.WriteString(`<table><thead><tr><th>Project</th><th>Repo Dir</th><th>Branch</th><th>Enabled</th><th>Auto-pick</th><th>Actions</th></tr></thead><tbody>`)
 	for _, r := range repos {
 		enabled := "Yes"
 		if !r.Enabled {
 			enabled = "No"
 		}
+		autoPick := "Off"
+		toggleLabel := "Enable auto-pick"
+		toggleClass := "secondary"
+		if r.AutoPickEnabled {
+			autoPick = "On"
+			toggleLabel = "Disable auto-pick"
+			toggleClass = "secondary"
+		}
 		fmt.Fprintf(&b, `<tr>
-<td>%s</td><td>%s</td><td>%s</td><td>%s</td>
+<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>
 <td>
+<button class="%s" hx-post="/admin/repos/%s/auto_pick" hx-target="#repos-table" hx-swap="innerHTML">%s</button>
 <button class="secondary" hx-post="/admin/repos/%s/check_gh" hx-swap="none">Test GH</button>
 <button class="danger" hx-delete="/admin/repos/%s" hx-confirm="Delete %s?" hx-swap="none">Delete</button>
-</td></tr>`, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, r.ProjectID, r.ProjectID, r.ProjectName)
+</td></tr>`, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, autoPick,
+			toggleClass, r.ProjectID, toggleLabel,
+			r.ProjectID, r.ProjectID, r.ProjectName)
 	}
 	b.WriteString(`</tbody></table>`)
 	w.Write([]byte(b.String()))
@@ -1048,6 +1106,9 @@ func (s *adminServer) reposDispatchHandler(w http.ResponseWriter, r *http.Reques
 	case "/test_clone":
 		r.URL.Path = "/admin/repos/" + projectID + "/test_clone"
 		s.testCloneHandler(w, r)
+	case "/auto_pick":
+		r.URL.Path = "/admin/repos/" + projectID + "/auto_pick"
+		s.toggleAutoPickHandler(w, r)
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 	}

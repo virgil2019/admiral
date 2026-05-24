@@ -285,6 +285,29 @@ CREATE TABLE IF NOT EXISTS pending_questions (
 ALTER TABLE admiral_tasks ADD COLUMN pending_question_id TEXT;
 `
 
+// migration0016 adds the per-repo opt-in flag the admiral-discoverer
+// service reads to decide which Linear projects it is allowed to scan.
+// Default 0 (off) so existing deploys never auto-pick until the operator
+// flips the toggle in the admin UI.
+const migration0016 = `
+ALTER TABLE repos ADD COLUMN auto_pick_enabled INTEGER NOT NULL DEFAULT 0;
+`
+
+// migration0017 records every Linear issue admiral-discoverer has
+// elected to self-assign. The dedup signal is picked_state: when the
+// issue's current Linear state matches picked_state, the discoverer
+// skips it; when the state changes (an "external reset" signal from a
+// human), the row is overwritten and the issue may be picked again.
+const migration0017 = `
+CREATE TABLE IF NOT EXISTS discoverer_picks (
+    issue_id          TEXT PRIMARY KEY,
+    issue_identifier  TEXT NOT NULL,
+    picked_at         TEXT NOT NULL,
+    picked_state      TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -306,6 +329,8 @@ var migrations = []migration{
 	{13, migration0013},
 	{14, migration0014},
 	{15, migration0015},
+	{16, migration0016},
+	{17, migration0017},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -1613,17 +1638,18 @@ func (s *Store) CountPendingEvents() (int, error) {
 
 // Repo holds a Linear project → repo mapping.
 type Repo struct {
-	ProjectID   string
-	ProjectName string
-	RepoDir     string
-	BaseBranch  string
-	Enabled     bool
+	ProjectID       string
+	ProjectName     string
+	RepoDir         string
+	BaseBranch      string
+	Enabled         bool
+	AutoPickEnabled bool
 }
 
 // ListRepos returns all repos ordered by project_name.
 func (s *Store) ListRepos() ([]Repo, error) {
 	rows, err := s.DB.Query(`
-		SELECT project_id, project_name, repo_dir, base_branch, enabled
+		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled
 		FROM repos ORDER BY project_name ASC
 	`)
 	if err != nil {
@@ -1633,11 +1659,12 @@ func (s *Store) ListRepos() ([]Repo, error) {
 	var out []Repo
 	for rows.Next() {
 		var r Repo
-		var enabled int
-		if err := rows.Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled); err != nil {
+		var enabled, autoPick int
+		if err := rows.Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick); err != nil {
 			return nil, err
 		}
 		r.Enabled = enabled == 1
+		r.AutoPickEnabled = autoPick == 1
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -1647,11 +1674,11 @@ func (s *Store) ListRepos() ([]Repo, error) {
 // Returns (nil, nil) when no repo is configured for that project.
 func (s *Store) GetRepoByProjectID(projectID string) (*Repo, error) {
 	var r Repo
-	var enabled int
+	var enabled, autoPick int
 	err := s.DB.QueryRow(`
-		SELECT project_id, project_name, repo_dir, base_branch, enabled
+		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled
 		FROM repos WHERE project_id=?
-	`, projectID).Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled)
+	`, projectID).Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1659,6 +1686,7 @@ func (s *Store) GetRepoByProjectID(projectID string) (*Repo, error) {
 		return nil, err
 	}
 	r.Enabled = enabled == 1
+	r.AutoPickEnabled = autoPick == 1
 	return &r, nil
 }
 
@@ -1669,22 +1697,103 @@ func (s *Store) UpsertRepo(r Repo) error {
 	if r.Enabled {
 		enabled = 1
 	}
+	autoPick := 0
+	if r.AutoPickEnabled {
+		autoPick = 1
+	}
 	_, err := s.DB.Exec(`
-		INSERT INTO repos(project_id, project_name, repo_dir, base_branch, enabled, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO repos(project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(project_id) DO UPDATE SET
 			project_name=excluded.project_name,
 			repo_dir=excluded.repo_dir,
 			base_branch=excluded.base_branch,
 			enabled=excluded.enabled,
+			auto_pick_enabled=excluded.auto_pick_enabled,
 			updated_at=excluded.updated_at
-	`, r.ProjectID, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, now, now)
+	`, r.ProjectID, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, autoPick, now, now)
 	return err
 }
 
 // DeleteRepo removes a repo by project_id.
 func (s *Store) DeleteRepo(projectID string) error {
 	_, err := s.DB.Exec(`DELETE FROM repos WHERE project_id=?`, projectID)
+	return err
+}
+
+// ListAutoPickEnabledProjectIDs returns the project IDs of repos that
+// are both enabled (auto_pick implies enabled) AND opted-in to the
+// discoverer's auto-pick scan. Drives the discoverer's per-tick scope.
+func (s *Store) ListAutoPickEnabledProjectIDs() ([]string, error) {
+	rows, err := s.DB.Query(`
+		SELECT project_id FROM repos
+		WHERE enabled=1 AND auto_pick_enabled=1
+		ORDER BY project_name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// --- discoverer_picks ---
+
+// DiscovererPick is one row in the discoverer_picks table: a record
+// that admiral-discoverer has elected to self-assign this issue at
+// least once. When picked_state still matches the issue's current
+// Linear state, the discoverer treats the issue as "already handled"
+// and skips. When the state diverges (external reset), the row is
+// overwritten on the next pick.
+type DiscovererPick struct {
+	IssueID         string
+	IssueIdentifier string
+	PickedAt        string
+	PickedState     string
+	UpdatedAt       string
+}
+
+// GetDiscovererPick returns the pick record for an issue, or (nil, nil)
+// when none exists.
+func (s *Store) GetDiscovererPick(issueID string) (*DiscovererPick, error) {
+	var p DiscovererPick
+	err := s.DB.QueryRow(`
+		SELECT issue_id, issue_identifier, picked_at, picked_state, updated_at
+		FROM discoverer_picks WHERE issue_id=?
+	`, issueID).Scan(&p.IssueID, &p.IssueIdentifier, &p.PickedAt, &p.PickedState, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// UpsertDiscovererPick records (or refreshes) a pick. Used both for
+// the initial assign and for re-picks after an external state reset.
+func (s *Store) UpsertDiscovererPick(p DiscovererPick) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if p.PickedAt == "" {
+		p.PickedAt = now
+	}
+	_, err := s.DB.Exec(`
+		INSERT INTO discoverer_picks(issue_id, issue_identifier, picked_at, picked_state, updated_at)
+		VALUES(?, ?, ?, ?, ?)
+		ON CONFLICT(issue_id) DO UPDATE SET
+			issue_identifier=excluded.issue_identifier,
+			picked_at=excluded.picked_at,
+			picked_state=excluded.picked_state,
+			updated_at=excluded.updated_at
+	`, p.IssueID, p.IssueIdentifier, p.PickedAt, p.PickedState, now)
 	return err
 }
 
