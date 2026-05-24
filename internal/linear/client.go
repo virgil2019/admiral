@@ -576,6 +576,179 @@ func (c *Client) IssueUpdate(ctx context.Context, issueID, stateID string) error
 	return nil
 }
 
+// AssignIssue sets the assignee of issueID to userID. Used by the
+// discoverer service to self-assign issues it elects to take.
+func (c *Client) AssignIssue(ctx context.Context, issueID, userID string) error {
+	input := map[string]any{"assigneeId": userID}
+	var data struct {
+		IssueUpdate struct {
+			Success bool `json:"success"`
+		} `json:"issueUpdate"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     issueUpdateMutation,
+		Variables: map[string]any{"id": issueID, "input": input},
+	}, &data); err != nil {
+		return err
+	}
+	if !data.IssueUpdate.Success {
+		return fmt.Errorf("issueUpdate returned success=false")
+	}
+	return nil
+}
+
+// Viewer holds the authenticated Linear user identity (the one whose
+// OAuth token / API key the client is configured with). admiral's
+// discoverer uses this to learn its own user ID when not configured.
+type Viewer struct {
+	ID   string
+	Name string
+}
+
+const viewerQuery = `query Viewer { viewer { id name } }`
+
+// GetViewer returns the identity of the user whose token the client is
+// using. Used by the discoverer to auto-resolve admiral's own Linear
+// user ID for self-assignment.
+func (c *Client) GetViewer(ctx context.Context) (*Viewer, error) {
+	var data struct {
+		Viewer *struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"viewer"`
+	}
+	if err := c.do(ctx, graphQLRequest{Query: viewerQuery}, &data); err != nil {
+		return nil, err
+	}
+	if data.Viewer == nil {
+		return nil, fmt.Errorf("viewer not found")
+	}
+	return &Viewer{ID: data.Viewer.ID, Name: data.Viewer.Name}, nil
+}
+
+// SearchFilter is the candidate filter used by SearchAssignableIssues.
+// Empty fields are skipped — pass only what you want to constrain.
+type SearchFilter struct {
+	TeamKeys       []string
+	ProjectIDs     []string
+	StateTypes     []string
+	RequireLabel   string
+	UnassignedOnly bool
+	Limit          int
+}
+
+const searchIssuesQuery = `query SearchIssues($filter: IssueFilter, $first: Int!) {
+  issues(filter: $filter, first: $first, orderBy: createdAt) {
+    nodes {
+      id
+      identifier
+      title
+      description
+      url
+      priority
+      state { name type }
+      assignee { id }
+      team { id }
+      project { id }
+      labels { nodes { name } }
+    }
+  }
+}`
+
+// SearchAssignableIssues lists Linear issues matching f. Returns up to
+// f.Limit results (default 50, hard cap 250). The discoverer uses this
+// to find candidates worth self-assigning.
+func (c *Client) SearchAssignableIssues(ctx context.Context, f SearchFilter) ([]Issue, error) {
+	filter := map[string]any{}
+	if len(f.TeamKeys) > 0 {
+		filter["team"] = map[string]any{"key": map[string]any{"in": f.TeamKeys}}
+	}
+	if len(f.ProjectIDs) > 0 {
+		filter["project"] = map[string]any{"id": map[string]any{"in": f.ProjectIDs}}
+	}
+	if len(f.StateTypes) > 0 {
+		filter["state"] = map[string]any{"type": map[string]any{"in": f.StateTypes}}
+	}
+	if strings.TrimSpace(f.RequireLabel) != "" {
+		filter["labels"] = map[string]any{"name": map[string]any{"eq": f.RequireLabel}}
+	}
+	if f.UnassignedOnly {
+		filter["assignee"] = map[string]any{"null": true}
+	}
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 250 {
+		limit = 250
+	}
+
+	var data struct {
+		Issues struct {
+			Nodes []struct {
+				ID          string `json:"id"`
+				Identifier  string `json:"identifier"`
+				Title       string `json:"title"`
+				Description string `json:"description"`
+				URL         string `json:"url"`
+				Priority    int    `json:"priority"`
+				State       *struct {
+					Name string `json:"name"`
+					Type string `json:"type"`
+				} `json:"state"`
+				Assignee *struct {
+					ID string `json:"id"`
+				} `json:"assignee"`
+				Team *struct {
+					ID string `json:"id"`
+				} `json:"team"`
+				Project *struct {
+					ID string `json:"id"`
+				} `json:"project"`
+				Labels struct {
+					Nodes []struct {
+						Name string `json:"name"`
+					} `json:"nodes"`
+				} `json:"labels"`
+			} `json:"nodes"`
+		} `json:"issues"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     searchIssuesQuery,
+		Variables: map[string]any{"filter": filter, "first": limit},
+	}, &data); err != nil {
+		return nil, err
+	}
+	out := make([]Issue, 0, len(data.Issues.Nodes))
+	for _, n := range data.Issues.Nodes {
+		iss := Issue{
+			ID:          n.ID,
+			Identifier:  n.Identifier,
+			Title:       n.Title,
+			Description: n.Description,
+			URL:         n.URL,
+			Priority:    n.Priority,
+		}
+		if n.State != nil {
+			iss.StateName = n.State.Name
+		}
+		if n.Assignee != nil {
+			iss.AssigneeID = n.Assignee.ID
+		}
+		if n.Team != nil {
+			iss.TeamID = n.Team.ID
+		}
+		if n.Project != nil {
+			iss.ProjectID = n.Project.ID
+		}
+		for _, l := range n.Labels.Nodes {
+			iss.Labels = append(iss.Labels, l.Name)
+		}
+		out = append(out, iss)
+	}
+	return out, nil
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
