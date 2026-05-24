@@ -128,3 +128,34 @@ autopilot:
   #                  # Default is derived from storage.sqlite_path:
   #                  # e.g. ~/.local/share/admiral/job-streams
   # worker_count: 3   # max concurrent issues admiral processes; same-session events stay serialized
+
+# admiral-discoverer: standalone scanner that finds Linear issues admiral
+# can take and self-assigns them, looping back through the normal
+# Linear webhook -> autopilot path. Read by `admiral-discoverer` only.
+# Disabled by default — set `enabled: true` to activate.
+discoverer:
+  enabled: false
+  # Scan cadence. Default: 10m.
+  poll_interval: 10m
+  # At least one of `teams` (Linear team keys) or `project_ids` is required.
+  teams: ["GEO"]
+  # project_ids: ["00000000-0000-0000-0000-000000000000"]
+  # Linear workflow state.type values to scan. Default: ["backlog", "unstarted"].
+  state_types: ["backlog", "unstarted"]
+  # Only consider issues carrying this label. Empty disables the label
+  # filter — strongly recommended to keep set so a human curates what
+  # the scanner even sees. Default: "" (no filter).
+  require_label: "agent-ready"
+  # Cap per scan round; should be <= autopilot.max_concurrent_runs.
+  max_pick_per_round: 3
+  # admiral's Linear user UUID. If empty, resolved from `viewer { id }`
+  # on startup (no per-scan cost).
+  # admiral_user_id: ""
+  judge:
+    # When true, each candidate is passed to `claude -p` for a yes/no
+    # verdict before self-assignment. Default: true.
+    enabled: true
+    # Defaults to autopilot.claude_bin when empty.
+    # claude_bin: ""
+    # Hard cap on a single judge invocation. Default: 60s.
+    timeout: 60s

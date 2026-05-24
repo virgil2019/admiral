@@ -24,10 +24,60 @@ type Config struct {
 	Logging          Logging     `yaml:"logging"`
 	Linear           Linear      `yaml:"linear"`
 	Autopilot        Autopilot   `yaml:"autopilot"`
+	Discoverer       Discoverer  `yaml:"discoverer"`
 
 	// Warnings collects non-fatal config notices (e.g. deprecated key
 	// usage). Populated during Load; main.go logs them after open.
 	Warnings []string `yaml:"-"`
+}
+
+// Discoverer configures the admiral-discoverer binary: a standalone
+// service that scans Linear for assignable issues, runs an optional
+// `claude -p` judge, and self-assigns matches to admiral. Designed to
+// be split off into its own repo later — keep it independent of
+// Autopilot fields.
+type Discoverer struct {
+	// Enabled is the master switch. Default: false. The binary refuses
+	// to start when false so a deploy can ship the unit file without
+	// activating the scanner until configured.
+	Enabled bool `yaml:"enabled"`
+	// PollInterval is the gap between Linear scans. Default: 10m.
+	PollInterval time.Duration `yaml:"poll_interval"`
+	// TeamKeys constrains the scan to these Linear team keys (e.g.
+	// ["GEO"]). Empty = no team constraint. At least one of TeamKeys /
+	// ProjectIDs is required (validated).
+	TeamKeys []string `yaml:"teams"`
+	// ProjectIDs constrains the scan to these Linear project UUIDs.
+	ProjectIDs []string `yaml:"project_ids"`
+	// StateTypes filters by Linear workflow state.type. Default:
+	// ["backlog", "unstarted"].
+	StateTypes []string `yaml:"state_types"`
+	// RequireLabel restricts candidates to issues carrying this label.
+	// Empty = no label requirement. Recommended: "agent-ready" so a
+	// human is in the loop on what gets scanned even with the judge on.
+	RequireLabel string `yaml:"require_label"`
+	// MaxPickPerRound caps how many issues a single scan round will
+	// self-assign. Should be ≤ autopilot.max_concurrent_runs to avoid
+	// backing up events_inbox. Default: 3.
+	MaxPickPerRound int `yaml:"max_pick_per_round"`
+	// AdmiralUserID is admiral's Linear user UUID. If empty, the
+	// binary resolves it from `viewer { id }` at startup.
+	AdmiralUserID string `yaml:"admiral_user_id"`
+	// Judge configures the optional `claude -p` filter applied to each
+	// candidate before self-assignment.
+	Judge DiscovererJudge `yaml:"judge"`
+}
+
+// DiscovererJudge is the per-issue LLM judge configuration.
+type DiscovererJudge struct {
+	// Enabled gates the judge step. When false, every candidate that
+	// passes the filter is self-assigned. Default: true.
+	Enabled *bool `yaml:"enabled"`
+	// ClaudeBin is the absolute path to the claude CLI. Empty inherits
+	// from autopilot.claude_bin so co-deployed installs share one path.
+	ClaudeBin string `yaml:"claude_bin"`
+	// Timeout caps a single judge invocation. Default: 60s.
+	Timeout time.Duration `yaml:"timeout"`
 }
 
 // Linear holds Linear API + webhook auth. Required by the autopilot binary;
@@ -245,6 +295,23 @@ func LoadAutopilot(path string) (*Config, error) {
 	return c, nil
 }
 
+// LoadDiscoverer is the entry point for cmd/admiral-discoverer. It
+// validates the linear / discoverer / storage / logging blocks; the
+// autopilot block is only consulted as a fallback for shared paths
+// (e.g. discoverer.judge.claude_bin defaults to autopilot.claude_bin
+// when the discoverer is co-deployed in the same config). Bridge-only
+// keys are ignored.
+func LoadDiscoverer(path string) (*Config, error) {
+	c, err := parse(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validateDiscovererAndExpand(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
 func parse(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -359,6 +426,64 @@ func (c *Config) validateAutopilotAndExpand() error {
 	}
 	if c.Autopilot.BlockerPollInterval <= 0 {
 		c.Autopilot.BlockerPollInterval = 10 * time.Minute
+	}
+
+	c.Storage.SQLitePath = expandTilde(c.Storage.SQLitePath)
+	if c.Storage.SQLitePath == "" {
+		c.Storage.SQLitePath = expandTilde("~/.local/share/admiral/autopilot.db")
+	}
+	c.Logging.File = expandTilde(c.Logging.File)
+	if c.Logging.Level == "" {
+		c.Logging.Level = "info"
+	}
+	return nil
+}
+
+func (c *Config) validateDiscovererAndExpand() error {
+	if strings.TrimSpace(c.Linear.APIToken) == "" {
+		return fmt.Errorf("linear.api_token is required")
+	}
+	if strings.TrimSpace(c.Linear.APIBase) == "" {
+		c.Linear.APIBase = "https://api.linear.app/graphql"
+	}
+	if strings.TrimSpace(c.Linear.RedirectURI) == "" {
+		c.Linear.RedirectURI = "http://127.0.0.1:8080/callback"
+	}
+
+	d := &c.Discoverer
+	if !d.Enabled {
+		return fmt.Errorf("discoverer.enabled is false; set discoverer.enabled: true to run admiral-discoverer")
+	}
+	if len(d.TeamKeys) == 0 && len(d.ProjectIDs) == 0 {
+		return fmt.Errorf("discoverer requires at least one of discoverer.teams or discoverer.project_ids")
+	}
+	if d.PollInterval <= 0 {
+		d.PollInterval = 10 * time.Minute
+	}
+	if len(d.StateTypes) == 0 {
+		d.StateTypes = []string{"backlog", "unstarted"}
+	}
+	if d.MaxPickPerRound <= 0 {
+		d.MaxPickPerRound = 3
+	}
+
+	if d.Judge.Enabled == nil {
+		trueVal := true
+		d.Judge.Enabled = &trueVal
+	}
+	if *d.Judge.Enabled {
+		if strings.TrimSpace(d.Judge.ClaudeBin) == "" {
+			d.Judge.ClaudeBin = c.Autopilot.ClaudeBin
+		}
+		if strings.TrimSpace(d.Judge.ClaudeBin) == "" {
+			d.Judge.ClaudeBin = "claude"
+		}
+		if _, err := exec.LookPath(d.Judge.ClaudeBin); err != nil {
+			return fmt.Errorf("discoverer.judge.claude_bin not found: %w", err)
+		}
+		if d.Judge.Timeout <= 0 {
+			d.Judge.Timeout = 60 * time.Second
+		}
 	}
 
 	c.Storage.SQLitePath = expandTilde(c.Storage.SQLitePath)
