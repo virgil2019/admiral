@@ -29,6 +29,17 @@ func TestParseVerdictWrappedInProse(t *testing.T) {
 	}
 }
 
+func TestParseVerdictMarkdownCodeFence(t *testing.T) {
+	raw := "```json\n{\"verdict\":\"yes\",\"reason\":\"bounded\"}\n```"
+	v, err := parseVerdict(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Decision != "yes" || !strings.Contains(v.Reason, "bounded") {
+		t.Errorf("unexpected verdict: %+v", v)
+	}
+}
+
 func TestParseVerdictMissingJSON(t *testing.T) {
 	_, err := parseVerdict("I think yes.")
 	if err == nil {

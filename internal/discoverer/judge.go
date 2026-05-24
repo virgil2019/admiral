@@ -87,6 +87,7 @@ func (j *claudeJudge) runClaude(ctx context.Context, prompt string) (string, err
 
 	cmd := exec.CommandContext(cctx, j.claudeBin,
 		"-p", prompt,
+		"--output-format", "text",
 		"--dangerously-skip-permissions",
 	)
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }

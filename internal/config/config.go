@@ -36,25 +36,23 @@ type Config struct {
 // `claude -p` judge, and self-assigns matches to admiral. Designed to
 // be split off into its own repo later — keep it independent of
 // Autopilot fields.
+//
+// Project scope is NOT here — admiral-discoverer reads the list of
+// auto-pick projects from the repos table (toggled in the admin UI).
 type Discoverer struct {
-	// Enabled is the master switch. Default: false. The binary refuses
-	// to start when false so a deploy can ship the unit file without
-	// activating the scanner until configured.
+	// Enabled is the master switch. Default: false. When false the
+	// admiral-discoverer binary exits cleanly so a systemd unit can
+	// ship pre-installed and the operator activates by editing config.
 	Enabled bool `yaml:"enabled"`
 	// PollInterval is the gap between Linear scans. Default: 10m.
 	PollInterval time.Duration `yaml:"poll_interval"`
-	// TeamKeys constrains the scan to these Linear team keys (e.g.
-	// ["GEO"]). Empty = no team constraint. At least one of TeamKeys /
-	// ProjectIDs is required (validated).
-	TeamKeys []string `yaml:"teams"`
-	// ProjectIDs constrains the scan to these Linear project UUIDs.
-	ProjectIDs []string `yaml:"project_ids"`
 	// StateTypes filters by Linear workflow state.type. Default:
 	// ["backlog", "unstarted"].
 	StateTypes []string `yaml:"state_types"`
 	// RequireLabel restricts candidates to issues carrying this label.
-	// Empty = no label requirement. Recommended: "agent-ready" so a
-	// human is in the loop on what gets scanned even with the judge on.
+	// Empty = no label requirement; loud warning logged on boot since
+	// "no label + judge off" is a foot-gun (auto-assigns everything in
+	// scope). Recommended: "agent-ready".
 	RequireLabel string `yaml:"require_label"`
 	// MaxPickPerRound caps how many issues a single scan round will
 	// self-assign. Should be ≤ autopilot.max_concurrent_runs to avoid
@@ -451,12 +449,6 @@ func (c *Config) validateDiscovererAndExpand() error {
 	}
 
 	d := &c.Discoverer
-	if !d.Enabled {
-		return fmt.Errorf("discoverer.enabled is false; set discoverer.enabled: true to run admiral-discoverer")
-	}
-	if len(d.TeamKeys) == 0 && len(d.ProjectIDs) == 0 {
-		return fmt.Errorf("discoverer requires at least one of discoverer.teams or discoverer.project_ids")
-	}
 	if d.PollInterval <= 0 {
 		d.PollInterval = 10 * time.Minute
 	}
@@ -484,6 +476,13 @@ func (c *Config) validateDiscovererAndExpand() error {
 		if d.Judge.Timeout <= 0 {
 			d.Judge.Timeout = 60 * time.Second
 		}
+	}
+
+	if d.Enabled && strings.TrimSpace(d.RequireLabel) == "" && !*d.Judge.Enabled {
+		c.Warnings = append(c.Warnings,
+			"discoverer.require_label is empty AND discoverer.judge.enabled is false — "+
+				"every unassigned candidate in opted-in projects will be auto-assigned. "+
+				"Set require_label or enable the judge.")
 	}
 
 	c.Storage.SQLitePath = expandTilde(c.Storage.SQLitePath)

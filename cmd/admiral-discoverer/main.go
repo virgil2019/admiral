@@ -1,15 +1,20 @@
-// admiral-discoverer scans Linear for assignable issues and (optionally
-// gated by a `claude -p` judge) self-assigns them to admiral. The
+// admiral-discoverer scans Linear for assignable issues that belong to
+// projects opted-in via the admiral-autopilot admin UI (repos table
+// auto_pick_enabled flag) and self-assigns them to admiral. The
 // Linear webhook does the rest — admiral-autopilot picks up the
 // AgentSessionEvent and runs the issue normally.
 //
-// Designed as a standalone binary so it can be split off into its own
-// repo later. Shares only read-only access to the linear client and
-// admiral_tasks store with admiral-autopilot.
+// Standalone binary by design: shares only the linear client and the
+// SQLite store with admiral-autopilot, and writes only to its own
+// discoverer_picks table. The token refresher in this main does write
+// to linear_oauth / auth_error (admiral-owned tables) — TODO when this
+// binary moves to its own repo: replace with a read-only TokenStore
+// shim and route refresh through autopilot's admin API.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -36,6 +41,15 @@ func main() {
 		os.Exit(1)
 	}
 	logger := newLogger(cfg.Logging)
+	for _, msg := range cfg.Warnings {
+		logger.Warn("config_warning", "msg", msg)
+	}
+
+	if !cfg.Discoverer.Enabled {
+		logger.Info("admiral-discoverer not enabled, exiting cleanly",
+			"hint", "set discoverer.enabled: true in config to activate")
+		return
+	}
 
 	db, err := store.Open(cfg.Storage.SQLitePath)
 	if err != nil {
@@ -71,8 +85,6 @@ func main() {
 	judgeEnabled := cfg.Discoverer.Judge.Enabled != nil && *cfg.Discoverer.Judge.Enabled
 	svc := discoverer.New(discoverer.Config{
 		PollInterval:    cfg.Discoverer.PollInterval,
-		TeamKeys:        cfg.Discoverer.TeamKeys,
-		ProjectIDs:      cfg.Discoverer.ProjectIDs,
 		StateTypes:      cfg.Discoverer.StateTypes,
 		RequireLabel:    cfg.Discoverer.RequireLabel,
 		MaxPickPerRound: cfg.Discoverer.MaxPickPerRound,
@@ -89,7 +101,7 @@ func main() {
 		"poll_interval", cfg.Discoverer.PollInterval,
 	)
 
-	if err := svc.Run(ctx); err != nil && err != context.Canceled {
+	if err := svc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("discoverer exited with error", "err", err)
 		os.Exit(1)
 	}
