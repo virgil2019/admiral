@@ -160,3 +160,12 @@ discoverer:
     # claude_bin: ""
     # Hard cap on a single judge invocation. Default: 60s.
     timeout: 60s
+  # Optional Linear workflow-state names for the OPEN-PR transitions
+  # the discoverer drives. Empty entries are skipped: the merged-PR
+  # (→ Linear type=completed) and closed-unmerged (→ Linear type=canceled)
+  # transitions always run via type fallback and need no config.
+  linear_states:
+    # Pushed when admiral's PR is open and has no approval yet.
+    in_review: "In Review"
+    # Pushed when admiral's PR is open and has at least one approval.
+    reviewed: "Reviewed"

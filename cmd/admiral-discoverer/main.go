@@ -26,6 +26,7 @@ import (
 
 	"github.com/georgehuang/admiral/internal/config"
 	"github.com/georgehuang/admiral/internal/discoverer"
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
@@ -77,6 +78,7 @@ func main() {
 	}
 
 	judgeEnabled := cfg.Discoverer.Judge.Enabled != nil && *cfg.Discoverer.Judge.Enabled
+	ghClient := ghpkg.NewClient(cfg.Autopilot.GhToken)
 	svc := discoverer.New(discoverer.Config{
 		PollInterval:    cfg.Discoverer.PollInterval,
 		StateTypes:      cfg.Discoverer.StateTypes,
@@ -88,7 +90,11 @@ func main() {
 			ClaudeBin: cfg.Discoverer.Judge.ClaudeBin,
 			Timeout:   cfg.Discoverer.Judge.Timeout,
 		},
-	}, lc, db, nil, logger)
+		LinearStates: discoverer.LinearStateMap{
+			InReview: cfg.Discoverer.LinearStates.InReview,
+			Reviewed: cfg.Discoverer.LinearStates.Reviewed,
+		},
+	}, lc, &prAdapter{c: ghClient}, db, nil, logger)
 
 	logger.Info("admiral-discoverer starting",
 		"sqlite", cfg.Storage.SQLitePath,
@@ -113,6 +119,26 @@ func parseLevel(lvl string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// prAdapter bridges internal/github.Client to the discoverer's narrow
+// prClient interface, keeping the discoverer package free of an
+// internal/github import. When the discoverer is split off into its
+// own repo, the adapter is the only piece that has to move with it.
+type prAdapter struct {
+	c *ghpkg.Client
+}
+
+func (a *prAdapter) GetPRStatus(ctx context.Context, prURL string) (discoverer.PRStatus, error) {
+	s, err := a.c.GetPRStatus(ctx, prURL)
+	if err != nil {
+		return discoverer.PRStatus{}, err
+	}
+	return discoverer.PRStatus{
+		State:             s.State,
+		MergedAt:          s.MergedAt,
+		HasApprovedReview: s.HasApprovedReview,
+	}, nil
 }
 
 func newLogger(c config.Logging) *slog.Logger {

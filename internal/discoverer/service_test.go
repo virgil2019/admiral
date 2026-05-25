@@ -14,16 +14,24 @@ import (
 )
 
 type fakeLinear struct {
-	mu      sync.Mutex
-	scanRet []linear.Issue
-	scanErr error
-	assigns []assignCall
-	assnErr error
+	mu             sync.Mutex
+	scanRet        []linear.Issue
+	scanErr        error
+	assigns        []assignCall
+	assnErr        error
+	issues         map[string]*linear.Issue
+	workflowStates map[string][]linear.WorkflowState
+	issueUpdates   []issueUpdateCall
 }
 
 type assignCall struct {
 	IssueID string
 	UserID  string
+}
+
+type issueUpdateCall struct {
+	IssueID string
+	StateID string
 }
 
 func (f *fakeLinear) SearchAssignableIssues(_ context.Context, _ linear.SearchFilter) ([]linear.Issue, error) {
@@ -42,6 +50,29 @@ func (f *fakeLinear) AssignIssue(_ context.Context, issueID, userID string) erro
 	return nil
 }
 
+func (f *fakeLinear) GetIssue(_ context.Context, id string) (*linear.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if iss, ok := f.issues[id]; ok {
+		out := *iss
+		return &out, nil
+	}
+	return nil, nil
+}
+
+func (f *fakeLinear) GetWorkflowStates(_ context.Context, teamID string) ([]linear.WorkflowState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.workflowStates[teamID], nil
+}
+
+func (f *fakeLinear) IssueUpdate(_ context.Context, issueID, stateID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.issueUpdates = append(f.issueUpdates, issueUpdateCall{IssueID: issueID, StateID: stateID})
+	return nil
+}
+
 func (f *fakeLinear) assignedIDs() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -53,21 +84,24 @@ func (f *fakeLinear) assignedIDs() []string {
 }
 
 type fakeStore struct {
-	mu         sync.Mutex
-	tracked    map[string]*store.AdmiralTask
-	picks      map[string]*store.DiscovererPick
-	projectIDs []string
-	taskErr    error
-	pickGetErr error
-	pickUpsErr error
-	projErr    error
+	mu              sync.Mutex
+	tracked         map[string]*store.AdmiralTask
+	picks           map[string]*store.DiscovererPick
+	projectIDs      []string
+	tasksByState    map[string]*store.AdmiralTask
+	taskErr         error
+	pickGetErr      error
+	pickUpsErr      error
+	projErr         error
+	tasksByStateErr error
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		tracked:    map[string]*store.AdmiralTask{},
-		picks:      map[string]*store.DiscovererPick{},
-		projectIDs: []string{"proj-A"},
+		tracked:      map[string]*store.AdmiralTask{},
+		picks:        map[string]*store.DiscovererPick{},
+		projectIDs:   []string{"proj-A"},
+		tasksByState: map[string]*store.AdmiralTask{},
 	}
 }
 
@@ -107,6 +141,47 @@ func (s *fakeStore) UpsertDiscovererPick(p store.DiscovererPick) error {
 	return nil
 }
 
+func (s *fakeStore) ListAdmiralTasksByStates(states []string) ([]store.AdmiralTask, error) {
+	if s.tasksByStateErr != nil {
+		return nil, s.tasksByStateErr
+	}
+	allow := map[string]bool{}
+	for _, st := range states {
+		allow[st] = true
+	}
+	var out []store.AdmiralTask
+	for _, t := range s.tasksByState {
+		if allow[t.State] {
+			out = append(out, *t)
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tasksByState[issueID]
+	if !ok {
+		return nil
+	}
+	fn(t)
+	return nil
+}
+
+// fakePR is the discoverer prClient test double.
+type fakePR struct {
+	statuses map[string]PRStatus
+	err      error
+}
+
+func (p *fakePR) GetPRStatus(_ context.Context, prURL string) (PRStatus, error) {
+	if p.err != nil {
+		return PRStatus{}, p.err
+	}
+	return p.statuses[prURL], nil
+}
+
 type fakeJudge struct {
 	verdicts map[string]Verdict
 	calls    int
@@ -129,7 +204,20 @@ func discardLogger() *slog.Logger {
 }
 
 func newSvc(cfg Config, lc linearClient, ts taskRegistry, j judger) *Service {
-	return &Service{cfg: cfg, linear: lc, store: ts, judge: j, logger: discardLogger()}
+	return &Service{
+		cfg:                 cfg,
+		linear:              lc,
+		store:               ts,
+		judge:               j,
+		logger:              discardLogger(),
+		workflowStatesCache: map[string][]linear.WorkflowState{},
+	}
+}
+
+func newSvcWithPR(cfg Config, lc linearClient, pr prClient, ts taskRegistry, j judger) *Service {
+	s := newSvc(cfg, lc, ts, j)
+	s.pr = pr
+	return s
 }
 
 func TestConsiderSkipsExistingTask(t *testing.T) {
