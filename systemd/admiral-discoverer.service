@@ -1,0 +1,30 @@
+[Unit]
+Description=admiral-discoverer — Linear issue scanner + self-assign service
+Documentation=https://github.com/virgil2019/admiral
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Same unprivileged user that runs admiral-autopilot. The discoverer
+# only needs network access to Linear, read access to the autopilot
+# SQLite DB (for dedup), and exec access to `claude` if the judge is on.
+User=admiral
+Group=admiral
+
+WorkingDirectory=/home/admiral
+
+EnvironmentFile=-/etc/admiral/admiral.env
+
+ExecStart=/usr/local/bin/admiral-discoverer --config /etc/admiral/config.yaml
+
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

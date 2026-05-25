@@ -87,6 +87,159 @@ func TestIssueUpdate(t *testing.T) {
 	}
 }
 
+func TestAssignIssue(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueUpdate": map[string]any{"success": true},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if err := c.AssignIssue(context.Background(), "issue-xyz", "user-42"); err != nil {
+		t.Fatalf("AssignIssue failed: %v", err)
+	}
+	vars := receivedBody["variables"].(map[string]any)
+	input := vars["input"].(map[string]any)
+	if input["assigneeId"] != "user-42" {
+		t.Errorf("expected assigneeId 'user-42', got %v", input["assigneeId"])
+	}
+	if vars["id"] != "issue-xyz" {
+		t.Errorf("expected id 'issue-xyz', got %v", vars["id"])
+	}
+}
+
+func TestGetViewer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"viewer": map[string]any{"id": "user-self", "name": "admiral-bot"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	v, err := c.GetViewer(context.Background())
+	if err != nil {
+		t.Fatalf("GetViewer failed: %v", err)
+	}
+	if v.ID != "user-self" || v.Name != "admiral-bot" {
+		t.Errorf("unexpected viewer: %+v", v)
+	}
+}
+
+func TestSearchAssignableIssues(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issues": map[string]any{
+					"nodes": []map[string]any{
+						{
+							"id":          "iss-1",
+							"identifier":  "GEO-100",
+							"title":       "Add foo",
+							"description": "do the foo",
+							"url":         "https://linear.app/x/issue/GEO-100",
+							"priority":    2,
+							"state":       map[string]any{"name": "Backlog", "type": "backlog"},
+							"assignee":    nil,
+							"team":        map[string]any{"id": "team-A"},
+							"project":     map[string]any{"id": "proj-1"},
+							"labels":      map[string]any{"nodes": []map[string]any{{"name": "agent-ready"}}},
+						},
+						{
+							"id":          "iss-2",
+							"identifier":  "GEO-101",
+							"title":       "Refactor bar",
+							"description": "",
+							"url":         "https://linear.app/x/issue/GEO-101",
+							"priority":    0,
+							"state":       map[string]any{"name": "Todo", "type": "unstarted"},
+							"assignee":    nil,
+							"team":        map[string]any{"id": "team-A"},
+							"project":     nil,
+							"labels":      map[string]any{"nodes": []map[string]any{}},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	got, err := c.SearchAssignableIssues(context.Background(), SearchFilter{
+		TeamKeys:       []string{"GEO"},
+		StateTypes:     []string{"backlog", "unstarted"},
+		RequireLabel:   "agent-ready",
+		UnassignedOnly: true,
+		Limit:          10,
+	})
+	if err != nil {
+		t.Fatalf("SearchAssignableIssues failed: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 issues, got %d", len(got))
+	}
+	if got[0].Identifier != "GEO-100" || got[0].StateName != "Backlog" || len(got[0].Labels) != 1 || got[0].Labels[0] != "agent-ready" {
+		t.Errorf("issue[0] parse mismatch: %+v", got[0])
+	}
+	if got[1].ProjectID != "" {
+		t.Errorf("expected empty project id for issue[1], got %q", got[1].ProjectID)
+	}
+
+	vars := receivedBody["variables"].(map[string]any)
+	filter := vars["filter"].(map[string]any)
+	team := filter["team"].(map[string]any)["key"].(map[string]any)["in"].([]any)
+	if len(team) != 1 || team[0] != "GEO" {
+		t.Errorf("team filter mismatch: %v", team)
+	}
+	if _, ok := filter["assignee"].(map[string]any)["null"]; !ok {
+		t.Errorf("expected assignee.null in filter, got %v", filter["assignee"])
+	}
+	labels := filter["labels"].(map[string]any)["name"].(map[string]any)["eq"]
+	if labels != "agent-ready" {
+		t.Errorf("label filter mismatch: %v", labels)
+	}
+	if vars["first"].(float64) != 10 {
+		t.Errorf("first mismatch: %v", vars["first"])
+	}
+}
+
+func TestSearchAssignableIssuesDefaultLimit(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"issues": map[string]any{"nodes": []map[string]any{}}},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.SearchAssignableIssues(context.Background(), SearchFilter{}); err != nil {
+		t.Fatal(err)
+	}
+	if receivedBody["variables"].(map[string]any)["first"].(float64) != 50 {
+		t.Errorf("default first should be 50, got %v", receivedBody["variables"].(map[string]any)["first"])
+	}
+}
+
 // mockStore is a test double for store.Store.
 type mockStore struct {
 	mu             sync.Mutex
