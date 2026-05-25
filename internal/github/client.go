@@ -26,10 +26,28 @@ type PRClient interface {
 	// auth broken); a missing PR is not an error.
 	GetPRState(ctx context.Context, prURL string) (string, error)
 
+	// GetPRStatus returns the lifecycle snapshot admiral-discoverer
+	// needs to drive the Linear-state advancement: state plus merge
+	// timestamp plus whether any latest review has approved. Returns
+	// (PRStatus{}, nil) when gh can't resolve the PR.
+	GetPRStatus(ctx context.Context, prURL string) (PRStatus, error)
+
 	// GetDiff returns the unified diff for the PR as a single string.
 	// The worker uses it to anchor inline review comments (path:line)
 	// against the hunks it actually owns.
 	GetDiff(ctx context.Context, prURL string) (string, error)
+}
+
+// PRStatus is the discoverer's snapshot of a PR's lifecycle.
+type PRStatus struct {
+	// State is "OPEN" / "MERGED" / "CLOSED" (empty when PR not found).
+	State string
+	// MergedAt is the merge timestamp (RFC3339) when state=="MERGED",
+	// empty otherwise.
+	MergedAt string
+	// HasApprovedReview is true when the PR has at least one current
+	// approval review (latestReviews .state == "APPROVED").
+	HasApprovedReview bool
 }
 
 // runner is the indirection that lets tests substitute the gh subprocess
@@ -125,6 +143,41 @@ func (c *Client) GetPRState(ctx context.Context, prURL string) (string, error) {
 		return "", fmt.Errorf("parse gh pr view output: %w (raw: %s)", err, truncate(out, 200))
 	}
 	return v.State, nil
+}
+
+// GetPRStatus shells out to `gh pr view <url> --json state,mergedAt,latestReviews`
+// and assembles a snapshot useful for Linear-state advancement.
+// Returns (PRStatus{}, nil) when gh cannot resolve the PR (mirrors
+// GetPRState's contract).
+func (c *Client) GetPRStatus(ctx context.Context, prURL string) (PRStatus, error) {
+	if strings.TrimSpace(prURL) == "" {
+		return PRStatus{}, fmt.Errorf("github: GetPRStatus: empty prURL")
+	}
+	out, err := c.gh(ctx, "pr", "view", prURL, "--json", "state,mergedAt,latestReviews")
+	if err != nil {
+		if isPRNotResolvable(out) {
+			return PRStatus{}, nil
+		}
+		return PRStatus{}, fmt.Errorf("gh pr view %s: %w (output: %s)", prURL, err, truncate(out, 200))
+	}
+	var v struct {
+		State         string `json:"state"`
+		MergedAt      string `json:"mergedAt"`
+		LatestReviews []struct {
+			State string `json:"state"`
+		} `json:"latestReviews"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		return PRStatus{}, fmt.Errorf("parse gh pr view output: %w (raw: %s)", err, truncate(out, 200))
+	}
+	status := PRStatus{State: v.State, MergedAt: v.MergedAt}
+	for _, r := range v.LatestReviews {
+		if strings.EqualFold(r.State, "APPROVED") {
+			status.HasApprovedReview = true
+			break
+		}
+	}
+	return status, nil
 }
 
 // GetDiff shells out to `gh pr diff <url>` and returns the raw unified
