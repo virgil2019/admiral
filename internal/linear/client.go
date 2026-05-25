@@ -133,22 +133,31 @@ func isTransientHTTPStatus(s int) bool {
 
 // isTransientNetErr returns true for temporary network errors.
 //
-// net.Error.Temporary is deprecated since Go 1.18 (most "temporary"
-// errors are timeouts; the few exceptions are surprising). Timeout()
-// alone is the right contract here.
+// Notes on the dual-check shape:
+//   - `*url.Error` (returned by http.Client.Do) implements net.Error,
+//     so `errors.As(err, &ne)` succeeds for ANY HTTP transport error,
+//     including EOF / unexpected-EOF. The previous shape returned
+//     `ne.Timeout()` directly there — that short-circuited the
+//     io.EOF / io.ErrUnexpectedEOF checks below, classifying every
+//     non-timeout net error as non-transient and disabling retries
+//     on the most common transient class (server-side TCP reset).
+//   - net.Error.Temporary is deprecated since Go 1.18 (most
+//     "temporary" errors are timeouts; the few exceptions are
+//     surprising). Timeout() alone is the right contract for the
+//     net.Error branch.
+//   - io.EOF surfaces when the Go HTTP transport reuses a pooled
+//     keep-alive connection that the server has already closed; the
+//     next request reads back zero bytes. Retrying on a fresh conn
+//     almost always succeeds and matches what curl/browsers do
+//     transparently.
 func isTransientNetErr(err error) bool {
 	var ne net.Error
-	if errors.As(err, &ne) {
-		return ne.Timeout()
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
 	}
 	return errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, context.Canceled) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
-		// io.EOF surfaces when the Go HTTP transport reuses a pooled
-		// keep-alive connection that the server has already closed; the
-		// next request reads back zero bytes. Retrying on a fresh conn
-		// almost always succeeds and matches what curl/browsers do
-		// transparently.
 		errors.Is(err, io.EOF)
 }
 
