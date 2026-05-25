@@ -18,10 +18,24 @@ import (
 //	PR open + approved  → Linear LinearStates.Reviewed (if configured)
 //	PR open + no review → Linear LinearStates.InReview (if configured)
 //
+// Scoped to projects with auto_pick_enabled — a task whose issue lives
+// in a project that is no longer opted in is skipped, leaving its
+// Linear state where it is. Re-enabling the project resumes
+// transitions on the next tick.
+//
 // All Linear writes are best-effort: failures log a warning and the
 // task stays in its current state, so the next tick retries naturally.
 func (s *Service) advanceLinearStates(ctx context.Context) {
 	if s.pr == nil {
+		return
+	}
+	enabled, err := s.enabledProjectSet()
+	if err != nil {
+		s.logger.Error("state_advance_project_list_failed", "err", err)
+		return
+	}
+	if len(enabled) == 0 {
+		s.logger.Debug("state_advance_skipped_no_enabled_projects")
 		return
 	}
 	tasks, err := s.store.ListAdmiralTasksByStates([]string{
@@ -35,19 +49,55 @@ func (s *Service) advanceLinearStates(ctx context.Context) {
 	if len(tasks) == 0 {
 		return
 	}
-	s.logger.Debug("state_advance_start", "tasks", len(tasks))
+	s.logger.Debug("state_advance_start", "tasks", len(tasks), "enabled_projects", len(enabled))
 	for i := range tasks {
 		if ctx.Err() != nil {
 			return
 		}
-		s.advanceOne(ctx, &tasks[i])
+		s.advanceOne(ctx, &tasks[i], enabled)
 	}
 }
 
-func (s *Service) advanceOne(ctx context.Context, t *store.AdmiralTask) {
+func (s *Service) enabledProjectSet() (map[string]struct{}, error) {
+	ids, err := s.store.ListAutoPickEnabledProjectIDs()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		out[id] = struct{}{}
+	}
+	return out, nil
+}
+
+func (s *Service) advanceOne(ctx context.Context, t *store.AdmiralTask, enabled map[string]struct{}) {
 	if t.PRURL == "" {
 		return
 	}
+
+	// Resolve the issue first: project_id gates the rest, so it pays
+	// off to filter via one cheap GraphQL call before the more
+	// expensive `gh pr view` subprocess. The same payload (team_id /
+	// state_name) is then reused by the downstream push* helpers,
+	// saving a redundant GetIssue call per task on the happy path.
+	issue, err := s.linear.GetIssue(ctx, t.IssueID)
+	if err != nil {
+		s.logger.Warn("state_advance_get_issue_failed",
+			"issue", t.IssueIdentifier, "err", err)
+		return
+	}
+	if issue.ProjectID == "" {
+		s.logger.Debug("state_advance_skip_issue_has_no_project",
+			"issue", t.IssueIdentifier)
+		return
+	}
+	if _, ok := enabled[issue.ProjectID]; !ok {
+		s.logger.Debug("state_advance_skip_not_enabled_project",
+			"issue", t.IssueIdentifier,
+			"project", issue.ProjectID)
+		return
+	}
+
 	status, err := s.pr.GetPRStatus(ctx, t.PRURL)
 	if err != nil {
 		s.logger.Warn("state_advance_pr_lookup_failed",
@@ -62,16 +112,16 @@ func (s *Service) advanceOne(ctx context.Context, t *store.AdmiralTask) {
 
 	switch status.State {
 	case "MERGED":
-		s.advanceMerged(ctx, t)
+		s.advanceMerged(ctx, t, issue)
 	case "CLOSED":
-		s.advanceCancelled(ctx, t)
+		s.advanceCancelled(ctx, t, issue)
 	case "OPEN":
-		s.advanceOpen(ctx, t, status.HasApprovedReview)
+		s.advanceOpen(ctx, t, issue, status.HasApprovedReview)
 	}
 }
 
-func (s *Service) advanceMerged(ctx context.Context, t *store.AdmiralTask) {
-	if err := s.pushLinearStateByType(ctx, t, "completed"); err != nil {
+func (s *Service) advanceMerged(ctx context.Context, t *store.AdmiralTask, issue *linear.Issue) {
+	if err := s.pushLinearStateByType(ctx, t, issue, "completed"); err != nil {
 		s.logger.Warn("state_advance_linear_completed_failed",
 			"issue", t.IssueIdentifier, "err", err)
 		return
@@ -87,8 +137,8 @@ func (s *Service) advanceMerged(ctx context.Context, t *store.AdmiralTask) {
 		"issue", t.IssueIdentifier, "pr", t.PRURL)
 }
 
-func (s *Service) advanceCancelled(ctx context.Context, t *store.AdmiralTask) {
-	if err := s.pushLinearStateByType(ctx, t, "canceled"); err != nil {
+func (s *Service) advanceCancelled(ctx context.Context, t *store.AdmiralTask, issue *linear.Issue) {
+	if err := s.pushLinearStateByType(ctx, t, issue, "canceled"); err != nil {
 		s.logger.Warn("state_advance_linear_canceled_failed",
 			"issue", t.IssueIdentifier, "err", err)
 		return
@@ -104,7 +154,7 @@ func (s *Service) advanceCancelled(ctx context.Context, t *store.AdmiralTask) {
 		"issue", t.IssueIdentifier, "pr", t.PRURL)
 }
 
-func (s *Service) advanceOpen(ctx context.Context, t *store.AdmiralTask, hasApproval bool) {
+func (s *Service) advanceOpen(ctx context.Context, t *store.AdmiralTask, issue *linear.Issue, hasApproval bool) {
 	var target string
 	if hasApproval {
 		target = s.cfg.LinearStates.Reviewed
@@ -114,7 +164,7 @@ func (s *Service) advanceOpen(ctx context.Context, t *store.AdmiralTask, hasAppr
 	if target == "" {
 		return
 	}
-	if err := s.pushLinearStateByName(ctx, t, target); err != nil {
+	if err := s.pushLinearStateByName(ctx, t, issue, target); err != nil {
 		s.logger.Warn("state_advance_linear_open_failed",
 			"issue", t.IssueIdentifier, "target", target, "err", err)
 	}
@@ -126,11 +176,7 @@ func (s *Service) advanceOpen(ctx context.Context, t *store.AdmiralTask, hasAppr
 // calls and Linear-side state churn). Returns nil for both
 // "wrote successfully" and "skipped because already in target type" —
 // the latter logs a debug line so the silent skip is observable.
-func (s *Service) pushLinearStateByType(ctx context.Context, t *store.AdmiralTask, wantType string) error {
-	issue, err := s.linear.GetIssue(ctx, t.IssueID)
-	if err != nil {
-		return fmt.Errorf("get issue: %w", err)
-	}
+func (s *Service) pushLinearStateByType(ctx context.Context, t *store.AdmiralTask, issue *linear.Issue, wantType string) error {
 	states, err := s.workflowStates(ctx, issue.TeamID)
 	if err != nil {
 		return err
@@ -153,11 +199,7 @@ func (s *Service) pushLinearStateByType(ctx context.Context, t *store.AdmiralTas
 // pushLinearStateByName pushes the issue's Linear workflow state to
 // the state with the given (case-insensitive) name. Skips when the
 // issue is already there.
-func (s *Service) pushLinearStateByName(ctx context.Context, t *store.AdmiralTask, wantName string) error {
-	issue, err := s.linear.GetIssue(ctx, t.IssueID)
-	if err != nil {
-		return fmt.Errorf("get issue: %w", err)
-	}
+func (s *Service) pushLinearStateByName(ctx context.Context, t *store.AdmiralTask, issue *linear.Issue, wantName string) error {
 	if eqFoldTrim(issue.StateName, wantName) {
 		return nil
 	}
