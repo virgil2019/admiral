@@ -216,7 +216,7 @@ func bearer(token string) string {
 	return "Bearer " + token
 }
 
-const issueQuery = `query Issue($id: ID!) {
+const issueQuery = `query Issue($id: String!) {
   issue(id: $id) {
     id
     identifier
@@ -433,7 +433,7 @@ type IssueBlocker struct {
 	IssueIdentifier string
 }
 
-const issueRelationsQuery = `query IssueRelations($id: ID!) {
+const issueRelationsQuery = `query IssueRelations($id: String!) {
   issue(id: $id) {
     relations(first: 50) {
       nodes {
@@ -490,7 +490,7 @@ func (c *Client) GetIssueBlockers(ctx context.Context, issueID string) ([]IssueB
 	return out, nil
 }
 
-const projectQuery = `query Project($id: ID!) {
+const projectQuery = `query Project($id: String!) {
   project(id: $id) {
     id
     name
@@ -553,7 +553,7 @@ func (c *Client) ListProjects(ctx context.Context) ([]Project, error) {
 	return out, nil
 }
 
-const issueUpdateMutation = `mutation IssueUpdate($id: ID!, $input: IssueUpdateInput!) {
+const issueUpdateMutation = `mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
   issueUpdate(id: $id, input: $input) { success }
 }`
 
