@@ -106,12 +106,21 @@ func (c *Client) gh(ctx context.Context, args ...string) (string, error) {
 // arguments must be non-empty (whitespace-only counts as empty) — an
 // empty body would post a literally-empty comment on the PR, which is
 // always a caller mistake.
+//
+// Every posted body is prefixed with the self-comment sentinel (a
+// hidden HTML comment) so the inbound webhook can drop self-triggered
+// events deterministically — see webhook.go. The sentinel is
+// invisible in the rendered GitHub UI. Bodies already carrying the
+// sentinel are not re-prefixed.
 func (c *Client) PostComment(ctx context.Context, prURL, body string) error {
 	if strings.TrimSpace(prURL) == "" {
 		return fmt.Errorf("github: PostComment: empty prURL")
 	}
 	if strings.TrimSpace(body) == "" {
 		return fmt.Errorf("github: PostComment: empty body")
+	}
+	if !hasSelfCommentSentinel(body) {
+		body = selfCommentSentinel + "\n" + body
 	}
 	out, err := c.gh(ctx, "pr", "comment", prURL, "-b", body)
 	if err != nil {

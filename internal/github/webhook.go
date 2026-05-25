@@ -14,8 +14,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // EventEnqueuer is the subset of *store.Store the webhook needs. Decoupled
@@ -81,7 +83,26 @@ const (
 	// smaller. Pick a generous-but-bounded cap so a malformed sender
 	// can't exhaust memory.
 	maxBodyBytes = 5 << 20
+
+	// selfCommentSentinel is a hidden HTML-comment marker that
+	// admiral's PostComment prepends to every PR conversation comment
+	// it writes. The webhook drops any incoming issue_comment whose
+	// body starts with it, giving a deterministic self-loop guard that
+	// does not depend on `gh_bot_login` or keyword heuristics — useful
+	// in single-author repos where the bot login equals the reviewer
+	// login. Renders as nothing in the GitHub UI; visible only in raw
+	// markdown source.
+	selfCommentSentinel = "<!-- admiral:status -->"
 )
+
+// hasSelfCommentSentinel reports whether body (ignoring leading
+// whitespace, including Unicode whitespace) starts with the sentinel.
+// Shared by Client.PostComment (to avoid double-prefix) and the
+// webhook (to drop self-triggered events) so the two sides cannot
+// drift on what counts as "already sentinel-prefixed".
+func hasSelfCommentSentinel(body string) bool {
+	return strings.HasPrefix(strings.TrimLeftFunc(body, unicode.IsSpace), selfCommentSentinel)
+}
 
 // rawReviewEvent is the subset of GitHub's webhook payloads admiral
 // cares about. Covers pull_request_review, pull_request_review_comment,
@@ -106,6 +127,7 @@ type rawReviewEvent struct {
 	} `json:"review,omitempty"`
 	Comment *struct {
 		ID   int64 `json:"id"`
+		Body string `json:"body"`
 		User struct {
 			Login string `json:"login"`
 		} `json:"user"`
@@ -190,7 +212,12 @@ func (h *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	// issue_comment fires on both issue and PR comments; admiral only
-	// handles PR comments (PR is open). Filter the rest here.
+	// handles PR comments (PR is open) AND only when the body looks like
+	// reviewer feedback. Same person typically authors both the code and
+	// the review so sender-based self-filtering is unsafe here — the
+	// self-comment sentinel (added by PostComment on every outgoing
+	// comment) is the deterministic self-loop guard, and review-style
+	// keywords are the gate for everything else. Filter the rest here.
 	if eventType == eventIssueComment {
 		if p.Issue == nil || p.Issue.PullRequest == nil {
 			h.logger.Debug("github_webhook_skip_non_pr_issue_comment",
@@ -200,6 +227,21 @@ func (h *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		if p.Issue.State != issueStateOpen {
 			h.logger.Debug("github_webhook_skip_closed_pr_issue_comment",
 				"state", p.Issue.State, "delivery", deliveryID)
+			return
+		}
+		if p.Comment == nil {
+			h.logger.Debug("github_webhook_skip_missing_comment_payload",
+				"delivery", deliveryID)
+			return
+		}
+		if hasSelfCommentSentinel(p.Comment.Body) {
+			h.logger.Debug("github_webhook_skip_self_sentinel",
+				"delivery", deliveryID)
+			return
+		}
+		if !looksLikeReviewComment(p.Comment.Body) {
+			h.logger.Debug("github_webhook_skip_non_review_issue_comment",
+				"delivery", deliveryID)
 			return
 		}
 	}
@@ -290,6 +332,44 @@ func (h *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		"pr", sessionID,
 		"comment_id", commentIDStr,
 		"delivery", deliveryID)
+}
+
+// issueCommentReviewKeywordRE decides whether a plain PR conversation
+// comment (issue_comment) is review-style feedback worth running
+// admiral on. Hits any one keyword and the event passes; misses
+// everything and it's dropped at the webhook layer. The
+// self-comment sentinel is the primary self-loop guard; this keyword
+// gate is the secondary filter that drops casual chitchat ("lgtm",
+// "thanks") from real reviewers.
+//
+// Keyword shape choices:
+//   - ASCII tokens use \b word boundaries; combined with the keyword
+//     list this means "fixed" / "fixes" / "prefix" / "prefixed" do
+//     not match because they contain extra characters past the
+//     boundary, so admiral's own status comments stay below the gate
+//     even if the sentinel ever gets stripped.
+//   - CJK keywords match as plain substrings — Go's \b is ASCII-only
+//     so it never triggers between two CJK characters, making
+//     boundary anchors useless there.
+//   - (?i) lets the ASCII alternation match case-insensitively.
+//   - Loose tokens that admiral itself routinely emits ("update",
+//     "问题", "错误") are intentionally omitted to keep false-positive
+//     surface low; the sentinel + remaining keywords are enough.
+//
+// RE2 (Go's engine) is linear-time over the input, so even a 5 MiB
+// body (the maxBodyBytes cap) has no ReDoS exposure.
+var issueCommentReviewKeywordRE = regexp.MustCompile(
+	`(?i)\b(review|fix|change|modify|please)\b` +
+		`|修改|修复|改一下|请改|调整`,
+)
+
+// looksLikeReviewComment reports whether body contains any
+// review-style keyword.
+func looksLikeReviewComment(body string) bool {
+	if body == "" {
+		return false
+	}
+	return issueCommentReviewKeywordRE.MatchString(body)
 }
 
 // verifySignature decodes GitHub's "sha256=<hex>" header and does a

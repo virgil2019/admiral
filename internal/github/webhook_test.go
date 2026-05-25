@@ -505,7 +505,7 @@ func TestServeHTTP_SkipsIssueCommentFromBot(t *testing.T) {
 			"state":"open",
 			"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
 		},
-		"comment":{"id":42,"body":"self","user":{"login":"admiral-bot"}},
+		"comment":{"id":42,"body":"please fix","user":{"login":"admiral-bot"}},
 		"sender":{"login":"admiral-bot"}
 	}`)
 	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-self", body)
@@ -540,5 +540,267 @@ func TestServeHTTP_SkipsIssueCommentEditedAction(t *testing.T) {
 	}
 	if len(st.calls) != 0 {
 		t.Errorf("edited issue_comment must not enqueue, got %d", len(st.calls))
+	}
+}
+
+func TestServeHTTP_SkipsIssueCommentWithoutReviewKeyword(t *testing.T) {
+	wh, st := newTestWebhook(t, "")
+	body := []byte(`{
+		"action":"created",
+		"issue":{
+			"state":"open",
+			"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+		},
+		"comment":{"id":99,"body":"thanks, lgtm","user":{"login":"someone"}},
+		"sender":{"login":"someone"}
+	}`)
+	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-no-kw", body)
+	rec := httptest.NewRecorder()
+	wh.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+	if len(st.calls) != 0 {
+		t.Errorf("non-review issue_comment must not enqueue, got %d", len(st.calls))
+	}
+}
+
+func TestServeHTTP_SkipsIssueCommentEmptyBody(t *testing.T) {
+	wh, st := newTestWebhook(t, "")
+	body := []byte(`{
+		"action":"created",
+		"issue":{
+			"state":"open",
+			"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+		},
+		"comment":{"id":100,"body":"","user":{"login":"someone"}},
+		"sender":{"login":"someone"}
+	}`)
+	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-empty", body)
+	rec := httptest.NewRecorder()
+	wh.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+	if len(st.calls) != 0 {
+		t.Errorf("empty-body issue_comment must not enqueue, got %d", len(st.calls))
+	}
+}
+
+func TestServeHTTP_EnqueuesIssueCommentWithChineseKeyword(t *testing.T) {
+	wh, st := newTestWebhook(t, "")
+	body := []byte(`{
+		"action":"created",
+		"issue":{
+			"state":"open",
+			"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+		},
+		"comment":{"id":101,"body":"这里需要修改一下","user":{"login":"someone"}},
+		"sender":{"login":"someone"}
+	}`)
+	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-cn", body)
+	rec := httptest.NewRecorder()
+	wh.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+	if len(st.calls) != 1 {
+		t.Fatalf("CJK review keyword should enqueue, got %d calls", len(st.calls))
+	}
+}
+
+func TestServeHTTP_EnqueuesIssueCommentCaseInsensitive(t *testing.T) {
+	wh, st := newTestWebhook(t, "")
+	body := []byte(`{
+		"action":"created",
+		"issue":{
+			"state":"open",
+			"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+		},
+		"comment":{"id":102,"body":"PLEASE Fix this","user":{"login":"someone"}},
+		"sender":{"login":"someone"}
+	}`)
+	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-case", body)
+	rec := httptest.NewRecorder()
+	wh.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+	if len(st.calls) != 1 {
+		t.Fatalf("uppercase keyword should enqueue, got %d calls", len(st.calls))
+	}
+}
+
+func TestLooksLikeReviewComment(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"empty", "", false},
+		{"plain chitchat", "thanks!", false},
+		{"lgtm", "lgtm", false},
+		{"emoji only", "👍", false},
+		{"english review", "Please review this", true},
+		{"english fix", "fix the typo on line 3", true},
+		{"english change", "change the variable name", true},
+		{"english modify", "modify the signature", true},
+		{"chinese 修改", "这里需要修改", true},
+		{"chinese 修复", "请修复 bug", true},
+		{"chinese 调整", "请调整一下顺序", true},
+		{"uppercase", "FIX THIS", true},
+		{"mixed case", "Please Review", true},
+		// Admiral's own outgoing status phrasings must NOT match — these
+		// are the typical shapes the sentinel covers, but the keyword
+		// list is defense in depth in case the sentinel ever gets
+		// stripped (e.g. by a reviewer quoting admiral and editing).
+		{"admiral updated past tense", "PR updated", false},
+		{"admiral fixed past tense", "Fixed in commit abc123", false},
+		{"admiral changes pushed", "Changes pushed", false},
+		// Dropped keywords — explicit negatives so a future re-add is intentional.
+		{"dropped update", "update the docs", false},
+		{"dropped 问题 alone", "有个问题想讨论", false},
+		{"dropped 错误 alone", "这个错误消息看不懂", false},
+		{"keyword as substring", "prefixed", false}, // not a keyword on its own
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := looksLikeReviewComment(c.body)
+			if got != c.want {
+				t.Errorf("looksLikeReviewComment(%q) = %v, want %v", c.body, got, c.want)
+			}
+		})
+	}
+}
+
+func TestServeHTTP_SkipsIssueCommentWithSelfSentinel(t *testing.T) {
+	// Admiral's own outgoing comments carry the self-comment sentinel. The
+	// webhook must drop them BEFORE the keyword filter — even when the
+	// body following the sentinel contains review keywords (which it
+	// usually does, e.g. "ready for review", "please re-review").
+	wh, st := newTestWebhook(t, "")
+	body := []byte(`{
+		"action":"created",
+		"issue":{
+			"state":"open",
+			"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+		},
+		"comment":{"id":201,"body":"<!-- admiral:status -->\nPlease re-review: https://github.com/x/y/pull/99","user":{"login":"someone"}},
+		"sender":{"login":"someone"}
+	}`)
+	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-sentinel", body)
+	rec := httptest.NewRecorder()
+	wh.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+	if len(st.calls) != 0 {
+		t.Errorf("sentinel comment must not enqueue, got %d", len(st.calls))
+	}
+}
+
+func TestServeHTTP_SentinelDropsBeforeKeywordCheck(t *testing.T) {
+	// Pins the ordering invariant: sentinel check runs BEFORE keyword
+	// filter. Body has the sentinel but otherwise NO review keyword
+	// ("thanks!" is plain chitchat). If a future refactor swapped the
+	// order, the keyword filter would still drop this — for the wrong
+	// reason — so this test would silently keep passing. To make the
+	// ordering observable, we also assert via a body that the keyword
+	// filter would PASS ("please re-review"); the sentinel must drop
+	// it regardless. Two cases, one test.
+	t.Run("sentinel_plus_chitchat", func(t *testing.T) {
+		wh, st := newTestWebhook(t, "")
+		body := []byte(`{
+			"action":"created",
+			"issue":{
+				"state":"open",
+				"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+			},
+			"comment":{"id":210,"body":"<!-- admiral:status -->\nthanks!","user":{"login":"someone"}},
+			"sender":{"login":"someone"}
+		}`)
+		req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-sentinel-chitchat", body)
+		rec := httptest.NewRecorder()
+		wh.Handler().ServeHTTP(rec, req)
+		if len(st.calls) != 0 {
+			t.Errorf("sentinel + chitchat must not enqueue, got %d", len(st.calls))
+		}
+	})
+	t.Run("sentinel_plus_keyword", func(t *testing.T) {
+		wh, st := newTestWebhook(t, "")
+		body := []byte(`{
+			"action":"created",
+			"issue":{
+				"state":"open",
+				"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+			},
+			"comment":{"id":211,"body":"<!-- admiral:status -->\nplease re-review","user":{"login":"someone"}},
+			"sender":{"login":"someone"}
+		}`)
+		req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-sentinel-kw", body)
+		rec := httptest.NewRecorder()
+		wh.Handler().ServeHTTP(rec, req)
+		if len(st.calls) != 0 {
+			t.Errorf("sentinel + keyword must still drop via sentinel, got %d", len(st.calls))
+		}
+	})
+}
+
+func TestServeHTTP_SkipsIssueCommentWithSentinelAndLeadingWhitespace(t *testing.T) {
+	// Reviewers sometimes quote admiral and the rendered body picks up
+	// stray leading whitespace; the sentinel check tolerates that so
+	// self-loops still close.
+	wh, st := newTestWebhook(t, "")
+	body := []byte(`{
+		"action":"created",
+		"issue":{
+			"state":"open",
+			"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+		},
+		"comment":{"id":202,"body":"  \n<!-- admiral:status -->\nfix",
+			"user":{"login":"someone"}},
+		"sender":{"login":"someone"}
+	}`)
+	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-sentinel-ws", body)
+	rec := httptest.NewRecorder()
+	wh.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+	if len(st.calls) != 0 {
+		t.Errorf("whitespace-prefixed sentinel must still drop, got %d", len(st.calls))
+	}
+}
+
+func TestServeHTTP_SkipsIssueCommentNilComment(t *testing.T) {
+	// A malformed issue_comment payload with no `comment` field must
+	// not nil-deref on p.Comment.Body — the explicit nil guard at the
+	// keyword-filter site is what prevents it. Keep this as a
+	// regression test so a future refactor that "DRYs out" the check
+	// doesn't crash the receiver.
+	wh, st := newTestWebhook(t, "")
+	body := []byte(`{
+		"action":"created",
+		"issue":{
+			"state":"open",
+			"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+		},
+		"sender":{"login":"someone"}
+	}`)
+	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-nil-comment", body)
+	rec := httptest.NewRecorder()
+	wh.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+	if len(st.calls) != 0 {
+		t.Errorf("nil-comment issue_comment must not enqueue, got %d", len(st.calls))
 	}
 }
