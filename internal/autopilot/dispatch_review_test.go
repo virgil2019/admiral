@@ -197,6 +197,15 @@ func TestExtractReviewBody_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestExtractReviewBody_IssueComment(t *testing.T) {
+	payload := `{"comment":{"body":"Hey admiral, please update the readme."}}`
+	got := extractReviewBody(payload, "issue_comment.created")
+	want := "Hey admiral, please update the readme."
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func TestBuildReviewPrompt_ContainsKeyParts(t *testing.T) {
 	p := buildReviewPrompt(
 		"https://github.com/owner/repo/pull/5",
@@ -274,6 +283,16 @@ func TestExtractReviewState_InlineCommentReturnsEmpty(t *testing.T) {
 	)
 	if got != "" {
 		t.Errorf("got %q, want empty for inline comment events", got)
+	}
+}
+
+func TestExtractReviewState_IssueCommentReturnsEmpty(t *testing.T) {
+	got := extractReviewState(
+		`{"comment":{"body":"@admiral please fix"}}`,
+		"issue_comment.created",
+	)
+	if got != "" {
+		t.Errorf("got %q, want empty for issue_comment events", got)
 	}
 }
 

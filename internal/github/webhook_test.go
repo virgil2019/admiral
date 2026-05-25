@@ -420,3 +420,125 @@ func TestServeHTTP_StoreErrorIsLoggedNotPropagated(t *testing.T) {
 		t.Errorf("store should be called once even when it errors, got %d", len(st.calls))
 	}
 }
+
+func TestServeHTTP_EnqueuesIssueCommentOnOpenPR(t *testing.T) {
+	wh, st := newTestWebhook(t, "admiral-bot")
+	body := []byte(`{
+		"action":"created",
+		"issue":{
+			"state":"open",
+			"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+		},
+		"comment":{"id":7777,"body":"hey admiral please look","user":{"login":"someone"}},
+		"sender":{"login":"someone"}
+	}`)
+	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-1", body)
+	rec := httptest.NewRecorder()
+	wh.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	if len(st.calls) != 1 {
+		t.Fatalf("enqueue calls: got %d, want 1", len(st.calls))
+	}
+	c := st.calls[0]
+	if c.action != "issue_comment.created" {
+		t.Errorf("action: got %q, want issue_comment.created", c.action)
+	}
+	if c.sessionID != "https://github.com/x/y/pull/99" {
+		t.Errorf("sessionID: got %q, want PR url", c.sessionID)
+	}
+	if c.commentID != "7777" {
+		t.Errorf("commentID: got %q, want 7777", c.commentID)
+	}
+}
+
+func TestServeHTTP_SkipsIssueCommentOnClosedPR(t *testing.T) {
+	wh, st := newTestWebhook(t, "")
+	body := []byte(`{
+		"action":"created",
+		"issue":{
+			"state":"closed",
+			"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+		},
+		"comment":{"id":7777,"body":"old","user":{"login":"someone"}},
+		"sender":{"login":"someone"}
+	}`)
+	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-closed", body)
+	rec := httptest.NewRecorder()
+	wh.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+	if len(st.calls) != 0 {
+		t.Errorf("closed PR comment must not enqueue, got %d", len(st.calls))
+	}
+}
+
+func TestServeHTTP_SkipsIssueCommentOnPureIssue(t *testing.T) {
+	wh, st := newTestWebhook(t, "")
+	body := []byte(`{
+		"action":"created",
+		"issue":{"state":"open"},
+		"comment":{"id":1,"body":"on an issue","user":{"login":"someone"}},
+		"sender":{"login":"someone"}
+	}`)
+	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-pure", body)
+	rec := httptest.NewRecorder()
+	wh.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+	if len(st.calls) != 0 {
+		t.Errorf("pure issue comment must not enqueue, got %d", len(st.calls))
+	}
+}
+
+func TestServeHTTP_SkipsIssueCommentFromBot(t *testing.T) {
+	wh, st := newTestWebhook(t, "admiral-bot")
+	body := []byte(`{
+		"action":"created",
+		"issue":{
+			"state":"open",
+			"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+		},
+		"comment":{"id":42,"body":"self","user":{"login":"admiral-bot"}},
+		"sender":{"login":"admiral-bot"}
+	}`)
+	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-self", body)
+	rec := httptest.NewRecorder()
+	wh.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+	if len(st.calls) != 0 {
+		t.Errorf("bot self issue comment must not enqueue, got %d", len(st.calls))
+	}
+}
+
+func TestServeHTTP_SkipsIssueCommentEditedAction(t *testing.T) {
+	wh, st := newTestWebhook(t, "")
+	body := []byte(`{
+		"action":"edited",
+		"issue":{
+			"state":"open",
+			"pull_request":{"html_url":"https://github.com/x/y/pull/99"}
+		},
+		"comment":{"id":42,"body":"edited","user":{"login":"someone"}},
+		"sender":{"login":"someone"}
+	}`)
+	req := signedRequest(t, "the-secret", eventIssueComment, "d-ic-edit", body)
+	rec := httptest.NewRecorder()
+	wh.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+	if len(st.calls) != 0 {
+		t.Errorf("edited issue_comment must not enqueue, got %d", len(st.calls))
+	}
+}

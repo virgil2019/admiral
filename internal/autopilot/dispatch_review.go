@@ -270,15 +270,26 @@ func runClaudeForReview(ctx context.Context, claudeBin string, maxRunSeconds int
 	return strings.TrimSpace(sb.String()), nil
 }
 
-// extractReviewBody returns the human-readable text from the GitHub webhook
-// payload JSON. row.Action is "pull_request_review.submitted" or
-// "pull_request_review_comment.created".
+// isCommentLikeAction reports whether action is an inline-review or
+// generic PR-conversation comment event. These payloads carry the body
+// under comment.body (no review state).
+func isCommentLikeAction(action string) bool {
+	return strings.HasPrefix(action, "pull_request_review_comment") ||
+		strings.HasPrefix(action, "issue_comment")
+}
+
+// extractReviewBody returns the human-readable text from the GitHub
+// webhook payload JSON. row.Action is one of:
+//
+//	pull_request_review.submitted     → review.body
+//	pull_request_review_comment.created → comment.body
+//	issue_comment.created             → comment.body
 func extractReviewBody(payloadJSON, action string) string {
 	var p reviewPayload
 	if err := json.Unmarshal([]byte(payloadJSON), &p); err != nil {
 		return ""
 	}
-	if strings.HasPrefix(action, "pull_request_review_comment") {
+	if isCommentLikeAction(action) {
 		if p.Comment != nil {
 			return strings.TrimSpace(p.Comment.Body)
 		}
@@ -290,10 +301,10 @@ func extractReviewBody(payloadJSON, action string) string {
 }
 
 // extractReviewState returns the lowercased review state ("approved",
-// "changes_requested", "commented") for pull_request_review.submitted events.
-// Returns "" for pull_request_review_comment events, which carry no state.
+// "changes_requested", "commented") for pull_request_review.submitted
+// events. Returns "" for comment-like events (no review state).
 func extractReviewState(payloadJSON, action string) string {
-	if strings.HasPrefix(action, "pull_request_review_comment") {
+	if isCommentLikeAction(action) {
 		return ""
 	}
 	var p reviewPayload

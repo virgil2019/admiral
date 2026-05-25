@@ -69,9 +69,12 @@ const (
 
 	eventReview        = "pull_request_review"
 	eventReviewComment = "pull_request_review_comment"
+	eventIssueComment  = "issue_comment"
 
 	actionSubmitted = "submitted"
 	actionCreated   = "created"
+
+	issueStateOpen = "open"
 
 	// GitHub caps webhook payloads at 25 MiB; review events are vastly
 	// smaller. Pick a generous-but-bounded cap so a malformed sender
@@ -79,15 +82,21 @@ const (
 	maxBodyBytes = 5 << 20
 )
 
-// rawReviewEvent is the subset of GitHub's review-event payloads admiral
-// cares about. Both pull_request_review and pull_request_review_comment
-// fit this shape because we only look at one of Review / Comment at a
-// time depending on event type.
+// rawReviewEvent is the subset of GitHub's webhook payloads admiral
+// cares about. Covers pull_request_review, pull_request_review_comment,
+// and issue_comment — the last is shaped differently (PR info lives
+// under issue.pull_request rather than at top level).
 type rawReviewEvent struct {
 	Action      string `json:"action"`
 	PullRequest struct {
 		HTMLURL string `json:"html_url"`
 	} `json:"pull_request"`
+	Issue *struct {
+		State       string `json:"state"`
+		PullRequest *struct {
+			HTMLURL string `json:"html_url"`
+		} `json:"pull_request,omitempty"`
+	} `json:"issue,omitempty"`
 	Review *struct {
 		ID   int64 `json:"id"`
 		User struct {
@@ -151,7 +160,7 @@ func (h *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if eventType != eventReview && eventType != eventReviewComment {
+	if eventType != eventReview && eventType != eventReviewComment && eventType != eventIssueComment {
 		h.logger.Debug("github_webhook_skip_event",
 			"event", eventType, "delivery", deliveryID)
 		return
@@ -171,7 +180,7 @@ func (h *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 				"event", eventType, "action", p.Action, "delivery", deliveryID)
 			return
 		}
-	case eventReviewComment:
+	case eventReviewComment, eventIssueComment:
 		if p.Action != actionCreated {
 			h.logger.Debug("github_webhook_skip_action",
 				"event", eventType, "action", p.Action, "delivery", deliveryID)
@@ -179,7 +188,26 @@ func (h *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if p.PullRequest.HTMLURL == "" {
+	// issue_comment fires on both issue and PR comments; admiral only
+	// handles PR comments (PR is open). Filter the rest here.
+	if eventType == eventIssueComment {
+		if p.Issue == nil || p.Issue.PullRequest == nil {
+			h.logger.Debug("github_webhook_skip_non_pr_issue_comment",
+				"delivery", deliveryID)
+			return
+		}
+		if p.Issue.State != issueStateOpen {
+			h.logger.Debug("github_webhook_skip_closed_pr_issue_comment",
+				"state", p.Issue.State, "delivery", deliveryID)
+			return
+		}
+	}
+
+	prURL := p.PullRequest.HTMLURL
+	if eventType == eventIssueComment {
+		prURL = p.Issue.PullRequest.HTMLURL
+	}
+	if prURL == "" {
 		h.logger.Warn("github_webhook_missing_pr_url",
 			"event", eventType, "delivery", deliveryID)
 		return
@@ -196,7 +224,7 @@ func (h *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		}
 		commentID = p.Review.ID
 		authorLogin = p.Review.User.Login
-	case eventReviewComment:
+	case eventReviewComment, eventIssueComment:
 		if p.Comment == nil {
 			h.logger.Warn("github_webhook_missing_comment",
 				"delivery", deliveryID)
@@ -232,7 +260,7 @@ func (h *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 	// single-flight naturally enforces "one in-flight job per PR".
 	// Linear's session_id namespace is UUIDs, structurally distinct from
 	// PR URLs, so the source-blind claim logic stays correct.
-	sessionID := p.PullRequest.HTMLURL
+	sessionID := prURL
 	action := eventType + "." + p.Action
 	commentIDStr := strconv.FormatInt(commentID, 10)
 
