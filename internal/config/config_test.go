@@ -334,3 +334,54 @@ storage:
 		t.Errorf("MaxConcurrentRuns env override: got %d, want 11 (env should beat config 7)", cfg.Autopilot.MaxConcurrentRuns)
 	}
 }
+
+func TestLoadDiscoverer_LinearStatesDefaults(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+autopilot:
+  claude_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+discoverer:
+  require_label: "agent-ready"
+`
+	cfg, err := LoadDiscoverer(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadDiscoverer: %v", err)
+	}
+	if cfg.Discoverer.LinearStates.InReview != "In Review" {
+		t.Errorf("InReview default: got %q, want %q", cfg.Discoverer.LinearStates.InReview, "In Review")
+	}
+	if cfg.Discoverer.LinearStates.Reviewed != "Reviewed" {
+		t.Errorf("Reviewed default: got %q, want %q", cfg.Discoverer.LinearStates.Reviewed, "Reviewed")
+	}
+}
+
+func TestLoadDiscoverer_LinearStatesOverride(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+autopilot:
+  claude_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+discoverer:
+  require_label: "agent-ready"
+  linear_states:
+    in_review: "Code Review"
+    reviewed: "Approved"
+`
+	cfg, err := LoadDiscoverer(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadDiscoverer: %v", err)
+	}
+	if cfg.Discoverer.LinearStates.InReview != "Code Review" {
+		t.Errorf("InReview override: got %q, want %q", cfg.Discoverer.LinearStates.InReview, "Code Review")
+	}
+	if cfg.Discoverer.LinearStates.Reviewed != "Approved" {
+		t.Errorf("Reviewed override: got %q, want %q", cfg.Discoverer.LinearStates.Reviewed, "Approved")
+	}
+}

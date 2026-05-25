@@ -493,6 +493,16 @@ func (c *Config) validateDiscovererAndExpand() error {
 		}
 	}
 
+	// Default to Linear's stock workflow-state names so a deploy on a
+	// default team layout works without yaml. Operators with renamed
+	// states (or non-English teams) still override via yaml.
+	if strings.TrimSpace(d.LinearStates.InReview) == "" {
+		d.LinearStates.InReview = "In Review"
+	}
+	if strings.TrimSpace(d.LinearStates.Reviewed) == "" {
+		d.LinearStates.Reviewed = "Reviewed"
+	}
+
 	if strings.TrimSpace(d.RequireLabel) == "" && !*d.Judge.Enabled {
 		c.Warnings = append(c.Warnings,
 			"discoverer.require_label is empty AND discoverer.judge.enabled is false — "+
