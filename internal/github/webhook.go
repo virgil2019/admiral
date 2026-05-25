@@ -24,11 +24,12 @@ type EventEnqueuer interface {
 	EnqueueEventWithSource(source, webhookID, action, sessionID, issueID, payloadJSON, commentID string) (bool, error)
 }
 
-// Webhook is the inbound HTTP receiver for GitHub PR review events. It
-// validates HMAC, filters to the actionable subset (pull_request_review
-// submitted + pull_request_review_comment created), drops events authored
-// by the configured bot identity (loop guard), and enqueues into
-// events_inbox so the worker can pick them up.
+// Webhook is the inbound HTTP receiver for GitHub PR feedback events.
+// It validates HMAC, filters to the actionable subset
+// (pull_request_review submitted, pull_request_review_comment created,
+// issue_comment created on an open PR), drops events authored by the
+// configured bot identity (loop guard), and enqueues into events_inbox
+// so the worker can pick them up.
 type Webhook struct {
 	secret   []byte
 	botLogin string
