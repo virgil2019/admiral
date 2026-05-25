@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeRunner captures one invocation's args + env so tests can assert
@@ -271,4 +272,178 @@ func equalSlice(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// seqRunner returns a scripted (stdout, err) per call and counts
+// invocations. Used to exercise ghReadRetry's backoff path without
+// real subprocess spawns.
+type seqRunner struct {
+	calls   int
+	outputs []seqOutput
+}
+
+type seqOutput struct {
+	stdout string
+	err    error
+}
+
+func (s *seqRunner) run(_ context.Context, _ []string, _ string, _ ...string) (string, error) {
+	idx := s.calls
+	s.calls++
+	if idx >= len(s.outputs) {
+		// Past the scripted set — return the last one, so an
+		// always-transient script can be expressed by repeating one
+		// entry once.
+		return s.outputs[len(s.outputs)-1].stdout, s.outputs[len(s.outputs)-1].err
+	}
+	return s.outputs[idx].stdout, s.outputs[idx].err
+}
+
+func newClientWithSeq(sr *seqRunner) *Client {
+	return &Client{bin: "gh", runCmd: sr.run}
+}
+
+// withZeroRetryDelays nukes the backoff schedule for one test so
+// retries don't actually sleep. Restored on cleanup.
+func withZeroRetryDelays(t *testing.T) {
+	t.Helper()
+	orig := ghReadRetryDelays
+	ghReadRetryDelays = []time.Duration{0, 0, 0}
+	t.Cleanup(func() { ghReadRetryDelays = orig })
+}
+
+func TestIsTransientGhFailure(t *testing.T) {
+	bang := errors.New("exit status 1")
+	cases := []struct {
+		name   string
+		output string
+		err    error
+		want   bool
+	}{
+		{"nil err", "any output", nil, false},
+		{"empty output", "", bang, false},
+		{"unexpected EOF", `Get "https://api.github.com/...": unexpected EOF`, bang, true},
+		{"uppercase EOF", "Unexpected EOF", bang, true},
+		{"connection reset", "read tcp ... connection reset by peer", bang, true},
+		{"i/o timeout", "Get ...: i/o timeout", bang, true},
+		{"503", "HTTP 503: Service Unavailable", bang, true},
+		{"502", "HTTP 502: Bad Gateway", bang, true},
+		{"504", "HTTP 504: Gateway Timeout", bang, true},
+		{"rate limit", "API rate limit exceeded", bang, true},
+		// Permanent failures must NOT be retried.
+		{"could not resolve", "GraphQL: Could not resolve to a PullRequest", bang, false},
+		{"404 not found", "HTTP 404: Not Found", bang, false},
+		{"401 unauthorized", "HTTP 401: Unauthorized", bang, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isTransientGhFailure(c.output, c.err); got != c.want {
+				t.Errorf("isTransientGhFailure(%q, %v) = %v, want %v",
+					c.output, c.err, got, c.want)
+			}
+		})
+	}
+}
+
+func TestGhReadRetry_SucceedsFirstTry(t *testing.T) {
+	withZeroRetryDelays(t)
+	sr := &seqRunner{outputs: []seqOutput{{stdout: "ok"}}}
+	c := newClientWithSeq(sr)
+	out, err := c.ghReadRetry(context.Background(), "pr", "view")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if out != "ok" {
+		t.Errorf("stdout: got %q, want ok", out)
+	}
+	if sr.calls != 1 {
+		t.Errorf("calls: got %d, want 1", sr.calls)
+	}
+}
+
+func TestGhReadRetry_TransientThenSuccess(t *testing.T) {
+	withZeroRetryDelays(t)
+	sr := &seqRunner{outputs: []seqOutput{
+		{stdout: `Get "...": unexpected EOF`, err: errors.New("exit status 1")},
+		{stdout: `{"state":"OPEN"}`, err: nil},
+	}}
+	c := newClientWithSeq(sr)
+	out, err := c.ghReadRetry(context.Background(), "pr", "view")
+	if err != nil {
+		t.Fatalf("unexpected err after retry: %v", err)
+	}
+	if out != `{"state":"OPEN"}` {
+		t.Errorf("stdout: got %q, want JSON state", out)
+	}
+	if sr.calls != 2 {
+		t.Errorf("calls: got %d, want 2 (1 transient + 1 success)", sr.calls)
+	}
+}
+
+func TestGhReadRetry_AllTransientExhausts(t *testing.T) {
+	withZeroRetryDelays(t)
+	sr := &seqRunner{outputs: []seqOutput{
+		{stdout: "unexpected EOF", err: errors.New("exit status 1")},
+	}}
+	c := newClientWithSeq(sr)
+	_, err := c.ghReadRetry(context.Background(), "pr", "view")
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	// Initial + 3 retries = 4 invocations total (matches ghReadRetryDelays
+	// having 3 entries).
+	if sr.calls != 4 {
+		t.Errorf("calls: got %d, want 4 (initial + 3 retries)", sr.calls)
+	}
+}
+
+func TestGhReadRetry_NonTransientNoRetry(t *testing.T) {
+	withZeroRetryDelays(t)
+	sr := &seqRunner{outputs: []seqOutput{
+		{stdout: "GraphQL: Could not resolve to a PullRequest", err: errors.New("exit status 1")},
+	}}
+	c := newClientWithSeq(sr)
+	_, err := c.ghReadRetry(context.Background(), "pr", "view")
+	if err == nil {
+		t.Fatal("expected error to propagate")
+	}
+	if sr.calls != 1 {
+		t.Errorf("calls: got %d, want 1 (no retry for permanent failure)", sr.calls)
+	}
+}
+
+func TestGhReadRetry_ContextCancelStopsBackoff(t *testing.T) {
+	// Use a real (non-zero) backoff so cancel has something to interrupt.
+	sr := &seqRunner{outputs: []seqOutput{
+		{stdout: "unexpected EOF", err: errors.New("exit status 1")},
+	}}
+	c := newClientWithSeq(sr)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before call
+	_, err := c.ghReadRetry(ctx, "pr", "view")
+	if err == nil {
+		t.Fatal("expected ctx error")
+	}
+	// Should make at most 1 attempt before the cancel interrupts the
+	// first backoff sleep.
+	if sr.calls > 1 {
+		t.Errorf("calls: got %d, want 1 (cancel must stop further attempts)", sr.calls)
+	}
+}
+
+func TestPostComment_DoesNotRetryOnTransient(t *testing.T) {
+	// POST is not idempotent — a comment that fails with "unexpected EOF"
+	// after the request may have been created server-side. Retrying would
+	// double-post. PostComment must call gh() directly, not ghReadRetry.
+	sr := &seqRunner{outputs: []seqOutput{
+		{stdout: "unexpected EOF", err: errors.New("exit status 1")},
+	}}
+	c := newClientWithSeq(sr)
+	err := c.PostComment(context.Background(), "https://github.com/x/y/pull/1", "body")
+	if err == nil {
+		t.Fatal("expected error on transient PostComment failure")
+	}
+	if sr.calls != 1 {
+		t.Errorf("calls: got %d, want 1 (PostComment must not retry POSTs)", sr.calls)
+	}
 }

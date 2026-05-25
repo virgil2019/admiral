@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // PRClient is the outbound API admiral uses to talk to a PR on GitHub.
@@ -102,6 +103,79 @@ func (c *Client) gh(ctx context.Context, args ...string) (string, error) {
 	return c.runCmd(ctx, extraEnv, c.bin, args...)
 }
 
+// ghReadRetryDelays is the backoff schedule for transient `gh` read
+// failures. Matched to internal/linear's retryHTTP shape so admiral's
+// two upstream APIs (GitHub via gh, Linear via direct HTTP) recover
+// from blips on the same cadence. Exposed as a var so tests can
+// override to zero-duration without sleeping the test suite.
+var ghReadRetryDelays = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+
+// ghReadRetry wraps gh() with bounded backoff retry for transient
+// GitHub failures (TCP reset on a pooled keep-alive, brief 5xx, etc).
+// Safe ONLY for idempotent GET-style operations — never call from
+// `gh pr comment` and friends: POSTs that fail with `unexpected EOF`
+// may have already succeeded server-side, and retrying would
+// double-create the resource.
+func (c *Client) ghReadRetry(ctx context.Context, args ...string) (string, error) {
+	var (
+		out     string
+		lastErr error
+	)
+	for attempt := 0; attempt <= len(ghReadRetryDelays); attempt++ {
+		out, lastErr = c.gh(ctx, args...)
+		if lastErr == nil {
+			return out, nil
+		}
+		if !isTransientGhFailure(out, lastErr) || attempt == len(ghReadRetryDelays) {
+			return out, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return out, ctx.Err()
+		case <-time.After(ghReadRetryDelays[attempt]):
+		}
+	}
+	return out, lastErr
+}
+
+// isTransientGhFailure inspects gh's combined output for patterns
+// that suggest a retry is worthwhile. gh itself does not classify
+// these — it just exits non-zero and prints the upstream error
+// verbatim, so we pattern-match on the substring shapes admiral has
+// actually seen in production (or that GitHub documents as transient).
+//
+// Patterns covered (case-insensitive substring on combined output):
+//   - "unexpected EOF"     — server-side TCP reset on pooled keep-alive
+//   - "connection reset"   — RST mid-stream
+//   - "i/o timeout"        — request deadline exceeded at transport
+//   - "503"/"502"/"504"    — gateway/availability hiccups
+//   - "rate limit"         — API rate limit (backoff helps modestly)
+//
+// Deliberately NOT covered: HTTP 401/403/404 and gh's
+// "could not resolve" — those are permanent and a retry just wastes
+// time. The PR-not-resolvable path is already handled at the call
+// site (isPRNotResolvable), so we don't need to also filter it here.
+func isTransientGhFailure(output string, err error) bool {
+	if err == nil {
+		return false
+	}
+	hay := strings.ToLower(output)
+	for _, needle := range []string{
+		"unexpected eof",
+		"connection reset",
+		"i/o timeout",
+		"503",
+		"502",
+		"504",
+		"rate limit",
+	} {
+		if strings.Contains(hay, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 // PostComment shells out to `gh pr comment <url> -b <body>`. Both
 // arguments must be non-empty (whitespace-only counts as empty) — an
 // empty body would post a literally-empty comment on the PR, which is
@@ -138,7 +212,7 @@ func (c *Client) GetPRState(ctx context.Context, prURL string) (string, error) {
 	if strings.TrimSpace(prURL) == "" {
 		return "", fmt.Errorf("github: GetPRState: empty prURL")
 	}
-	out, err := c.gh(ctx, "pr", "view", prURL, "--json", "state")
+	out, err := c.ghReadRetry(ctx, "pr", "view", prURL, "--json", "state")
 	if err != nil {
 		if isPRNotResolvable(out) {
 			return "", nil
@@ -162,7 +236,7 @@ func (c *Client) GetPRStatus(ctx context.Context, prURL string) (PRStatus, error
 	if strings.TrimSpace(prURL) == "" {
 		return PRStatus{}, fmt.Errorf("github: GetPRStatus: empty prURL")
 	}
-	out, err := c.gh(ctx, "pr", "view", prURL, "--json", "state,mergedAt,latestReviews")
+	out, err := c.ghReadRetry(ctx, "pr", "view", prURL, "--json", "state,mergedAt,latestReviews")
 	if err != nil {
 		if isPRNotResolvable(out) {
 			return PRStatus{}, nil
@@ -197,7 +271,7 @@ func (c *Client) GetDiff(ctx context.Context, prURL string) (string, error) {
 	if strings.TrimSpace(prURL) == "" {
 		return "", fmt.Errorf("github: GetDiff: empty prURL")
 	}
-	out, err := c.gh(ctx, "pr", "diff", prURL)
+	out, err := c.ghReadRetry(ctx, "pr", "diff", prURL)
 	if err != nil {
 		return "", fmt.Errorf("gh pr diff %s: %w (output: %s)", prURL, err, truncate(out, 200))
 	}
