@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -933,6 +935,55 @@ func TestQueryGraphQLVariableTypes(t *testing.T) {
 				if strings.Contains(c.query, bad) {
 					t.Errorf("query has forbidden declaration %q:\n%s", bad, c.query)
 				}
+			}
+		})
+	}
+}
+
+// TestIsTransientNetErr pins the classification contract for retry
+// eligibility. Regression: a previous version returned early on any
+// error implementing net.Error (e.g. *url.Error) via ne.Timeout(),
+// which classified EOF / unexpected-EOF as non-transient and disabled
+// retries on the most common Linear failure (server-side TCP reset
+// surfaced as `Post ... : unexpected EOF`).
+func TestIsTransientNetErr(t *testing.T) {
+	// Synthetic "non-transient" net.Error stand-in: implements
+	// net.Error but Timeout() returns false. Mirrors the shape
+	// *url.Error wraps when http.Client.Do returns a non-timeout
+	// transport error.
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"plain io.EOF", io.EOF, true},
+		{"plain io.ErrUnexpectedEOF", io.ErrUnexpectedEOF, true},
+		{"context.DeadlineExceeded", context.DeadlineExceeded, true},
+		{"context.Canceled", context.Canceled, true},
+		// url.Error wrapping EOF — exactly what http.Client.Do
+		// returns on a server-side TCP reset. Must classify
+		// transient even though url.Error itself is a net.Error
+		// whose Timeout() is false.
+		{
+			"url.Error wrapping io.EOF",
+			&url.Error{Op: "Post", URL: "https://api.linear.app/graphql", Err: io.EOF},
+			true,
+		},
+		{
+			"url.Error wrapping io.ErrUnexpectedEOF",
+			&url.Error{Op: "Post", URL: "https://api.linear.app/graphql", Err: io.ErrUnexpectedEOF},
+			true,
+		},
+		// Non-network unrelated error: must NOT be classified
+		// transient — that path should fall through to a permanent
+		// failure rather than spin forever.
+		{"plain non-net error", errors.New("boom"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isTransientNetErr(c.err); got != c.want {
+				t.Errorf("isTransientNetErr(%v) = %v, want %v", c.err, got, c.want)
 			}
 		})
 	}
