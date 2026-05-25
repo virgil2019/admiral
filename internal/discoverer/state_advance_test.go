@@ -43,6 +43,7 @@ func newGEOIssue(stateName string) *linear.Issue {
 		Identifier: "GEO-77",
 		Title:      "x",
 		TeamID:     "team-GEO",
+		ProjectID:  "proj-A", // matches fakeStore.projectIDs default
 		StateName:  stateName,
 	}
 }
@@ -220,6 +221,95 @@ func TestAdvanceSkipsWhenNoPR(t *testing.T) {
 
 	if len(lc.issueUpdates) != 0 {
 		t.Errorf("expected no API calls for task without PR, got %+v", lc.issueUpdates)
+	}
+}
+
+func TestAdvanceSkipsWhenProjectNotEnabled(t *testing.T) {
+	// Regression: discoverer must not touch Linear state for tasks
+	// whose issue lives in a project that's no longer opted in via
+	// admin UI (repos.auto_pick_enabled). Otherwise historical
+	// admiral_tasks rows from disabled projects keep getting state
+	// pushes every tick.
+	prURL := newPRURL()
+	task := newGEOTaskDone(prURL)
+	ts := newFakeStore()
+	ts.tasksByState[task.IssueID] = &task
+
+	lc := &fakeLinear{}
+	iss := newGEOIssue("In Progress")
+	iss.ProjectID = "proj-X" // NOT in fakeStore.projectIDs ([]string{"proj-A"})
+	lc.issues = map[string]*linear.Issue{"iss-A": iss}
+	seedTeamGEO(lc)
+
+	pr := &fakePR{statuses: map[string]PRStatus{
+		prURL: {State: "MERGED", MergedAt: "2026-05-25T06:00:00Z"},
+	}}
+
+	svc := newSvcWithPR(Config{AdmiralUserID: "u-1"}, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if len(lc.issueUpdates) != 0 {
+		t.Errorf("expected no Linear write for disabled-project task, got %+v", lc.issueUpdates)
+	}
+	if ts.tasksByState["iss-A"].State != store.JobStateDone {
+		t.Errorf("admiral_tasks state must stay DONE (no transition), got %q",
+			ts.tasksByState["iss-A"].State)
+	}
+}
+
+func TestAdvanceSkipsWhenIssueHasNoProject(t *testing.T) {
+	// Edge case: Linear allows project-less issues. The skip path must
+	// fire its own log key (state_advance_skip_issue_has_no_project)
+	// distinct from the disabled-project path, so on-call doesn't
+	// misread the enabled-set lookup as broken.
+	prURL := newPRURL()
+	task := newGEOTaskDone(prURL)
+	ts := newFakeStore()
+	ts.tasksByState[task.IssueID] = &task
+
+	lc := &fakeLinear{}
+	iss := newGEOIssue("In Progress")
+	iss.ProjectID = "" // project-less issue
+	lc.issues = map[string]*linear.Issue{"iss-A": iss}
+	seedTeamGEO(lc)
+
+	pr := &fakePR{statuses: map[string]PRStatus{
+		prURL: {State: "MERGED"},
+	}}
+
+	svc := newSvcWithPR(Config{AdmiralUserID: "u-1"}, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if len(lc.issueUpdates) != 0 {
+		t.Errorf("expected no Linear write for project-less issue, got %+v", lc.issueUpdates)
+	}
+	if ts.tasksByState["iss-A"].State != store.JobStateDone {
+		t.Errorf("admiral_tasks state must stay DONE, got %q", ts.tasksByState["iss-A"].State)
+	}
+}
+
+func TestAdvanceSkipsWhenNoEnabledProjects(t *testing.T) {
+	// All projects disabled → discoverer must short-circuit before
+	// touching admiral_tasks at all (no PR lookup, no GetIssue).
+	prURL := newPRURL()
+	task := newGEOTaskDone(prURL)
+	ts := newFakeStore()
+	ts.projectIDs = nil // empty enabled set
+	ts.tasksByState[task.IssueID] = &task
+
+	lc := &fakeLinear{}
+	lc.issues = map[string]*linear.Issue{"iss-A": newGEOIssue("In Progress")}
+	seedTeamGEO(lc)
+
+	pr := &fakePR{statuses: map[string]PRStatus{
+		prURL: {State: "MERGED"},
+	}}
+
+	svc := newSvcWithPR(Config{AdmiralUserID: "u-1"}, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if len(lc.issueUpdates) != 0 {
+		t.Errorf("expected no Linear write when no enabled projects, got %+v", lc.issueUpdates)
 	}
 }
 
