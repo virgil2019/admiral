@@ -2695,6 +2695,44 @@ func TestDispatch_FixOnFailed_SuggestsRerun(t *testing.T) {
 	}
 }
 
+// TestDispatch_FixOnDoneMerged_SuggestsRerun verifies /fix on a task
+// whose PR has been merged (discoverer flipped DONE -> DONE_MERGED)
+// is rejected with a message pointing the user at /rerun, instead of
+// falling through to the catch-all "/fix not supported in state" branch.
+func TestDispatch_FixOnDoneMerged_SuggestsRerun(t *testing.T) {
+	mlc := &mockLinearClient{}
+	live := &store.AdmiralTask{
+		IssueID:         "issue-merged",
+		State:           store.JobStateDoneMerged,
+		AttemptN:        1,
+		PRURL:           "https://github.com/x/y/pull/3",
+		ClaudeSessionID: "claude-merged",
+	}
+	ms := &mockStore{
+		AdmiralTask:     live,
+		LiveAdmiralTask: live,
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-fix-merged",
+		IssueID:         "issue-merged",
+		IssueIdentifier: "MERGED-1",
+		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-fix-merged",
+		PromptContext:   "/fix one more tweak",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "merged") {
+		t.Errorf("expected merge-aware reject reply, got: %s", body)
+	}
+	if !strings.Contains(body, "/rerun") {
+		t.Errorf("expected suggestion to use /rerun, got: %s", body)
+	}
+}
+
 // TestDispatch_FixWithoutDescription_Rejects verifies /fix without a
 // description (just `/fix` alone) is rejected with help. Without text
 // the resume claude run has nothing to act on.

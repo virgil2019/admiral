@@ -483,6 +483,15 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 			task.State,
 		))
 		return
+	case store.JobStateDoneMerged:
+		// PR was merged → branch may already be deleted on origin and the
+		// worktree cleaned up. /fix would either fail at worktree
+		// recreation or push to a dead branch. Tell the user to /rerun.
+		o.logger.Info("dispatch_reject_fix_done_merged",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postRejection(ev.SessionID,
+			"PR was already merged — /fix can't reopen merged work. Use /rerun to start fresh on a new branch.")
+		return
 	case store.JobStateDone:
 		// proceed
 	default:
@@ -1236,20 +1245,12 @@ func (f *flow) execute() error {
 		cancel()
 	}
 
-	// Update Linear issue status to "completed" asynchronously (non-blocking).
-	// Skip on noop: claude produced no diff, so admiral does not assert the
-	// issue is actually done — leave that judgment to the user.
-	if !isNoop && f.o.cfg.UpdateIssueStatus != nil && *f.o.cfg.UpdateIssueStatus && f.teamID != "" {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if id, err := f.o.stateIDByType(ctx, f.teamID, "completed"); err == nil && id != "" {
-				if err := f.o.lc.IssueUpdate(ctx, f.ev.IssueID, id); err != nil {
-					f.o.logger.Warn("issue_update_completed_failed", "err", err)
-				}
-			}
-		}()
-	}
+	// Linear post-PR state transitions (in_review / reviewed / completed /
+	// canceled) are now driven by admiral-discoverer based on the live
+	// GitHub PR state — autopilot only owns the "started" transition above
+	// since it needs the in-process knowledge of "claude run is starting
+	// now". The completed transition used to live here; removed in the
+	// task-lifecycle refactor.
 
 	f.cleanupWorktree(cleanupDelete)
 	return nil

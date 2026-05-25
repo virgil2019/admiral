@@ -40,6 +40,22 @@ type Config struct {
 	MaxPickPerRound int
 	AdmiralUserID   string
 	Judge           JudgeConfig
+	// LinearStates maps the admiral workflow stages onto Linear
+	// workflow-state names. Empty entries are skipped (transition is
+	// not pushed to Linear). The merged-PR transition does not consult
+	// this map: it uses Linear state.type=completed as a stable target.
+	LinearStates LinearStateMap
+}
+
+// LinearStateMap holds optional per-team Linear state names.
+type LinearStateMap struct {
+	// InReview is the Linear state to push when admiral's PR is open
+	// and has no approval yet (typically "In Review"). Empty = skip.
+	InReview string
+	// Reviewed is the Linear state to push when admiral's PR is open
+	// and has at least one approval (typically "Reviewed"). Empty =
+	// skip.
+	Reviewed string
 }
 
 // JudgeConfig configures the claude -p judge step.
@@ -54,17 +70,40 @@ type linearClient interface {
 	SearchAssignableIssues(ctx context.Context, f linear.SearchFilter) ([]linear.Issue, error)
 	AssignIssue(ctx context.Context, issueID, userID string) error
 	GetIssueBlockers(ctx context.Context, issueID string) ([]linear.IssueBlocker, error)
+	GetIssue(ctx context.Context, id string) (*linear.Issue, error)
+	GetWorkflowStates(ctx context.Context, teamID string) ([]linear.WorkflowState, error)
+	IssueUpdate(ctx context.Context, issueID, stateID string) error
+}
+
+// prClient is the slice of the GitHub client the discoverer uses for
+// state-advance polling.
+type prClient interface {
+	GetPRStatus(ctx context.Context, prURL string) (PRStatus, error)
+}
+
+// PRStatus is the discoverer's view of a GitHub PR. cmd/admiral-discoverer
+// adapts from internal/github.PRStatus so this package does not pull
+// internal/github into its own dependency surface — keeps the split-
+// off path clean.
+type PRStatus struct {
+	State             string
+	MergedAt          string
+	HasApprovedReview bool
 }
 
 // taskRegistry is the slice of the store the discoverer needs:
 //   - GetAdmiralTaskByIssue: tertiary dedup against in-flight autopilot work
 //   - ListAutoPickEnabledProjectIDs: source of truth for scan scope
 //   - GetDiscovererPick / UpsertDiscovererPick: own dedup record
+//   - ListAdmiralTasksByStates / UpdateAdmiralTask: drives the
+//     Linear-state advancement on DONE tasks
 type taskRegistry interface {
 	GetAdmiralTaskByIssue(issueID string) (*store.AdmiralTask, error)
 	ListAutoPickEnabledProjectIDs() ([]string, error)
 	GetDiscovererPick(issueID string) (*store.DiscovererPick, error)
 	UpsertDiscovererPick(p store.DiscovererPick) error
+	ListAdmiralTasksByStates(states []string) ([]store.AdmiralTask, error)
+	UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask)) error
 }
 
 // judger is the judge interface — easier to fake than the concrete
@@ -77,14 +116,20 @@ type judger interface {
 type Service struct {
 	cfg    Config
 	linear linearClient
+	pr     prClient
 	store  taskRegistry
 	judge  judger
 	logger *slog.Logger
+
+	// workflowStatesCache memoises Linear team workflow-state lookups
+	// across ticks — they rarely change.
+	workflowStatesCache map[string][]linear.WorkflowState
 }
 
 // New constructs a discoverer Service. When cfg.Judge.Enabled is true
-// and judge is nil, a default claudeJudge is wired.
-func New(cfg Config, lc linearClient, tr taskRegistry, j judger, logger *slog.Logger) *Service {
+// and judge is nil, a default claudeJudge is wired. pr may be nil; the
+// state-advance phase is then a no-op (the scan phase still runs).
+func New(cfg Config, lc linearClient, pr prClient, tr taskRegistry, j judger, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -97,11 +142,13 @@ func New(cfg Config, lc linearClient, tr taskRegistry, j judger, logger *slog.Lo
 		}
 	}
 	return &Service{
-		cfg:    cfg,
-		linear: lc,
-		store:  tr,
-		judge:  j,
-		logger: logger,
+		cfg:                 cfg,
+		linear:              lc,
+		pr:                  pr,
+		store:               tr,
+		judge:               j,
+		logger:              logger,
+		workflowStatesCache: map[string][]linear.WorkflowState{},
 	}
 }
 
@@ -136,6 +183,14 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 func (s *Service) tick(ctx context.Context) {
+	s.scanAndPick(ctx)
+	if ctx.Err() != nil {
+		return
+	}
+	s.advanceLinearStates(ctx)
+}
+
+func (s *Service) scanAndPick(ctx context.Context) {
 	projectIDs, err := s.store.ListAutoPickEnabledProjectIDs()
 	if err != nil {
 		s.logger.Error("project_list_failed", "err", err)

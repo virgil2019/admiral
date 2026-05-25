@@ -62,6 +62,23 @@ type Discoverer struct {
 	// Judge configures the optional `claude -p` filter applied to each
 	// candidate before self-assignment.
 	Judge DiscovererJudge `yaml:"judge"`
+	// LinearStates maps admiral lifecycle stages onto Linear workflow
+	// state names. Empty entries skip that transition. The merged-PR
+	// transition (→ Linear.completed) and PR-closed transition (→
+	// Linear.canceled) bypass this map and use Linear's state.type as
+	// the stable target, so the defaults work without any config.
+	LinearStates DiscovererLinearStates `yaml:"linear_states"`
+}
+
+// DiscovererLinearStates is the optional Linear-state-name map used by
+// the discoverer's state-advance phase.
+type DiscovererLinearStates struct {
+	// InReview is the Linear workflow state name to push when admiral's
+	// PR is open and has no approval yet. Empty = don't push.
+	InReview string `yaml:"in_review"`
+	// Reviewed is the Linear workflow state name to push when admiral's
+	// PR is open and has at least one approval. Empty = don't push.
+	Reviewed string `yaml:"reviewed"`
 }
 
 // DiscovererJudge is the per-issue LLM judge configuration.
