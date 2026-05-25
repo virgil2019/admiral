@@ -882,25 +882,45 @@ func TestRefresh_Success_ClearsAuthError(t *testing.T) {
 	}
 }
 
-// TestQueryIDVariableTypes pins each ID-typed GraphQL variable to ID!
-// rather than String!. Linear's schema rejects String! in strict scalar
-// positions (e.g. IDComparator inside filter inputs — workflowStates
-// failed in production with GRAPHQL_VALIDATION_FAILED before this was
-// tightened). The stub-server tests in this file don't run real schema
-// validation, so without this static check the next typo of this
-// shape would only surface as a production HTTP 400.
-func TestQueryIDVariableTypes(t *testing.T) {
+// TestQueryGraphQLVariableTypes pins each query's variable declarations
+// to what Linear's schema actually accepts. The schema is asymmetric —
+// most ID-bearing fields are typed String! at the argument site
+// (issue(id:), project(id:), issueUpdate(id:)), but IDComparator
+// inside filter inputs (workflowStates filter team.id.eq) is strict
+// ID!. We learned this the hard way: PR #123 tightened everything to
+// ID! and immediately broke issue() in production. The stub-server
+// tests in this file don't run real schema validation, so this static
+// check is the only guard against the next typo of either shape.
+//
+// If a future change adds a new query: confirm against Linear's live
+// schema (https://studio.apollographql.com/public/Linear-API/) and
+// add a case here with the exact required declaration.
+func TestQueryGraphQLVariableTypes(t *testing.T) {
 	cases := []struct {
-		name  string
-		query string
-		// Substrings that MUST appear (correct declarations).
+		name        string
+		query       string
 		mustContain []string
+		mustNotHave []string
 	}{
-		{"issueQuery", issueQuery, []string{"$id: ID!"}},
-		{"workflowStatesQuery", workflowStatesQuery, []string{"$teamID: ID!"}},
-		{"issueRelationsQuery", issueRelationsQuery, []string{"$id: ID!"}},
-		{"projectQuery", projectQuery, []string{"$id: ID!"}},
-		{"issueUpdateMutation", issueUpdateMutation, []string{"$id: ID!"}},
+		// issue(id:) — schema requires String!. Tightening to ID!
+		// triggers GRAPHQL_VALIDATION_FAILED ("ID! used in position
+		// expecting type String!").
+		{"issueQuery", issueQuery,
+			[]string{"$id: String!"}, []string{"$id: ID!"}},
+		// workflowStates filter goes through IDComparator which is
+		// strict ID!. Originally declared String! → production 400.
+		{"workflowStatesQuery", workflowStatesQuery,
+			[]string{"$teamID: ID!"}, []string{"$teamID: String!"}},
+		// issue(id:) again, via a sibling query — same constraint.
+		{"issueRelationsQuery", issueRelationsQuery,
+			[]string{"$id: String!"}, []string{"$id: ID!"}},
+		// project(id:) — same String! shape as issue(id:).
+		{"projectQuery", projectQuery,
+			[]string{"$id: String!"}, []string{"$id: ID!"}},
+		// issueUpdate(id:, input:) — id is String!. $input stays
+		// IssueUpdateInput! and is not policed here.
+		{"issueUpdateMutation", issueUpdateMutation,
+			[]string{"$id: String!"}, []string{"$id: ID!"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -909,11 +929,10 @@ func TestQueryIDVariableTypes(t *testing.T) {
 					t.Errorf("query missing %q:\n%s", want, c.query)
 				}
 			}
-			// Guard against regressions in the opposite direction —
-			// no ID variable should be declared as String!.
-			if strings.Contains(c.query, "$id: String!") ||
-				strings.Contains(c.query, "$teamID: String!") {
-				t.Errorf("ID variable typed as String! — Linear rejects this in strict positions:\n%s", c.query)
+			for _, bad := range c.mustNotHave {
+				if strings.Contains(c.query, bad) {
+					t.Errorf("query has forbidden declaration %q:\n%s", bad, c.query)
+				}
 			}
 		})
 	}
