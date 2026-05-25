@@ -146,6 +146,12 @@ func (c *Client) ghReadRetry(ctx context.Context, args ...string) (string, error
 //
 // Patterns covered (case-insensitive substring on combined output):
 //   - "unexpected EOF"     — server-side TCP reset on pooled keep-alive
+//     (Go HTTP transport: mid-response body cut)
+//   - `": EOF"`            — plain io.EOF, the connection was closed
+//     before the response started. Go formats this as
+//     `Get "<URL>": EOF`. Anchored on the closing quote + colon to
+//     avoid false-positives on the literal word "EOF" appearing
+//     elsewhere in gh output (e.g. in commit messages).
 //   - "connection reset"   — RST mid-stream
 //   - "i/o timeout"        — request deadline exceeded at transport
 //   - "503"/"502"/"504"    — gateway/availability hiccups
@@ -162,6 +168,7 @@ func isTransientGhFailure(output string, err error) bool {
 	hay := strings.ToLower(output)
 	for _, needle := range []string{
 		"unexpected eof",
+		`": eof`,
 		"connection reset",
 		"i/o timeout",
 		"503",

@@ -324,6 +324,15 @@ func TestIsTransientGhFailure(t *testing.T) {
 		{"empty output", "", bang, false},
 		{"unexpected EOF", `Get "https://api.github.com/...": unexpected EOF`, bang, true},
 		{"uppercase EOF", "Unexpected EOF", bang, true},
+		// Plain io.EOF — Go formats as `Get "URL": EOF` when the
+		// connection is closed before the response starts. Distinct
+		// from "unexpected EOF" which is mid-response.
+		{"plain EOF", `could not find pull request diff: Get "https://api.github.com/repos/x/y/pulls/5": EOF`, bang, true},
+		// EOF in a non-URL-terminator context must NOT match. The
+		// regex anchor `": EOF` requires the closing quote + colon
+		// + space immediately before EOF.
+		{"EOF in commit message", `feat: handle EOF in parser`, bang, false},
+		{"EOF in PR title", "EOF detection", bang, false},
 		{"connection reset", "read tcp ... connection reset by peer", bang, true},
 		{"i/o timeout", "Get ...: i/o timeout", bang, true},
 		{"503", "HTTP 503: Service Unavailable", bang, true},
