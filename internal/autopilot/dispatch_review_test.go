@@ -121,6 +121,41 @@ func TestHandleReviewEvent_NoBranch(t *testing.T) {
 	}
 }
 
+func TestHandleReviewEvent_SkipsTerminalTaskState(t *testing.T) {
+	for _, state := range []string{
+		store.JobStateDone,
+		store.JobStateFailed,
+		store.JobStateTimedOut,
+		store.JobStateDoneThreadInconsistent,
+		store.JobStateCancelled,
+	} {
+		t.Run(state, func(t *testing.T) {
+			db := &mockStore{
+				AdmiralTaskByPRURL: &store.AdmiralTask{
+					IssueID:         "issue-1",
+					IssueIdentifier: "GEO-99",
+					PRURL:           "https://github.com/owner/repo/pull/3",
+					Branch:          "linear/geo-99",
+					State:           state,
+				},
+			}
+			pr := &mockPRClient{}
+			o := newReviewOrchestrator(db, &mockLinearClient{}, pr)
+			row := &store.EventInboxRow{
+				Source:     "github",
+				WebhookID:  "wh-terminal",
+				SessionID:  "https://github.com/owner/repo/pull/3",
+				Action:     "issue_comment.created",
+				PayloadJSON: `{"comment":{"body":"any update?"}}`,
+			}
+			o.HandleReviewEvent(context.Background(), row)
+			if len(pr.postedComments) != 0 {
+				t.Errorf("terminal state %s: expected no PR comment, got %d", state, len(pr.postedComments))
+			}
+		})
+	}
+}
+
 // TestHandleReviewEvent_SpawnsGoroutine verifies that a valid event triggers
 // the background goroutine path. The goroutine will fail early (no Linear
 // issue to look up) but must not panic and must attempt GetDiff.
@@ -194,6 +229,15 @@ func TestExtractReviewBody_InvalidJSON(t *testing.T) {
 	got := extractReviewBody("{bad json", "pull_request_review.submitted")
 	if got != "" {
 		t.Errorf("expected empty on bad JSON, got %q", got)
+	}
+}
+
+func TestExtractReviewBody_IssueComment(t *testing.T) {
+	payload := `{"comment":{"body":"Hey admiral, please update the readme."}}`
+	got := extractReviewBody(payload, "issue_comment.created")
+	want := "Hey admiral, please update the readme."
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
@@ -274,6 +318,16 @@ func TestExtractReviewState_InlineCommentReturnsEmpty(t *testing.T) {
 	)
 	if got != "" {
 		t.Errorf("got %q, want empty for inline comment events", got)
+	}
+}
+
+func TestExtractReviewState_IssueCommentReturnsEmpty(t *testing.T) {
+	got := extractReviewState(
+		`{"comment":{"body":"@admiral please fix"}}`,
+		"issue_comment.created",
+	)
+	if got != "" {
+		t.Errorf("got %q, want empty for issue_comment events", got)
 	}
 }
 

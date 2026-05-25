@@ -18,9 +18,11 @@ import (
 	"github.com/georgehuang/admiral/internal/store"
 )
 
-// reviewPayload is the minimal subset of GitHub PR review webhook payloads
-// that the review dispatcher needs. Covers both pull_request_review and
-// pull_request_review_comment event types.
+// reviewPayload is the minimal subset of GitHub PR-feedback webhook
+// payloads the dispatcher needs. Covers pull_request_review,
+// pull_request_review_comment, and issue_comment — comment.body is
+// shared across the latter two; review.body / review.state live under
+// "review" for the first.
 type reviewPayload struct {
 	Review *struct {
 		Body  string `json:"body"`
@@ -56,6 +58,15 @@ func (o *Orchestrator) HandleReviewEvent(ctx context.Context, row *store.EventIn
 	}
 	if task == nil {
 		o.logger.Info("review_dispatch_no_task", "pr", prURL)
+		return
+	}
+	// Terminal-state PRs (merged / failed / cancelled) keep their
+	// admiral_tasks row for audit, but their branch and worktree may
+	// already be gone. A drive-by comment on a merged PR would
+	// otherwise burn a claude run that ends in a failed push.
+	if isTerminalTaskState(task.State) {
+		o.logger.Info("review_dispatch_skip_terminal_task",
+			"pr", prURL, "state", task.State, "issue", task.IssueIdentifier)
 		return
 	}
 	if task.Branch == "" {
@@ -270,15 +281,44 @@ func runClaudeForReview(ctx context.Context, claudeBin string, maxRunSeconds int
 	return strings.TrimSpace(sb.String()), nil
 }
 
-// extractReviewBody returns the human-readable text from the GitHub webhook
-// payload JSON. row.Action is "pull_request_review.submitted" or
-// "pull_request_review_comment.created".
+// isCommentLikeAction reports whether action is an inline-review or
+// generic PR-conversation comment event. These payloads carry the body
+// under comment.body (no review state). The trailing dot anchors the
+// match so a hypothetical future event named "issue_comment_v2" does
+// not silently slip into this branch.
+func isCommentLikeAction(action string) bool {
+	return strings.HasPrefix(action, "pull_request_review_comment.") ||
+		strings.HasPrefix(action, "issue_comment.")
+}
+
+// isTerminalTaskState reports whether the admiral_tasks state is one
+// admiral will not continue working on (PR merged, failed, etc.).
+// Branch and worktree may not exist anymore, so dispatching a review
+// run on a terminal task is wasted work.
+func isTerminalTaskState(state string) bool {
+	switch state {
+	case store.JobStateDone,
+		store.JobStateFailed,
+		store.JobStateTimedOut,
+		store.JobStateDoneThreadInconsistent,
+		store.JobStateCancelled:
+		return true
+	}
+	return false
+}
+
+// extractReviewBody returns the human-readable text from the GitHub
+// webhook payload JSON. row.Action is one of:
+//
+//	pull_request_review.submitted     → review.body
+//	pull_request_review_comment.created → comment.body
+//	issue_comment.created             → comment.body
 func extractReviewBody(payloadJSON, action string) string {
 	var p reviewPayload
 	if err := json.Unmarshal([]byte(payloadJSON), &p); err != nil {
 		return ""
 	}
-	if strings.HasPrefix(action, "pull_request_review_comment") {
+	if isCommentLikeAction(action) {
 		if p.Comment != nil {
 			return strings.TrimSpace(p.Comment.Body)
 		}
@@ -290,10 +330,10 @@ func extractReviewBody(payloadJSON, action string) string {
 }
 
 // extractReviewState returns the lowercased review state ("approved",
-// "changes_requested", "commented") for pull_request_review.submitted events.
-// Returns "" for pull_request_review_comment events, which carry no state.
+// "changes_requested", "commented") for pull_request_review.submitted
+// events. Returns "" for comment-like events (no review state).
 func extractReviewState(payloadJSON, action string) string {
-	if strings.HasPrefix(action, "pull_request_review_comment") {
+	if isCommentLikeAction(action) {
 		return ""
 	}
 	var p reviewPayload
