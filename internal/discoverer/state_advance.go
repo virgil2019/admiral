@@ -123,7 +123,9 @@ func (s *Service) advanceOpen(ctx context.Context, t *store.AdmiralTask, hasAppr
 // pushLinearStateByType pushes the issue's Linear workflow state to the
 // state matching wantType (e.g. "completed", "canceled"). Skips when
 // the issue is already in a state of that type (avoids redundant API
-// calls and Linear-side state churn).
+// calls and Linear-side state churn). Returns nil for both
+// "wrote successfully" and "skipped because already in target type" —
+// the latter logs a debug line so the silent skip is observable.
 func (s *Service) pushLinearStateByType(ctx context.Context, t *store.AdmiralTask, wantType string) error {
 	issue, err := s.linear.GetIssue(ctx, t.IssueID)
 	if err != nil {
@@ -135,6 +137,10 @@ func (s *Service) pushLinearStateByType(ctx context.Context, t *store.AdmiralTas
 	}
 	cur := lookupStateByName(states, issue.StateName)
 	if cur != nil && cur.Type == wantType {
+		s.logger.Debug("state_advance_linear_already_in_target_type",
+			"issue", t.IssueIdentifier,
+			"current_state", issue.StateName,
+			"want_type", wantType)
 		return nil
 	}
 	target := lookupStateByType(states, wantType)

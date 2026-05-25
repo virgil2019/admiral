@@ -483,6 +483,15 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 			task.State,
 		))
 		return
+	case store.JobStateDoneMerged:
+		// PR was merged → branch may already be deleted on origin and the
+		// worktree cleaned up. /fix would either fail at worktree
+		// recreation or push to a dead branch. Tell the user to /rerun.
+		o.logger.Info("dispatch_reject_fix_done_merged",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postRejection(ev.SessionID,
+			"PR was already merged — /fix can't reopen merged work. Use /rerun to start fresh on a new branch.")
+		return
 	case store.JobStateDone:
 		// proceed
 	default:
