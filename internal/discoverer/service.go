@@ -69,6 +69,7 @@ type JudgeConfig struct {
 type linearClient interface {
 	SearchAssignableIssues(ctx context.Context, f linear.SearchFilter) ([]linear.Issue, error)
 	AssignIssue(ctx context.Context, issueID, userID string) error
+	GetIssueBlockers(ctx context.Context, issueID string) ([]linear.IssueBlocker, error)
 	GetIssue(ctx context.Context, id string) (*linear.Issue, error)
 	GetWorkflowStates(ctx context.Context, teamID string) ([]linear.WorkflowState, error)
 	IssueUpdate(ctx context.Context, issueID, stateID string) error
@@ -266,6 +267,14 @@ func (s *Service) consider(ctx context.Context, iss linear.Issue) bool {
 		)
 	}
 
+	// Skip issues with unresolved blocked_by relations before the judge so we
+	// don't pay claude -p cost on something autopilot would just park as
+	// BLOCKED. We deliberately do NOT upsert a pick row here: leaving picks
+	// untouched lets the next scan tick re-evaluate as blockers resolve.
+	if s.hasUnresolvedBlockers(ctx, iss) {
+		return false
+	}
+
 	if s.cfg.Judge.Enabled {
 		v, err := s.judge.Judge(ctx, iss)
 		if err != nil {
@@ -319,4 +328,31 @@ func (s *Service) lookupPick(iss linear.Issue) *store.DiscovererPick {
 		return nil
 	}
 	return p
+}
+
+// hasUnresolvedBlockers returns true iff the issue has at least one
+// unresolved blocked_by relation. On API error we log and return false
+// (fail-open) so a Linear hiccup does not stall the scanner; the
+// orchestrator's dispatchFreshAssign performs the same check as a backstop.
+func (s *Service) hasUnresolvedBlockers(ctx context.Context, iss linear.Issue) bool {
+	bctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	blockers, err := s.linear.GetIssueBlockers(bctx, iss.ID)
+	if err != nil {
+		s.logger.Warn("blocker_check_failed_proceeding",
+			"issue", iss.Identifier, "err", err)
+		return false
+	}
+	if len(blockers) == 0 {
+		return false
+	}
+	ids := make([]string, len(blockers))
+	for i, b := range blockers {
+		ids[i] = b.IssueIdentifier
+	}
+	s.logger.Info("skip_blocked",
+		"issue", iss.Identifier,
+		"blockers", ids,
+	)
+	return true
 }
