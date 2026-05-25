@@ -216,7 +216,7 @@ func bearer(token string) string {
 	return "Bearer " + token
 }
 
-const issueQuery = `query Issue($id: String!) {
+const issueQuery = `query Issue($id: ID!) {
   issue(id: $id) {
     id
     identifier
@@ -391,7 +391,7 @@ func (c *Client) PostAgentActivity(ctx context.Context, sessionID string, a Agen
 	return nil
 }
 
-const workflowStatesQuery = `query WorkflowStates($teamID: String!) {
+const workflowStatesQuery = `query WorkflowStates($teamID: ID!) {
   workflowStates(filter: {team: {id: {eq: $teamID}}}) {
     nodes { id name type position }
   }
@@ -433,7 +433,7 @@ type IssueBlocker struct {
 	IssueIdentifier string
 }
 
-const issueRelationsQuery = `query IssueRelations($id: String!) {
+const issueRelationsQuery = `query IssueRelations($id: ID!) {
   issue(id: $id) {
     relations(first: 50) {
       nodes {
@@ -490,22 +490,23 @@ func (c *Client) GetIssueBlockers(ctx context.Context, issueID string) ([]IssueB
 	return out, nil
 }
 
-// GetProject returns the Linear project with the given ID, or an error if
-// the project does not exist or the API call fails.
-func (c *Client) GetProject(ctx context.Context, id string) (*Project, error) {
-	const query = `query Project($id: String!) {
+const projectQuery = `query Project($id: ID!) {
   project(id: $id) {
     id
     name
   }
 }`
+
+// GetProject returns the Linear project with the given ID, or an error if
+// the project does not exist or the API call fails.
+func (c *Client) GetProject(ctx context.Context, id string) (*Project, error) {
 	var data struct {
 		Project *struct {
 			ID   string `json:"id"`
 			Name string `json:"name"`
 		} `json:"project"`
 	}
-	if err := c.do(ctx, graphQLRequest{Query: query, Variables: map[string]any{"id": id}}, &data); err != nil {
+	if err := c.do(ctx, graphQLRequest{Query: projectQuery, Variables: map[string]any{"id": id}}, &data); err != nil {
 		return nil, err
 	}
 	if data.Project == nil {
@@ -552,7 +553,7 @@ func (c *Client) ListProjects(ctx context.Context) ([]Project, error) {
 	return out, nil
 }
 
-const issueUpdateMutation = `mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+const issueUpdateMutation = `mutation IssueUpdate($id: ID!, $input: IssueUpdateInput!) {
   issueUpdate(id: $id, input: $input) { success }
 }`
 

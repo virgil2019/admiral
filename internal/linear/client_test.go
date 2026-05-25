@@ -881,3 +881,40 @@ func TestRefresh_Success_ClearsAuthError(t *testing.T) {
 		t.Error("ClearAuthError should be called on successful refresh")
 	}
 }
+
+// TestQueryIDVariableTypes pins each ID-typed GraphQL variable to ID!
+// rather than String!. Linear's schema rejects String! in strict scalar
+// positions (e.g. IDComparator inside filter inputs — workflowStates
+// failed in production with GRAPHQL_VALIDATION_FAILED before this was
+// tightened). The stub-server tests in this file don't run real schema
+// validation, so without this static check the next typo of this
+// shape would only surface as a production HTTP 400.
+func TestQueryIDVariableTypes(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+		// Substrings that MUST appear (correct declarations).
+		mustContain []string
+	}{
+		{"issueQuery", issueQuery, []string{"$id: ID!"}},
+		{"workflowStatesQuery", workflowStatesQuery, []string{"$teamID: ID!"}},
+		{"issueRelationsQuery", issueRelationsQuery, []string{"$id: ID!"}},
+		{"projectQuery", projectQuery, []string{"$id: ID!"}},
+		{"issueUpdateMutation", issueUpdateMutation, []string{"$id: ID!"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, want := range c.mustContain {
+				if !strings.Contains(c.query, want) {
+					t.Errorf("query missing %q:\n%s", want, c.query)
+				}
+			}
+			// Guard against regressions in the opposite direction —
+			// no ID variable should be declared as String!.
+			if strings.Contains(c.query, "$id: String!") ||
+				strings.Contains(c.query, "$teamID: String!") {
+				t.Errorf("ID variable typed as String! — Linear rejects this in strict positions:\n%s", c.query)
+			}
+		})
+	}
+}
