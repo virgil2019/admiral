@@ -292,15 +292,22 @@ func isCommentLikeAction(action string) bool {
 }
 
 // isTerminalTaskState reports whether the admiral_tasks state is one
-// admiral will not continue working on (PR merged, failed, etc.).
-// Branch and worktree may not exist anymore, so dispatching a review
-// run on a terminal task is wasted work.
+// admiral truly cannot act on anymore:
+//   - DONE_MERGED: the PR was merged; branch may be deleted, no more
+//     work possible.
+//   - FAILED / TIMED_OUT / CANCELLED: admiral gave up.
+//
+// DONE and DONE_THREAD_INCONSISTENT are NON-terminal: they mean
+// "admiral's first pass completed, PR is open and awaiting human
+// review" — incoming review/comment events should still trigger a
+// claude run. The task-lifecycle refactor narrowed this set so an
+// issue_comment on a PR admiral made (the common case) actually
+// reaches the dispatcher.
 func isTerminalTaskState(state string) bool {
 	switch state {
-	case store.JobStateDone,
+	case store.JobStateDoneMerged,
 		store.JobStateFailed,
 		store.JobStateTimedOut,
-		store.JobStateDoneThreadInconsistent,
 		store.JobStateCancelled:
 		return true
 	}
