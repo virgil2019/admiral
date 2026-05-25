@@ -132,13 +132,13 @@ autopilot:
 # admiral-discoverer: standalone scanner that finds Linear issues admiral
 # can take and self-assigns them, looping back through the normal
 # Linear webhook -> autopilot path. Read by `admiral-discoverer` only.
-# Disabled by default — set `enabled: true` to activate.
 #
-# Project scope is NOT configured here. The discoverer scans only those
-# Linear projects whose `auto_pick_enabled` flag is on in the
+# Running the binary (or enabling the systemd unit) is the activation
+# signal — there is no enabled flag here. Project scope is NOT
+# configured here either: the discoverer scans only those Linear
+# projects whose `auto_pick_enabled` flag is on in the
 # admiral-autopilot admin UI (repos table). Toggle it per-project there.
 discoverer:
-  enabled: false
   # Scan cadence. Default: 10m.
   poll_interval: 10m
   # Linear workflow state.type values to scan. Default: ["backlog", "unstarted"].
