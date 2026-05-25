@@ -44,12 +44,56 @@ func TestPostComment_Composition(t *testing.T) {
 	if fr.gotName != "gh" {
 		t.Errorf("name: got %q, want gh", fr.gotName)
 	}
-	want := []string{"pr", "comment", "https://github.com/x/y/pull/1", "-b", "looks good"}
+	wantBody := selfCommentSentinel + "\nlooks good"
+	want := []string{"pr", "comment", "https://github.com/x/y/pull/1", "-b", wantBody}
 	if !equalSlice(fr.gotArgs, want) {
 		t.Errorf("args mismatch:\n got %v\nwant %v", fr.gotArgs, want)
 	}
 	if len(fr.gotEnv) != 1 || fr.gotEnv[0] != "GH_TOKEN=tok-abc" {
 		t.Errorf("env: got %v, want [GH_TOKEN=tok-abc]", fr.gotEnv)
+	}
+}
+
+func TestPostComment_PrependsSentinelOnce(t *testing.T) {
+	// Calling PostComment with a body that already starts with the
+	// sentinel must not double-prefix — that would leave a visible
+	// stray sentinel in the rendered comment.
+	fr := &fakeRunner{stdout: "ok"}
+	c := newTestClient("tok", fr)
+
+	pre := selfCommentSentinel + "\nalready prefixed"
+	if err := c.PostComment(context.Background(), "https://github.com/x/y/pull/1", pre); err != nil {
+		t.Fatalf("PostComment: %v", err)
+	}
+	if len(fr.gotArgs) != 5 {
+		t.Fatalf("args length: got %d, want 5", len(fr.gotArgs))
+	}
+	gotBody := fr.gotArgs[4]
+	if gotBody != pre {
+		t.Errorf("body should pass through verbatim when already sentinel-prefixed:\n got %q\nwant %q", gotBody, pre)
+	}
+	if strings.Count(gotBody, selfCommentSentinel) != 1 {
+		t.Errorf("sentinel must appear exactly once, got %d in %q",
+			strings.Count(gotBody, selfCommentSentinel), gotBody)
+	}
+}
+
+func TestPostComment_PrependsSentinelDespiteLeadingWhitespace(t *testing.T) {
+	// A body with leading whitespace then the sentinel is also
+	// considered already-prefixed (TrimLeft on whitespace before
+	// HasPrefix). This guards against accidental double-prefix when
+	// callers compose multi-line bodies.
+	fr := &fakeRunner{stdout: "ok"}
+	c := newTestClient("tok", fr)
+
+	pre := "  \n" + selfCommentSentinel + "\nbody"
+	if err := c.PostComment(context.Background(), "https://github.com/x/y/pull/1", pre); err != nil {
+		t.Fatalf("PostComment: %v", err)
+	}
+	gotBody := fr.gotArgs[4]
+	if strings.Count(gotBody, selfCommentSentinel) != 1 {
+		t.Errorf("sentinel must appear exactly once, got %d in %q",
+			strings.Count(gotBody, selfCommentSentinel), gotBody)
 	}
 }
 
