@@ -14,11 +14,13 @@ import (
 )
 
 type fakeLinear struct {
-	mu      sync.Mutex
-	scanRet []linear.Issue
-	scanErr error
-	assigns []assignCall
-	assnErr error
+	mu          sync.Mutex
+	scanRet     []linear.Issue
+	scanErr     error
+	assigns     []assignCall
+	assnErr     error
+	blockers    map[string][]linear.IssueBlocker
+	blockersErr error
 }
 
 type assignCall struct {
@@ -40,6 +42,15 @@ func (f *fakeLinear) AssignIssue(_ context.Context, issueID, userID string) erro
 	}
 	f.assigns = append(f.assigns, assignCall{IssueID: issueID, UserID: userID})
 	return nil
+}
+
+func (f *fakeLinear) GetIssueBlockers(_ context.Context, issueID string) ([]linear.IssueBlocker, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.blockersErr != nil {
+		return nil, f.blockersErr
+	}
+	return f.blockers[issueID], nil
 }
 
 func (f *fakeLinear) assignedIDs() []string {
@@ -233,6 +244,71 @@ func TestConsiderAssignErrorDoesNotWritePicks(t *testing.T) {
 	}
 	if _, ok := ts.picks["iss-7"]; ok {
 		t.Fatal("picks row must not be written when assign fails")
+	}
+}
+
+func TestConsiderSkipsBlockedIssue(t *testing.T) {
+	lc := &fakeLinear{
+		blockers: map[string][]linear.IssueBlocker{
+			"iss-blk": {{IssueID: "b-1", IssueIdentifier: "GEO-100"}},
+		},
+	}
+	ts := newFakeStore()
+	svc := newSvc(Config{AdmiralUserID: "u-1"}, lc, ts, nil)
+	if svc.consider(context.Background(), linear.Issue{ID: "iss-blk", Identifier: "GEO-9", StateName: "Todo"}) {
+		t.Fatal("expected consider to skip blocked issue")
+	}
+	if len(lc.assignedIDs()) != 0 {
+		t.Fatal("AssignIssue must not be called when blocked")
+	}
+	if _, ok := ts.picks["iss-blk"]; ok {
+		t.Fatal("picks row must not be written when blocked (so next tick can re-evaluate)")
+	}
+}
+
+func TestConsiderBlockerCheckRunsBeforeJudge(t *testing.T) {
+	lc := &fakeLinear{
+		blockers: map[string][]linear.IssueBlocker{
+			"iss-blk2": {{IssueID: "b-1", IssueIdentifier: "GEO-100"}},
+		},
+	}
+	ts := newFakeStore()
+	j := &fakeJudge{verdicts: map[string]Verdict{"iss-blk2": {Decision: "yes"}}}
+	svc := newSvc(Config{
+		AdmiralUserID: "u-1",
+		Judge:         JudgeConfig{Enabled: true},
+	}, lc, ts, j)
+	if svc.consider(context.Background(), linear.Issue{ID: "iss-blk2", Identifier: "GEO-10"}) {
+		t.Fatal("expected consider to skip blocked issue")
+	}
+	if j.calls != 0 {
+		t.Errorf("judge must not be invoked for blocked issues, got %d calls", j.calls)
+	}
+}
+
+func TestConsiderBlockerCheckFailsOpen(t *testing.T) {
+	lc := &fakeLinear{blockersErr: errors.New("linear 5xx")}
+	ts := newFakeStore()
+	svc := newSvc(Config{AdmiralUserID: "u-1"}, lc, ts, nil)
+	if !svc.consider(context.Background(), linear.Issue{ID: "iss-err", Identifier: "GEO-11", StateName: "Todo"}) {
+		t.Fatal("expected consider to fail-open on blocker API error")
+	}
+	if got := lc.assignedIDs(); len(got) != 1 || got[0] != "iss-err" {
+		t.Errorf("expected assign despite blocker API error, got %v", got)
+	}
+}
+
+func TestConsiderUnblockedAssigns(t *testing.T) {
+	lc := &fakeLinear{
+		blockers: map[string][]linear.IssueBlocker{}, // no blockers
+	}
+	ts := newFakeStore()
+	svc := newSvc(Config{AdmiralUserID: "u-1"}, lc, ts, nil)
+	if !svc.consider(context.Background(), linear.Issue{ID: "iss-ok", Identifier: "GEO-12", StateName: "Todo"}) {
+		t.Fatal("expected consider to assign when no blockers")
+	}
+	if got := lc.assignedIDs(); len(got) != 1 || got[0] != "iss-ok" {
+		t.Errorf("expected assign, got %v", got)
 	}
 }
 
