@@ -39,11 +39,9 @@ type Config struct {
 //
 // Project scope is NOT here — admiral-discoverer reads the list of
 // auto-pick projects from the repos table (toggled in the admin UI).
+// The decision to run discoverer at all is made by whoever starts the
+// binary (or enables the systemd unit); there is no in-config gate.
 type Discoverer struct {
-	// Enabled is the master switch. Default: false. When false the
-	// admiral-discoverer binary exits cleanly so a systemd unit can
-	// ship pre-installed and the operator activates by editing config.
-	Enabled bool `yaml:"enabled"`
 	// PollInterval is the gap between Linear scans. Default: 10m.
 	PollInterval time.Duration `yaml:"poll_interval"`
 	// StateTypes filters by Linear workflow state.type. Default:
@@ -478,7 +476,7 @@ func (c *Config) validateDiscovererAndExpand() error {
 		}
 	}
 
-	if d.Enabled && strings.TrimSpace(d.RequireLabel) == "" && !*d.Judge.Enabled {
+	if strings.TrimSpace(d.RequireLabel) == "" && !*d.Judge.Enabled {
 		c.Warnings = append(c.Warnings,
 			"discoverer.require_label is empty AND discoverer.judge.enabled is false — "+
 				"every unassigned candidate in opted-in projects will be auto-assigned. "+

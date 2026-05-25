@@ -45,12 +45,6 @@ func main() {
 		logger.Warn("config_warning", "msg", msg)
 	}
 
-	if !cfg.Discoverer.Enabled {
-		logger.Info("admiral-discoverer not enabled, exiting cleanly",
-			"hint", "set discoverer.enabled: true in config to activate")
-		return
-	}
-
 	db, err := store.Open(cfg.Storage.SQLitePath)
 	if err != nil {
 		logger.Error("sqlite open failed", "err", err)
