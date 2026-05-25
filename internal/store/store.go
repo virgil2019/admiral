@@ -497,6 +497,12 @@ const (
 	JobStateBlocked                = "BLOCKED"
 	JobStateAwaitingInput          = "AWAITING_INPUT"
 	JobStateAborted                = "ABORTED"
+	// JobStateDoneMerged is the true terminal state for a successful
+	// admiral task: the PR admiral opened was merged into the base
+	// branch on GitHub. Written by admiral-discoverer (admiral-autopilot
+	// itself does not observe merge events) when it polls a DONE task's
+	// PR and finds merged_at non-empty.
+	JobStateDoneMerged = "DONE_MERGED"
 )
 
 type AutopilotJob struct {
@@ -925,6 +931,52 @@ type AdmiralTaskHistory struct {
 	StreamLogPath    string
 	SupersededAt     string
 	SupersededReason string
+}
+
+// ListAdmiralTasksByStates returns admiral_tasks rows whose state is
+// in the given list, ordered by started_at ASC. Used by
+// admiral-discoverer to find tasks whose PRs may need Linear-state
+// advancement (e.g. all DONE tasks → poll GitHub to learn merge /
+// approval status). Returns an empty slice when states is empty.
+func (s *Store) ListAdmiralTasksByStates(states []string) ([]AdmiralTask, error) {
+	if len(states) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(states))
+	args := make([]any, len(states))
+	for i, st := range states {
+		placeholders[i] = "?"
+		args[i] = st
+	}
+	q := `
+		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(last_event_session_id,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,''),
+		       COALESCE(pending_question_id,'')
+		FROM admiral_tasks
+		WHERE state IN (` + strings.Join(placeholders, ",") + `)
+		ORDER BY started_at ASC
+	`
+	rows, err := s.DB.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AdmiralTask
+	for rows.Next() {
+		var t AdmiralTask
+		if err := rows.Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
+			&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
+			&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
+			&t.Error, &t.StreamLogPath, &t.PendingQuestionID); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // GetAdmiralTaskByIssue returns the live task row for an issue, or
