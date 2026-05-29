@@ -456,3 +456,76 @@ func TestPostComment_DoesNotRetryOnTransient(t *testing.T) {
 		t.Errorf("calls: got %d, want 1 (PostComment must not retry POSTs)", sr.calls)
 	}
 }
+
+func TestPostReview_ApproveCommand(t *testing.T) {
+	fr := &fakeRunner{}
+	c := newTestClient("tok", fr)
+	if err := c.PostReview(context.Background(),
+		"https://github.com/x/y/pull/1", "approve", "ok"); err != nil {
+		t.Fatalf("PostReview: %v", err)
+	}
+	want := []string{"pr", "review", "https://github.com/x/y/pull/1", "--approve", "--body", "ok"}
+	if !equalSlice(fr.gotArgs, want) {
+		t.Errorf("args:\n got %v\nwant %v", fr.gotArgs, want)
+	}
+}
+
+func TestPostReview_RequestChangesRequiresBody(t *testing.T) {
+	fr := &fakeRunner{}
+	c := newTestClient("tok", fr)
+	err := c.PostReview(context.Background(),
+		"https://github.com/x/y/pull/1", "request_changes", "")
+	if err == nil {
+		t.Fatal("expected error when body empty for request_changes")
+	}
+	if fr.gotName != "" {
+		t.Errorf("gh should not have been invoked, got args=%v", fr.gotArgs)
+	}
+}
+
+func TestPostReview_ApproveAllowsEmptyBody(t *testing.T) {
+	fr := &fakeRunner{}
+	c := newTestClient("tok", fr)
+	if err := c.PostReview(context.Background(),
+		"https://github.com/x/y/pull/1", "approve", ""); err != nil {
+		t.Fatalf("approve with empty body should work: %v", err)
+	}
+	want := []string{"pr", "review", "https://github.com/x/y/pull/1", "--approve"}
+	if !equalSlice(fr.gotArgs, want) {
+		t.Errorf("args:\n got %v\nwant %v", fr.gotArgs, want)
+	}
+}
+
+func TestPostReview_UnknownVerdictRejected(t *testing.T) {
+	fr := &fakeRunner{}
+	c := newTestClient("tok", fr)
+	err := c.PostReview(context.Background(),
+		"https://github.com/x/y/pull/1", "wat", "body")
+	if err == nil {
+		t.Fatal("expected error for unknown verdict")
+	}
+	if fr.gotName != "" {
+		t.Error("gh should not be invoked for unknown verdict")
+	}
+}
+
+func TestPostReview_EmptyPRURLRejected(t *testing.T) {
+	fr := &fakeRunner{}
+	c := newTestClient("tok", fr)
+	if err := c.PostReview(context.Background(), "  ", "approve", ""); err == nil {
+		t.Fatal("expected error for empty prURL")
+	}
+}
+
+func TestPostReview_PropagatesRunnerError(t *testing.T) {
+	fr := &fakeRunner{err: errors.New("gh boom"), stdout: "permission denied"}
+	c := newTestClient("tok", fr)
+	err := c.PostReview(context.Background(),
+		"https://github.com/x/y/pull/1", "approve", "ok")
+	if err == nil {
+		t.Fatal("expected error propagated from gh failure")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("error should include gh output, got: %v", err)
+	}
+}

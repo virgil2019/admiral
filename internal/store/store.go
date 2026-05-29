@@ -308,6 +308,63 @@ CREATE TABLE IF NOT EXISTS discoverer_picks (
 );
 `
 
+// migration0018 backs the admiral-planner-mcp server: a host agent
+// (claude / codex / ...) records the requirement decomposition during
+// planning, then later reads back the spec + PR diff at verification
+// time. Three tables:
+//   - features: one row per high-level feature, 1:1 with a Linear
+//     project, holding the original requirements text as ground truth
+//     for L2 acceptance. Optional timestamps (closed_at, source_agent)
+//     use nullable TEXT + COALESCE on read, matching admiral_tasks /
+//     autopilot_jobs convention.
+//   - feature_issues: per-issue acceptance criteria written during
+//     decomposition; the standard against which L1 PR review judges.
+//     FK to features is real — PRAGMA foreign_keys=ON is enabled in
+//     Open(), so a typo'd feature_id in InsertFeatureIssue errors out
+//     instead of silently storing an orphan.
+//   - pr_verifications: audit trail of every L1 verdict the planner
+//     submitted to GitHub. Synthetic INTEGER PK lets two verdicts in
+//     the same RFC3339 second coexist (was a real risk with the
+//     earlier composite PK on (pr_url, created_at)). CHECK enforces
+//     the verdict allowlist at the DB level so a typo cannot slip in
+//     even if InsertPRVerification's in-code guard is bypassed.
+const migration0018 = `
+CREATE TABLE IF NOT EXISTS features (
+    id                 TEXT PRIMARY KEY,
+    name               TEXT NOT NULL,
+    linear_project_id  TEXT NOT NULL UNIQUE,
+    requirements_text  TEXT NOT NULL,
+    source_agent       TEXT,
+    created_at         TEXT NOT NULL,
+    closed_at          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS feature_issues (
+    feature_id           TEXT NOT NULL,
+    linear_issue_id      TEXT NOT NULL,
+    acceptance_criteria  TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    PRIMARY KEY (feature_id, linear_issue_id),
+    FOREIGN KEY (feature_id) REFERENCES features(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_feature_issues_issue
+    ON feature_issues(linear_issue_id);
+
+CREATE TABLE IF NOT EXISTS pr_verifications (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    pr_url      TEXT NOT NULL,
+    verdict     TEXT NOT NULL
+                  CHECK (verdict IN ('approve', 'request_changes', 'needs_rebase')),
+    reasoning   TEXT NOT NULL,
+    agent       TEXT,
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pr_verifications_pr_created
+    ON pr_verifications(pr_url, created_at DESC);
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -331,6 +388,7 @@ var migrations = []migration{
 	{15, migration0015},
 	{16, migration0016},
 	{17, migration0017},
+	{18, migration0018},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -476,6 +534,15 @@ func Open(path string) (*Store, error) {
 	// only conn admiral ever uses, so it's effectively permanent.
 	if _, err := db.Exec(`PRAGMA busy_timeout=5000;`); err != nil {
 		return nil, fmt.Errorf("set busy_timeout: %w", err)
+	}
+	// SQLite defaults foreign_keys OFF — any FK declared in DDL is purely
+	// decorative without this PRAGMA. migration0018 (planner tables) is
+	// the first migration to declare an FK and relies on real enforcement
+	// to catch typo'd feature_id values in InsertFeatureIssue. No existing
+	// table declares FKs, so enabling this globally has no effect on
+	// pre-planner code paths.
+	if _, err := db.Exec(`PRAGMA foreign_keys=ON;`); err != nil {
+		return nil, fmt.Errorf("set foreign_keys: %w", err)
 	}
 	if err := applyMigrations(db); err != nil {
 		return nil, fmt.Errorf("migrations: %w", err)
