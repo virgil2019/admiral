@@ -78,11 +78,19 @@ func main() {
 	// just unlabelled / un-stated (operator must move them manually).
 	var pickup planner.PickupRules
 	cfgPath := os.Getenv("ADMIRAL_CONFIG_PATH")
+	explicitCfg := cfgPath != ""
 	if cfgPath == "" {
 		cfgPath = config.DefaultConfigPath()
 	}
 	if rules, err := config.LoadPickupRules(cfgPath); err != nil {
-		log.Printf("load pickup rules from %s: %v — feature_followup_submit will create issues without pickup label/state", cfgPath, err)
+		// An explicitly-set ADMIRAL_CONFIG_PATH that can't be read is an
+		// operator error: silently proceeding would create un-pickable
+		// issues forever (defeating the whole point). Fail loud at boot.
+		// A missing default-path config is legitimately optional.
+		if explicitCfg {
+			log.Fatalf("ADMIRAL_CONFIG_PATH=%s set but unreadable: %v", cfgPath, err)
+		}
+		log.Printf("no config at default path %s (%v) — feature_followup_submit will create issues without pickup label/state; set ADMIRAL_CONFIG_PATH to enable", cfgPath, err)
 	} else {
 		pickup = planner.PickupRules{RequireLabel: rules.RequireLabel, StateTypes: rules.StateTypes}
 	}

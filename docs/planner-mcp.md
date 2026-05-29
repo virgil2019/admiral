@@ -79,10 +79,15 @@ project it's opted into (`repos.auto_pick_enabled`), (b) carry its
 `require_label`, and (c) sit in a workflow state whose type is in
 `state_types`. `feature_followup_submit` reads the same `config.yaml`
 (`ADMIRAL_CONFIG_PATH`) and stamps the require_label + a matching state
-(lowest-position state of a wanted type) onto each issue it creates, so the
-two never drift. It errors loudly if the configured label or a matching
-state can't be resolved in the issue's team — better than silently creating
-an issue admiral will never pick up.
+onto each issue it creates, so the two never drift. When a team has several
+states of a wanted type, it picks the lowest-position one (e.g. with
+`state_types: [backlog, unstarted]` the issue lands in Backlog); the
+discoverer's filter is type-only, so any matching state is pickable, but if
+the exact landing state matters, set `state_types` to a single narrow type.
+It errors loudly if the configured label or a matching state can't be
+resolved in the issue's team — better than silently creating an issue
+admiral will never pick up. If `ADMIRAL_CONFIG_PATH` is set but unreadable,
+the server refuses to start rather than create un-pickable issues.
 
 ## Tools
 
