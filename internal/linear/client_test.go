@@ -410,6 +410,149 @@ func TestGetTeamLabelIDNotFound(t *testing.T) {
 	}
 }
 
+func TestGetSubIssues(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issue": map[string]any{
+					"id": "parent-1",
+					"children": map[string]any{
+						"nodes": []map[string]any{
+							{"id": "c1", "identifier": "GEO-2", "state": map[string]any{"type": "completed"}},
+							{"id": "c2", "identifier": "GEO-3", "state": map[string]any{"type": "started"}},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	subs, err := c.GetSubIssues(context.Background(), "parent-1")
+	if err != nil {
+		t.Fatalf("GetSubIssues failed: %v", err)
+	}
+	if len(subs) != 2 {
+		t.Fatalf("want 2 sub-issues, got %d", len(subs))
+	}
+	if subs[0].ID != "c1" || subs[0].Identifier != "GEO-2" || subs[0].StateType != "completed" {
+		t.Errorf("sub[0] wrong: %+v", subs[0])
+	}
+	if subs[1].StateType != "started" {
+		t.Errorf("sub[1] state wrong: %+v", subs[1])
+	}
+	if receivedBody["variables"].(map[string]any)["id"] != "parent-1" {
+		t.Errorf("query var wrong: %v", receivedBody["variables"])
+	}
+}
+
+func TestGetSubIssues_NoChildren(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issue": map[string]any{"id": "parent-1", "children": map[string]any{"nodes": []map[string]any{}}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	subs, err := c.GetSubIssues(context.Background(), "parent-1")
+	if err != nil {
+		t.Fatalf("GetSubIssues failed: %v", err)
+	}
+	if len(subs) != 0 {
+		t.Errorf("want 0 sub-issues, got %d", len(subs))
+	}
+}
+
+func TestGetSubIssues_NullState(t *testing.T) {
+	// A child with no workflow state must yield StateType=="" not a panic.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issue": map[string]any{
+					"id": "parent-1",
+					"children": map[string]any{
+						"nodes": []map[string]any{{"id": "c1", "identifier": "GEO-2", "state": nil}},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	subs, err := c.GetSubIssues(context.Background(), "parent-1")
+	if err != nil {
+		t.Fatalf("GetSubIssues failed: %v", err)
+	}
+	if len(subs) != 1 || subs[0].StateType != "" {
+		t.Errorf("expected one sub with empty StateType, got %+v", subs)
+	}
+}
+
+func TestGetSubIssues_NotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"issue": nil}})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.GetSubIssues(context.Background(), "ghost"); err == nil {
+		t.Error("expected error when parent issue not found")
+	}
+}
+
+func TestGetParentID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issue": map[string]any{"id": "c1", "parent": map[string]any{"id": "parent-1"}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	id, err := c.GetParentID(context.Background(), "c1")
+	if err != nil {
+		t.Fatalf("GetParentID failed: %v", err)
+	}
+	if id != "parent-1" {
+		t.Errorf("expected parent-1, got %q", id)
+	}
+}
+
+func TestGetParentID_NoParent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"issue": map[string]any{"id": "top", "parent": nil}},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	id, err := c.GetParentID(context.Background(), "top")
+	if err != nil {
+		t.Fatalf("GetParentID failed: %v", err)
+	}
+	if id != "" {
+		t.Errorf("expected empty parent for top-level issue, got %q", id)
+	}
+}
+
 func TestGetViewer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
