@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
 
 	"github.com/georgehuang/admiral/internal/store"
 )
@@ -46,9 +49,11 @@ type PRDiffer interface {
 // (e.g. read-only inspection of planner state).
 func BuildTools(db *store.Store, gh PRDiffer) map[string]*toolDef {
 	return map[string]*toolDef{
-		"feature_get_materials": featureGetMaterialsTool(db),
-		"issue_list_by_feature": issueListByFeatureTool(db),
-		"pr_get_materials":      prGetMaterialsTool(db, gh),
+		"feature_start":          featureStartTool(db),
+		"issue_set_acceptance":   issueSetAcceptanceTool(db),
+		"feature_get_materials":  featureGetMaterialsTool(db),
+		"issue_list_by_feature":  issueListByFeatureTool(db),
+		"pr_get_materials":       prGetMaterialsTool(db, gh),
 	}
 }
 
@@ -267,6 +272,157 @@ func prGetMaterialsTool(db *store.Store, gh PRDiffer) *toolDef {
 				Branch:             task.Branch,
 				Diff:               diff,
 			}, nil
+		},
+	}
+}
+
+// --- feature_start ---
+
+type featureStartArgs struct {
+	Name             string `json:"name"`
+	RequirementsText string `json:"requirements_text"`
+	LinearProjectID  string `json:"linear_project_id"`
+	SourceAgent      string `json:"source_agent,omitempty"`
+}
+
+type featureStartResult struct {
+	FeatureID       string `json:"feature_id"`
+	LinearProjectID string `json:"linear_project_id"`
+}
+
+func featureStartTool(db *store.Store) *toolDef {
+	return &toolDef{
+		Name: "feature_start",
+		Description: "Open a new planner feature: bind a Linear project to the original " +
+			"user requirements (the ground-truth text used at L2 acceptance). " +
+			"Returns a feature_id the host agent passes to subsequent tools. " +
+			"Errors with a UNIQUE-style message if linear_project_id is already " +
+			"bound to another open feature — call feature_get_materials with " +
+			"that project's existing feature_id instead.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"name": map[string]any{
+					"type":        "string",
+					"description": "Short slug for the feature (used in logs / search; need not be unique).",
+				},
+				"requirements_text": map[string]any{
+					"type":        "string",
+					"description": "Verbatim original requirements from the user. Use the raw conversation text, not a paraphrase, so L2 acceptance can judge against true intent.",
+				},
+				"linear_project_id": map[string]any{
+					"type":        "string",
+					"description": "The Linear project UUID this feature is scoped to. The host agent must create the project (or pick an existing one) before calling feature_start.",
+				},
+				"source_agent": map[string]any{
+					"type":        "string",
+					"description": "Optional telemetry tag (e.g. 'claude', 'codex').",
+				},
+			},
+			"required": []string{"name", "requirements_text", "linear_project_id"},
+		},
+		Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
+			var args featureStartArgs
+			if err := json.Unmarshal(raw, &args); err != nil {
+				return nil, fmt.Errorf("invalid arguments: %w", err)
+			}
+			if args.Name == "" || args.RequirementsText == "" || args.LinearProjectID == "" {
+				return nil, fmt.Errorf("name, requirements_text, linear_project_id all required")
+			}
+			// uuid7 would be nicer (sortable) but google/uuid in this repo
+			// is on v1.6.0 which doesn't expose v7. v4 (random) is fine.
+			id := "f-" + uuid.NewString()
+			f := store.Feature{
+				ID:               id,
+				Name:             args.Name,
+				LinearProjectID:  args.LinearProjectID,
+				RequirementsText: args.RequirementsText,
+				SourceAgent:      args.SourceAgent,
+			}
+			if err := db.InsertFeature(f); err != nil {
+				// UNIQUE on linear_project_id is the most likely failure;
+				// surface it with the existing feature_id when we can find
+				// it so the host agent can switch over instead of retrying.
+				if strings.Contains(err.Error(), "UNIQUE") || strings.Contains(err.Error(), "constraint") {
+					if existing, _ := db.GetFeatureByLinearProject(args.LinearProjectID); existing != nil {
+						return nil, fmt.Errorf("linear_project_id %s is already bound to feature %s (%q)",
+							args.LinearProjectID, existing.ID, existing.Name)
+					}
+				}
+				return nil, fmt.Errorf("insert feature: %w", err)
+			}
+			return featureStartResult{
+				FeatureID:       id,
+				LinearProjectID: args.LinearProjectID,
+			}, nil
+		},
+	}
+}
+
+// --- issue_set_acceptance ---
+
+type issueSetAcceptanceArgs struct {
+	FeatureID          string `json:"feature_id"`
+	LinearIssueID      string `json:"linear_issue_id"`
+	AcceptanceCriteria string `json:"acceptance_criteria"`
+}
+
+type issueSetAcceptanceResult struct {
+	OK bool `json:"ok"`
+}
+
+func issueSetAcceptanceTool(db *store.Store) *toolDef {
+	return &toolDef{
+		Name: "issue_set_acceptance",
+		Description: "Record the L1 acceptance criteria for a Linear issue inside a " +
+			"feature. Idempotent: re-calling with the same (feature_id, " +
+			"linear_issue_id) overwrites the criteria (used during decomposition " +
+			"refinement). The host agent should call this for every issue it " +
+			"creates after feature_start — without criteria, pr_verify_submit " +
+			"has no standard to judge against.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"feature_id": map[string]any{
+					"type":        "string",
+					"description": "The feature ID returned by feature_start.",
+				},
+				"linear_issue_id": map[string]any{
+					"type":        "string",
+					"description": "The Linear issue UUID this criterion applies to.",
+				},
+				"acceptance_criteria": map[string]any{
+					"type":        "string",
+					"description": "Concrete, verifiable conditions a PR for this issue must meet. Be specific — vague criteria produce vague verdicts.",
+				},
+			},
+			"required": []string{"feature_id", "linear_issue_id", "acceptance_criteria"},
+		},
+		Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
+			var args issueSetAcceptanceArgs
+			if err := json.Unmarshal(raw, &args); err != nil {
+				return nil, fmt.Errorf("invalid arguments: %w", err)
+			}
+			if args.FeatureID == "" || args.LinearIssueID == "" || args.AcceptanceCriteria == "" {
+				return nil, fmt.Errorf("feature_id, linear_issue_id, acceptance_criteria all required")
+			}
+			// Validate parent exists so a typo'd feature_id surfaces as a
+			// crisp tool-level error instead of a FK constraint message.
+			f, err := db.GetFeature(args.FeatureID)
+			if err != nil {
+				return nil, fmt.Errorf("get feature: %w", err)
+			}
+			if f == nil {
+				return nil, fmt.Errorf("feature %q not found", args.FeatureID)
+			}
+			if err := db.UpsertFeatureIssue(store.FeatureIssue{
+				FeatureID:          args.FeatureID,
+				LinearIssueID:      args.LinearIssueID,
+				AcceptanceCriteria: args.AcceptanceCriteria,
+			}); err != nil {
+				return nil, fmt.Errorf("upsert feature_issue: %w", err)
+			}
+			return issueSetAcceptanceResult{OK: true}, nil
 		},
 	}
 }

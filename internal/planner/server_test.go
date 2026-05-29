@@ -553,7 +553,7 @@ func TestPRGetMaterials_DiffFetchFails(t *testing.T) {
 	}
 }
 
-func TestToolsList_IncludesAllThreeReadTools(t *testing.T) {
+func TestToolsList_IncludesAllRegisteredTools(t *testing.T) {
 	// Belt for the registry: as new tools are added, this catches
 	// accidentally dropping one from BuildTools.
 	db := newPlannerTestStore(t)
@@ -565,9 +565,207 @@ func TestToolsList_IncludesAllThreeReadTools(t *testing.T) {
 	for _, raw := range tools {
 		got[raw.(map[string]any)["name"].(string)] = true
 	}
-	for _, name := range []string{"feature_get_materials", "issue_list_by_feature", "pr_get_materials"} {
+	for _, name := range []string{
+		"feature_start",
+		"issue_set_acceptance",
+		"feature_get_materials",
+		"issue_list_by_feature",
+		"pr_get_materials",
+	} {
 		if !got[name] {
 			t.Fatalf("tools/list missing %s; got %v", name, got)
 		}
+	}
+}
+
+// --- feature_start ---
+
+// callFeatureStart is a convenience that decodes the wire envelope
+// into the typed result. Returns the result map and tool-level
+// (isError + text) info; protocol-level errors fail the test.
+func callFeatureStart(t *testing.T, db *store.Store, args map[string]any) (map[string]any, bool, string) {
+	t.Helper()
+	resps := driveServer(t, db, nil, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{"name": "feature_start", "arguments": args},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	isErr := result["isError"].(bool)
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	return result, isErr, text
+}
+
+func TestFeatureStart_HappyPath(t *testing.T) {
+	db := newPlannerTestStore(t)
+	result, isErr, text := callFeatureStart(t, db, map[string]any{
+		"name":              "login",
+		"requirements_text": "build login with email + password",
+		"linear_project_id": "proj-1",
+		"source_agent":      "claude",
+	})
+	if isErr {
+		t.Fatalf("happy path failed: %s", text)
+	}
+	var payload featureStartResult
+	if err := json.Unmarshal([]byte(result["content"].([]any)[0].(map[string]any)["text"].(string)), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.HasPrefix(payload.FeatureID, "f-") {
+		t.Fatalf("feature_id should start with 'f-', got %q", payload.FeatureID)
+	}
+	if payload.LinearProjectID != "proj-1" {
+		t.Fatalf("linear_project_id round-trip lost: %q", payload.LinearProjectID)
+	}
+	// Verify the row actually landed in the DB with source_agent + requirements.
+	f, _ := db.GetFeature(payload.FeatureID)
+	if f == nil || f.RequirementsText != "build login with email + password" || f.SourceAgent != "claude" {
+		t.Fatalf("DB row missing fields: %+v", f)
+	}
+}
+
+func TestFeatureStart_RejectsMissingFields(t *testing.T) {
+	db := newPlannerTestStore(t)
+	cases := []struct {
+		name string
+		args map[string]any
+	}{
+		{"no name", map[string]any{"requirements_text": "r", "linear_project_id": "p"}},
+		{"no requirements", map[string]any{"name": "n", "linear_project_id": "p"}},
+		{"no project", map[string]any{"name": "n", "requirements_text": "r"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, isErr, _ := callFeatureStart(t, db, tc.args)
+			if !isErr {
+				t.Fatal("expected isError")
+			}
+		})
+	}
+}
+
+func TestFeatureStart_DuplicateProjectSurfacesExistingFeature(t *testing.T) {
+	// Calling feature_start twice with the same linear_project_id must
+	// produce an actionable error that names the existing feature, so
+	// the host agent can switch to feature_get_materials instead of
+	// retrying.
+	db := newPlannerTestStore(t)
+	_, isErr, text := callFeatureStart(t, db, map[string]any{
+		"name": "first", "requirements_text": "r1", "linear_project_id": "p-shared",
+	})
+	if isErr {
+		t.Fatalf("first call: %s", text)
+	}
+	_, isErr, text = callFeatureStart(t, db, map[string]any{
+		"name": "second", "requirements_text": "r2", "linear_project_id": "p-shared",
+	})
+	if !isErr {
+		t.Fatal("expected isError on duplicate project")
+	}
+	if !strings.Contains(text, "already bound") || !strings.Contains(text, "p-shared") {
+		t.Fatalf("error should name the conflicting project, got: %s", text)
+	}
+}
+
+// --- issue_set_acceptance ---
+
+func TestIssueSetAcceptance_HappyPath(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "a", LinearProjectID: "p-1"})
+
+	resps := driveServer(t, db, nil, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "issue_set_acceptance",
+			"arguments": map[string]any{
+				"feature_id":          "f-1",
+				"linear_issue_id":     "i-1",
+				"acceptance_criteria": "Reject invalid emails with 400",
+			},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != false {
+		t.Fatalf("isError true: %v", result["content"])
+	}
+	got, _ := db.GetFeatureIssue("f-1", "i-1")
+	if got == nil || got.AcceptanceCriteria != "Reject invalid emails with 400" {
+		t.Fatalf("criteria not persisted: %+v", got)
+	}
+}
+
+func TestIssueSetAcceptance_RefinesCriteria(t *testing.T) {
+	// Re-call with new criteria text must overwrite (idempotent upsert).
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "a", LinearProjectID: "p-1"})
+
+	for _, txt := range []string{"v1 criteria", "v2 criteria (refined)"} {
+		resps := driveServer(t, db, nil, []map[string]any{{
+			"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+			"params": map[string]any{
+				"name": "issue_set_acceptance",
+				"arguments": map[string]any{
+					"feature_id":          "f-1",
+					"linear_issue_id":     "i-1",
+					"acceptance_criteria": txt,
+				},
+			},
+		}})
+		if resps[0]["result"].(map[string]any)["isError"] != false {
+			t.Fatalf("set %q: %v", txt, resps[0]["result"])
+		}
+	}
+	got, _ := db.GetFeatureIssue("f-1", "i-1")
+	if got.AcceptanceCriteria != "v2 criteria (refined)" {
+		t.Fatalf("upsert did not overwrite: %q", got.AcceptanceCriteria)
+	}
+}
+
+func TestIssueSetAcceptance_RejectsUnknownFeature(t *testing.T) {
+	// Pre-check beats the raw FK violation — the host agent sees a
+	// readable error rather than a SQLite constraint string.
+	db := newPlannerTestStore(t)
+	resps := driveServer(t, db, nil, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "issue_set_acceptance",
+			"arguments": map[string]any{
+				"feature_id":          "no-such",
+				"linear_issue_id":     "i-1",
+				"acceptance_criteria": "c",
+			},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError for unknown feature")
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "not found") {
+		t.Fatalf("error should say 'not found', got: %s", text)
+	}
+}
+
+func TestIssueSetAcceptance_RejectsMissingFields(t *testing.T) {
+	db := newPlannerTestStore(t)
+	cases := []struct {
+		name string
+		args map[string]any
+	}{
+		{"no feature", map[string]any{"linear_issue_id": "i", "acceptance_criteria": "c"}},
+		{"no issue", map[string]any{"feature_id": "f", "acceptance_criteria": "c"}},
+		{"no criteria", map[string]any{"feature_id": "f", "linear_issue_id": "i"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resps := driveServer(t, db, nil, []map[string]any{{
+				"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+				"params": map[string]any{
+					"name": "issue_set_acceptance", "arguments": tc.args,
+				},
+			}})
+			if resps[0]["result"].(map[string]any)["isError"] != true {
+				t.Fatal("expected isError")
+			}
+		})
 	}
 }
