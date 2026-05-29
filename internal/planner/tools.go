@@ -26,13 +26,29 @@ type toolDef struct {
 	Handler     toolHandler
 }
 
+// PRDiffer fetches the unified diff for a pull request. The concrete
+// implementation in production is *github.Client; tests inject a stub.
+// Kept as a narrow interface so the planner package does not depend on
+// the full GitHub client surface (which carries cobra / gh-CLI shell-
+// out machinery the MCP server has no business needing).
+type PRDiffer interface {
+	GetDiff(ctx context.Context, prURL string) (string, error)
+}
+
 // BuildTools wires every tool the planner exposes, closing over the
-// Store dependency. cmd/admiral-planner-mcp calls this once at
-// startup and passes the result to NewServer. Adding a tool means
-// adding one entry here plus its handler below.
-func BuildTools(db *store.Store) map[string]*toolDef {
+// Store + PRDiffer dependencies. cmd/admiral-planner-mcp calls this
+// once at startup and passes the result to NewServer. Adding a tool
+// means adding one entry here plus its handler below.
+//
+// gh may be nil — tools that need it (pr_get_materials) return an MCP
+// error in that case rather than crashing the process. This lets the
+// server boot in environments where ADMIRAL_GH_TOKEN is not configured
+// (e.g. read-only inspection of planner state).
+func BuildTools(db *store.Store, gh PRDiffer) map[string]*toolDef {
 	return map[string]*toolDef{
 		"feature_get_materials": featureGetMaterialsTool(db),
+		"issue_list_by_feature": issueListByFeatureTool(db),
+		"pr_get_materials":      prGetMaterialsTool(db, gh),
 	}
 }
 
@@ -75,6 +91,187 @@ type featureIssuePayload struct {
 	AcceptanceCriteria  string `json:"acceptance_criteria"`
 	CreatedAt           string `json:"created_at"`
 }
+
+// --- issue_list_by_feature ---
+
+type issueListByFeatureArgs struct {
+	FeatureID string `json:"feature_id"`
+}
+
+// issueRowPayload bundles the planner's per-issue spec with the
+// admiral_tasks state for that same Linear issue, so the host agent
+// sees "what we asked for" and "what admiral has produced" in one
+// shot — that's the join it would otherwise have to do via two
+// separate tool calls.
+type issueRowPayload struct {
+	LinearIssueID      string `json:"linear_issue_id"`
+	IssueIdentifier    string `json:"issue_identifier,omitempty"` // "GEO-50"
+	AcceptanceCriteria string `json:"acceptance_criteria"`
+	State              string `json:"state,omitempty"`            // admiral_tasks.state, or "" when admiral hasn't started yet
+	PRURL              string `json:"pr_url,omitempty"`
+}
+
+type issueListByFeatureResult struct {
+	FeatureID string            `json:"feature_id"`
+	Issues    []issueRowPayload `json:"issues"`
+}
+
+func issueListByFeatureTool(db *store.Store) *toolDef {
+	return &toolDef{
+		Name: "issue_list_by_feature",
+		Description: "List every issue belonging to a feature with its acceptance " +
+			"criteria and current admiral_tasks state (RECEIVED / EXECUTING / DONE / " +
+			"DONE_MERGED / ...) plus PR URL when one exists. Use to find which PRs " +
+			"are ready for L1 verification.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"feature_id": map[string]any{
+					"type":        "string",
+					"description": "The feature ID returned by feature_start.",
+				},
+			},
+			"required": []string{"feature_id"},
+		},
+		Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
+			var args issueListByFeatureArgs
+			if err := json.Unmarshal(raw, &args); err != nil {
+				return nil, fmt.Errorf("invalid arguments: %w", err)
+			}
+			if args.FeatureID == "" {
+				return nil, fmt.Errorf("feature_id is required")
+			}
+			// Verify the feature exists so the caller sees "unknown feature"
+			// rather than an empty list (which could mean "no issues yet").
+			f, err := db.GetFeature(args.FeatureID)
+			if err != nil {
+				return nil, fmt.Errorf("get feature: %w", err)
+			}
+			if f == nil {
+				return nil, fmt.Errorf("feature %q not found", args.FeatureID)
+			}
+			rawIssues, err := db.ListFeatureIssues(args.FeatureID)
+			if err != nil {
+				return nil, fmt.Errorf("list feature issues: %w", err)
+			}
+			out := make([]issueRowPayload, 0, len(rawIssues))
+			for _, fi := range rawIssues {
+				row := issueRowPayload{
+					LinearIssueID:      fi.LinearIssueID,
+					AcceptanceCriteria: fi.AcceptanceCriteria,
+				}
+				// admiral_tasks may not yet exist (issue not started). N+1
+				// query is acceptable: a feature rarely has more than a
+				// handful of issues and the DB is single-conn anyway.
+				task, terr := db.GetAdmiralTaskByIssue(fi.LinearIssueID)
+				if terr != nil {
+					return nil, fmt.Errorf("get task for issue %s: %w", fi.LinearIssueID, terr)
+				}
+				if task != nil {
+					row.IssueIdentifier = task.IssueIdentifier
+					row.State = task.State
+					row.PRURL = task.PRURL
+				}
+				out = append(out, row)
+			}
+			return issueListByFeatureResult{
+				FeatureID: args.FeatureID,
+				Issues:    out,
+			}, nil
+		},
+	}
+}
+
+// --- pr_get_materials ---
+
+type prGetMaterialsArgs struct {
+	PRURL string `json:"pr_url"`
+}
+
+// prGetMaterialsResult is what the host agent reads to do L1
+// acceptance on a single PR: the criteria the issue was decomposed
+// against (planner-side ground truth) and the unified diff (the work
+// to judge). Base branch is included as context for the agent's
+// reasoning ("did the diff stay within the intended scope of this
+// branch?"); empty when admiral_tasks didn't record one.
+type prGetMaterialsResult struct {
+	FeatureID          string `json:"feature_id"`
+	FeatureName        string `json:"feature_name"`
+	LinearIssueID      string `json:"linear_issue_id"`
+	IssueIdentifier    string `json:"issue_identifier,omitempty"`
+	AcceptanceCriteria string `json:"acceptance_criteria"`
+	Branch             string `json:"branch,omitempty"`
+	Diff               string `json:"diff"`
+}
+
+func prGetMaterialsTool(db *store.Store, gh PRDiffer) *toolDef {
+	return &toolDef{
+		Name: "pr_get_materials",
+		Description: "Read everything needed to judge a single PR against its L1 " +
+			"acceptance criteria: the criteria recorded for the underlying Linear " +
+			"issue, plus the unified diff fetched live from GitHub. Use before " +
+			"calling pr_verify_submit. Errors if the PR is not tracked by admiral " +
+			"or not linked to any planner feature.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"pr_url": map[string]any{
+					"type":        "string",
+					"description": "GitHub PR URL (https://github.com/owner/repo/pull/N).",
+				},
+			},
+			"required": []string{"pr_url"},
+		},
+		Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
+			var args prGetMaterialsArgs
+			if err := json.Unmarshal(raw, &args); err != nil {
+				return nil, fmt.Errorf("invalid arguments: %w", err)
+			}
+			if args.PRURL == "" {
+				return nil, fmt.Errorf("pr_url is required")
+			}
+			if gh == nil {
+				return nil, fmt.Errorf("GitHub client not configured (set ADMIRAL_GH_TOKEN)")
+			}
+			task, err := db.GetAdmiralTaskByPRURL(args.PRURL)
+			if err != nil {
+				return nil, fmt.Errorf("lookup admiral_task: %w", err)
+			}
+			if task == nil {
+				return nil, fmt.Errorf("no admiral task tracks PR %s", args.PRURL)
+			}
+			feat, err := db.FindFeatureByIssue(task.IssueID)
+			if err != nil {
+				return nil, fmt.Errorf("find feature for issue %s: %w", task.IssueID, err)
+			}
+			if feat == nil {
+				return nil, fmt.Errorf("issue %s is not part of any planner feature", task.IssueIdentifier)
+			}
+			fi, err := db.GetFeatureIssue(feat.ID, task.IssueID)
+			if err != nil {
+				return nil, fmt.Errorf("get acceptance criteria: %w", err)
+			}
+			if fi == nil {
+				return nil, fmt.Errorf("no acceptance criteria recorded for issue %s", task.IssueIdentifier)
+			}
+			diff, err := gh.GetDiff(ctx, args.PRURL)
+			if err != nil {
+				return nil, fmt.Errorf("fetch PR diff: %w", err)
+			}
+			return prGetMaterialsResult{
+				FeatureID:          feat.ID,
+				FeatureName:        feat.Name,
+				LinearIssueID:      task.IssueID,
+				IssueIdentifier:    task.IssueIdentifier,
+				AcceptanceCriteria: fi.AcceptanceCriteria,
+				Branch:             task.Branch,
+				Diff:               diff,
+			}, nil
+		},
+	}
+}
+
+// --- feature_get_materials ---
 
 func featureGetMaterialsTool(db *store.Store) *toolDef {
 	return &toolDef{

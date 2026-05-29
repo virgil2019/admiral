@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,11 +14,31 @@ import (
 	"github.com/georgehuang/admiral/internal/store"
 )
 
+// stubPRDiffer is the test double for the GitHub client. Returns
+// either a canned diff or a canned error per pr_url so tests can
+// exercise both happy path and fetch-failure branches without
+// hitting the network.
+type stubPRDiffer struct {
+	diffs map[string]string
+	errs  map[string]error
+}
+
+func (s *stubPRDiffer) GetDiff(_ context.Context, prURL string) (string, error) {
+	if err, ok := s.errs[prURL]; ok {
+		return "", err
+	}
+	if d, ok := s.diffs[prURL]; ok {
+		return d, nil
+	}
+	return "", errors.New("stubPRDiffer: no diff seeded for " + prURL)
+}
+
 // driveServer feeds requests as newline-delimited JSON-RPC into the
 // server and returns the responses in the same order. Used by every
 // protocol-level test so the MCP wire format is exercised end-to-end,
-// not just the handler functions.
-func driveServer(t *testing.T, db *store.Store, requests []map[string]any) []map[string]any {
+// not just the handler functions. gh may be nil to simulate a server
+// that booted without ADMIRAL_GH_TOKEN.
+func driveServer(t *testing.T, db *store.Store, gh PRDiffer, requests []map[string]any) []map[string]any {
 	t.Helper()
 	var in bytes.Buffer
 	for _, r := range requests {
@@ -31,7 +52,7 @@ func driveServer(t *testing.T, db *store.Store, requests []map[string]any) []map
 	var out bytes.Buffer
 	var errBuf bytes.Buffer
 
-	tools := BuildTools(db)
+	tools := BuildTools(db, gh)
 	srv := NewServer(&in, &out, &errBuf, tools)
 	if err := srv.Run(context.Background()); err != nil {
 		t.Fatalf("server run: %v (stderr: %s)", err, errBuf.String())
@@ -63,7 +84,7 @@ func newPlannerTestStore(t *testing.T) *store.Store {
 
 func TestInitialize_AdvertisesToolsCapability(t *testing.T) {
 	db := newPlannerTestStore(t)
-	resps := driveServer(t, db, []map[string]any{
+	resps := driveServer(t, db, nil, []map[string]any{
 		{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{}},
 	})
 	if len(resps) != 1 {
@@ -86,7 +107,7 @@ func TestInitialize_AdvertisesToolsCapability(t *testing.T) {
 
 func TestNotificationsInitialized_NoResponse(t *testing.T) {
 	db := newPlannerTestStore(t)
-	resps := driveServer(t, db, []map[string]any{
+	resps := driveServer(t, db, nil, []map[string]any{
 		{"jsonrpc": "2.0", "method": "notifications/initialized"},
 	})
 	if len(resps) != 0 {
@@ -96,7 +117,7 @@ func TestNotificationsInitialized_NoResponse(t *testing.T) {
 
 func TestToolsList_ReturnsRegisteredTools(t *testing.T) {
 	db := newPlannerTestStore(t)
-	resps := driveServer(t, db, []map[string]any{
+	resps := driveServer(t, db, nil, []map[string]any{
 		{"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
 	})
 	if len(resps) != 1 {
@@ -127,7 +148,7 @@ func TestToolsList_ReturnsRegisteredTools(t *testing.T) {
 
 func TestUnknownMethod_ReturnsMethodNotFound(t *testing.T) {
 	db := newPlannerTestStore(t)
-	resps := driveServer(t, db, []map[string]any{
+	resps := driveServer(t, db, nil, []map[string]any{
 		{"jsonrpc": "2.0", "id": 1, "method": "totally/made/up"},
 	})
 	if len(resps) != 1 {
@@ -142,7 +163,7 @@ func TestUnknownMethod_ReturnsMethodNotFound(t *testing.T) {
 
 func TestPing_ReturnsEmptyResult(t *testing.T) {
 	db := newPlannerTestStore(t)
-	resps := driveServer(t, db, []map[string]any{
+	resps := driveServer(t, db, nil, []map[string]any{
 		{"jsonrpc": "2.0", "id": 7, "method": "ping"},
 	})
 	if len(resps) != 1 {
@@ -170,7 +191,7 @@ func TestFeatureGetMaterials_HappyPath(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	resps := driveServer(t, db, []map[string]any{{
+	resps := driveServer(t, db, nil, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
 			"name":      "feature_get_materials",
@@ -208,7 +229,7 @@ func TestFeatureGetMaterials_HappyPath(t *testing.T) {
 
 func TestFeatureGetMaterials_MissingFeatureID_ToolError(t *testing.T) {
 	db := newPlannerTestStore(t)
-	resps := driveServer(t, db, []map[string]any{{
+	resps := driveServer(t, db, nil, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
 			"name":      "feature_get_materials",
@@ -228,7 +249,7 @@ func TestFeatureGetMaterials_MissingFeatureID_ToolError(t *testing.T) {
 
 func TestFeatureGetMaterials_NotFound_ToolError(t *testing.T) {
 	db := newPlannerTestStore(t)
-	resps := driveServer(t, db, []map[string]any{{
+	resps := driveServer(t, db, nil, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
 			"name":      "feature_get_materials",
@@ -247,7 +268,7 @@ func TestFeatureGetMaterials_NotFound_ToolError(t *testing.T) {
 
 func TestToolsCall_UnknownTool(t *testing.T) {
 	db := newPlannerTestStore(t)
-	resps := driveServer(t, db, []map[string]any{{
+	resps := driveServer(t, db, nil, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
 			"name":      "no_such_tool",
@@ -273,7 +294,7 @@ func TestFullTranscript_InitializeThenListThenCall(t *testing.T) {
 		store.Feature{ID: "f-tx", Name: "tx", LinearProjectID: "p-tx", RequirementsText: "r"},
 		[]store.FeatureIssue{{LinearIssueID: "i-1", AcceptanceCriteria: "c"}},
 	)
-	resps := driveServer(t, db, []map[string]any{
+	resps := driveServer(t, db, nil, []map[string]any{
 		{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{}},
 		{"jsonrpc": "2.0", "method": "notifications/initialized"},
 		{"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
@@ -296,5 +317,257 @@ func TestFullTranscript_InitializeThenListThenCall(t *testing.T) {
 	want := []int{1, 2, 3}
 	if len(ids) != 3 || ids[0] != want[0] || ids[1] != want[1] || ids[2] != want[2] {
 		t.Fatalf("ids out of order: got %v want %v", ids, want)
+	}
+}
+
+// --- issue_list_by_feature ---
+
+// seedFeatureWithTask seeds a feature + one issue + (optionally) an
+// admiral_tasks row claiming that issue so tests can verify the join
+// in issue_list_by_feature.
+func seedFeatureWithTask(t *testing.T, db *store.Store, featureID, issueID, identifier, prURL, state string) {
+	t.Helper()
+	if err := db.InsertFeatureWithIssues(
+		store.Feature{ID: featureID, Name: featureID, LinearProjectID: "p-" + featureID, RequirementsText: "r"},
+		[]store.FeatureIssue{{LinearIssueID: issueID, AcceptanceCriteria: "criteria-for-" + issueID}},
+	); err != nil {
+		t.Fatalf("seed feature: %v", err)
+	}
+	if identifier == "" {
+		return // no admiral_task wanted
+	}
+	if _, err := db.ClaimAdmiralTask(issueID, identifier, "ev-1"); err != nil {
+		t.Fatalf("claim task: %v", err)
+	}
+	if err := db.UpdateAdmiralTask(issueID, func(at *store.AdmiralTask) {
+		at.State = state
+		at.PRURL = prURL
+		at.Branch = "linear/" + identifier
+	}); err != nil {
+		t.Fatalf("update task: %v", err)
+	}
+}
+
+func TestIssueListByFeature_JoinsAdmiralTaskState(t *testing.T) {
+	db := newPlannerTestStore(t)
+	seedFeatureWithTask(t, db, "f-1", "i-1", "GEO-50",
+		"https://github.com/o/r/pull/1", store.JobStateDone)
+
+	resps := driveServer(t, db, nil, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "issue_list_by_feature",
+			"arguments": map[string]any{"feature_id": "f-1"},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != false {
+		t.Fatalf("isError true: %v", result["content"])
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	var payload issueListByFeatureResult
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload.FeatureID != "f-1" || len(payload.Issues) != 1 {
+		t.Fatalf("unexpected payload: %+v", payload)
+	}
+	got := payload.Issues[0]
+	if got.LinearIssueID != "i-1" || got.IssueIdentifier != "GEO-50" ||
+		got.PRURL != "https://github.com/o/r/pull/1" || got.State != store.JobStateDone ||
+		got.AcceptanceCriteria != "criteria-for-i-1" {
+		t.Fatalf("row missing fields: %+v", got)
+	}
+}
+
+func TestIssueListByFeature_IssueWithoutAdmiralTask(t *testing.T) {
+	// Issue is registered in planner but admiral hasn't started it yet.
+	// State / PRURL must be empty; LinearIssueID + criteria still present.
+	db := newPlannerTestStore(t)
+	seedFeatureWithTask(t, db, "f-2", "i-orphan", "", "", "")
+
+	resps := driveServer(t, db, nil, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "issue_list_by_feature",
+			"arguments": map[string]any{"feature_id": "f-2"},
+		},
+	}})
+	text := resps[0]["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	var payload issueListByFeatureResult
+	_ = json.Unmarshal([]byte(text), &payload)
+	if len(payload.Issues) != 1 {
+		t.Fatalf("want 1 issue, got %d", len(payload.Issues))
+	}
+	got := payload.Issues[0]
+	if got.State != "" || got.PRURL != "" {
+		t.Fatalf("expected empty state/pr_url for unstarted issue, got %+v", got)
+	}
+	if got.AcceptanceCriteria == "" {
+		t.Fatal("criteria should still be present")
+	}
+}
+
+func TestIssueListByFeature_UnknownFeature(t *testing.T) {
+	db := newPlannerTestStore(t)
+	resps := driveServer(t, db, nil, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "issue_list_by_feature",
+			"arguments": map[string]any{"feature_id": "nope"},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError for unknown feature")
+	}
+}
+
+// --- pr_get_materials ---
+
+func TestPRGetMaterials_HappyPath(t *testing.T) {
+	db := newPlannerTestStore(t)
+	prURL := "https://github.com/o/r/pull/42"
+	seedFeatureWithTask(t, db, "f-pr", "i-pr", "GEO-42", prURL, store.JobStateDone)
+	gh := &stubPRDiffer{
+		diffs: map[string]string{prURL: "diff --git a/x b/x\n+hello"},
+	}
+
+	resps := driveServer(t, db, gh, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "pr_get_materials",
+			"arguments": map[string]any{"pr_url": prURL},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != false {
+		t.Fatalf("isError true: %v", result["content"])
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	var payload prGetMaterialsResult
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload.FeatureID != "f-pr" || payload.LinearIssueID != "i-pr" ||
+		payload.IssueIdentifier != "GEO-42" ||
+		payload.AcceptanceCriteria != "criteria-for-i-pr" ||
+		payload.Branch != "linear/GEO-42" ||
+		!strings.Contains(payload.Diff, "+hello") {
+		t.Fatalf("unexpected payload: %+v", payload)
+	}
+}
+
+func TestPRGetMaterials_NoGHClient_ReturnsError(t *testing.T) {
+	// Server booted without ADMIRAL_GH_TOKEN — pr_get_materials must
+	// fail cleanly with a guidance message rather than panic.
+	db := newPlannerTestStore(t)
+	seedFeatureWithTask(t, db, "f", "i", "X-1", "https://github.com/o/r/pull/1", store.JobStateDone)
+
+	resps := driveServer(t, db, nil, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "pr_get_materials",
+			"arguments": map[string]any{"pr_url": "https://github.com/o/r/pull/1"},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError when gh client missing")
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "ADMIRAL_GH_TOKEN") {
+		t.Fatalf("error should mention ADMIRAL_GH_TOKEN, got: %s", text)
+	}
+}
+
+func TestPRGetMaterials_UntrackedPR(t *testing.T) {
+	db := newPlannerTestStore(t)
+	gh := &stubPRDiffer{}
+	resps := driveServer(t, db, gh, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "pr_get_materials",
+			"arguments": map[string]any{"pr_url": "https://github.com/o/r/pull/999"},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError for PR admiral doesn't track")
+	}
+}
+
+func TestPRGetMaterials_IssueNotInFeature(t *testing.T) {
+	// admiral has a task with this PR but the underlying issue was
+	// never registered with the planner — common case for issues
+	// created before planner-mcp was rolled out.
+	db := newPlannerTestStore(t)
+	prURL := "https://github.com/o/r/pull/77"
+	if _, err := db.ClaimAdmiralTask("legacy-issue", "GEO-77", "ev"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	_ = db.UpdateAdmiralTask("legacy-issue", func(at *store.AdmiralTask) {
+		at.State = store.JobStateDone
+		at.PRURL = prURL
+		at.Branch = "linear/GEO-77"
+	})
+	gh := &stubPRDiffer{diffs: map[string]string{prURL: "diff"}}
+
+	resps := driveServer(t, db, gh, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "pr_get_materials",
+			"arguments": map[string]any{"pr_url": prURL},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError for legacy issue not in planner")
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "not part of any planner feature") {
+		t.Fatalf("error wording lost guidance: %s", text)
+	}
+}
+
+func TestPRGetMaterials_DiffFetchFails(t *testing.T) {
+	db := newPlannerTestStore(t)
+	prURL := "https://github.com/o/r/pull/88"
+	seedFeatureWithTask(t, db, "f-x", "i-x", "GEO-88", prURL, store.JobStateDone)
+	gh := &stubPRDiffer{errs: map[string]error{prURL: errors.New("rate-limited")}}
+
+	resps := driveServer(t, db, gh, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "pr_get_materials",
+			"arguments": map[string]any{"pr_url": prURL},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError when gh.GetDiff fails")
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "rate-limited") {
+		t.Fatalf("error should propagate gh failure, got: %s", text)
+	}
+}
+
+func TestToolsList_IncludesAllThreeReadTools(t *testing.T) {
+	// Belt for the registry: as new tools are added, this catches
+	// accidentally dropping one from BuildTools.
+	db := newPlannerTestStore(t)
+	resps := driveServer(t, db, nil, []map[string]any{
+		{"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+	})
+	tools := resps[0]["result"].(map[string]any)["tools"].([]any)
+	got := map[string]bool{}
+	for _, raw := range tools {
+		got[raw.(map[string]any)["name"].(string)] = true
+	}
+	for _, name := range []string{"feature_get_materials", "issue_list_by_feature", "pr_get_materials"} {
+		if !got[name] {
+			t.Fatalf("tools/list missing %s; got %v", name, got)
+		}
 	}
 }
