@@ -1377,3 +1377,31 @@ func TestFeatureFollowupSubmit_IssueCreateError_NoCriteriaWritten(t *testing.T) 
 		t.Errorf("no criteria should be written when IssueCreate fails, got %d", len(issues))
 	}
 }
+
+func TestFeatureFollowupSubmit_CriteriaUpsertFails_ErrorNamesIssue(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
+	// IssueCreate returns a malformed issue (empty ID) — the Linear issue
+	// exists, but UpsertFeatureIssue rejects the empty linear_issue_id,
+	// exercising the "issue created but criteria registration failed" path.
+	lc := &stubLinear{teamID: "team-1", created: &linear.Issue{ID: "", Identifier: "GEO-77"}}
+	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "feature_followup_submit",
+			"arguments": map[string]any{
+				"feature_id": "f-1", "title": "t", "acceptance_criteria": "c",
+			},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError when criteria upsert fails")
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	// Error must name the created issue so the agent can recover via
+	// issue_set_acceptance, and make clear the issue itself was created.
+	if !strings.Contains(text, "GEO-77") || !strings.Contains(text, "created") {
+		t.Fatalf("error should name the created issue and say it was created, got: %s", text)
+	}
+}
