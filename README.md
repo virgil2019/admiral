@@ -1,6 +1,6 @@
 # admiral
 
-Two Go binaries in one repo:
+User-facing Go binaries in this repo:
 
 - **`admiral`** — TG bridge. Bridges a single Telegram chat to a single
   team-cli team (`omx` or `omc`) via `<bin> team api`. Mac-local MVP.
@@ -10,6 +10,11 @@ Two Go binaries in one repo:
   worktree, runs `claude -p`, opens a PR, posts progress back into the
   Linear agent thread. See [admiral-autopilot setup](#admiral-autopilot-v03-linear-driven)
   for the dedicated section.
+- **`admiral-planner-mcp`** — MCP stdio server that a host agent
+  (claude / codex / any MCP-aware agent) calls to plan features and
+  verify PRs against acceptance criteria. The agent is the brain; the
+  server is its persistent notebook + hands on GitHub. See
+  [docs/planner-mcp.md](docs/planner-mcp.md).
 
 Repo location: `/Users/georgehuang/Program/george/admiral` (repo root —
 `go run ./cmd/admiral` or `go run ./cmd/admiral-autopilot` from here).
