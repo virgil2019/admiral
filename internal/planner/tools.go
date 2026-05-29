@@ -76,6 +76,20 @@ type GitHubClient interface {
 type LinearClient interface {
 	GetProjectTeamID(ctx context.Context, projectID string) (string, error)
 	IssueCreate(ctx context.Context, in linear.IssueCreateInput) (*linear.Issue, error)
+	GetTeamLabelID(ctx context.Context, teamID, name string) (string, error)
+	GetWorkflowStates(ctx context.Context, teamID string) ([]linear.WorkflowState, error)
+}
+
+// PickupRules mirror the discoverer's require_label + state_types so the
+// issues the planner creates satisfy the discoverer's pickup gates and get
+// shipped automatically. Loaded from admiral's config by the main package
+// (kept as a planner-local struct so this package doesn't depend on config).
+// A zero value (nil StateTypes) means "not configured" — the planner then
+// creates issues without a label or forced state, as it did before pickup
+// support, and the operator must label / move them manually.
+type PickupRules struct {
+	RequireLabel string
+	StateTypes   []string
 }
 
 // BuildTools wires every tool the planner exposes, closing over the
@@ -88,7 +102,7 @@ type LinearClient interface {
 // MCP error in that case rather than crashing the process. This lets the
 // server boot in environments where ADMIRAL_GH_TOKEN or the Linear OAuth
 // token is not configured (e.g. read-only inspection of planner state).
-func BuildTools(db *store.Store, gh GitHubClient, lc LinearClient) map[string]*toolDef {
+func BuildTools(db *store.Store, gh GitHubClient, lc LinearClient, pickup PickupRules) map[string]*toolDef {
 	return map[string]*toolDef{
 		"feature_start":           featureStartTool(db),
 		"issue_set_acceptance":    issueSetAcceptanceTool(db),
@@ -96,7 +110,7 @@ func BuildTools(db *store.Store, gh GitHubClient, lc LinearClient) map[string]*t
 		"issue_list_by_feature":   issueListByFeatureTool(db),
 		"pr_get_materials":        prGetMaterialsTool(db, gh),
 		"pr_verify_submit":        prVerifySubmitTool(db, gh),
-		"feature_followup_submit": featureFollowupSubmitTool(db, lc),
+		"feature_followup_submit": featureFollowupSubmitTool(db, lc, pickup),
 		"feature_close":           featureCloseTool(db),
 	}
 }
@@ -689,14 +703,55 @@ type featureFollowupSubmitResult struct {
 	URL             string `json:"url,omitempty"`
 }
 
-func featureFollowupSubmitTool(db *store.Store, lc LinearClient) *toolDef {
+// resolvePickup turns the discoverer's pickup rules into concrete Linear IDs
+// for a team: the require_label's UUID (when a label is configured) and a
+// workflow state whose type is in state_types (the lowest-position match, for
+// determinism). Returns (nil, "", nil) when pickup isn't configured so the
+// caller creates a plain issue. Errors loudly when a configured label or a
+// pickable state can't be resolved — a silently un-pickable issue would
+// defeat the whole purpose.
+func resolvePickup(ctx context.Context, lc LinearClient, teamID string, pickup PickupRules) ([]string, string, error) {
+	if len(pickup.StateTypes) == 0 {
+		return nil, "", nil // not configured
+	}
+	var labelIDs []string
+	if pickup.RequireLabel != "" {
+		id, err := lc.GetTeamLabelID(ctx, teamID, pickup.RequireLabel)
+		if err != nil {
+			return nil, "", fmt.Errorf("resolve pickup label %q: %w", pickup.RequireLabel, err)
+		}
+		labelIDs = []string{id}
+	}
+	states, err := lc.GetWorkflowStates(ctx, teamID)
+	if err != nil {
+		return nil, "", fmt.Errorf("list workflow states for team %s: %w", teamID, err)
+	}
+	wanted := make(map[string]bool, len(pickup.StateTypes))
+	for _, t := range pickup.StateTypes {
+		wanted[t] = true
+	}
+	var pick *linear.WorkflowState
+	for i := range states {
+		s := &states[i]
+		if wanted[s.Type] && (pick == nil || s.Position < pick.Position) {
+			pick = s
+		}
+	}
+	if pick == nil {
+		return nil, "", fmt.Errorf("team %s has no workflow state of type %v (needed for discoverer pickup)", teamID, pickup.StateTypes)
+	}
+	return labelIDs, pick.ID, nil
+}
+
+func featureFollowupSubmitTool(db *store.Store, lc LinearClient, pickup PickupRules) *toolDef {
 	return &toolDef{
 		Name: "feature_followup_submit",
 		Description: "Create a new Linear issue for an L2 follow-up gap and register its " +
 			"acceptance criteria in the planner, in one call. Use after feature_get_materials " +
 			"reveals the shipped PRs don't fully match user intent. The issue is created in " +
-			"the feature's Linear project (and that project's team); the criteria is recorded " +
-			"so a later pr_verify_submit on the follow-up's PR has a standard to judge against. " +
+			"the feature's Linear project (and that project's team), labelled and stated so " +
+			"admiral's discoverer auto-picks it; the criteria is recorded so a later " +
+			"pr_verify_submit on the follow-up's PR has a standard to judge against. " +
 			"Returns the created issue's id / identifier / url. Requires a Linear OAuth token " +
 			"in the admiral DB.",
 		InputSchema: map[string]any{
@@ -743,11 +798,20 @@ func featureFollowupSubmitTool(db *store.Store, lc LinearClient) *toolDef {
 			if err != nil {
 				return nil, fmt.Errorf("resolve team for project %s: %w", f.LinearProjectID, err)
 			}
+			// Resolve the discoverer's pickup label + a pickable state so the
+			// issue is auto-discovered. Skipped entirely when pickup rules
+			// aren't configured (planner launched without admiral's config).
+			labelIDs, stateID, err := resolvePickup(ctx, lc, teamID, pickup)
+			if err != nil {
+				return nil, err
+			}
 			iss, err := lc.IssueCreate(ctx, linear.IssueCreateInput{
 				TeamID:      teamID,
 				ProjectID:   f.LinearProjectID,
 				Title:       args.Title,
 				Description: args.Description,
+				LabelIDs:    labelIDs,
+				StateID:     stateID,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("create linear issue: %w", err)
