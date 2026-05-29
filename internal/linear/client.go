@@ -607,6 +607,111 @@ func (c *Client) AssignIssue(ctx context.Context, issueID, userID string) error 
 	return nil
 }
 
+// IssueCreateInput holds the fields admiral sets when creating a Linear
+// issue. TeamID is required by Linear (every issue belongs to a team);
+// ProjectID is optional but the planner always sets it so a follow-up
+// issue lands inside the feature's project.
+type IssueCreateInput struct {
+	TeamID      string
+	ProjectID   string
+	Title       string
+	Description string
+}
+
+const issueCreateMutation = `mutation IssueCreate($input: IssueCreateInput!) {
+  issueCreate(input: $input) {
+    success
+    issue { id identifier url }
+  }
+}`
+
+// IssueCreate creates a Linear issue and returns the created issue's
+// id / identifier / url. TeamID and Title are required; ProjectID and
+// Description are sent only when non-empty.
+func (c *Client) IssueCreate(ctx context.Context, in IssueCreateInput) (*Issue, error) {
+	if in.TeamID == "" {
+		return nil, fmt.Errorf("teamId is required")
+	}
+	if in.Title == "" {
+		return nil, fmt.Errorf("title is required")
+	}
+	input := map[string]any{
+		"teamId": in.TeamID,
+		"title":  in.Title,
+	}
+	if in.ProjectID != "" {
+		input["projectId"] = in.ProjectID
+	}
+	if in.Description != "" {
+		input["description"] = in.Description
+	}
+	var data struct {
+		IssueCreate struct {
+			Success bool `json:"success"`
+			Issue   *struct {
+				ID         string `json:"id"`
+				Identifier string `json:"identifier"`
+				URL        string `json:"url"`
+			} `json:"issue"`
+		} `json:"issueCreate"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     issueCreateMutation,
+		Variables: map[string]any{"input": input},
+	}, &data); err != nil {
+		return nil, err
+	}
+	if !data.IssueCreate.Success || data.IssueCreate.Issue == nil {
+		return nil, fmt.Errorf("issueCreate returned success=false")
+	}
+	return &Issue{
+		ID:         data.IssueCreate.Issue.ID,
+		Identifier: data.IssueCreate.Issue.Identifier,
+		URL:        data.IssueCreate.Issue.URL,
+		Title:      in.Title,
+		TeamID:     in.TeamID,
+		ProjectID:  in.ProjectID,
+	}, nil
+}
+
+const projectTeamQuery = `query ProjectTeam($id: String!) {
+  project(id: $id) {
+    id
+    teams(first: 1) { nodes { id } }
+  }
+}`
+
+// GetProjectTeamID returns the first team the project belongs to. Linear's
+// issueCreate requires a teamId but a planner feature only records the
+// project; this resolves a usable team for follow-up issue creation. A
+// project can span multiple teams — admiral picks the first, which matches
+// admiral's single-team deployment. Errors if the project has no teams.
+func (c *Client) GetProjectTeamID(ctx context.Context, projectID string) (string, error) {
+	var data struct {
+		Project *struct {
+			ID    string `json:"id"`
+			Teams struct {
+				Nodes []struct {
+					ID string `json:"id"`
+				} `json:"nodes"`
+			} `json:"teams"`
+		} `json:"project"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     projectTeamQuery,
+		Variables: map[string]any{"id": projectID},
+	}, &data); err != nil {
+		return "", err
+	}
+	if data.Project == nil {
+		return "", fmt.Errorf("project %s not found", projectID)
+	}
+	if len(data.Project.Teams.Nodes) == 0 {
+		return "", fmt.Errorf("project %s has no teams", projectID)
+	}
+	return data.Project.Teams.Nodes[0].ID, nil
+}
+
 // Viewer holds the authenticated Linear user identity (the one whose
 // OAuth token / API key the client is configured with). admiral's
 // discoverer uses this to learn its own user ID when not configured.
