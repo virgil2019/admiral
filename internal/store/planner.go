@@ -125,9 +125,9 @@ func (s *Store) InsertFeatureWithIssues(f Feature, issues []FeatureIssue) error 
 		return err
 	}
 
-	for _, fi := range issues {
+	for i, fi := range issues {
 		if fi.LinearIssueID == "" {
-			return fmt.Errorf("InsertFeatureWithIssues: issue at index %d missing linear_issue_id", len(issues))
+			return fmt.Errorf("InsertFeatureWithIssues: issue at index %d missing linear_issue_id", i)
 		}
 		// Force the issue's feature_id to match — caller mistakes here
 		// would otherwise produce a feature with mismatched children.

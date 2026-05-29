@@ -216,6 +216,13 @@ func (c *Client) PostComment(ctx context.Context, prURL, body string) error {
 // request_changes and comment (gh enforces this); for approve it is
 // optional. Used by admiral-planner-mcp's pr_verify_submit tool to
 // finalize an L1 verification on GitHub.
+//
+// Uses c.gh (not c.ghReadRetry) on purpose: review submission is a
+// write that GitHub does not deduplicate, so an automatic retry on
+// transient failure could double-post a review. Matches PostComment's
+// stance. Callers that want resilience layer it themselves —
+// pr_verify_submit checks the latest stored verdict before re-issuing,
+// which lets the host agent retry safely with the same arguments.
 func (c *Client) PostReview(ctx context.Context, prURL, verdict, body string) error {
 	if strings.TrimSpace(prURL) == "" {
 		return fmt.Errorf("github: PostReview: empty prURL")

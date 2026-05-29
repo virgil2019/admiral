@@ -189,6 +189,32 @@ func TestPing_ReturnsEmptyResult(t *testing.T) {
 	}
 }
 
+func TestPing_AsNotification_NoResponse(t *testing.T) {
+	// Per JSON-RPC 2.0 §4.1 a server MUST NOT reply to notifications
+	// (messages without id). Ping is a likely candidate for keep-alive
+	// notifications. Same suppression must apply to any request-style
+	// method when called without id.
+	db := newPlannerTestStore(t)
+	resps := driveServer(t, db, nil, []map[string]any{
+		{"jsonrpc": "2.0", "method": "ping"}, // no id
+	})
+	if len(resps) != 0 {
+		t.Fatalf("ping-as-notification must not produce a response, got %d: %+v", len(resps), resps)
+	}
+}
+
+func TestUnknownMethod_AsNotification_Silent(t *testing.T) {
+	// Unknown methods sent as notifications must also be silently
+	// dropped (no error response).
+	db := newPlannerTestStore(t)
+	resps := driveServer(t, db, nil, []map[string]any{
+		{"jsonrpc": "2.0", "method": "totally/made/up"}, // no id
+	})
+	if len(resps) != 0 {
+		t.Fatalf("unknown notification must be silent, got %+v", resps)
+	}
+}
+
 // --- feature_get_materials tool ---
 
 func TestFeatureGetMaterials_HappyPath(t *testing.T) {
@@ -542,6 +568,47 @@ func TestPRGetMaterials_IssueNotInFeature(t *testing.T) {
 	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
 	if !strings.Contains(text, "not part of any planner feature") {
 		t.Fatalf("error wording lost guidance: %s", text)
+	}
+}
+
+func TestPRGetMaterials_EmptyIssueIdentifierFallsBackToIssueID(t *testing.T) {
+	// admiral_tasks.issue_identifier is nullable — a row created via
+	// a path that didn't populate it would otherwise produce an error
+	// message of the form `issue "" is not part of any planner
+	// feature`, which the caller cannot grep for. The fallback to
+	// IssueID lets them search Linear for the canonical UUID instead.
+	db := newPlannerTestStore(t)
+	prURL := "https://github.com/o/r/pull/200"
+	// Claim without identifier (empty string), then attach PR URL.
+	const issueID = "issue-no-identifier"
+	if _, err := db.ClaimAdmiralTask(issueID, "", "ev"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	_ = db.UpdateAdmiralTask(issueID, func(at *store.AdmiralTask) {
+		at.State = store.JobStateDone
+		at.PRURL = prURL
+	})
+	gh := &stubGH{diffs: map[string]string{prURL: "diff"}}
+
+	resps := driveServer(t, db, gh, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "pr_get_materials",
+			"arguments": map[string]any{"pr_url": prURL},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError because no feature wraps this issue")
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	// Must NOT contain the dreaded `issue "" is not part of...` form.
+	if strings.Contains(text, `issue ""`) || strings.Contains(text, "issue  is") {
+		t.Fatalf("error must not render empty identifier, got: %s", text)
+	}
+	// Must contain the IssueID as the fallback reference.
+	if !strings.Contains(text, issueID) {
+		t.Fatalf("error should fall back to IssueID %q, got: %s", issueID, text)
 	}
 }
 

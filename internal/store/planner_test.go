@@ -210,6 +210,27 @@ func TestInsertFeatureWithIssues_AtomicSuccess(t *testing.T) {
 	}
 }
 
+func TestInsertFeatureWithIssues_ErrorMentionsCorrectIndex(t *testing.T) {
+	// Regression for off-by-N bug: the loop's range index, not the
+	// slice length, must appear in the error so the caller can find
+	// the bad row.
+	s := newTestStore(t)
+	f := Feature{ID: "f-idx", Name: "idx", LinearProjectID: "p-idx"}
+	issues := []FeatureIssue{
+		{LinearIssueID: "i-0", AcceptanceCriteria: "ok"},
+		{LinearIssueID: "i-1", AcceptanceCriteria: "ok"},
+		{LinearIssueID: "", AcceptanceCriteria: "bad"}, // index 2
+		{LinearIssueID: "i-3", AcceptanceCriteria: "ok"},
+	}
+	err := s.InsertFeatureWithIssues(f, issues)
+	if err == nil {
+		t.Fatal("expected error for empty linear_issue_id at index 2")
+	}
+	if !strings.Contains(err.Error(), "index 2") {
+		t.Fatalf("error should name index 2, got: %v", err)
+	}
+}
+
 func TestInsertFeatureWithIssues_RollsBackOnIssueError(t *testing.T) {
 	s := newTestStore(t)
 	f := Feature{ID: "f-rb", Name: "rb", LinearProjectID: "p-rb"}

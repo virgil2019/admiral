@@ -29,6 +29,20 @@ type toolDef struct {
 	Handler     toolHandler
 }
 
+// issueRef returns the most readable identifier for an admiral_task:
+// the human "GEO-50" identifier when populated, falling back to the
+// internal UUID. Used in error messages so callers can grep / search
+// in Linear without guessing.
+func issueRef(task *store.AdmiralTask) string {
+	if task == nil {
+		return ""
+	}
+	if task.IssueIdentifier != "" {
+		return task.IssueIdentifier
+	}
+	return task.IssueID
+}
+
 // PRDiffer is the read half of the GitHub dependency — fetches the
 // unified diff for a PR. Kept separate so tests of read-only tools
 // don't need to satisfy the write half.
@@ -266,15 +280,19 @@ func prGetMaterialsTool(db *store.Store, gh PRDiffer) *toolDef {
 			if err != nil {
 				return nil, fmt.Errorf("find feature for issue %s: %w", task.IssueID, err)
 			}
+			// admiral_tasks.issue_identifier is nullable — fall back to
+			// IssueID so the error string isn't `issue "" is not part
+			// of...`, which would force the caller to guess what failed.
+			issueRef := issueRef(task)
 			if feat == nil {
-				return nil, fmt.Errorf("issue %s is not part of any planner feature", task.IssueIdentifier)
+				return nil, fmt.Errorf("issue %s is not part of any planner feature", issueRef)
 			}
 			fi, err := db.GetFeatureIssue(feat.ID, task.IssueID)
 			if err != nil {
 				return nil, fmt.Errorf("get acceptance criteria: %w", err)
 			}
 			if fi == nil {
-				return nil, fmt.Errorf("no acceptance criteria recorded for issue %s", task.IssueIdentifier)
+				return nil, fmt.Errorf("no acceptance criteria recorded for issue %s", issueRef)
 			}
 			diff, err := gh.GetDiff(ctx, args.PRURL)
 			if err != nil {

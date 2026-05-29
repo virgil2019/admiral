@@ -71,6 +71,17 @@ var ServerInfo = map[string]any{
 // fields we want to surface in initialize.
 const MCPProtocolVersion = "2024-11-05"
 
+// scannerMaxMessageBytes caps inbound JSON-RPC line length. Outbound
+// PR diffs go back to the host agent in tool results (Server only
+// receives requests, so this affects the *request* side). The
+// realistic upper bound is the host agent feeding a prior diff back
+// into a tool call's reasoning argument — 32MB is comfortably above
+// what gh pr diff produces for even huge PRs. If this still trips,
+// the right fix is to switch to json.Decoder (no per-message cap);
+// keeping bufio.Scanner for now to preserve newline-delimited
+// framing semantics shared with admiral-mcp-ask.
+const scannerMaxMessageBytes = 32 << 20
+
 // NewServer wires the tool registry and prepares the I/O streams.
 // stdin / stdout / stderr are passed explicitly so tests can drive
 // the loop with bytes.Buffer / io.Pipe — production main() supplies
@@ -78,9 +89,7 @@ const MCPProtocolVersion = "2024-11-05"
 func NewServer(stdin io.Reader, stdout io.Writer, stderr io.Writer, tools map[string]*toolDef) *Server {
 	logger := log.New(stderr, "[admiral-planner-mcp] ", 0)
 	sc := bufio.NewScanner(stdin)
-	// Allow up to 4MB per message — large PR diffs (PR #3+) will be
-	// embedded in tool results. 1MB default would clip them.
-	sc.Buffer(make([]byte, 0, 1<<20), 4<<20)
+	sc.Buffer(make([]byte, 0, 1<<20), scannerMaxMessageBytes)
 	return &Server{
 		tools:   tools,
 		scanner: sc,
@@ -218,7 +227,29 @@ func (s *Server) handleToolCall(ctx context.Context, msg rpcMsg) error {
 	})
 }
 
+// isNotification reports whether the inbound message was a JSON-RPC
+// notification (no id field). Per JSON-RPC 2.0 §4.1 a server MUST NOT
+// send a response to a notification — even for normally-request-style
+// methods like "ping" if the client deliberately omits id as a
+// keep-alive. handle() runs the side effects regardless; only the
+// reply is suppressed.
+func isNotification(id json.RawMessage) bool {
+	// json.RawMessage decodes a missing field as nil; the literal JSON
+	// null also reaches here as the 4 bytes "null". Treat both as
+	// notification — a client sending id=null is buggy but we should
+	// still not send a paired response with a null id, which §4.2
+	// describes only for parse errors (and we already handle those at
+	// the scanner layer).
+	if len(id) == 0 {
+		return true
+	}
+	return string(id) == "null"
+}
+
 func (s *Server) respond(id json.RawMessage, result any) error {
+	if isNotification(id) {
+		return nil
+	}
 	return s.enc.Encode(rpcMsg{
 		JSONRPC: "2.0",
 		ID:      id,
@@ -227,6 +258,9 @@ func (s *Server) respond(id json.RawMessage, result any) error {
 }
 
 func (s *Server) respondErr(id json.RawMessage, code int, msg string) error {
+	if isNotification(id) {
+		return nil
+	}
 	return s.enc.Encode(rpcMsg{
 		JSONRPC: "2.0",
 		ID:      id,
