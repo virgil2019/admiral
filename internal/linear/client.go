@@ -610,12 +610,16 @@ func (c *Client) AssignIssue(ctx context.Context, issueID, userID string) error 
 // IssueCreateInput holds the fields admiral sets when creating a Linear
 // issue. TeamID is required by Linear (every issue belongs to a team);
 // ProjectID is optional but the planner always sets it so a follow-up
-// issue lands inside the feature's project.
+// issue lands inside the feature's project. LabelIDs / StateID are set by
+// the planner so the issue satisfies the discoverer's pickup gates
+// (require_label + state_types) and gets shipped automatically.
 type IssueCreateInput struct {
 	TeamID      string
 	ProjectID   string
 	Title       string
 	Description string
+	LabelIDs    []string
+	StateID     string
 }
 
 const issueCreateMutation = `mutation IssueCreate($input: IssueCreateInput!) {
@@ -644,6 +648,12 @@ func (c *Client) IssueCreate(ctx context.Context, in IssueCreateInput) (*Issue, 
 	}
 	if in.Description != "" {
 		input["description"] = in.Description
+	}
+	if len(in.LabelIDs) > 0 {
+		input["labelIds"] = in.LabelIDs
+	}
+	if in.StateID != "" {
+		input["stateId"] = in.StateID
 	}
 	var data struct {
 		IssueCreate struct {
@@ -710,6 +720,57 @@ func (c *Client) GetProjectTeamID(ctx context.Context, projectID string) (string
 		return "", fmt.Errorf("project %s has no teams", projectID)
 	}
 	return data.Project.Teams.Nodes[0].ID, nil
+}
+
+const labelByNameQuery = `query LabelByName($name: String!) {
+  issueLabels(filter: {name: {eq: $name}}) {
+    nodes { id name team { id } }
+  }
+}`
+
+// GetTeamLabelID resolves a label name to a UUID usable on an issue in
+// teamID. Linear's issueCreate takes labelIds (UUIDs), not names; the planner
+// has only the configured label name (matching the discoverer's
+// require_label), so this bridges the two.
+//
+// A label may be team-scoped (team.id set) or workspace-scoped (team null,
+// valid on every team). We query by name across all scopes — filtering by
+// team would miss a workspace-level label, which is the common case for a
+// cross-cutting label like "agent-ready" — then prefer an exact team match
+// and fall back to a workspace label. Errors if neither exists, so a
+// misconfigured label surfaces loudly rather than silently producing an
+// un-pickable issue.
+func (c *Client) GetTeamLabelID(ctx context.Context, teamID, name string) (string, error) {
+	var data struct {
+		IssueLabels struct {
+			Nodes []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+				Team *struct {
+					ID string `json:"id"`
+				} `json:"team"`
+			} `json:"nodes"`
+		} `json:"issueLabels"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     labelByNameQuery,
+		Variables: map[string]any{"name": name},
+	}, &data); err != nil {
+		return "", err
+	}
+	var workspaceLabel string
+	for _, n := range data.IssueLabels.Nodes {
+		if n.Team != nil && n.Team.ID == teamID {
+			return n.ID, nil // exact team match wins
+		}
+		if n.Team == nil && workspaceLabel == "" {
+			workspaceLabel = n.ID
+		}
+	}
+	if workspaceLabel != "" {
+		return workspaceLabel, nil
+	}
+	return "", fmt.Errorf("label %q not found for team %s (no team-scoped or workspace label)", name, teamID)
 }
 
 // Viewer holds the authenticated Linear user identity (the one whose

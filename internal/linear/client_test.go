@@ -276,6 +276,140 @@ func TestGetProjectTeamIDNotFound(t *testing.T) {
 	}
 }
 
+func TestIssueCreateThreadsLabelsAndState(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueCreate": map[string]any{
+					"success": true,
+					"issue":   map[string]any{"id": "i", "identifier": "GEO-1", "url": "u"},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.IssueCreate(context.Background(), IssueCreateInput{
+		TeamID:   "t",
+		Title:    "x",
+		LabelIDs: []string{"lbl-1", "lbl-2"},
+		StateID:  "state-backlog",
+	}); err != nil {
+		t.Fatalf("IssueCreate failed: %v", err)
+	}
+	input := receivedBody["variables"].(map[string]any)["input"].(map[string]any)
+	labels, ok := input["labelIds"].([]any)
+	if !ok || len(labels) != 2 || labels[0] != "lbl-1" || labels[1] != "lbl-2" {
+		t.Errorf("labelIds not threaded: %v", input["labelIds"])
+	}
+	if input["stateId"] != "state-backlog" {
+		t.Errorf("stateId not threaded: %v", input["stateId"])
+	}
+}
+
+func TestGetTeamLabelID_WorkspaceLabel(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		// Workspace-level label: team is null. Must still resolve.
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueLabels": map[string]any{
+					"nodes": []map[string]any{{"id": "lbl-ready", "name": "agent-ready", "team": nil}},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	id, err := c.GetTeamLabelID(context.Background(), "team-1", "agent-ready")
+	if err != nil {
+		t.Fatalf("GetTeamLabelID failed: %v", err)
+	}
+	if id != "lbl-ready" {
+		t.Errorf("expected lbl-ready, got %q", id)
+	}
+	vars := receivedBody["variables"].(map[string]any)
+	if vars["name"] != "agent-ready" {
+		t.Errorf("query vars wrong: %v", vars)
+	}
+}
+
+func TestGetTeamLabelID_PrefersTeamScopedOverWorkspace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// Both a workspace label and a team-scoped label share the name;
+		// the team-scoped one (matching our team) must win.
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueLabels": map[string]any{
+					"nodes": []map[string]any{
+						{"id": "lbl-workspace", "name": "agent-ready", "team": nil},
+						{"id": "lbl-team", "name": "agent-ready", "team": map[string]any{"id": "team-1"}},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	id, err := c.GetTeamLabelID(context.Background(), "team-1", "agent-ready")
+	if err != nil {
+		t.Fatalf("GetTeamLabelID failed: %v", err)
+	}
+	if id != "lbl-team" {
+		t.Errorf("expected team-scoped lbl-team to win, got %q", id)
+	}
+}
+
+func TestGetTeamLabelID_OtherTeamLabelIgnored(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// Only a label scoped to a DIFFERENT team exists — not usable here.
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueLabels": map[string]any{
+					"nodes": []map[string]any{
+						{"id": "lbl-other", "name": "agent-ready", "team": map[string]any{"id": "team-2"}},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.GetTeamLabelID(context.Background(), "team-1", "agent-ready"); err == nil {
+		t.Error("expected error when only another team's label matches")
+	}
+}
+
+func TestGetTeamLabelIDNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"issueLabels": map[string]any{"nodes": []map[string]any{}}},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.GetTeamLabelID(context.Background(), "team-1", "nope"); err == nil {
+		t.Error("expected error when label not found")
+	}
+}
+
 func TestGetViewer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
