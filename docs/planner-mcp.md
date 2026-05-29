@@ -59,16 +59,35 @@ client to launch it.
 Use whatever stdio-MCP configuration the client supports. The two env
 vars below are the only contract:
 
-| Variable           | Required | Purpose                                              |
-| ------------------ | -------- | ---------------------------------------------------- |
-| `ADMIRAL_DB_PATH`  | yes      | Absolute path to the admiral SQLite file.            |
-| `ADMIRAL_GH_TOKEN` | optional | GitHub PAT; needed for `pr_get_materials` + `pr_verify_submit`. Without it those tools return a clear "set ADMIRAL_GH_TOKEN" error and other tools still work. |
+| Variable             | Required | Purpose                                              |
+| -------------------- | -------- | ---------------------------------------------------- |
+| `ADMIRAL_DB_PATH`    | yes      | Absolute path to the admiral SQLite file.            |
+| `ADMIRAL_GH_TOKEN`   | optional | GitHub PAT; needed for `pr_get_materials` + `pr_verify_submit`. Without it those tools return a clear "set ADMIRAL_GH_TOKEN" error and other tools still work. |
+| `ADMIRAL_CONFIG_PATH`| optional | Path to admiral's `config.yaml`. Read so `feature_followup_submit` labels / states the issues it creates to match the discoverer's pickup gates (see below). Defaults to admiral's standard config location; without a readable config, issues are created unlabelled / un-stated and must be moved manually. |
 
 Linear OAuth is read from the admiral database, not env — no separate
 config needed if admiral itself is already authenticated. Without a token,
 `feature_followup_submit` returns a clear "not configured" error and the
 other tools still work. `ADMIRAL_LINEAR_ENDPOINT` optionally overrides the
 GraphQL endpoint (defaults to `https://api.linear.app/graphql`).
+
+### Pickup contract
+
+For admiral to actually ship a planner-created issue, `admiral-discoverer`
+must discover it. The discoverer only picks issues that (a) live in a
+project it's opted into (`repos.auto_pick_enabled`), (b) carry its
+`require_label`, and (c) sit in a workflow state whose type is in
+`state_types`. `feature_followup_submit` reads the same `config.yaml`
+(`ADMIRAL_CONFIG_PATH`) and stamps the require_label + a matching state
+onto each issue it creates, so the two never drift. When a team has several
+states of a wanted type, it picks the lowest-position one (e.g. with
+`state_types: [backlog, unstarted]` the issue lands in Backlog); the
+discoverer's filter is type-only, so any matching state is pickable, but if
+the exact landing state matters, set `state_types` to a single narrow type.
+It errors loudly if the configured label or a matching state can't be
+resolved in the issue's team — better than silently creating an issue
+admiral will never pick up. If `ADMIRAL_CONFIG_PATH` is set but unreadable,
+the server refuses to start rather than create un-pickable issues.
 
 ## Tools
 
@@ -141,9 +160,11 @@ Input: `{feature_id, title, description?, acceptance_criteria}` →
 `{linear_issue_id, issue_identifier, url?}`. Use after
 `feature_get_materials` reveals the shipped PRs don't fully match user
 intent. The issue is created in the feature's Linear project (and that
-project's team — see Limitations on multi-team projects); the criteria is
-recorded so a later `pr_verify_submit` on the follow-up's PR has a
-standard to judge against. Requires a Linear OAuth token in the admiral DB
+project's team — see Limitations on multi-team projects), stamped with the
+discoverer's pickup label + a pickable state (see "Pickup contract") so
+admiral ships it automatically; the criteria is recorded so a later
+`pr_verify_submit` on the follow-up's PR has a standard to judge against.
+Requires a Linear OAuth token in the admiral DB
 (the same one admiral itself uses); returns a clear "not configured" error
 without one. Unlike the read tools, this needs no `linear_issue_id` —
 unlike `issue_set_acceptance`, it creates the issue rather than annotating

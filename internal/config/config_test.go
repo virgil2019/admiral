@@ -385,3 +385,43 @@ discoverer:
 		t.Errorf("Reviewed override: got %q, want %q", cfg.Discoverer.LinearStates.Reviewed, "Approved")
 	}
 }
+
+func TestLoadPickupRules_Defaults(t *testing.T) {
+	// No discoverer block at all → defaults apply, no drift from the
+	// discoverer's own state_types default.
+	p := writeConfig(t, "linear:\n  api_token: x\n")
+	rules, err := LoadPickupRules(p)
+	if err != nil {
+		t.Fatalf("LoadPickupRules: %v", err)
+	}
+	if rules.RequireLabel != "" {
+		t.Errorf("RequireLabel: got %q, want empty", rules.RequireLabel)
+	}
+	if len(rules.StateTypes) != 2 || rules.StateTypes[0] != "backlog" || rules.StateTypes[1] != "unstarted" {
+		t.Errorf("StateTypes default: got %v", rules.StateTypes)
+	}
+}
+
+func TestLoadPickupRules_FromConfig(t *testing.T) {
+	p := writeConfig(t, `
+discoverer:
+  require_label: "agent-ready"
+  state_types: ["triage"]
+`)
+	rules, err := LoadPickupRules(p)
+	if err != nil {
+		t.Fatalf("LoadPickupRules: %v", err)
+	}
+	if rules.RequireLabel != "agent-ready" {
+		t.Errorf("RequireLabel: got %q", rules.RequireLabel)
+	}
+	if len(rules.StateTypes) != 1 || rules.StateTypes[0] != "triage" {
+		t.Errorf("StateTypes: got %v", rules.StateTypes)
+	}
+}
+
+func TestLoadPickupRules_MissingFile(t *testing.T) {
+	if _, err := LoadPickupRules("/no/such/config.yaml"); err == nil {
+		t.Error("expected error for missing config file")
+	}
+}

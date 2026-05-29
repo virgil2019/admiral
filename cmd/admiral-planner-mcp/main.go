@@ -19,6 +19,7 @@ import (
 	"log"
 	"os"
 
+	"github.com/georgehuang/admiral/internal/config"
 	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/planner"
@@ -70,7 +71,31 @@ func main() {
 		lc = linear.NewClient(linearEndpoint, tok.AccessToken)
 	}
 
-	tools := planner.BuildTools(db, gh, lc)
+	// Pickup rules let feature_followup_submit label / state the issues it
+	// creates so admiral-discoverer auto-picks them (Seam-A). Read from the
+	// same config the discoverer uses — single source of truth, no drift.
+	// Optional: without a readable config the planner still creates issues,
+	// just unlabelled / un-stated (operator must move them manually).
+	var pickup planner.PickupRules
+	cfgPath := os.Getenv("ADMIRAL_CONFIG_PATH")
+	explicitCfg := cfgPath != ""
+	if cfgPath == "" {
+		cfgPath = config.DefaultConfigPath()
+	}
+	if rules, err := config.LoadPickupRules(cfgPath); err != nil {
+		// An explicitly-set ADMIRAL_CONFIG_PATH that can't be read is an
+		// operator error: silently proceeding would create un-pickable
+		// issues forever (defeating the whole point). Fail loud at boot.
+		// A missing default-path config is legitimately optional.
+		if explicitCfg {
+			log.Fatalf("ADMIRAL_CONFIG_PATH=%s set but unreadable: %v", cfgPath, err)
+		}
+		log.Printf("no config at default path %s (%v) — feature_followup_submit will create issues without pickup label/state; set ADMIRAL_CONFIG_PATH to enable", cfgPath, err)
+	} else {
+		pickup = planner.PickupRules{RequireLabel: rules.RequireLabel, StateTypes: rules.StateTypes}
+	}
+
+	tools := planner.BuildTools(db, gh, lc, pickup)
 	srv := planner.NewServer(os.Stdin, os.Stdout, os.Stderr, tools)
 	if err := srv.Run(context.Background()); err != nil {
 		log.Fatalf("server: %v", err)

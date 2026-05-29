@@ -325,6 +325,41 @@ func LoadDiscoverer(path string) (*Config, error) {
 	return c, nil
 }
 
+// defaultStateTypes is the discoverer's default Linear workflow-state.type
+// filter. Shared by validateDiscovererAndExpand and LoadPickupRules so the
+// planner and the discoverer can't drift on what "pickable" means.
+func defaultStateTypes() []string {
+	return []string{"backlog", "unstarted"}
+}
+
+// PickupRules is the subset of discoverer config the planner needs so the
+// issues it creates satisfy the discoverer's pickup gates (require_label +
+// state_types). Loaded without validating the linear / storage blocks —
+// admiral-planner-mcp reads its Linear token from the DB and has no storage
+// config, so the full discoverer validation doesn't apply to it.
+type PickupRules struct {
+	RequireLabel string
+	StateTypes   []string
+}
+
+// LoadPickupRules reads just the discoverer pickup rules from a config file,
+// applying the same defaults as the discoverer itself. Used by
+// admiral-planner-mcp to label / state issues so they get auto-discovered.
+func LoadPickupRules(path string) (PickupRules, error) {
+	c, err := parse(path)
+	if err != nil {
+		return PickupRules{}, err
+	}
+	st := c.Discoverer.StateTypes
+	if len(st) == 0 {
+		st = defaultStateTypes()
+	}
+	return PickupRules{
+		RequireLabel: strings.TrimSpace(c.Discoverer.RequireLabel),
+		StateTypes:   st,
+	}, nil
+}
+
 func parse(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -468,7 +503,7 @@ func (c *Config) validateDiscovererAndExpand() error {
 		d.PollInterval = 10 * time.Minute
 	}
 	if len(d.StateTypes) == 0 {
-		d.StateTypes = []string{"backlog", "unstarted"}
+		d.StateTypes = defaultStateTypes()
 	}
 	if d.MaxPickPerRound <= 0 {
 		d.MaxPickPerRound = 3

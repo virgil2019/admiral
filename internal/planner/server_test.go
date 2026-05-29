@@ -19,10 +19,10 @@ import (
 // halves of GitHubClient — GetDiff returns canned diffs / errors,
 // PostReview records every call so tests can assert what was sent.
 type stubGH struct {
-	diffs       map[string]string
-	diffErrs    map[string]error
-	reviewErrs  map[string]error // per-pr error override for PostReview
-	postedRevs  []postedReview
+	diffs      map[string]string
+	diffErrs   map[string]error
+	reviewErrs map[string]error // per-pr error override for PostReview
+	postedRevs []postedReview
 }
 
 type postedReview struct {
@@ -56,15 +56,16 @@ func (s *stubGH) PostReview(_ context.Context, prURL, verdict, body string) erro
 // that booted without ADMIRAL_GH_TOKEN.
 func driveServer(t *testing.T, db *store.Store, gh GitHubClient, requests []map[string]any) []map[string]any {
 	t.Helper()
-	return runRequests(t, BuildTools(db, gh, nil), requests)
+	return runRequests(t, BuildTools(db, gh, nil, PickupRules{}), requests)
 }
 
-// driveServerLinear is driveServer with a Linear client wired in, for the
-// feature_followup_submit tests. Existing tests don't exercise Linear, so
-// driveServer passes nil and avoids threading lc through all its callers.
-func driveServerLinear(t *testing.T, db *store.Store, gh GitHubClient, lc LinearClient, requests []map[string]any) []map[string]any {
+// driveServerLinear is driveServer with a Linear client + pickup rules wired
+// in, for the feature_followup_submit tests. Existing tests don't exercise
+// Linear, so driveServer passes nil and avoids threading these through all
+// its callers.
+func driveServerLinear(t *testing.T, db *store.Store, gh GitHubClient, lc LinearClient, pickup PickupRules, requests []map[string]any) []map[string]any {
 	t.Helper()
-	return runRequests(t, BuildTools(db, gh, lc), requests)
+	return runRequests(t, BuildTools(db, gh, lc, pickup), requests)
 }
 
 func runRequests(t *testing.T, tools map[string]*toolDef, requests []map[string]any) []map[string]any {
@@ -1193,6 +1194,11 @@ type stubLinear struct {
 	createErr  error
 	lastCreate linear.IssueCreateInput
 	gotProject string
+
+	labelID   string
+	labelErr  error
+	states    []linear.WorkflowState
+	statesErr error
 }
 
 func (s *stubLinear) GetProjectTeamID(_ context.Context, projectID string) (string, error) {
@@ -1211,6 +1217,20 @@ func (s *stubLinear) IssueCreate(_ context.Context, in linear.IssueCreateInput) 
 	return s.created, nil
 }
 
+func (s *stubLinear) GetTeamLabelID(_ context.Context, _, _ string) (string, error) {
+	if s.labelErr != nil {
+		return "", s.labelErr
+	}
+	return s.labelID, nil
+}
+
+func (s *stubLinear) GetWorkflowStates(_ context.Context, _ string) ([]linear.WorkflowState, error) {
+	if s.statesErr != nil {
+		return nil, s.statesErr
+	}
+	return s.states, nil
+}
+
 func TestFeatureFollowupSubmit_HappyPath(t *testing.T) {
 	db := newPlannerTestStore(t)
 	if err := db.InsertFeature(store.Feature{
@@ -1222,7 +1242,7 @@ func TestFeatureFollowupSubmit_HappyPath(t *testing.T) {
 		teamID:  "team-1",
 		created: &linear.Issue{ID: "i-new", Identifier: "GEO-99", URL: "https://linear.app/x/issue/GEO-99"},
 	}
-	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+	resps := driveServerLinear(t, db, nil, lc, PickupRules{}, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
 			"name": "feature_followup_submit",
@@ -1271,7 +1291,7 @@ func TestFeatureFollowupSubmit_HappyPath(t *testing.T) {
 func TestFeatureFollowupSubmit_NilLinear_ToolError(t *testing.T) {
 	db := newPlannerTestStore(t)
 	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
-	resps := driveServerLinear(t, db, nil, nil, []map[string]any{{
+	resps := driveServerLinear(t, db, nil, nil, PickupRules{}, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
 			"name": "feature_followup_submit",
@@ -1293,7 +1313,7 @@ func TestFeatureFollowupSubmit_NilLinear_ToolError(t *testing.T) {
 func TestFeatureFollowupSubmit_MissingArgs_ToolError(t *testing.T) {
 	db := newPlannerTestStore(t)
 	lc := &stubLinear{teamID: "team-1", created: &linear.Issue{ID: "i", Identifier: "GEO-1"}}
-	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+	resps := driveServerLinear(t, db, nil, lc, PickupRules{}, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
 			"name":      "feature_followup_submit",
@@ -1309,7 +1329,7 @@ func TestFeatureFollowupSubmit_MissingArgs_ToolError(t *testing.T) {
 func TestFeatureFollowupSubmit_UnknownFeature_ToolError(t *testing.T) {
 	db := newPlannerTestStore(t)
 	lc := &stubLinear{teamID: "team-1", created: &linear.Issue{ID: "i", Identifier: "GEO-1"}}
-	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+	resps := driveServerLinear(t, db, nil, lc, PickupRules{}, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
 			"name": "feature_followup_submit",
@@ -1332,7 +1352,7 @@ func TestFeatureFollowupSubmit_TeamResolveError_NoIssueCreated(t *testing.T) {
 	db := newPlannerTestStore(t)
 	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
 	lc := &stubLinear{teamErr: errors.New("project has no teams")}
-	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+	resps := driveServerLinear(t, db, nil, lc, PickupRules{}, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
 			"name": "feature_followup_submit",
@@ -1355,7 +1375,7 @@ func TestFeatureFollowupSubmit_IssueCreateError_NoCriteriaWritten(t *testing.T) 
 	db := newPlannerTestStore(t)
 	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
 	lc := &stubLinear{teamID: "team-1", createErr: errors.New("graphql 500")}
-	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+	resps := driveServerLinear(t, db, nil, lc, PickupRules{}, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
 			"name": "feature_followup_submit",
@@ -1385,7 +1405,7 @@ func TestFeatureFollowupSubmit_CriteriaUpsertFails_ErrorNamesIssue(t *testing.T)
 	// exists, but UpsertFeatureIssue rejects the empty linear_issue_id,
 	// exercising the "issue created but criteria registration failed" path.
 	lc := &stubLinear{teamID: "team-1", created: &linear.Issue{ID: "", Identifier: "GEO-77"}}
-	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+	resps := driveServerLinear(t, db, nil, lc, PickupRules{}, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
 			"name": "feature_followup_submit",
@@ -1403,5 +1423,118 @@ func TestFeatureFollowupSubmit_CriteriaUpsertFails_ErrorNamesIssue(t *testing.T)
 	// issue_set_acceptance, and make clear the issue itself was created.
 	if !strings.Contains(text, "GEO-77") || !strings.Contains(text, "created") {
 		t.Fatalf("error should name the created issue and say it was created, got: %s", text)
+	}
+}
+
+// --- feature_followup_submit: pickup label/state (Seam-A) ---
+
+func followupCall(featureID string) map[string]any {
+	return map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "feature_followup_submit",
+			"arguments": map[string]any{
+				"feature_id": featureID, "title": "t", "acceptance_criteria": "c",
+			},
+		},
+	}
+}
+
+func TestFeatureFollowupSubmit_AppliesPickupLabelAndState(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
+	lc := &stubLinear{
+		teamID:  "team-1",
+		created: &linear.Issue{ID: "i-new", Identifier: "GEO-50"},
+		labelID: "lbl-ready",
+		states: []linear.WorkflowState{
+			{ID: "s-unstarted", Type: "unstarted", Position: 2},
+			{ID: "s-backlog", Type: "backlog", Position: 1},
+			{ID: "s-started", Type: "started", Position: 3},
+		},
+	}
+	pickup := PickupRules{RequireLabel: "agent-ready", StateTypes: []string{"backlog", "unstarted"}}
+	resps := driveServerLinear(t, db, nil, lc, pickup, []map[string]any{followupCall("f-1")})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != false {
+		t.Fatalf("expected success, got %v", result["content"])
+	}
+	if len(lc.lastCreate.LabelIDs) != 1 || lc.lastCreate.LabelIDs[0] != "lbl-ready" {
+		t.Errorf("pickup label not applied: %v", lc.lastCreate.LabelIDs)
+	}
+	// Lowest-position matching state wins (s-backlog at position 1).
+	if lc.lastCreate.StateID != "s-backlog" {
+		t.Errorf("expected lowest-position matching state s-backlog, got %q", lc.lastCreate.StateID)
+	}
+}
+
+func TestFeatureFollowupSubmit_PickupNoLabelStillSetsState(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
+	lc := &stubLinear{
+		teamID:  "team-1",
+		created: &linear.Issue{ID: "i", Identifier: "GEO-1"},
+		states:  []linear.WorkflowState{{ID: "s-backlog", Type: "backlog", Position: 1}},
+	}
+	// require_label empty (discoverer relies on judge) — state still forced.
+	pickup := PickupRules{RequireLabel: "", StateTypes: []string{"backlog"}}
+	resps := driveServerLinear(t, db, nil, lc, pickup, []map[string]any{followupCall("f-1")})
+	if resps[0]["result"].(map[string]any)["isError"] != false {
+		t.Fatal("expected success")
+	}
+	if len(lc.lastCreate.LabelIDs) != 0 {
+		t.Errorf("no label should be applied when require_label empty, got %v", lc.lastCreate.LabelIDs)
+	}
+	if lc.lastCreate.StateID != "s-backlog" {
+		t.Errorf("state should still be set, got %q", lc.lastCreate.StateID)
+	}
+}
+
+func TestFeatureFollowupSubmit_UnconfiguredPickup_NoLabelOrState(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
+	lc := &stubLinear{teamID: "team-1", created: &linear.Issue{ID: "i", Identifier: "GEO-1"}}
+	// Zero PickupRules (planner launched without config) → plain issue.
+	resps := driveServerLinear(t, db, nil, lc, PickupRules{}, []map[string]any{followupCall("f-1")})
+	if resps[0]["result"].(map[string]any)["isError"] != false {
+		t.Fatal("expected success")
+	}
+	if len(lc.lastCreate.LabelIDs) != 0 || lc.lastCreate.StateID != "" {
+		t.Errorf("unconfigured pickup must not set label/state, got labels=%v state=%q", lc.lastCreate.LabelIDs, lc.lastCreate.StateID)
+	}
+}
+
+func TestFeatureFollowupSubmit_LabelResolveFails_NoIssueCreated(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
+	lc := &stubLinear{teamID: "team-1", labelErr: errors.New("label not found")}
+	pickup := PickupRules{RequireLabel: "agent-ready", StateTypes: []string{"backlog"}}
+	resps := driveServerLinear(t, db, nil, lc, pickup, []map[string]any{followupCall("f-1")})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError when pickup label can't be resolved")
+	}
+	if lc.lastCreate.Title != "" {
+		t.Error("issue must not be created when label resolution fails")
+	}
+}
+
+func TestFeatureFollowupSubmit_NoPickableState_NoIssueCreated(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
+	// Team has only a 'started' state — none of the wanted types.
+	lc := &stubLinear{
+		teamID:  "team-1",
+		labelID: "lbl-ready",
+		states:  []linear.WorkflowState{{ID: "s-started", Type: "started", Position: 1}},
+	}
+	pickup := PickupRules{RequireLabel: "agent-ready", StateTypes: []string{"backlog", "unstarted"}}
+	resps := driveServerLinear(t, db, nil, lc, pickup, []map[string]any{followupCall("f-1")})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError when no state matches state_types")
+	}
+	if lc.lastCreate.Title != "" {
+		t.Error("issue must not be created when no pickable state exists")
 	}
 }
