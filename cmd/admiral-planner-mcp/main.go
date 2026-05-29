@@ -20,6 +20,7 @@ import (
 	"os"
 
 	ghpkg "github.com/georgehuang/admiral/internal/github"
+	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/planner"
 	"github.com/georgehuang/admiral/internal/store"
 )
@@ -52,7 +53,24 @@ func main() {
 		log.Print("ADMIRAL_GH_TOKEN not set — pr_get_materials / pr_verify_submit will return an error until configured")
 	}
 
-	tools := planner.BuildTools(db, gh)
+	// Linear OAuth token is read from the admiral DB (not env), matching
+	// admiral-mcp-ask — keeps the token out of the host agent's process
+	// tree. feature_followup_submit returns a tool-level error when lc is
+	// nil, so the server still boots for everything else without a token.
+	var lc planner.LinearClient
+	linearEndpoint := os.Getenv("ADMIRAL_LINEAR_ENDPOINT")
+	if linearEndpoint == "" {
+		linearEndpoint = "https://api.linear.app/graphql"
+	}
+	if tok, err := db.GetLinearOAuthToken(); err != nil {
+		log.Printf("read linear oauth token: %v — feature_followup_submit will return an error until configured", err)
+	} else if tok == nil || tok.AccessToken == "" {
+		log.Print("linear oauth token not found in db — feature_followup_submit will return an error until configured")
+	} else {
+		lc = linear.NewClient(linearEndpoint, tok.AccessToken)
+	}
+
+	tools := planner.BuildTools(db, gh, lc)
 	srv := planner.NewServer(os.Stdin, os.Stdout, os.Stderr, tools)
 	if err := srv.Run(context.Background()); err != nil {
 		log.Fatalf("server: %v", err)
