@@ -41,14 +41,15 @@ func main() {
 	defer db.Close()
 
 	// GitHub token is read from env to keep this binary independent of
-	// admiral's config.yaml. Optional: tools that need it (pr_get_materials)
-	// return a tool-level error when gh is nil, so a host agent doing
-	// only feature_* reads still works.
-	var gh planner.PRDiffer
+	// admiral's config.yaml. Optional: tools that need it
+	// (pr_get_materials / pr_verify_submit) return a tool-level error
+	// when gh is nil, so a host agent doing only feature_* reads still
+	// works.
+	var gh planner.GitHubClient
 	if tok := os.Getenv("ADMIRAL_GH_TOKEN"); tok != "" {
 		gh = ghpkg.NewClient(tok)
 	} else {
-		log.Print("ADMIRAL_GH_TOKEN not set — pr_get_materials will return an error until configured")
+		log.Print("ADMIRAL_GH_TOKEN not set — pr_get_materials / pr_verify_submit will return an error until configured")
 	}
 
 	tools := planner.BuildTools(db, gh)

@@ -29,13 +29,28 @@ type toolDef struct {
 	Handler     toolHandler
 }
 
-// PRDiffer fetches the unified diff for a pull request. The concrete
-// implementation in production is *github.Client; tests inject a stub.
-// Kept as a narrow interface so the planner package does not depend on
-// the full GitHub client surface (which carries cobra / gh-CLI shell-
-// out machinery the MCP server has no business needing).
+// PRDiffer is the read half of the GitHub dependency — fetches the
+// unified diff for a PR. Kept separate so tests of read-only tools
+// don't need to satisfy the write half.
 type PRDiffer interface {
 	GetDiff(ctx context.Context, prURL string) (string, error)
+}
+
+// PRReviewer is the write half — actually posts a verdict to GitHub
+// via `gh pr review`. The concrete implementation in production is
+// *github.Client; tests inject a stub.
+type PRReviewer interface {
+	PostReview(ctx context.Context, prURL, verdict, body string) error
+}
+
+// GitHubClient bundles both halves. cmd/admiral-planner-mcp passes
+// a *github.Client which satisfies both, but tools.go takes the
+// composite so individual tools can pin to just the slice they need
+// (pr_get_materials wants only PRDiffer, pr_verify_submit wants
+// PRReviewer + idempotency lookup against the planner store).
+type GitHubClient interface {
+	PRDiffer
+	PRReviewer
 }
 
 // BuildTools wires every tool the planner exposes, closing over the
@@ -47,13 +62,15 @@ type PRDiffer interface {
 // error in that case rather than crashing the process. This lets the
 // server boot in environments where ADMIRAL_GH_TOKEN is not configured
 // (e.g. read-only inspection of planner state).
-func BuildTools(db *store.Store, gh PRDiffer) map[string]*toolDef {
+func BuildTools(db *store.Store, gh GitHubClient) map[string]*toolDef {
 	return map[string]*toolDef{
-		"feature_start":          featureStartTool(db),
-		"issue_set_acceptance":   issueSetAcceptanceTool(db),
-		"feature_get_materials":  featureGetMaterialsTool(db),
-		"issue_list_by_feature":  issueListByFeatureTool(db),
-		"pr_get_materials":       prGetMaterialsTool(db, gh),
+		"feature_start":         featureStartTool(db),
+		"issue_set_acceptance":  issueSetAcceptanceTool(db),
+		"feature_get_materials": featureGetMaterialsTool(db),
+		"issue_list_by_feature": issueListByFeatureTool(db),
+		"pr_get_materials":      prGetMaterialsTool(db, gh),
+		"pr_verify_submit":      prVerifySubmitTool(db, gh),
+		"feature_close":         featureCloseTool(db),
 	}
 }
 
@@ -486,6 +503,192 @@ func featureGetMaterialsTool(db *store.Store) *toolDef {
 				},
 				Issues: issues,
 			}, nil
+		},
+	}
+}
+
+// --- pr_verify_submit ---
+
+type prVerifySubmitArgs struct {
+	PRURL     string `json:"pr_url"`
+	Verdict   string `json:"verdict"`
+	Reasoning string `json:"reasoning"`
+	Agent     string `json:"agent,omitempty"`
+}
+
+// prVerifySubmitResult records both what the planner decided and
+// whether the side-effect (gh pr review) actually fired. submitted=
+// false with verdict==prior verdict means idempotency caught it.
+type prVerifySubmitResult struct {
+	Submitted bool   `json:"submitted"`
+	Verdict   string `json:"verdict"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// verdictToGHFlag maps planner verdicts to the gh-CLI argument
+// PostReview accepts. needs_rebase folds into request_changes because
+// admiral's dispatch_review handler treats request_changes as the
+// trigger to spawn claude to address the feedback — perfect for a
+// "rebase onto base" prompt.
+func verdictToGHFlag(v string) string {
+	switch v {
+	case store.PRVerdictApprove:
+		return "approve"
+	case store.PRVerdictRequestChanges, store.PRVerdictNeedsRebase:
+		return "request_changes"
+	}
+	return ""
+}
+
+// rebaseBodyPrefix is prepended to needs_rebase reasoning so the
+// downstream review handler sees the intent before the planner's
+// detailed comments.
+const rebaseBodyPrefix = "Rebase onto base branch and resolve conflicts before re-review.\n\n"
+
+func prVerifySubmitTool(db *store.Store, gh GitHubClient) *toolDef {
+	return &toolDef{
+		Name: "pr_verify_submit",
+		Description: "Submit an L1 verdict on a PR. verdict must be one of approve, " +
+			"request_changes, needs_rebase. Calls `gh pr review` and records an " +
+			"audit row. Idempotent against the most recent verdict for the same " +
+			"PR: if the latest recorded verdict already matches, the gh call is " +
+			"skipped and submitted=false is returned. Use reasoning to explain " +
+			"the decision; required for request_changes / needs_rebase (gh " +
+			"enforces a body for those), optional for approve.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"pr_url": map[string]any{
+					"type":        "string",
+					"description": "GitHub PR URL.",
+				},
+				"verdict": map[string]any{
+					"type":        "string",
+					"enum":        []string{store.PRVerdictApprove, store.PRVerdictRequestChanges, store.PRVerdictNeedsRebase},
+					"description": "approve | request_changes | needs_rebase. needs_rebase is request_changes plus a rebase-themed body prefix.",
+				},
+				"reasoning": map[string]any{
+					"type":        "string",
+					"description": "Explanation surfaced to the reviewer / admiral autopilot. Required when verdict != approve.",
+				},
+				"agent": map[string]any{
+					"type":        "string",
+					"description": "Optional telemetry tag (e.g. 'claude').",
+				},
+			},
+			"required": []string{"pr_url", "verdict"},
+		},
+		Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
+			var args prVerifySubmitArgs
+			if err := json.Unmarshal(raw, &args); err != nil {
+				return nil, fmt.Errorf("invalid arguments: %w", err)
+			}
+			if args.PRURL == "" || args.Verdict == "" {
+				return nil, fmt.Errorf("pr_url and verdict are required")
+			}
+			ghFlag := verdictToGHFlag(args.Verdict)
+			if ghFlag == "" {
+				return nil, fmt.Errorf("invalid verdict %q (want approve | request_changes | needs_rebase)", args.Verdict)
+			}
+			if (args.Verdict == store.PRVerdictRequestChanges || args.Verdict == store.PRVerdictNeedsRebase) &&
+				strings.TrimSpace(args.Reasoning) == "" {
+				return nil, fmt.Errorf("reasoning is required for verdict %q", args.Verdict)
+			}
+			if gh == nil {
+				return nil, fmt.Errorf("GitHub client not configured (set ADMIRAL_GH_TOKEN)")
+			}
+
+			// Idempotency: skip when the latest recorded verdict already
+			// matches. Don't even append an audit row — repeated calls
+			// with the same conclusion don't carry new information.
+			latest, err := db.GetLatestPRVerification(args.PRURL)
+			if err != nil {
+				return nil, fmt.Errorf("lookup prior verdict: %w", err)
+			}
+			if latest != nil && latest.Verdict == args.Verdict {
+				return prVerifySubmitResult{
+					Submitted: false,
+					Verdict:   args.Verdict,
+					Reason:    "latest recorded verdict already matches; gh call skipped",
+				}, nil
+			}
+
+			body := args.Reasoning
+			if args.Verdict == store.PRVerdictNeedsRebase {
+				body = rebaseBodyPrefix + body
+			}
+			if err := gh.PostReview(ctx, args.PRURL, ghFlag, body); err != nil {
+				return nil, fmt.Errorf("post review: %w", err)
+			}
+			// Audit only after gh succeeded — a failed PostReview that
+			// still wrote an audit row would mislead future idempotency
+			// checks into believing the verdict landed.
+			if err := db.InsertPRVerification(store.PRVerification{
+				PRURL:     args.PRURL,
+				Verdict:   args.Verdict,
+				Reasoning: args.Reasoning,
+				Agent:     args.Agent,
+			}); err != nil {
+				return nil, fmt.Errorf("audit row: %w", err)
+			}
+			return prVerifySubmitResult{
+				Submitted: true,
+				Verdict:   args.Verdict,
+			}, nil
+		},
+	}
+}
+
+// --- feature_close ---
+
+type featureCloseArgs struct {
+	FeatureID string `json:"feature_id"`
+}
+
+type featureCloseResult struct {
+	Closed bool   `json:"closed"`
+	Reason string `json:"reason,omitempty"`
+}
+
+func featureCloseTool(db *store.Store) *toolDef {
+	return &toolDef{
+		Name: "feature_close",
+		Description: "Mark a feature closed after L2 acceptance has confirmed all " +
+			"PRs match the user's intent and any follow-up issues have been " +
+			"recorded. Idempotent: closing an already-closed feature returns " +
+			"closed=false with a reason. Errors only when feature_id is unknown.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"feature_id": map[string]any{
+					"type":        "string",
+					"description": "The feature ID returned by feature_start.",
+				},
+			},
+			"required": []string{"feature_id"},
+		},
+		Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
+			var args featureCloseArgs
+			if err := json.Unmarshal(raw, &args); err != nil {
+				return nil, fmt.Errorf("invalid arguments: %w", err)
+			}
+			if args.FeatureID == "" {
+				return nil, fmt.Errorf("feature_id is required")
+			}
+			closed, err := db.CloseFeature(args.FeatureID)
+			if err != nil {
+				// ErrFeatureNotFound bubbles up here — surface it as a
+				// readable tool error so the host agent sees "not found"
+				// instead of the sentinel string.
+				return nil, fmt.Errorf("close feature: %w", err)
+			}
+			if !closed {
+				return featureCloseResult{
+					Closed: false,
+					Reason: "feature was already closed",
+				}, nil
+			}
+			return featureCloseResult{Closed: true}, nil
 		},
 	}
 }

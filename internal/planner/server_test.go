@@ -14,23 +14,38 @@ import (
 	"github.com/georgehuang/admiral/internal/store"
 )
 
-// stubPRDiffer is the test double for the GitHub client. Returns
-// either a canned diff or a canned error per pr_url so tests can
-// exercise both happy path and fetch-failure branches without
-// hitting the network.
-type stubPRDiffer struct {
-	diffs map[string]string
-	errs  map[string]error
+// stubGH is the test double for the GitHub client. Implements both
+// halves of GitHubClient — GetDiff returns canned diffs / errors,
+// PostReview records every call so tests can assert what was sent.
+type stubGH struct {
+	diffs       map[string]string
+	diffErrs    map[string]error
+	reviewErrs  map[string]error // per-pr error override for PostReview
+	postedRevs  []postedReview
 }
 
-func (s *stubPRDiffer) GetDiff(_ context.Context, prURL string) (string, error) {
-	if err, ok := s.errs[prURL]; ok {
+type postedReview struct {
+	prURL   string
+	verdict string
+	body    string
+}
+
+func (s *stubGH) GetDiff(_ context.Context, prURL string) (string, error) {
+	if err, ok := s.diffErrs[prURL]; ok {
 		return "", err
 	}
 	if d, ok := s.diffs[prURL]; ok {
 		return d, nil
 	}
-	return "", errors.New("stubPRDiffer: no diff seeded for " + prURL)
+	return "", errors.New("stubGH: no diff seeded for " + prURL)
+}
+
+func (s *stubGH) PostReview(_ context.Context, prURL, verdict, body string) error {
+	if err, ok := s.reviewErrs[prURL]; ok {
+		return err
+	}
+	s.postedRevs = append(s.postedRevs, postedReview{prURL, verdict, body})
+	return nil
 }
 
 // driveServer feeds requests as newline-delimited JSON-RPC into the
@@ -38,7 +53,7 @@ func (s *stubPRDiffer) GetDiff(_ context.Context, prURL string) (string, error) 
 // protocol-level test so the MCP wire format is exercised end-to-end,
 // not just the handler functions. gh may be nil to simulate a server
 // that booted without ADMIRAL_GH_TOKEN.
-func driveServer(t *testing.T, db *store.Store, gh PRDiffer, requests []map[string]any) []map[string]any {
+func driveServer(t *testing.T, db *store.Store, gh GitHubClient, requests []map[string]any) []map[string]any {
 	t.Helper()
 	var in bytes.Buffer
 	for _, r := range requests {
@@ -429,7 +444,7 @@ func TestPRGetMaterials_HappyPath(t *testing.T) {
 	db := newPlannerTestStore(t)
 	prURL := "https://github.com/o/r/pull/42"
 	seedFeatureWithTask(t, db, "f-pr", "i-pr", "GEO-42", prURL, store.JobStateDone)
-	gh := &stubPRDiffer{
+	gh := &stubGH{
 		diffs: map[string]string{prURL: "diff --git a/x b/x\n+hello"},
 	}
 
@@ -483,7 +498,7 @@ func TestPRGetMaterials_NoGHClient_ReturnsError(t *testing.T) {
 
 func TestPRGetMaterials_UntrackedPR(t *testing.T) {
 	db := newPlannerTestStore(t)
-	gh := &stubPRDiffer{}
+	gh := &stubGH{}
 	resps := driveServer(t, db, gh, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
@@ -511,7 +526,7 @@ func TestPRGetMaterials_IssueNotInFeature(t *testing.T) {
 		at.PRURL = prURL
 		at.Branch = "linear/GEO-77"
 	})
-	gh := &stubPRDiffer{diffs: map[string]string{prURL: "diff"}}
+	gh := &stubGH{diffs: map[string]string{prURL: "diff"}}
 
 	resps := driveServer(t, db, gh, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -534,7 +549,7 @@ func TestPRGetMaterials_DiffFetchFails(t *testing.T) {
 	db := newPlannerTestStore(t)
 	prURL := "https://github.com/o/r/pull/88"
 	seedFeatureWithTask(t, db, "f-x", "i-x", "GEO-88", prURL, store.JobStateDone)
-	gh := &stubPRDiffer{errs: map[string]error{prURL: errors.New("rate-limited")}}
+	gh := &stubGH{diffErrs: map[string]error{prURL: errors.New("rate-limited")}}
 
 	resps := driveServer(t, db, gh, []map[string]any{{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -571,6 +586,8 @@ func TestToolsList_IncludesAllRegisteredTools(t *testing.T) {
 		"feature_get_materials",
 		"issue_list_by_feature",
 		"pr_get_materials",
+		"pr_verify_submit",
+		"feature_close",
 	} {
 		if !got[name] {
 			t.Fatalf("tools/list missing %s; got %v", name, got)
@@ -767,5 +784,317 @@ func TestIssueSetAcceptance_RejectsMissingFields(t *testing.T) {
 				t.Fatal("expected isError")
 			}
 		})
+	}
+}
+
+// --- pr_verify_submit ---
+
+// seedForVerify is a one-stop fixture: a feature, an issue under it,
+// admiral_tasks claiming the issue with the given PR URL. Returns the
+// feature ID so tests can chain into other tools.
+func seedForVerify(t *testing.T, db *store.Store, prURL string) string {
+	t.Helper()
+	const featureID = "f-verify"
+	const issueID = "i-verify"
+	if err := db.InsertFeatureWithIssues(
+		store.Feature{ID: featureID, Name: "v", LinearProjectID: "p-verify", RequirementsText: "r"},
+		[]store.FeatureIssue{{LinearIssueID: issueID, AcceptanceCriteria: "criteria"}},
+	); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := db.ClaimAdmiralTask(issueID, "GEO-V", "ev"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	_ = db.UpdateAdmiralTask(issueID, func(at *store.AdmiralTask) {
+		at.State = store.JobStateDone
+		at.PRURL = prURL
+		at.Branch = "linear/GEO-V"
+	})
+	return featureID
+}
+
+func TestPRVerifySubmit_ApproveHappyPath(t *testing.T) {
+	db := newPlannerTestStore(t)
+	prURL := "https://github.com/o/r/pull/100"
+	_ = seedForVerify(t, db, prURL)
+	gh := &stubGH{}
+
+	resps := driveServer(t, db, gh, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "pr_verify_submit",
+			"arguments": map[string]any{
+				"pr_url":    prURL,
+				"verdict":   store.PRVerdictApprove,
+				"reasoning": "looks good",
+				"agent":     "claude",
+			},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != false {
+		t.Fatalf("isError true: %v", result["content"])
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	var payload prVerifySubmitResult
+	_ = json.Unmarshal([]byte(text), &payload)
+	if !payload.Submitted || payload.Verdict != store.PRVerdictApprove {
+		t.Fatalf("expected submitted+approve, got %+v", payload)
+	}
+	// Verify gh was called with the right flag + body.
+	if len(gh.postedRevs) != 1 {
+		t.Fatalf("want 1 PostReview call, got %d", len(gh.postedRevs))
+	}
+	if gh.postedRevs[0].verdict != "approve" || gh.postedRevs[0].body != "looks good" {
+		t.Fatalf("wrong gh call: %+v", gh.postedRevs[0])
+	}
+	// Audit row landed.
+	v, _ := db.GetLatestPRVerification(prURL)
+	if v == nil || v.Verdict != store.PRVerdictApprove || v.Agent != "claude" {
+		t.Fatalf("audit row missing: %+v", v)
+	}
+}
+
+func TestPRVerifySubmit_NeedsRebase_RequestChangesWithRebasePrefix(t *testing.T) {
+	// needs_rebase folds into gh's --request-changes but with the
+	// rebase-themed prefix so admiral's dispatch_review spawns claude
+	// with the right intent.
+	db := newPlannerTestStore(t)
+	prURL := "https://github.com/o/r/pull/101"
+	_ = seedForVerify(t, db, prURL)
+	gh := &stubGH{}
+
+	resps := driveServer(t, db, gh, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "pr_verify_submit",
+			"arguments": map[string]any{
+				"pr_url":    prURL,
+				"verdict":   store.PRVerdictNeedsRebase,
+				"reasoning": "merge conflict with main",
+			},
+		},
+	}})
+	if resps[0]["result"].(map[string]any)["isError"] != false {
+		t.Fatalf("unexpected error: %v", resps[0])
+	}
+	if len(gh.postedRevs) != 1 {
+		t.Fatalf("want 1 PostReview, got %d", len(gh.postedRevs))
+	}
+	got := gh.postedRevs[0]
+	if got.verdict != "request_changes" {
+		t.Fatalf("needs_rebase should map to request_changes, got %q", got.verdict)
+	}
+	if !strings.HasPrefix(got.body, "Rebase onto base") {
+		t.Fatalf("body should lead with rebase prefix, got: %q", got.body)
+	}
+	if !strings.Contains(got.body, "merge conflict with main") {
+		t.Fatalf("body should retain caller reasoning, got: %q", got.body)
+	}
+}
+
+func TestPRVerifySubmit_RejectsRequestChangesWithoutReasoning(t *testing.T) {
+	// gh enforces --body for --request-changes; surface that to the
+	// host agent up front rather than letting gh error out.
+	db := newPlannerTestStore(t)
+	prURL := "https://github.com/o/r/pull/102"
+	_ = seedForVerify(t, db, prURL)
+
+	resps := driveServer(t, db, &stubGH{}, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "pr_verify_submit",
+			"arguments": map[string]any{
+				"pr_url":  prURL,
+				"verdict": store.PRVerdictRequestChanges,
+				// no reasoning
+			},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError")
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "reasoning") {
+		t.Fatalf("error should mention reasoning, got: %s", text)
+	}
+}
+
+func TestPRVerifySubmit_IdempotentSameVerdict(t *testing.T) {
+	// Second call with the same verdict must skip the gh call and
+	// return submitted=false.
+	db := newPlannerTestStore(t)
+	prURL := "https://github.com/o/r/pull/103"
+	_ = seedForVerify(t, db, prURL)
+	gh := &stubGH{}
+
+	call := map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "pr_verify_submit",
+			"arguments": map[string]any{
+				"pr_url":    prURL,
+				"verdict":   store.PRVerdictApprove,
+				"reasoning": "first pass ok",
+			},
+		},
+	}
+	_ = driveServer(t, db, gh, []map[string]any{call})
+	resps := driveServer(t, db, gh, []map[string]any{call})
+
+	text := resps[0]["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	var payload prVerifySubmitResult
+	_ = json.Unmarshal([]byte(text), &payload)
+	if payload.Submitted {
+		t.Fatal("second identical call must skip gh")
+	}
+	if len(gh.postedRevs) != 1 {
+		t.Fatalf("expected exactly 1 gh call total, got %d", len(gh.postedRevs))
+	}
+}
+
+func TestPRVerifySubmit_GHFailure_NoAuditRow(t *testing.T) {
+	// PostReview errors -> we must NOT write an audit row, so the next
+	// attempt doesn't see "we already submitted" and skip.
+	db := newPlannerTestStore(t)
+	prURL := "https://github.com/o/r/pull/104"
+	_ = seedForVerify(t, db, prURL)
+	gh := &stubGH{
+		reviewErrs: map[string]error{prURL: errors.New("network down")},
+	}
+
+	resps := driveServer(t, db, gh, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "pr_verify_submit",
+			"arguments": map[string]any{
+				"pr_url":    prURL,
+				"verdict":   store.PRVerdictApprove,
+				"reasoning": "ok",
+			},
+		},
+	}})
+	if resps[0]["result"].(map[string]any)["isError"] != true {
+		t.Fatal("expected isError on gh failure")
+	}
+	v, _ := db.GetLatestPRVerification(prURL)
+	if v != nil {
+		t.Fatalf("audit row must not exist when gh failed, got %+v", v)
+	}
+}
+
+func TestPRVerifySubmit_NoGHClient(t *testing.T) {
+	db := newPlannerTestStore(t)
+	resps := driveServer(t, db, nil, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "pr_verify_submit",
+			"arguments": map[string]any{
+				"pr_url":  "https://github.com/o/r/pull/1",
+				"verdict": store.PRVerdictApprove,
+			},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError when gh nil")
+	}
+	if !strings.Contains(
+		result["content"].([]any)[0].(map[string]any)["text"].(string),
+		"ADMIRAL_GH_TOKEN",
+	) {
+		t.Fatal("should mention ADMIRAL_GH_TOKEN")
+	}
+}
+
+func TestPRVerifySubmit_InvalidVerdict(t *testing.T) {
+	db := newPlannerTestStore(t)
+	resps := driveServer(t, db, &stubGH{}, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "pr_verify_submit",
+			"arguments": map[string]any{
+				"pr_url":  "https://github.com/o/r/pull/x",
+				"verdict": "looks_great", // typo
+			},
+		},
+	}})
+	if resps[0]["result"].(map[string]any)["isError"] != true {
+		t.Fatal("expected isError for unknown verdict")
+	}
+}
+
+// --- feature_close ---
+
+func TestFeatureClose_HappyPath(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-c", Name: "c", LinearProjectID: "p-c"})
+
+	resps := driveServer(t, db, nil, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "feature_close",
+			"arguments": map[string]any{"feature_id": "f-c"},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != false {
+		t.Fatalf("isError true: %v", result["content"])
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	var payload featureCloseResult
+	_ = json.Unmarshal([]byte(text), &payload)
+	if !payload.Closed {
+		t.Fatalf("want closed=true, got %+v", payload)
+	}
+	f, _ := db.GetFeature("f-c")
+	if f.ClosedAt == "" {
+		t.Fatal("closed_at not stamped")
+	}
+}
+
+func TestFeatureClose_AlreadyClosed_IdempotentNoOp(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-c", Name: "c", LinearProjectID: "p-c"})
+	_, _ = db.CloseFeature("f-c")
+
+	resps := driveServer(t, db, nil, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "feature_close",
+			"arguments": map[string]any{"feature_id": "f-c"},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != false {
+		t.Fatalf("re-close should be a clean no-op, got: %v", result["content"])
+	}
+	var payload featureCloseResult
+	_ = json.Unmarshal([]byte(result["content"].([]any)[0].(map[string]any)["text"].(string)), &payload)
+	if payload.Closed {
+		t.Fatal("second close should report closed=false")
+	}
+	if !strings.Contains(payload.Reason, "already closed") {
+		t.Fatalf("reason should explain idempotency, got: %q", payload.Reason)
+	}
+}
+
+func TestFeatureClose_UnknownFeature(t *testing.T) {
+	db := newPlannerTestStore(t)
+	resps := driveServer(t, db, nil, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "feature_close",
+			"arguments": map[string]any{"feature_id": "ghost"},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError for unknown feature")
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "not found") {
+		t.Fatalf("error should say 'not found', got: %s", text)
 	}
 }

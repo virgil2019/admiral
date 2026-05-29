@@ -210,6 +210,41 @@ func (c *Client) PostComment(ctx context.Context, prURL, body string) error {
 	return nil
 }
 
+// PostReview shells out to `gh pr review <url> --<verdict> [--body <body>]`.
+// verdict must be one of "approve", "request_changes", "comment" — these
+// map to the corresponding gh CLI flags. body is required for
+// request_changes and comment (gh enforces this); for approve it is
+// optional. Used by admiral-planner-mcp's pr_verify_submit tool to
+// finalize an L1 verification on GitHub.
+func (c *Client) PostReview(ctx context.Context, prURL, verdict, body string) error {
+	if strings.TrimSpace(prURL) == "" {
+		return fmt.Errorf("github: PostReview: empty prURL")
+	}
+	var flag string
+	switch verdict {
+	case "approve":
+		flag = "--approve"
+	case "request_changes":
+		flag = "--request-changes"
+	case "comment":
+		flag = "--comment"
+	default:
+		return fmt.Errorf("github: PostReview: unknown verdict %q (want approve | request_changes | comment)", verdict)
+	}
+	if (verdict == "request_changes" || verdict == "comment") && strings.TrimSpace(body) == "" {
+		return fmt.Errorf("github: PostReview: body required for verdict %q", verdict)
+	}
+	args := []string{"pr", "review", prURL, flag}
+	if body != "" {
+		args = append(args, "--body", body)
+	}
+	out, err := c.gh(ctx, args...)
+	if err != nil {
+		return fmt.Errorf("gh pr review %s: %w (output: %s)", prURL, err, truncate(out, 200))
+	}
+	return nil
+}
+
 // GetPRState shells out to `gh pr view <url> --json state` and returns
 // the State field. When gh can't resolve the PR (deleted / wrong repo /
 // permissions), gh exits non-zero with a "could not resolve" message —
