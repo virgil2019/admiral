@@ -11,6 +11,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
 
@@ -55,6 +56,19 @@ func (s *stubGH) PostReview(_ context.Context, prURL, verdict, body string) erro
 // that booted without ADMIRAL_GH_TOKEN.
 func driveServer(t *testing.T, db *store.Store, gh GitHubClient, requests []map[string]any) []map[string]any {
 	t.Helper()
+	return runRequests(t, BuildTools(db, gh, nil), requests)
+}
+
+// driveServerLinear is driveServer with a Linear client wired in, for the
+// feature_followup_submit tests. Existing tests don't exercise Linear, so
+// driveServer passes nil and avoids threading lc through all its callers.
+func driveServerLinear(t *testing.T, db *store.Store, gh GitHubClient, lc LinearClient, requests []map[string]any) []map[string]any {
+	t.Helper()
+	return runRequests(t, BuildTools(db, gh, lc), requests)
+}
+
+func runRequests(t *testing.T, tools map[string]*toolDef, requests []map[string]any) []map[string]any {
+	t.Helper()
 	var in bytes.Buffer
 	for _, r := range requests {
 		body, err := json.Marshal(r)
@@ -67,7 +81,6 @@ func driveServer(t *testing.T, db *store.Store, gh GitHubClient, requests []map[
 	var out bytes.Buffer
 	var errBuf bytes.Buffer
 
-	tools := BuildTools(db, gh)
 	srv := NewServer(&in, &out, &errBuf, tools)
 	if err := srv.Run(context.Background()); err != nil {
 		t.Fatalf("server run: %v (stderr: %s)", err, errBuf.String())
@@ -654,6 +667,7 @@ func TestToolsList_IncludesAllRegisteredTools(t *testing.T) {
 		"issue_list_by_feature",
 		"pr_get_materials",
 		"pr_verify_submit",
+		"feature_followup_submit",
 		"feature_close",
 	} {
 		if !got[name] {
@@ -1163,5 +1177,231 @@ func TestFeatureClose_UnknownFeature(t *testing.T) {
 	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
 	if !strings.Contains(text, "not found") {
 		t.Fatalf("error should say 'not found', got: %s", text)
+	}
+}
+
+// --- feature_followup_submit ---
+
+// stubLinear is the test double for LinearClient. teamID / teamErr drive
+// GetProjectTeamID; created / createErr drive IssueCreate. lastCreate
+// records the input the tool passed so tests can assert project/team
+// threading.
+type stubLinear struct {
+	teamID     string
+	teamErr    error
+	created    *linear.Issue
+	createErr  error
+	lastCreate linear.IssueCreateInput
+	gotProject string
+}
+
+func (s *stubLinear) GetProjectTeamID(_ context.Context, projectID string) (string, error) {
+	s.gotProject = projectID
+	if s.teamErr != nil {
+		return "", s.teamErr
+	}
+	return s.teamID, nil
+}
+
+func (s *stubLinear) IssueCreate(_ context.Context, in linear.IssueCreateInput) (*linear.Issue, error) {
+	s.lastCreate = in
+	if s.createErr != nil {
+		return nil, s.createErr
+	}
+	return s.created, nil
+}
+
+func TestFeatureFollowupSubmit_HappyPath(t *testing.T) {
+	db := newPlannerTestStore(t)
+	if err := db.InsertFeature(store.Feature{
+		ID: "f-1", Name: "login", LinearProjectID: "p-1", RequirementsText: "build login",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	lc := &stubLinear{
+		teamID:  "team-1",
+		created: &linear.Issue{ID: "i-new", Identifier: "GEO-99", URL: "https://linear.app/x/issue/GEO-99"},
+	}
+	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "feature_followup_submit",
+			"arguments": map[string]any{
+				"feature_id":          "f-1",
+				"title":               "Add rate limiting",
+				"description":         "login endpoint has no throttle",
+				"acceptance_criteria": "429 after 5 failed attempts in 1 min",
+			},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != false {
+		t.Fatalf("expected isError=false, got %v: %v", result["isError"], result["content"])
+	}
+	var payload featureFollowupSubmitResult
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload.LinearIssueID != "i-new" || payload.IssueIdentifier != "GEO-99" {
+		t.Fatalf("unexpected payload: %+v", payload)
+	}
+	// Team resolved from the feature's project, and the issue created in
+	// that same project + team.
+	if lc.gotProject != "p-1" {
+		t.Errorf("GetProjectTeamID got project %q, want p-1", lc.gotProject)
+	}
+	if lc.lastCreate.TeamID != "team-1" || lc.lastCreate.ProjectID != "p-1" {
+		t.Errorf("IssueCreate input wrong: %+v", lc.lastCreate)
+	}
+	if lc.lastCreate.Title != "Add rate limiting" || lc.lastCreate.Description != "login endpoint has no throttle" {
+		t.Errorf("IssueCreate input wrong: %+v", lc.lastCreate)
+	}
+	// Criteria registered against the new issue so a later pr_verify_submit
+	// has a standard to judge against.
+	fi, err := db.GetFeatureIssue("f-1", "i-new")
+	if err != nil || fi == nil {
+		t.Fatalf("criteria not registered: fi=%v err=%v", fi, err)
+	}
+	if fi.AcceptanceCriteria != "429 after 5 failed attempts in 1 min" {
+		t.Errorf("wrong criteria persisted: %q", fi.AcceptanceCriteria)
+	}
+}
+
+func TestFeatureFollowupSubmit_NilLinear_ToolError(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
+	resps := driveServerLinear(t, db, nil, nil, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "feature_followup_submit",
+			"arguments": map[string]any{
+				"feature_id": "f-1", "title": "t", "acceptance_criteria": "c",
+			},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError when Linear client not configured")
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "not configured") {
+		t.Fatalf("error should mention not configured, got: %s", text)
+	}
+}
+
+func TestFeatureFollowupSubmit_MissingArgs_ToolError(t *testing.T) {
+	db := newPlannerTestStore(t)
+	lc := &stubLinear{teamID: "team-1", created: &linear.Issue{ID: "i", Identifier: "GEO-1"}}
+	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "feature_followup_submit",
+			"arguments": map[string]any{"feature_id": "f-1", "title": "t"}, // no acceptance_criteria
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError when acceptance_criteria missing")
+	}
+}
+
+func TestFeatureFollowupSubmit_UnknownFeature_ToolError(t *testing.T) {
+	db := newPlannerTestStore(t)
+	lc := &stubLinear{teamID: "team-1", created: &linear.Issue{ID: "i", Identifier: "GEO-1"}}
+	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "feature_followup_submit",
+			"arguments": map[string]any{
+				"feature_id": "ghost", "title": "t", "acceptance_criteria": "c",
+			},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError for unknown feature")
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "not found") {
+		t.Fatalf("error should say 'not found', got: %s", text)
+	}
+}
+
+func TestFeatureFollowupSubmit_TeamResolveError_NoIssueCreated(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
+	lc := &stubLinear{teamErr: errors.New("project has no teams")}
+	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "feature_followup_submit",
+			"arguments": map[string]any{
+				"feature_id": "f-1", "title": "t", "acceptance_criteria": "c",
+			},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError when team resolution fails")
+	}
+	// IssueCreate must not have been reached, and no criteria row written.
+	if lc.lastCreate.Title != "" {
+		t.Error("IssueCreate should not be called when team resolution fails")
+	}
+}
+
+func TestFeatureFollowupSubmit_IssueCreateError_NoCriteriaWritten(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
+	lc := &stubLinear{teamID: "team-1", createErr: errors.New("graphql 500")}
+	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "feature_followup_submit",
+			"arguments": map[string]any{
+				"feature_id": "f-1", "title": "t", "acceptance_criteria": "c",
+			},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError when IssueCreate fails")
+	}
+	// No issue id to register against, so feature_issues stays empty.
+	issues, err := db.ListFeatureIssues("f-1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(issues) != 0 {
+		t.Errorf("no criteria should be written when IssueCreate fails, got %d", len(issues))
+	}
+}
+
+func TestFeatureFollowupSubmit_CriteriaUpsertFails_ErrorNamesIssue(t *testing.T) {
+	db := newPlannerTestStore(t)
+	_ = db.InsertFeature(store.Feature{ID: "f-1", Name: "x", LinearProjectID: "p-1", RequirementsText: "r"})
+	// IssueCreate returns a malformed issue (empty ID) — the Linear issue
+	// exists, but UpsertFeatureIssue rejects the empty linear_issue_id,
+	// exercising the "issue created but criteria registration failed" path.
+	lc := &stubLinear{teamID: "team-1", created: &linear.Issue{ID: "", Identifier: "GEO-77"}}
+	resps := driveServerLinear(t, db, nil, lc, []map[string]any{{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "feature_followup_submit",
+			"arguments": map[string]any{
+				"feature_id": "f-1", "title": "t", "acceptance_criteria": "c",
+			},
+		},
+	}})
+	result := resps[0]["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("expected isError when criteria upsert fails")
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	// Error must name the created issue so the agent can recover via
+	// issue_set_acceptance, and make clear the issue itself was created.
+	if !strings.Contains(text, "GEO-77") || !strings.Contains(text, "created") {
+		t.Fatalf("error should name the created issue and say it was created, got: %s", text)
 	}
 }

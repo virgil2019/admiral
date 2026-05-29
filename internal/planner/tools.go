@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
 
@@ -67,24 +68,36 @@ type GitHubClient interface {
 	PRReviewer
 }
 
+// LinearClient is the Linear write path the planner needs for L2
+// follow-up issue creation. *linear.Client satisfies it directly (same
+// arrangement as *github.Client and GitHubClient). May be nil when the
+// server booted without a Linear OAuth token in the DB — feature_followup_submit
+// returns a tool-level error in that case rather than crashing.
+type LinearClient interface {
+	GetProjectTeamID(ctx context.Context, projectID string) (string, error)
+	IssueCreate(ctx context.Context, in linear.IssueCreateInput) (*linear.Issue, error)
+}
+
 // BuildTools wires every tool the planner exposes, closing over the
 // Store + PRDiffer dependencies. cmd/admiral-planner-mcp calls this
 // once at startup and passes the result to NewServer. Adding a tool
 // means adding one entry here plus its handler below.
 //
-// gh may be nil — tools that need it (pr_get_materials) return an MCP
-// error in that case rather than crashing the process. This lets the
-// server boot in environments where ADMIRAL_GH_TOKEN is not configured
-// (e.g. read-only inspection of planner state).
-func BuildTools(db *store.Store, gh GitHubClient) map[string]*toolDef {
+// gh / lc may be nil — tools that need them (pr_get_materials /
+// pr_verify_submit need gh; feature_followup_submit needs lc) return an
+// MCP error in that case rather than crashing the process. This lets the
+// server boot in environments where ADMIRAL_GH_TOKEN or the Linear OAuth
+// token is not configured (e.g. read-only inspection of planner state).
+func BuildTools(db *store.Store, gh GitHubClient, lc LinearClient) map[string]*toolDef {
 	return map[string]*toolDef{
-		"feature_start":         featureStartTool(db),
-		"issue_set_acceptance":  issueSetAcceptanceTool(db),
-		"feature_get_materials": featureGetMaterialsTool(db),
-		"issue_list_by_feature": issueListByFeatureTool(db),
-		"pr_get_materials":      prGetMaterialsTool(db, gh),
-		"pr_verify_submit":      prVerifySubmitTool(db, gh),
-		"feature_close":         featureCloseTool(db),
+		"feature_start":           featureStartTool(db),
+		"issue_set_acceptance":    issueSetAcceptanceTool(db),
+		"feature_get_materials":   featureGetMaterialsTool(db),
+		"issue_list_by_feature":   issueListByFeatureTool(db),
+		"pr_get_materials":        prGetMaterialsTool(db, gh),
+		"pr_verify_submit":        prVerifySubmitTool(db, gh),
+		"feature_followup_submit": featureFollowupSubmitTool(db, lc),
+		"feature_close":           featureCloseTool(db),
 	}
 }
 
@@ -652,6 +665,108 @@ func prVerifySubmitTool(db *store.Store, gh GitHubClient) *toolDef {
 			return prVerifySubmitResult{
 				Submitted: true,
 				Verdict:   args.Verdict,
+			}, nil
+		},
+	}
+}
+
+// --- feature_followup_submit ---
+
+type featureFollowupSubmitArgs struct {
+	FeatureID          string `json:"feature_id"`
+	Title              string `json:"title"`
+	Description        string `json:"description,omitempty"`
+	AcceptanceCriteria string `json:"acceptance_criteria"`
+}
+
+// featureFollowupSubmitResult returns the created Linear issue so the
+// host agent can link it back to the user / surface it. The criteria is
+// already registered against the issue in the planner, so a later
+// pr_verify_submit on its PR has a standard to judge against.
+type featureFollowupSubmitResult struct {
+	LinearIssueID   string `json:"linear_issue_id"`
+	IssueIdentifier string `json:"issue_identifier"`
+	URL             string `json:"url,omitempty"`
+}
+
+func featureFollowupSubmitTool(db *store.Store, lc LinearClient) *toolDef {
+	return &toolDef{
+		Name: "feature_followup_submit",
+		Description: "Create a new Linear issue for an L2 follow-up gap and register its " +
+			"acceptance criteria in the planner, in one call. Use after feature_get_materials " +
+			"reveals the shipped PRs don't fully match user intent. The issue is created in " +
+			"the feature's Linear project (and that project's team); the criteria is recorded " +
+			"so a later pr_verify_submit on the follow-up's PR has a standard to judge against. " +
+			"Returns the created issue's id / identifier / url. Requires a Linear OAuth token " +
+			"in the admiral DB.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"feature_id": map[string]any{
+					"type":        "string",
+					"description": "The feature ID returned by feature_start. The follow-up issue lands in this feature's Linear project.",
+				},
+				"title": map[string]any{
+					"type":        "string",
+					"description": "Title for the new Linear issue. Should name the gap concisely.",
+				},
+				"description": map[string]any{
+					"type":        "string",
+					"description": "Optional issue body — explain the gap and what a fix must do.",
+				},
+				"acceptance_criteria": map[string]any{
+					"type":        "string",
+					"description": "Concrete, verifiable conditions a PR for this follow-up must meet. Recorded as the issue's L1 criteria.",
+				},
+			},
+			"required": []string{"feature_id", "title", "acceptance_criteria"},
+		},
+		Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
+			var args featureFollowupSubmitArgs
+			if err := json.Unmarshal(raw, &args); err != nil {
+				return nil, fmt.Errorf("invalid arguments: %w", err)
+			}
+			if args.FeatureID == "" || args.Title == "" || args.AcceptanceCriteria == "" {
+				return nil, fmt.Errorf("feature_id, title, acceptance_criteria all required")
+			}
+			if lc == nil {
+				return nil, fmt.Errorf("Linear client not configured (no OAuth token in admiral DB)")
+			}
+			f, err := db.GetFeature(args.FeatureID)
+			if err != nil {
+				return nil, fmt.Errorf("get feature: %w", err)
+			}
+			if f == nil {
+				return nil, fmt.Errorf("feature %q not found", args.FeatureID)
+			}
+			teamID, err := lc.GetProjectTeamID(ctx, f.LinearProjectID)
+			if err != nil {
+				return nil, fmt.Errorf("resolve team for project %s: %w", f.LinearProjectID, err)
+			}
+			iss, err := lc.IssueCreate(ctx, linear.IssueCreateInput{
+				TeamID:      teamID,
+				ProjectID:   f.LinearProjectID,
+				Title:       args.Title,
+				Description: args.Description,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("create linear issue: %w", err)
+			}
+			// Register criteria after the issue exists (we need its ID). If
+			// this fails, the issue is created but has no criteria — the host
+			// agent can recover with issue_set_acceptance. Surface the error
+			// so it knows the registration step didn't land.
+			if err := db.UpsertFeatureIssue(store.FeatureIssue{
+				FeatureID:          args.FeatureID,
+				LinearIssueID:      iss.ID,
+				AcceptanceCriteria: args.AcceptanceCriteria,
+			}); err != nil {
+				return nil, fmt.Errorf("issue %s created but registering criteria failed: %w", iss.Identifier, err)
+			}
+			return featureFollowupSubmitResult{
+				LinearIssueID:   iss.ID,
+				IssueIdentifier: iss.Identifier,
+				URL:             iss.URL,
 			}, nil
 		},
 	}

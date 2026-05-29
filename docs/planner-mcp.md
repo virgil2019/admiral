@@ -17,9 +17,10 @@ conversational context) while persistence lives in the planner store
 - **L1 per-PR** — does this PR satisfy the issue's acceptance criteria?
   Submitted via `gh pr review`.
 - **L2 feature-wide** — after all PRs merge, does the whole feature
-  match the user's original intent? Currently completed by the host
-  agent reading `feature_get_materials`; automatic follow-up issue
-  creation is not yet implemented (see Limitations).
+  match the user's original intent? The host agent reads
+  `feature_get_materials`, and when it finds a gap, calls
+  `feature_followup_submit` to open a Linear issue with criteria in one
+  step.
 
 ## Install
 
@@ -64,7 +65,10 @@ vars below are the only contract:
 | `ADMIRAL_GH_TOKEN` | optional | GitHub PAT; needed for `pr_get_materials` + `pr_verify_submit`. Without it those tools return a clear "set ADMIRAL_GH_TOKEN" error and other tools still work. |
 
 Linear OAuth is read from the admiral database, not env — no separate
-config needed if admiral itself is already authenticated.
+config needed if admiral itself is already authenticated. Without a token,
+`feature_followup_submit` returns a clear "not configured" error and the
+other tools still work. `ADMIRAL_LINEAR_ENDPOINT` optionally overrides the
+GraphQL endpoint (defaults to `https://api.linear.app/graphql`).
 
 ## Tools
 
@@ -129,6 +133,22 @@ recorded verdict matches the new one, the `gh` call is skipped and
 only written after `gh` succeeds, so a network failure leaves no
 ghost record.
 
+### `feature_followup_submit`
+Create a Linear issue for an L2 follow-up gap and register its acceptance
+criteria, in one call.
+
+Input: `{feature_id, title, description?, acceptance_criteria}` →
+`{linear_issue_id, issue_identifier, url?}`. Use after
+`feature_get_materials` reveals the shipped PRs don't fully match user
+intent. The issue is created in the feature's Linear project (and that
+project's team — see Limitations on multi-team projects); the criteria is
+recorded so a later `pr_verify_submit` on the follow-up's PR has a
+standard to judge against. Requires a Linear OAuth token in the admiral DB
+(the same one admiral itself uses); returns a clear "not configured" error
+without one. Unlike the read tools, this needs no `linear_issue_id` —
+unlike `issue_set_acceptance`, it creates the issue rather than annotating
+an existing one.
+
 ### `feature_close`
 Mark the feature done after L2 acceptance.
 
@@ -160,6 +180,9 @@ agent judges in LLM
   ─ pr_verify_submit ────────────────────►  gh pr review
                                             + audit row
                                             (idempotent)
+L2: agent reads feature_get_materials, judges whole feature
+  ─ feature_followup_submit (on a gap) ──►  Linear issueCreate
+                                            + feature_issues row
   ─ feature_close (after all merged) ────►  closed_at stamped
 ```
 
@@ -174,12 +197,13 @@ loop, which is "decompose → admiral ships → verify".
 - **No Linear issue creation.** Similarly, `issue_set_acceptance`
   requires an existing `linear_issue_id`. Create issues in Linear UI
   first; this server only records criteria against existing issues.
-- **No automatic L2 follow-up issue creation.** When L2 acceptance
-  finds a gap, the host agent has to ask the user to create a Linear
-  issue manually, then call `issue_set_acceptance` to register
-  criteria. A `feature_followup_submit` tool that creates issues via
-  the Linear API is planned but not yet implemented (requires adding
-  an `IssueCreate` mutation to `internal/linear`).
+- **Follow-up issues land in the project's first team.** When
+  `feature_followup_submit` creates an issue, Linear requires a team but
+  a feature only records a project. The server resolves the project's
+  first team (`teams(first: 1)`). In a single-team deployment this is
+  unambiguous; in a project spanning multiple teams, "first" is not
+  ordering-guaranteed — pick the team yourself by creating the issue in
+  the Linear UI and calling `issue_set_acceptance` instead.
 - **Single-database.** The server reads `ADMIRAL_DB_PATH`; all
   features go in one DB. Multi-tenant separation is out of scope.
 
