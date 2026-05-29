@@ -118,6 +118,164 @@ func TestAssignIssue(t *testing.T) {
 	}
 }
 
+func TestIssueCreate(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueCreate": map[string]any{
+					"success": true,
+					"issue": map[string]any{
+						"id":         "issue-new",
+						"identifier": "GEO-99",
+						"url":        "https://linear.app/x/issue/GEO-99",
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	iss, err := c.IssueCreate(context.Background(), IssueCreateInput{
+		TeamID:      "team-1",
+		ProjectID:   "proj-1",
+		Title:       "Follow-up: handle empty input",
+		Description: "details",
+	})
+	if err != nil {
+		t.Fatalf("IssueCreate failed: %v", err)
+	}
+	if iss.ID != "issue-new" || iss.Identifier != "GEO-99" {
+		t.Errorf("unexpected issue: %+v", iss)
+	}
+	input := receivedBody["variables"].(map[string]any)["input"].(map[string]any)
+	if input["teamId"] != "team-1" || input["projectId"] != "proj-1" {
+		t.Errorf("unexpected input: %v", input)
+	}
+	if input["title"] != "Follow-up: handle empty input" || input["description"] != "details" {
+		t.Errorf("unexpected input: %v", input)
+	}
+}
+
+func TestIssueCreateOmitsEmptyOptionalFields(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueCreate": map[string]any{
+					"success": true,
+					"issue":   map[string]any{"id": "i", "identifier": "GEO-1", "url": "u"},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.IssueCreate(context.Background(), IssueCreateInput{TeamID: "t", Title: "x"}); err != nil {
+		t.Fatalf("IssueCreate failed: %v", err)
+	}
+	input := receivedBody["variables"].(map[string]any)["input"].(map[string]any)
+	if _, ok := input["projectId"]; ok {
+		t.Errorf("projectId should be omitted when empty, got %v", input["projectId"])
+	}
+	if _, ok := input["description"]; ok {
+		t.Errorf("description should be omitted when empty, got %v", input["description"])
+	}
+}
+
+func TestIssueCreateValidatesRequiredFields(t *testing.T) {
+	c := NewClient("http://unused", "test-token")
+	if _, err := c.IssueCreate(context.Background(), IssueCreateInput{Title: "x"}); err == nil {
+		t.Error("expected error when teamId missing")
+	}
+	if _, err := c.IssueCreate(context.Background(), IssueCreateInput{TeamID: "t"}); err == nil {
+		t.Error("expected error when title missing")
+	}
+}
+
+func TestIssueCreateSuccessFalse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueCreate": map[string]any{"success": false, "issue": nil},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.IssueCreate(context.Background(), IssueCreateInput{TeamID: "t", Title: "x"}); err == nil {
+		t.Error("expected error when issueCreate returns success=false")
+	}
+}
+
+func TestGetProjectTeamID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"project": map[string]any{
+					"id": "proj-1",
+					"teams": map[string]any{
+						"nodes": []map[string]any{{"id": "team-first"}, {"id": "team-second"}},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	teamID, err := c.GetProjectTeamID(context.Background(), "proj-1")
+	if err != nil {
+		t.Fatalf("GetProjectTeamID failed: %v", err)
+	}
+	if teamID != "team-first" {
+		t.Errorf("expected first team 'team-first', got %q", teamID)
+	}
+}
+
+func TestGetProjectTeamIDNoTeams(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"project": map[string]any{"id": "proj-1", "teams": map[string]any{"nodes": []map[string]any{}}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.GetProjectTeamID(context.Background(), "proj-1"); err == nil {
+		t.Error("expected error when project has no teams")
+	}
+}
+
+func TestGetProjectTeamIDNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"project": nil}})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.GetProjectTeamID(context.Background(), "proj-x"); err == nil {
+		t.Error("expected error when project not found")
+	}
+}
+
 func TestGetViewer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
