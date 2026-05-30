@@ -260,6 +260,18 @@ type mockLinearClient struct {
 	// GetIssueBlockers override
 	IssueBlockers    []linear.IssueBlocker
 	IssueBlockersErr error
+
+	// Verify loop (C4) overrides.
+	SubIssues         []linear.SubIssue
+	SubIssuesErr      error
+	IssueCreateResult *linear.Issue
+	IssueCreateErr    error
+	IssueCreateInputs []linear.IssueCreateInput
+	TeamLabelID       string
+	TeamLabelIDErr    error
+	CreatedComments   []struct{ IssueID, Body string }
+	CreateCommentErr  error
+	GetIssueByID      map[string]*linear.Issue // per-id GetIssue override (sub titles)
 }
 
 func (m *mockLinearClient) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {
@@ -279,6 +291,9 @@ func (m *mockLinearClient) GetPostedBody() string {
 func (m *mockLinearClient) GetIssue(ctx context.Context, id string) (*linear.Issue, error) {
 	if m.GetIssueErr != nil {
 		return nil, m.GetIssueErr
+	}
+	if iss, ok := m.GetIssueByID[id]; ok {
+		return iss, nil
 	}
 	if m.GetIssueResult != nil {
 		return m.GetIssueResult, nil
@@ -306,6 +321,30 @@ func (m *mockLinearClient) IssueUpdate(ctx context.Context, issueID, stateID str
 
 func (m *mockLinearClient) GetIssueBlockers(_ context.Context, _ string) ([]linear.IssueBlocker, error) {
 	return m.IssueBlockers, m.IssueBlockersErr
+}
+
+func (m *mockLinearClient) GetSubIssues(_ context.Context, _ string) ([]linear.SubIssue, error) {
+	return m.SubIssues, m.SubIssuesErr
+}
+
+func (m *mockLinearClient) IssueCreate(_ context.Context, in linear.IssueCreateInput) (*linear.Issue, error) {
+	m.IssueCreateInputs = append(m.IssueCreateInputs, in)
+	if m.IssueCreateErr != nil {
+		return nil, m.IssueCreateErr
+	}
+	if m.IssueCreateResult != nil {
+		return m.IssueCreateResult, nil
+	}
+	return &linear.Issue{ID: "new-" + in.Title, Identifier: "GEO-NEW", Title: in.Title}, nil
+}
+
+func (m *mockLinearClient) GetTeamLabelID(_ context.Context, _, _ string) (string, error) {
+	return m.TeamLabelID, m.TeamLabelIDErr
+}
+
+func (m *mockLinearClient) CreateComment(_ context.Context, issueID, body string) error {
+	m.CreatedComments = append(m.CreatedComments, struct{ IssueID, Body string }{issueID, body})
+	return m.CreateCommentErr
 }
 
 // mockStore implements storeInterface for testing.
@@ -376,6 +415,15 @@ type mockStore struct {
 	SetBlockedCalls     []string // issueIDs passed to SetAdmiralTaskBlocked
 	BlockedTasks        []store.BlockedTask
 	TransitionBlockedOK bool
+
+	// task_verifications (C4) overrides.
+	TaskVerification        *store.TaskVerification
+	TaskVerificationErr     error
+	BumpedTaskVerification  *store.TaskVerification
+	BumpTaskVerificationErr error
+	BumpCalls               []string
+	SetStatusCalls          []struct{ ParentID, Status string }
+	SetStatusErr            error
 }
 
 func (m *mockStore) AnyAutopilotJobActive() (bool, string, error) {
@@ -527,6 +575,24 @@ func (m *mockStore) GetPendingQuestionByID(id string) (*store.PendingQuestion, e
 	return nil, nil
 }
 func (m *mockStore) CancelOpenPendingQuestionsForIssue(issueID string) error { return nil }
+
+func (m *mockStore) GetTaskVerification(parentIssueID string) (*store.TaskVerification, error) {
+	return m.TaskVerification, m.TaskVerificationErr
+}
+
+func (m *mockStore) BumpTaskVerificationRound(parentIssueID string) (*store.TaskVerification, error) {
+	m.mu.Lock()
+	m.BumpCalls = append(m.BumpCalls, parentIssueID)
+	m.mu.Unlock()
+	return m.BumpedTaskVerification, m.BumpTaskVerificationErr
+}
+
+func (m *mockStore) SetTaskVerificationStatus(parentIssueID, status string) error {
+	m.mu.Lock()
+	m.SetStatusCalls = append(m.SetStatusCalls, struct{ ParentID, Status string }{parentIssueID, status})
+	m.mu.Unlock()
+	return m.SetStatusErr
+}
 
 // fakeGhProbe is a deterministic ghProbe for tests. Configure the maps
 // keyed on branch name (for FindMergedPRForBranch) and PR url (for

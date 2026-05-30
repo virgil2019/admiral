@@ -173,6 +173,11 @@ type Autopilot struct {
 	GhBotLogin string `yaml:"gh_bot_login"`
 	// MaxRunSeconds caps a single claude -p invocation. Default: 1800 (30 min).
 	MaxRunSeconds int `yaml:"max_run_seconds"`
+	// VerifyMaxRounds bounds the autonomous L2 verification loop: how many
+	// times a task's parent issue may be re-verified before admiral stops
+	// filing follow-up sub-issues and escalates to a human via a Linear
+	// comment. Default: DefaultVerifyMaxRounds.
+	VerifyMaxRounds int `yaml:"verify_max_rounds"`
 	// JobStreamsDir is the directory where per-job claude stream-json files
 	// are written. Default: <sqlite_path dir>/job-streams (e.g. if
 	// sqlite_path is ~/.local/share/admiral/autopilot.db, the default is
@@ -325,6 +330,11 @@ func LoadDiscoverer(path string) (*Config, error) {
 	return c, nil
 }
 
+// DefaultVerifyMaxRounds is the default cap on the autonomous verification
+// loop. Exported so the autopilot orchestrator's defensive fallback shares
+// the single source of truth with the config default applied here.
+const DefaultVerifyMaxRounds = 3
+
 // defaultStateTypes is the discoverer's default Linear workflow-state.type
 // filter. Shared by validateDiscovererAndExpand and LoadPickupRules so the
 // planner and the discoverer can't drift on what "pickable" means.
@@ -443,6 +453,9 @@ func (c *Config) validateAutopilotAndExpand() error {
 	// Note: we do NOT call expandTilde on AdminToken — it's a secret, not a path.
 	if c.Autopilot.MaxRunSeconds <= 0 {
 		c.Autopilot.MaxRunSeconds = 1800
+	}
+	if c.Autopilot.VerifyMaxRounds <= 0 {
+		c.Autopilot.VerifyMaxRounds = DefaultVerifyMaxRounds
 	}
 	if strings.TrimSpace(c.Autopilot.JobStreamsDir) == "" {
 		// Default: <sqlite_path dir>/job-streams

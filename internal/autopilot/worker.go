@@ -148,6 +148,11 @@ func (w *Worker) dispatch(ctx context.Context, row *store.EventInboxRow) {
 		return
 	}
 
+	if row.Source == "verify" {
+		w.dispatchVerify(ctx, row)
+		return
+	}
+
 	var ev linear.AgentEvent
 	if err := json.Unmarshal([]byte(row.PayloadJSON), &ev); err != nil {
 		w.logger.Error("worker_parse_payload_failed",
@@ -173,6 +178,25 @@ func (w *Worker) dispatch(ctx context.Context, row *store.EventInboxRow) {
 	// Mark done immediately after HandleAgentEvent returns (even if the
 	// background goroutine is still running). The orchestrator owns the
 	// autopilot_jobs lifecycle; events_inbox only tracks delivery.
+	if err := w.db.MarkEventDone(row.WebhookID); err != nil {
+		w.logger.Error("worker_mark_done_failed", "err", err, "webhook_id", row.WebhookID)
+	}
+}
+
+// dispatchVerify handles a source='verify' event from the discoverer: the
+// row's session_id carries the parent issue id of a task whose sub-issues
+// have all reached completed. HandleVerifyEvent returns quickly (guard is
+// synchronous, the judge run is on a background goroutine), so the event is
+// marked done immediately after the call — events_inbox tracks delivery only,
+// while the task_verifications row tracks loop state.
+func (w *Worker) dispatchVerify(ctx context.Context, row *store.EventInboxRow) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("worker_panic", "panic", r, "webhook_id", row.WebhookID)
+			_ = w.db.MarkEventFailed(row.WebhookID, panicToString(r), false)
+		}
+	}()
+	w.orch.HandleVerifyEvent(ctx, row.SessionID)
 	if err := w.db.MarkEventDone(row.WebhookID); err != nil {
 		w.logger.Error("worker_mark_done_failed", "err", err, "webhook_id", row.WebhookID)
 	}

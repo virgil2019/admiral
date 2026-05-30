@@ -79,6 +79,11 @@ type storeInterface interface {
 	CancelOpenPendingQuestionsForIssue(issueID string) error
 	SetAdmiralTaskAwaitingInput(issueID, pendingQuestionID string) error
 	TransitionAwaitingInputToExecuting(issueID string) (bool, error)
+
+	// task_verifications: the autonomous L2 verification loop (C4).
+	GetTaskVerification(parentIssueID string) (*store.TaskVerification, error)
+	BumpTaskVerificationRound(parentIssueID string) (*store.TaskVerification, error)
+	SetTaskVerificationStatus(parentIssueID, status string) error
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -88,6 +93,13 @@ type linearClientInterface interface {
 	GetWorkflowStates(ctx context.Context, teamID string) ([]linear.WorkflowState, error)
 	IssueUpdate(ctx context.Context, issueID, stateID string) error
 	GetIssueBlockers(ctx context.Context, issueID string) ([]linear.IssueBlocker, error)
+
+	// Verify loop (C4): enumerate a task's sub-issues, file follow-up gaps
+	// as sub-issues, and escalate to a human via a parent-issue comment.
+	GetSubIssues(ctx context.Context, parentID string) ([]linear.SubIssue, error)
+	IssueCreate(ctx context.Context, in linear.IssueCreateInput) (*linear.Issue, error)
+	GetTeamLabelID(ctx context.Context, teamID, name string) (string, error)
+	CreateComment(ctx context.Context, issueID, body string) error
 }
 
 type Orchestrator struct {
@@ -125,6 +137,28 @@ type Orchestrator struct {
 	// dbPath is the absolute path to the SQLite file. Passed as
 	// ADMIRAL_DB_PATH to the admiral-mcp-ask subprocess.
 	dbPath string
+
+	// verifyLabel / verifyStateTypes are the discoverer's pickup gates,
+	// plumbed in via SetVerifyPickupRules so follow-up sub-issues the verify
+	// loop files are auto-picked and re-shipped (single source of truth with
+	// the discoverer — no drift). Empty verifyLabel means no label is set.
+	verifyLabel      string
+	verifyStateTypes []string
+
+	// verifyRunner runs the headless verify judge. Defaults to
+	// runClaudeForVerify; tests inject a stub so the guard/apply logic is
+	// exercised without spawning a real claude process.
+	verifyRunner func(ctx context.Context, repoDir, prompt string) (string, error)
+}
+
+// SetVerifyPickupRules wires the discoverer's pickup gates (require_label +
+// state_types) into the orchestrator so the verify loop's follow-up
+// sub-issues are created in a pickable state with the right label. Called
+// once from main after New. The orchestrator only holds *config.Autopilot,
+// so these cross-component values are injected rather than read from cfg.
+func (o *Orchestrator) SetVerifyPickupRules(label string, stateTypes []string) {
+	o.verifyLabel = label
+	o.verifyStateTypes = stateTypes
 }
 
 func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
@@ -147,6 +181,9 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 			cfg.CIWatchPollInterval, cfg.CIWatchTimeout),
 		replier:  NewAgentSessionReplier(lc),
 		prClient: ghpkg.NewClient(cfg.GhToken),
+	}
+	o.verifyRunner = func(ctx context.Context, repoDir, prompt string) (string, error) {
+		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, o.logger)
 	}
 	o.blockerWatcher = newBlockerWatcher(o, cfg.BlockerPollInterval)
 	// Ensure job_streams_dir exists on startup.
