@@ -67,6 +67,16 @@ func main() {
 		logger.Info("linear_token_refresh_enabled")
 	}
 	orch := autopilot.New(&cfg.Autopilot, lc, db, logger)
+	// Plumb the discoverer's pickup gates into the verify loop so the
+	// follow-up sub-issues it files are auto-picked and re-shipped — single
+	// source of truth with the discoverer, no drift. LoadPickupRules applies
+	// the same defaults the discoverer uses (the autopilot config load path
+	// does not validate/default the discoverer block).
+	if pickup, err := config.LoadPickupRules(cfgPath); err != nil {
+		logger.Warn("verify_pickup_rules_load_failed", "err", err)
+	} else {
+		orch.SetVerifyPickupRules(pickup.RequireLabel, pickup.StateTypes)
+	}
 
 	// signal channel for the webhook to notify worker of new events
 	sig := make(chan struct{}, 1)
