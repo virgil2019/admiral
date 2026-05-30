@@ -365,6 +365,27 @@ CREATE INDEX IF NOT EXISTS idx_pr_verifications_pr_created
     ON pr_verifications(pr_url, created_at DESC);
 `
 
+// migration0019 backs the autonomous verification loop. When every
+// sub-issue of a parent "task" issue reaches a merged state, the
+// discoverer asks a headless agent to verify the whole task against its
+// PRD. task_verifications tracks, per parent issue:
+//   - rounds: how many times verification has been triggered. The loop is
+//     self-converging (gaps → follow-up sub-issues → re-ship → re-verify),
+//     so a bound on rounds is the guard against an agent that can never
+//     satisfy its own criteria — past the cap it escalates to a human.
+//   - status: 'active' while the loop runs, 'escalated' once the round cap
+//     is hit, 'closed' once verification accepted the task. Both terminal
+//     statuses stop further triggers for that parent.
+const migration0019 = `
+CREATE TABLE IF NOT EXISTS task_verifications (
+    parent_issue_id  TEXT PRIMARY KEY,
+    rounds           INTEGER NOT NULL DEFAULT 0,
+    status           TEXT NOT NULL DEFAULT 'active'
+                       CHECK (status IN ('active', 'escalated', 'closed')),
+    updated_at       TEXT NOT NULL
+);
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -389,6 +410,7 @@ var migrations = []migration{
 	{16, migration0016},
 	{17, migration0017},
 	{18, migration0018},
+	{19, migration0019},
 }
 
 func tableExists(db *sql.DB, name string) bool {
