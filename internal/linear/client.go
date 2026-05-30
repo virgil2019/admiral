@@ -773,6 +773,98 @@ func (c *Client) GetTeamLabelID(ctx context.Context, teamID, name string) (strin
 	return "", fmt.Errorf("label %q not found for team %s (no team-scoped or workspace label)", name, teamID)
 }
 
+// SubIssue is the minimal view of a child issue used to judge whether a
+// parent "task" is complete: its identity plus the type of its current
+// workflow state ("completed", "started", ...). admiral flips a shipped
+// issue's Linear state to type=completed when its PR merges, so checking
+// every sub-issue's StateType == "completed" tells the discoverer the whole
+// task is done without joining admiral_tasks per child.
+type SubIssue struct {
+	ID         string
+	Identifier string
+	StateType  string
+}
+
+// first: 100 bounds the page explicitly (matching this file's comments(first:)
+// convention). A task with >100 sub-issues would truncate — far beyond any
+// realistic decomposition, but bounding it avoids a silent partial list that
+// could make the completion check falsely conclude a task is done.
+const subIssuesQuery = `query SubIssues($id: String!) {
+  issue(id: $id) {
+    id
+    children(first: 100) { nodes { id identifier state { type } } }
+  }
+}`
+
+// GetSubIssues returns the direct sub-issues of parentID. An issue with no
+// children yields an empty slice (not an error) — the caller decides what
+// "a task with no sub-issues" means.
+func (c *Client) GetSubIssues(ctx context.Context, parentID string) ([]SubIssue, error) {
+	var data struct {
+		Issue *struct {
+			ID       string `json:"id"`
+			Children struct {
+				Nodes []struct {
+					ID         string `json:"id"`
+					Identifier string `json:"identifier"`
+					State      *struct {
+						Type string `json:"type"`
+					} `json:"state"`
+				} `json:"nodes"`
+			} `json:"children"`
+		} `json:"issue"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     subIssuesQuery,
+		Variables: map[string]any{"id": parentID},
+	}, &data); err != nil {
+		return nil, err
+	}
+	if data.Issue == nil {
+		return nil, fmt.Errorf("issue %s not found", parentID)
+	}
+	out := make([]SubIssue, 0, len(data.Issue.Children.Nodes))
+	for _, n := range data.Issue.Children.Nodes {
+		s := SubIssue{ID: n.ID, Identifier: n.Identifier}
+		if n.State != nil {
+			s.StateType = n.State.Type
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+const parentIDQuery = `query ParentID($id: String!) {
+  issue(id: $id) { id parent { id } }
+}`
+
+// GetParentID returns the parent issue ID of childID, or "" when the issue
+// has no parent (a top-level issue). Used by the discoverer to walk from a
+// just-merged sub-issue up to the task it belongs to.
+func (c *Client) GetParentID(ctx context.Context, childID string) (string, error) {
+	var data struct {
+		Issue *struct {
+			ID     string `json:"id"`
+			Parent *struct {
+				ID string `json:"id"`
+			} `json:"parent"`
+		} `json:"issue"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     parentIDQuery,
+		Variables: map[string]any{"id": childID},
+	}, &data); err != nil {
+		return "", err
+	}
+	if data.Issue == nil {
+		return "", fmt.Errorf("issue %s not found", childID)
+	}
+	if data.Issue.Parent == nil {
+		return "", nil
+	}
+	return data.Issue.Parent.ID, nil
+}
+
 // Viewer holds the authenticated Linear user identity (the one whose
 // OAuth token / API key the client is configured with). admiral's
 // discoverer uses this to learn its own user ID when not configured.
