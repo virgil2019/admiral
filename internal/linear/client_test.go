@@ -300,6 +300,7 @@ func TestIssueCreateThreadsLabelsAndState(t *testing.T) {
 		Title:    "x",
 		LabelIDs: []string{"lbl-1", "lbl-2"},
 		StateID:  "state-backlog",
+		ParentID: "parent-1",
 	}); err != nil {
 		t.Fatalf("IssueCreate failed: %v", err)
 	}
@@ -310,6 +311,37 @@ func TestIssueCreateThreadsLabelsAndState(t *testing.T) {
 	}
 	if input["stateId"] != "state-backlog" {
 		t.Errorf("stateId not threaded: %v", input["stateId"])
+	}
+	if input["parentId"] != "parent-1" {
+		t.Errorf("parentId not threaded: %v", input["parentId"])
+	}
+}
+
+func TestIssueCreateOmitsParentWhenEmpty(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueCreate": map[string]any{
+					"success": true,
+					"issue":   map[string]any{"id": "i", "identifier": "GEO-1", "url": "u"},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.IssueCreate(context.Background(), IssueCreateInput{TeamID: "t", Title: "x"}); err != nil {
+		t.Fatalf("IssueCreate failed: %v", err)
+	}
+	input := receivedBody["variables"].(map[string]any)["input"].(map[string]any)
+	if _, ok := input["parentId"]; ok {
+		t.Errorf("parentId should be omitted when empty, got %v", input["parentId"])
 	}
 }
 

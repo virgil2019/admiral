@@ -612,7 +612,9 @@ func (c *Client) AssignIssue(ctx context.Context, issueID, userID string) error 
 // ProjectID is optional but the planner always sets it so a follow-up
 // issue lands inside the feature's project. LabelIDs / StateID are set by
 // the planner so the issue satisfies the discoverer's pickup gates
-// (require_label + state_types) and gets shipped automatically.
+// (require_label + state_types) and gets shipped automatically. ParentID
+// attaches the issue as a sub-issue — used by the verify loop to file
+// follow-up gaps under the task they belong to.
 type IssueCreateInput struct {
 	TeamID      string
 	ProjectID   string
@@ -620,6 +622,7 @@ type IssueCreateInput struct {
 	Description string
 	LabelIDs    []string
 	StateID     string
+	ParentID    string
 }
 
 const issueCreateMutation = `mutation IssueCreate($input: IssueCreateInput!) {
@@ -654,6 +657,9 @@ func (c *Client) IssueCreate(ctx context.Context, in IssueCreateInput) (*Issue, 
 	}
 	if in.StateID != "" {
 		input["stateId"] = in.StateID
+	}
+	if in.ParentID != "" {
+		input["parentId"] = in.ParentID
 	}
 	var data struct {
 		IssueCreate struct {
