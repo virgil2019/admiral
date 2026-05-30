@@ -871,6 +871,37 @@ func (c *Client) GetParentID(ctx context.Context, childID string) (string, error
 	return data.Issue.Parent.ID, nil
 }
 
+const commentCreateMutation = `mutation CommentCreate($input: CommentCreateInput!) {
+  commentCreate(input: $input) {
+    success
+    comment { id }
+  }
+}`
+
+// CreateComment posts a plain comment on an issue. Used by the verify loop
+// to escalate to a human on the parent task issue — which is human-created,
+// not an agent session, so PostAgentActivity does not apply.
+func (c *Client) CreateComment(ctx context.Context, issueID, body string) error {
+	if issueID == "" || body == "" {
+		return fmt.Errorf("issueID and body are required")
+	}
+	var data struct {
+		CommentCreate struct {
+			Success bool `json:"success"`
+		} `json:"commentCreate"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     commentCreateMutation,
+		Variables: map[string]any{"input": map[string]any{"issueId": issueID, "body": body}},
+	}, &data); err != nil {
+		return err
+	}
+	if !data.CommentCreate.Success {
+		return fmt.Errorf("commentCreate returned success=false")
+	}
+	return nil
+}
+
 // Viewer holds the authenticated Linear user identity (the one whose
 // OAuth token / API key the client is configured with). admiral's
 // discoverer uses this to learn its own user ID when not configured.

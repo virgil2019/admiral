@@ -585,6 +585,56 @@ func TestGetParentID_NoParent(t *testing.T) {
 	}
 }
 
+func TestCreateComment(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"commentCreate": map[string]any{"success": true, "comment": map[string]any{"id": "cmt-1"}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if err := c.CreateComment(context.Background(), "issue-1", "needs human review"); err != nil {
+		t.Fatalf("CreateComment failed: %v", err)
+	}
+	input := receivedBody["variables"].(map[string]any)["input"].(map[string]any)
+	if input["issueId"] != "issue-1" || input["body"] != "needs human review" {
+		t.Errorf("unexpected input: %v", input)
+	}
+}
+
+func TestCreateCommentValidatesArgs(t *testing.T) {
+	c := NewClient("http://unused", "test-token")
+	if err := c.CreateComment(context.Background(), "", "body"); err == nil {
+		t.Error("expected error when issueID empty")
+	}
+	if err := c.CreateComment(context.Background(), "issue-1", ""); err == nil {
+		t.Error("expected error when body empty")
+	}
+}
+
+func TestCreateCommentSuccessFalse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"commentCreate": map[string]any{"success": false}},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if err := c.CreateComment(context.Background(), "issue-1", "body"); err == nil {
+		t.Error("expected error when commentCreate returns success=false")
+	}
+}
+
 func TestGetViewer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
