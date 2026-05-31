@@ -73,6 +73,11 @@ type linearClient interface {
 	GetIssue(ctx context.Context, id string) (*linear.Issue, error)
 	GetWorkflowStates(ctx context.Context, teamID string) ([]linear.WorkflowState, error)
 	IssueUpdate(ctx context.Context, issueID, stateID string) error
+
+	// Verify trigger (D): walk a just-merged sub-issue up to its parent task
+	// and check whether every sibling sub-issue has completed.
+	GetParentID(ctx context.Context, childID string) (string, error)
+	GetSubIssues(ctx context.Context, parentID string) ([]linear.SubIssue, error)
 }
 
 // prClient is the slice of the GitHub client the discoverer uses for
@@ -104,6 +109,9 @@ type taskRegistry interface {
 	UpsertDiscovererPick(p store.DiscovererPick) error
 	ListAdmiralTasksByStates(states []string) ([]store.AdmiralTask, error)
 	UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask)) error
+	// EnqueueEventWithSource: the verify-trigger producer hands a
+	// source="verify" event to the autopilot worker's queue (D).
+	EnqueueEventWithSource(source, webhookID, action, sessionID, issueID, payloadJSON, commentID string) (bool, error)
 }
 
 // judger is the judge interface — easier to fake than the concrete

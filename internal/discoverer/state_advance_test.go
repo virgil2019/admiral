@@ -313,6 +313,82 @@ func TestAdvanceSkipsWhenNoEnabledProjects(t *testing.T) {
 	}
 }
 
+// mergedVerifyFixture builds the common setup for the verify-trigger tests:
+// a merged GEO-77 sub-issue (iss-A) under parent "parent-1".
+func mergedVerifyFixture() (*fakeLinear, *fakeStore, *fakePR) {
+	prURL := newPRURL()
+	task := newGEOTaskDone(prURL)
+	ts := newFakeStore()
+	ts.tasksByState[task.IssueID] = &task
+
+	lc := &fakeLinear{}
+	lc.issues = map[string]*linear.Issue{"iss-A": newGEOIssue("In Progress")}
+	lc.parents = map[string]string{"iss-A": "parent-1"}
+	seedTeamGEO(lc)
+
+	pr := &fakePR{statuses: map[string]PRStatus{
+		prURL: {State: "MERGED", MergedAt: "2026-05-25T06:00:00Z"},
+	}}
+	return lc, ts, pr
+}
+
+func TestAdvanceMergedEnqueuesVerifyWhenAllSubsComplete(t *testing.T) {
+	lc, ts, pr := mergedVerifyFixture()
+	lc.subIssues = map[string][]linear.SubIssue{
+		"parent-1": {
+			{ID: "iss-A", Identifier: "GEO-77", StateType: "completed"},
+			{ID: "sub-2", Identifier: "GEO-78", StateType: "completed"},
+		},
+	}
+
+	svc := newSvcWithPR(Config{AdmiralUserID: "u-1"}, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if len(ts.enqueued) != 1 {
+		t.Fatalf("expected one verify enqueue, got %+v", ts.enqueued)
+	}
+	e := ts.enqueued[0]
+	if e.Source != "verify" || e.SessionID != "parent-1" || e.IssueID != "parent-1" {
+		t.Errorf("verify event misrouted: %+v", e)
+	}
+	if e.WebhookID != "verify-parent-1-iss-A" {
+		t.Errorf("webhook_id = %q, want verify-parent-1-iss-A", e.WebhookID)
+	}
+}
+
+func TestAdvanceMergedSkipsVerifyWhenSubIncomplete(t *testing.T) {
+	lc, ts, pr := mergedVerifyFixture()
+	lc.subIssues = map[string][]linear.SubIssue{
+		"parent-1": {
+			{ID: "iss-A", StateType: "completed"},
+			{ID: "sub-2", StateType: "started"}, // sibling still in flight
+		},
+	}
+
+	svc := newSvcWithPR(Config{AdmiralUserID: "u-1"}, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if len(ts.enqueued) != 0 {
+		t.Errorf("expected no verify enqueue while a sibling is incomplete, got %+v", ts.enqueued)
+	}
+	// The merge transition itself must still happen.
+	if ts.tasksByState["iss-A"].State != store.JobStateDoneMerged {
+		t.Errorf("task state: got %q, want DONE_MERGED", ts.tasksByState["iss-A"].State)
+	}
+}
+
+func TestAdvanceMergedSkipsVerifyWhenNoParent(t *testing.T) {
+	lc, ts, pr := mergedVerifyFixture()
+	lc.parents = nil // top-level issue, not a decomposed sub-task
+
+	svc := newSvcWithPR(Config{AdmiralUserID: "u-1"}, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if len(ts.enqueued) != 0 {
+		t.Errorf("expected no verify enqueue for a parentless issue, got %+v", ts.enqueued)
+	}
+}
+
 func TestAdvanceSkipsWhenPRClientNil(t *testing.T) {
 	prURL := newPRURL()
 	task := newGEOTaskDone(prURL)

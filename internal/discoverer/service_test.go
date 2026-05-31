@@ -24,6 +24,10 @@ type fakeLinear struct {
 	issues         map[string]*linear.Issue
 	workflowStates map[string][]linear.WorkflowState
 	issueUpdates   []issueUpdateCall
+	parents        map[string]string            // childID -> parentID
+	subIssues      map[string][]linear.SubIssue // parentID -> children
+	parentErr      error
+	subIssuesErr   error
 }
 
 type assignCall struct {
@@ -84,6 +88,24 @@ func (f *fakeLinear) IssueUpdate(_ context.Context, issueID, stateID string) err
 	return nil
 }
 
+func (f *fakeLinear) GetParentID(_ context.Context, childID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.parentErr != nil {
+		return "", f.parentErr
+	}
+	return f.parents[childID], nil
+}
+
+func (f *fakeLinear) GetSubIssues(_ context.Context, parentID string) ([]linear.SubIssue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.subIssuesErr != nil {
+		return nil, f.subIssuesErr
+	}
+	return f.subIssues[parentID], nil
+}
+
 func (f *fakeLinear) assignedIDs() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -105,6 +127,13 @@ type fakeStore struct {
 	pickUpsErr      error
 	projErr         error
 	tasksByStateErr error
+	enqueued        []enqueueCall
+	enqueueFresh    bool
+	enqueueErr      error
+}
+
+type enqueueCall struct {
+	Source, WebhookID, Action, SessionID, IssueID, Payload, CommentID string
 }
 
 func newFakeStore() *fakeStore {
@@ -113,6 +142,7 @@ func newFakeStore() *fakeStore {
 		picks:        map[string]*store.DiscovererPick{},
 		projectIDs:   []string{"proj-A"},
 		tasksByState: map[string]*store.AdmiralTask{},
+		enqueueFresh: true,
 	}
 }
 
@@ -178,6 +208,19 @@ func (s *fakeStore) UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask
 	}
 	fn(t)
 	return nil
+}
+
+func (s *fakeStore) EnqueueEventWithSource(source, webhookID, action, sessionID, issueID, payloadJSON, commentID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.enqueueErr != nil {
+		return false, s.enqueueErr
+	}
+	s.enqueued = append(s.enqueued, enqueueCall{
+		Source: source, WebhookID: webhookID, Action: action,
+		SessionID: sessionID, IssueID: issueID, Payload: payloadJSON, CommentID: commentID,
+	})
+	return s.enqueueFresh, nil
 }
 
 // fakePR is the discoverer prClient test double.
