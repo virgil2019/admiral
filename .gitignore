@@ -9,3 +9,4 @@ config.yaml
 .omx/
 .task.md
 .env
+.tasks/
