@@ -1431,7 +1431,7 @@ func TestQueryGraphQLVariableTypes(t *testing.T) {
 		{"workflowStatesQuery", workflowStatesQuery,
 			[]string{"$teamID: ID!"}, []string{"$teamID: String!"}},
 		// issue(id:) again, via a sibling query — same constraint.
-		{"issueRelationsQuery", issueRelationsQuery,
+		{"issueBlockersQuery", issueBlockersQuery,
 			[]string{"$id: String!"}, []string{"$id: ID!"}},
 		// project(id:) — same String! shape as issue(id:).
 		{"projectQuery", projectQuery,
@@ -1503,5 +1503,86 @@ func TestIsTransientNetErr(t *testing.T) {
 				t.Errorf("isTransientNetErr(%v) = %v, want %v", c.err, got, c.want)
 			}
 		})
+	}
+}
+
+// blockersServer returns a test server that answers the issueBlockersQuery
+// with the given inverseRelations node set.
+func blockersServer(t *testing.T, inverse []map[string]any) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issue": map[string]any{
+					"inverseRelations": map[string]any{"nodes": inverse},
+				},
+			},
+		})
+	}))
+}
+
+// TestGetIssueBlockers_InverseRelationsBlocks is the regression test for the
+// real Linear shape: "B blocked by A" arrives on B as an inverseRelations node
+// of type "blocks" whose source `issue` is A.
+func TestGetIssueBlockers_InverseRelationsBlocks(t *testing.T) {
+	server := blockersServer(t, []map[string]any{
+		{"type": "blocks", "issue": map[string]any{
+			"id": "id-A", "identifier": "GEO-A", "state": map[string]any{"type": "backlog"}}},
+	})
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	blockers, err := c.GetIssueBlockers(context.Background(), "id-B")
+	if err != nil {
+		t.Fatalf("GetIssueBlockers: %v", err)
+	}
+	if len(blockers) != 1 {
+		t.Fatalf("expected exactly 1 blocker (GEO-A), got %d: %+v", len(blockers), blockers)
+	}
+	if blockers[0].IssueIdentifier != "GEO-A" {
+		t.Errorf("blocker = %q, want GEO-A", blockers[0].IssueIdentifier)
+	}
+}
+
+// TestGetIssueBlockers_NonBlockingTypesIgnored: only "blocks" inverse relations
+// gate. A "related" (or duplicate/similar) inverse relation must NOT block.
+func TestGetIssueBlockers_NonBlockingTypesIgnored(t *testing.T) {
+	server := blockersServer(t, []map[string]any{
+		{"type": "related", "issue": map[string]any{
+			"id": "id-R", "identifier": "GEO-R", "state": map[string]any{"type": "backlog"}}},
+		{"type": "duplicate", "issue": map[string]any{
+			"id": "id-Dup", "identifier": "GEO-DUP", "state": map[string]any{"type": "started"}}},
+	})
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	blockers, err := c.GetIssueBlockers(context.Background(), "id-B")
+	if err != nil {
+		t.Fatalf("GetIssueBlockers: %v", err)
+	}
+	if len(blockers) != 0 {
+		t.Fatalf("expected no blockers (no 'blocks' relations), got %+v", blockers)
+	}
+}
+
+// TestGetIssueBlockers_ResolvedSkipped: a blocker already in a completed /
+// canceled state type no longer blocks.
+func TestGetIssueBlockers_ResolvedSkipped(t *testing.T) {
+	server := blockersServer(t, []map[string]any{
+		{"type": "blocks", "issue": map[string]any{
+			"id": "id-A", "identifier": "GEO-A", "state": map[string]any{"type": "completed"}}},
+		{"type": "blocks", "issue": map[string]any{
+			"id": "id-X", "identifier": "GEO-X", "state": map[string]any{"type": "canceled"}}},
+	})
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	blockers, err := c.GetIssueBlockers(context.Background(), "id-B")
+	if err != nil {
+		t.Fatalf("GetIssueBlockers: %v", err)
+	}
+	if len(blockers) != 0 {
+		t.Fatalf("expected no blockers (all resolved), got %+v", blockers)
 	}
 }

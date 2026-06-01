@@ -442,39 +442,59 @@ type IssueBlocker struct {
 	IssueIdentifier string
 }
 
-const issueRelationsQuery = `query IssueRelations($id: String!) {
+// issueBlockersQuery fetches what blocks an issue via inverseRelations.
+//
+// In Linear's model a "B blocked by A" dependency is stored as a single
+// relation record of type "blocks" whose SOURCE is the blocker A. From the
+// blocked issue B's side that record is an *inverse* relation, exposed under
+// `inverseRelations` (NOT `relations`) — and its type is still "blocks", not
+// "blocked_by": Linear's IssueRelationType enum is {blocks, duplicate, related,
+// similar}, with no "blocked_by" value ("blocked by" is only the UI rendering
+// of the inverse. The previous query read `relations` and filtered
+// type=="blocked_by", which can never match — so the BLOCKED gate never fired
+// against live Linear.
+//
+// So: query inverseRelations, keep type=="blocks" nodes, and the blocker is
+// each node's source `issue`. `first: 50` bounds the page; an issue with >50
+// inbound relations would truncate, but >50 blockers on one issue is far
+// beyond any realistic decomposition.
+const issueBlockersQuery = `query IssueBlockers($id: String!) {
   issue(id: $id) {
-    relations(first: 50) {
-      nodes {
-        type
-        relatedIssue { id identifier state { name } }
-      }
+    inverseRelations(first: 50) {
+      nodes { type issue { id identifier state { type } } }
     }
   }
 }`
 
-// GetIssueBlockers returns unresolved blocked_by relations for issueID. A
-// blocker is "unresolved" when its state name is neither "Done" nor
-// "Cancelled". Returns nil when all blockers are resolved or there are none.
+// blockerResolved reports whether a blocker in this Linear workflow-state type
+// no longer blocks. Keyed on state.TYPE (completed / canceled) rather than a
+// display name like "Done"/"Cancelled", which varies per team.
+func blockerResolved(stateType string) bool {
+	return stateType == "completed" || stateType == "canceled"
+}
+
+// GetIssueBlockers returns the unresolved issues that block issueID. A blocker
+// is "unresolved" when its workflow-state type is neither completed nor
+// canceled. Returns nil when all blockers are resolved or there are none.
 func (c *Client) GetIssueBlockers(ctx context.Context, issueID string) ([]IssueBlocker, error) {
 	var data struct {
 		Issue *struct {
-			Relations struct {
+			InverseRelations struct {
 				Nodes []struct {
-					Type         string `json:"type"`
-					RelatedIssue struct {
+					Type  string `json:"type"`
+					Issue struct {
 						ID         string `json:"id"`
 						Identifier string `json:"identifier"`
 						State      struct {
-							Name string `json:"name"`
+							Type string `json:"type"`
 						} `json:"state"`
-					} `json:"relatedIssue"`
+					} `json:"issue"`
 				} `json:"nodes"`
-			} `json:"relations"`
+			} `json:"inverseRelations"`
 		} `json:"issue"`
 	}
 	if err := c.do(ctx, graphQLRequest{
-		Query:     issueRelationsQuery,
+		Query:     issueBlockersQuery,
 		Variables: map[string]any{"id": issueID},
 	}, &data); err != nil {
 		return nil, err
@@ -482,19 +502,25 @@ func (c *Client) GetIssueBlockers(ctx context.Context, issueID string) ([]IssueB
 	if data.Issue == nil {
 		return nil, nil
 	}
+
 	var out []IssueBlocker
-	for _, n := range data.Issue.Relations.Nodes {
-		if n.Type != "blocked_by" {
+	seen := map[string]struct{}{}
+	for _, n := range data.Issue.InverseRelations.Nodes {
+		// Only "blocks" is a dependency; "related"/"duplicate"/"similar" inverse
+		// relations do not block. The source issue of the inverse relation is
+		// the blocker.
+		if n.Type != "blocks" {
 			continue
 		}
-		name := n.RelatedIssue.State.Name
-		if name == "Done" || name == "Cancelled" {
+		b := n.Issue
+		if b.ID == "" || blockerResolved(b.State.Type) {
 			continue
 		}
-		out = append(out, IssueBlocker{
-			IssueID:         n.RelatedIssue.ID,
-			IssueIdentifier: n.RelatedIssue.Identifier,
-		})
+		if _, ok := seen[b.ID]; ok {
+			continue
+		}
+		seen[b.ID] = struct{}{}
+		out = append(out, IssueBlocker{IssueID: b.ID, IssueIdentifier: b.Identifier})
 	}
 	return out, nil
 }
