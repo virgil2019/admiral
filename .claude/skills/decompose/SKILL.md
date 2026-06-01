@@ -1,6 +1,6 @@
 ---
 name: decompose
-description: Decompose a task into a Linear issue hierarchy ready for the admiral autonomous loop — one parent issue holding the PRD, plus orthogonal sub-issues (foundation-first, dependency-ordered) each with acceptance criteria, wired with blocking relations and labelled agent-ready last so the discoverer picks them up only after setup is complete. Invoke when the user says "/decompose", "decompose this", "拆任务", "拆分到 Linear", "break this down into issues", or wants to turn a PRD/design doc into admiral-ready Linear sub-issues. Requires the Linear MCP.
+description: Decompose a task into a Linear issue hierarchy for the admiral autonomous loop — one parent issue holding the PRD, plus orthogonal sub-issues (foundation-first, dependency-ordered) each with acceptance criteria, wired with blocking relations. Creates the issues only; it deliberately does NOT apply the pickup label, so nothing is shipped until the user explicitly activates the task. Invoke when the user says "/decompose", "decompose this", "拆任务", "拆分到 Linear", "break this down into issues", or wants to turn a PRD/design doc into admiral-ready Linear sub-issues. Requires the Linear MCP.
 ---
 
 # Decompose
@@ -63,22 +63,24 @@ Extract from the PRD:
 - **Orthogonality**: pieces that can run in parallel without PR conflicts — keep them independent
 - **Acceptance criteria**: concrete, verifiable conditions for each piece
 
-## The label gates everything — set it LAST
+## The label is the trigger — this skill NEVER applies it
 
-This is the load-bearing invariant of the whole skill. admiral's discoverer
-picks up any sub-issue that carries the pickup label (the team's configured
+This is the load-bearing rule of the whole skill. admiral's discoverer picks
+up any sub-issue that carries the pickup label (the team's configured
 `discoverer.require_label`, default `agent-ready`) in a pickable state. The
 moment a sub-issue gets that label, it can be shipped on the next discoverer
 tick.
 
-So every other setup step — parent attachment, blocking relations,
-acceptance criteria — MUST be in place before the label is added. The phases
-below are ordered to guarantee this: labels go on only in the final phase,
-after all IDs exist and all `blockedBy` relations are set.
+**Decompose only creates the issue structure — it does NOT apply the pickup
+label.** Applying the label kicks off autonomous shipping, so it is a separate,
+explicit human action: the user reviews the decomposition first, then triggers
+activation themselves (see Step 7). This skill must leave every sub-issue
+UNlabeled.
 
 Use `linear.save_issue` for everything (create when `id` is omitted, update
 when `id` is passed). It supports `parentId`, `labels`, `blockedBy`,
-`blocks`, and `state` directly.
+`blocks`, and `state` directly — but do NOT pass `labels` with the pickup
+label at any point in this skill.
 
 ## Step 4 — Create the parent issue
 
@@ -96,10 +98,10 @@ unit — the discoverer only ever picks up its sub-issues.
 
 Record the returned parent identifier.
 
-## Step 5 — Create sub-issues (no label yet)
+## Step 5 — Create sub-issues (unlabeled)
 
 For each functional piece from Step 3, create a sub-issue WITHOUT the pickup
-label:
+label (this skill never adds it — see Step 7):
 
 ```
 linear.save_issue(
@@ -147,19 +149,25 @@ relations: a sub-issue with an unresolved blocker is parked BLOCKED and
 auto-resumes once its blockers reach a completed state — so foundation ships
 first, dependents wait, naturally.
 
-## Step 7 — Add the pickup label (final step, opens the gate)
+## Step 7 — Stop. Do NOT label. Hand off activation to the user
 
-Only now, with parents attached and all blocking relations set, label every
-sub-issue so the discoverer starts picking them up:
+The issue structure is now complete (parent + sub-issues + acceptance
+criteria + blocking relations), but every sub-issue is still UNlabeled, so
+the discoverer will not touch any of it. This is intentional.
 
-```
-linear.save_issue(id: <sub-issue identifier>, labels: ["agent-ready"])
-```
+Do NOT apply the pickup label. Instead, tell the user the task is staged and
+explain how to activate it when they are ready — activation is their explicit
+trigger, made after they review the decomposition:
 
-Use the team's configured `discoverer.require_label` value (default
-`agent-ready`). Adding the label any earlier opens a race where the
-discoverer grabs an issue before its blockers exist — that is exactly the
-window this ordering closes.
+- **Manually**: add the pickup label (`discoverer.require_label`, default
+  `agent-ready`) to the sub-issues in Linear. Add it to the foundation
+  sub-issue first if they want to gate the rollout; blocked dependents can be
+  labeled at the same time since their `blockedBy` relations already hold them
+  back until the foundation completes.
+
+If the user explicitly asks you (now or later) to activate the task, only then
+apply the label via `linear.save_issue(id, labels: [...])` — and because all
+blocking relations are already set (Step 6), labeling order is safe.
 
 ## Step 8 — Summary
 
@@ -168,7 +176,7 @@ Report to the user:
 - Parent issue URL
 - Sub-issue URLs with acceptance criteria summary
 - Dependency chain (which sub-issue must complete before which)
-- Confirmation that blocking relations were set and the pickup label applied
+- That the task is STAGED but NOT active (no pickup label applied), and how to activate it
 
 Example summary:
 
@@ -180,13 +188,14 @@ Parent: [GEO-1] Build login feature
      └─ [GEO-5] Session management (parallel with GEO-3)
 
 Blocking relations: set (GEO-3/GEO-5 blocked by GEO-2; GEO-4 blocked by GEO-3)
-Labels: agent-ready applied to GEO-2, GEO-3, GEO-4, GEO-5
+Status: STAGED — no agent-ready label applied; nothing will ship yet.
+To activate: add the "agent-ready" label to the sub-issues (or ask me to).
 ```
 
 ## Constraints
 
-- Parent issue NEVER gets agent-ready label — it is the task definition, not a work unit
-- Only sub-issues get agent-ready label, added at the very end
+- This skill NEVER applies the pickup label — not to the parent, not to sub-issues. Creating the structure and activating it are separate actions; activation is the user's explicit trigger.
+- Parent issue is the task definition, never a work unit — it is never labeled or picked up regardless.
 - Sub-issue description = acceptance criteria, not implementation details — this is what admiral's verify loop judges against
 - If the user provides vague requirements, ask clarifying questions before decomposing
 - Do not create more than ~10 sub-issues — if a task is that large, suggest decomposing into multiple parent tasks
