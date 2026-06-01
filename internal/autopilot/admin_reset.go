@@ -10,9 +10,42 @@ import (
 	"strings"
 	"time"
 
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
+
+// resetGhReadDelays is the backoff schedule for transient gh *read* failures
+// during a reset, mirroring internal/github's ghReadRetry. The merged-PR guard
+// must not abort the whole reset on a transient network blip (e.g. a GitHub
+// GraphQL EOF) — only on a real, persistent failure.
+var resetGhReadDelays = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+
+// ghReadWithRetry runs a gh read command, retrying on transient failures
+// (EOF / 5xx / connection reset / i/o timeout) per the given backoff. A
+// non-transient error, or transient failures that outlast the schedule, return
+// the last error — so callers (the merged-PR guard) still fail safe.
+func ghReadWithRetry(ctx context.Context, gh ghRunner, delays []time.Duration, args ...string) (string, error) {
+	var (
+		out string
+		err error
+	)
+	for attempt := 0; attempt <= len(delays); attempt++ {
+		out, err = gh(ctx, args...)
+		if err == nil {
+			return out, nil
+		}
+		if !ghpkg.IsTransientGhFailure(out, err) || attempt == len(delays) {
+			return out, err
+		}
+		select {
+		case <-ctx.Done():
+			return out, ctx.Err()
+		case <-time.After(delays[attempt]):
+		}
+	}
+	return out, err
+}
 
 // reset-task admin endpoint (POST /admin/reset-task). Fully resets a botched
 // or test task — the parent issue and all its sub-issues — across GitHub
@@ -280,7 +313,7 @@ func resolveBacklogStateID(ctx context.Context, lc resetLinear, teamID string) (
 // prIsMerged reports whether the PR at prURL is in the MERGED state, via
 // `gh pr view <url> --json state`.
 func prIsMerged(ctx context.Context, gh ghRunner, prURL string) (bool, error) {
-	out, err := gh(ctx, "pr", "view", prURL, "--json", "state")
+	out, err := ghReadWithRetry(ctx, gh, resetGhReadDelays, "pr", "view", prURL, "--json", "state")
 	if err != nil {
 		return false, fmt.Errorf("gh pr view: %v (output: %s)", err, truncate(out, 200))
 	}
