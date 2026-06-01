@@ -390,28 +390,45 @@ func (o *Orchestrator) dispatchFreshAssign(ev linear.AgentEvent) {
 		return
 	}
 
-	// Check for unresolved Linear blocked_by relations before spawning.
-	bctx, bcancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer bcancel()
-	blockers, err := o.lc.GetIssueBlockers(bctx, ev.IssueID)
-	if err != nil {
-		// Non-fatal: log and proceed without the check so a Linear API
-		// hiccup does not permanently stall the task.
-		o.logger.Warn("blocker_check_failed_proceeding",
-			"issue", ev.IssueIdentifier, "err", err)
-	} else if len(blockers) > 0 {
-		o.logger.Info("dispatch_blocked",
-			"issue", ev.IssueIdentifier, "blockers", blockerIdentifiers(blockers))
-		if setErr := o.db.SetAdmiralTaskBlocked(ev.IssueID, blockerIDsJSON(blockers)); setErr != nil {
-			o.logger.Error("set_blocked_failed", "issue", ev.IssueIdentifier, "err", setErr)
-		}
-		// Use Thought (non-terminal) so the AgentSession stays alive for the
-		// watcher's follow-up "resuming now" post when blockers are resolved.
-		o.postBlockedNotice(ev.SessionID, blockedMessage(blockers))
+	if o.parkIfBlocked(ev) {
 		return
 	}
 
 	go o.run(ev)
+}
+
+// parkIfBlocked checks for unresolved Linear blocked_by relations on ev's
+// issue. If any exist it parks the live admiral_tasks row as BLOCKED (the
+// BlockerWatcher resumes it once the blockers clear) and returns true — the
+// caller must NOT spawn a run. On a Linear API error it logs and returns false
+// (fail-open) so a transient hiccup does not permanently stall the task.
+//
+// Shared by the fresh-assign and /rerun paths so re-running an issue respects
+// the same dependency gate as first dispatch. Relies on the live row already
+// being claimed (fresh assign) or freshly superseded (/rerun) so
+// SetAdmiralTaskBlocked targets the right attempt; the BlockerWatcher resumes
+// with that row's attempt_n, preserving the rerun branch naming.
+func (o *Orchestrator) parkIfBlocked(ev linear.AgentEvent) bool {
+	bctx, bcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer bcancel()
+	blockers, err := o.lc.GetIssueBlockers(bctx, ev.IssueID)
+	if err != nil {
+		o.logger.Warn("blocker_check_failed_proceeding",
+			"issue", ev.IssueIdentifier, "err", err)
+		return false
+	}
+	if len(blockers) == 0 {
+		return false
+	}
+	o.logger.Info("dispatch_blocked",
+		"issue", ev.IssueIdentifier, "blockers", blockerIdentifiers(blockers))
+	if setErr := o.db.SetAdmiralTaskBlocked(ev.IssueID, blockerIDsJSON(blockers)); setErr != nil {
+		o.logger.Error("set_blocked_failed", "issue", ev.IssueIdentifier, "err", setErr)
+	}
+	// Use Thought (non-terminal) so the AgentSession stays alive for the
+	// watcher's follow-up "resuming now" post when blockers are resolved.
+	o.postBlockedNotice(ev.SessionID, blockedMessage(blockers))
+	return true
 }
 
 // dispatchRerun handles /rerun on an existing admiral_tasks row.
@@ -478,6 +495,17 @@ func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, task *store.AdmiralTa
 	} else {
 		rerunEv.PromptContext = ""
 	}
+
+	// Re-running must respect blockers just like a fresh assign: a task whose
+	// dependencies aren't done yet should park BLOCKED, not ship out of order.
+	// The just-claimed attempt-n+1 row is parked; the BlockerWatcher resumes it
+	// (with this attempt_n) once the blockers clear.
+	if o.parkIfBlocked(rerunEv) {
+		o.logger.Info("dispatch_rerun_parked_blocked",
+			"issue", ev.IssueIdentifier, "new_attempt_n", newAttempt)
+		return
+	}
+
 	go o.runWithAttempt(rerunEv, newAttempt)
 }
 

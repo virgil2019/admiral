@@ -548,8 +548,20 @@ func (m *mockStore) ListJobsByIssueAndStates(issueID string, states []string) ([
 }
 
 func (m *mockStore) SetAdmiralTaskBlocked(issueID, blockerIDs string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.SetBlockedCalls = append(m.SetBlockedCalls, issueID)
 	return nil
+}
+
+// SetBlockedSnapshot returns a copy of SetBlockedCalls read under m.mu, for
+// tests asserting a park that may be driven from a spawned goroutine.
+func (m *mockStore) SetBlockedSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.SetBlockedCalls))
+	copy(out, m.SetBlockedCalls)
+	return out
 }
 
 func (m *mockStore) GetBlockedAdmiralTasks() ([]store.BlockedTask, error) {
@@ -2553,6 +2565,52 @@ func TestDispatch_RerunOnDone_Supersedes(t *testing.T) {
 	}
 	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "sess-rerun" {
 		t.Errorf("expected fresh autopilot_jobs claim with new session id; got %v", got)
+	}
+}
+
+// TestDispatch_RerunOnDone_ParksWhenBlocked verifies /rerun respects blockers
+// like a fresh assign: a DONE task whose issue still has unresolved blockers is
+// superseded (fresh attempt claimed) and then parked BLOCKED instead of
+// spawning a run. The BlockerWatcher resumes it once the blockers clear. This
+// closes the gap where /rerun bypassed the dependency gate and shipped a
+// sub-issue before its foundation.
+func TestDispatch_RerunOnDone_ParksWhenBlocked(t *testing.T) {
+	mlc := &mockLinearClient{
+		IssueBlockers: []linear.IssueBlocker{{IssueID: "id-A", IssueIdentifier: "GEO-A"}},
+	}
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:  "issue-b",
+			State:    store.JobStateDone,
+			AttemptN: 1,
+			PRURL:    "https://github.com/x/y/pull/1",
+		},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-rerun",
+		IssueID:         "issue-b",
+		IssueIdentifier: "GEO-B",
+		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-rerun",
+		PromptContext:   "/rerun",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	// Supersede still happens before the gate (fresh attempt claimed).
+	if got := ms.SupersededAdmiralIssues; len(got) != 1 || got[0] != "issue-b" {
+		t.Errorf("expected supersession on issue-b; got %v", got)
+	}
+	// Parked BLOCKED, synchronously, before any run goroutine spawns.
+	if got := ms.SetBlockedSnapshot(); len(got) != 1 || got[0] != "issue-b" {
+		t.Errorf("expected issue-b parked BLOCKED; got %v", got)
+	}
+	// Give any (erroneously spawned) run goroutine a chance to claim, then
+	// assert none did.
+	time.Sleep(50 * time.Millisecond)
+	if got := ms.ClaimedSnapshot(); len(got) != 0 {
+		t.Errorf("blocked rerun must not spawn a run (no autopilot_jobs claim); got %v", got)
 	}
 }
 
