@@ -46,6 +46,15 @@ type resetLinear interface {
 // captureCmd with the configured ghBin; tests inject a fake.
 type ghRunner func(ctx context.Context, args ...string) (string, error)
 
+// resetStore is the slice of the store the reset flow needs. Declared as an
+// interface (not *store.Store) so both the admin handler (concrete *store.Store)
+// and the orchestrator's /reset command (storeInterface) can drive runResetTask.
+type resetStore interface {
+	GetAdmiralTaskByIssue(issueID string) (*store.AdmiralTask, error)
+	ResetIssueRows(issueID string) error
+	DeleteTaskVerification(parentIssueID string) error
+}
+
 type resetTaskRequest struct {
 	Parent string `json:"parent"`
 }
@@ -130,7 +139,7 @@ func runResetTask(
 	ctx context.Context,
 	lc resetLinear,
 	gh ghRunner,
-	db *store.Store,
+	db resetStore,
 	requireLabel string,
 	logger *slog.Logger,
 	parentID string,
