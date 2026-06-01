@@ -150,7 +150,7 @@ func main() {
 		"listen", adminAddr,
 	)
 	go func() {
-		if err := autopilot.ServeAdminHTTP(adminAddr, db, lc, cfg.Autopilot.GhBin, logger, n, adminToken); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := autopilot.ServeAdminHTTP(adminAddr, db, lc, cfg.Autopilot.GhBin, logger, n, adminToken, cfg.Discoverer.RequireLabel); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("admin server failed", "err", err)
 			cancel()
 		}

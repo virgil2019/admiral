@@ -32,13 +32,14 @@ func must(fsys fs.FS, err error) fs.FS {
 
 // adminServer serves the admin HTTP API (read + write).
 type adminServer struct {
-	db         *store.Store
-	lc         *linear.Client
-	logger     *slog.Logger
-	ghBin      string
-	start      time.Time
-	workers    int
-	adminToken string
+	db           *store.Store
+	lc           *linear.Client
+	logger       *slog.Logger
+	ghBin        string
+	start        time.Time
+	workers      int
+	adminToken   string
+	requireLabel string // discoverer.require_label; dropped from subs on reset-task
 }
 
 // adminRepoResponse is the JSON shape for /admin/repos.
@@ -117,8 +118,8 @@ type testCloneResponse struct {
 	Error     string `json:"error,omitempty"`
 }
 
-func newAdminServer(db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken string) *adminServer {
-	return &adminServer{db: db, lc: lc, ghBin: ghBin, logger: logger, start: time.Now(), workers: workers, adminToken: adminToken}
+func newAdminServer(db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken, requireLabel string) *adminServer {
+	return &adminServer{db: db, lc: lc, ghBin: ghBin, logger: logger, start: time.Now(), workers: workers, adminToken: adminToken, requireLabel: requireLabel}
 }
 
 // projectFilterCookie is the name of the cookie that scopes the admin UI
@@ -993,12 +994,12 @@ func adminAuth(token string, h http.Handler) http.Handler {
 
 // ServeAdminHTTP starts the admin HTTP server on addr.
 // If adminToken is empty the server is disabled (logged as warn) and returns nil immediately.
-func ServeAdminHTTP(addr string, db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken string) error {
+func ServeAdminHTTP(addr string, db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken, requireLabel string) error {
 	if adminToken == "" {
 		logger.Warn("admin server disabled: autopilot.admin_token not set; set ADMIRAL_ADMIN_TOKEN env or autopilot.admin_token in config to enable")
 		return nil
 	}
-	as := newAdminServer(db, lc, ghBin, logger, workers, adminToken)
+	as := newAdminServer(db, lc, ghBin, logger, workers, adminToken, requireLabel)
 	mux := newAdminMux(as, adminToken)
 	srv := &http.Server{
 		Addr:              addr,
@@ -1052,6 +1053,7 @@ func (s *adminServer) serveMux() *http.ServeMux {
 	mux.HandleFunc("/admin/jobs/", s.getJobHandler)
 	mux.HandleFunc("/admin/load", s.loadHandler)
 	mux.HandleFunc("/admin/health", s.healthHandler)
+	mux.HandleFunc("/admin/reset-task", s.resetTaskHandler)
 	return mux
 }
 
