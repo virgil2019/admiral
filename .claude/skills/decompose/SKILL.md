@@ -1,6 +1,6 @@
 ---
 name: decompose
-description: Decompose a task into a Linear issue hierarchy ready for the admiral autonomous loop — one parent issue holding the PRD, plus orthogonal sub-issues (foundation-first, dependency-ordered) each with acceptance criteria, wired with blocking relations and labelled agent-ready last so the discoverer picks them up only after setup is complete. Invoke when the user says "/decompose", "decompose this", "拆任务", "拆分到 Linear", "break this down into issues", or wants to turn a PRD/design doc into admiral-ready Linear sub-issues. Requires the Linear MCP.
+description: Decompose a task into a Linear issue hierarchy for the admiral autonomous loop — one parent issue holding the PRD, plus orthogonal sub-issues (foundation-first, dependency-ordered) each with acceptance criteria, wired with blocking relations. Creates the issues only; it deliberately does NOT apply the pickup label, so nothing is shipped until the user explicitly activates the task. Invoke when the user says "/decompose", "decompose this", "拆任务", "拆分到 Linear", "break this down into issues", or wants to turn a PRD/design doc into admiral-ready Linear sub-issues. Requires the Linear MCP.
 ---
 
 # Decompose
@@ -11,17 +11,47 @@ Break a task into a Linear issue hierarchy ready for the admiral autonomous loop
 
 Confirm you have Linear MCP available. If `linear.save_issue` is not available, tell the user and stop.
 
-## Step 1 — Confirm PRD is ready
+## Step 1 — Confirm the PRD exists
 
 Ask the user to confirm the requirements doc (design doc, PRD, issue description, or equivalent) is ready and accessible. Do not proceed until confirmed.
 
 If the user says the doc is not ready, stop and tell them to prepare it first.
 
-## Step 2 — Clarify if needed
+## Step 2 — Gate on detail: is the PRD decomposable?
 
-Read the PRD. If anything is ambiguous (scope, acceptance criteria, non-obvious decisions), use the Clarify tool to ask the user to clarify before decomposing.
+The PRD must be detailed enough to decompose well. The test is not length —
+it is this single meta-principle:
 
-You may resolve ambiguities yourself if you can infer the intent from context — only ask when genuinely unclear.
+> **A PRD is detailed enough when every functional piece you would split out
+> can be given a concrete, verifiable acceptance criterion — a black-box
+> condition a reviewer (or admiral's verify judge) can check a PR against
+> without guessing intent.**
+
+Why this matters: the acceptance criteria you write become each sub-issue's
+description, and that is the ONLY thing admiral's verify loop judges the
+shipped work against. Vague criteria → the judge cannot tell done from
+not-done → the loop cannot converge. A thin PRD does not fail loudly; it
+silently produces sub-issues nobody can verify.
+
+So, before decomposing, mentally draft an acceptance criterion for each piece
+you intend to split out. Wherever you **cannot** write a concrete, testable
+one — because the PRD is silent, vague, or self-contradictory there — that is
+a gap in the document, not something to paper over.
+
+For each gap, either:
+- **Infer it** if the intent is genuinely unambiguous from context (state the
+  assumption you are making), or
+- **Ask the user** via the Clarify tool to supply the missing detail, or offer
+  to draft the missing spec for them to confirm.
+
+Do NOT proceed to create issues while any intended sub-issue would have a
+vague or missing acceptance criterion. Resolve every gap first — refine the
+PRD with the user until each piece is concretely verifiable. Only then move on.
+
+A useful prompt to the user when the doc is too thin: list the specific
+questions whose answers you need to write testable criteria (e.g. "what is the
+expected response when the id is unknown — 404 or empty 200?"), rather than a
+generic "please add more detail".
 
 ## Step 3 — Analyze the requirements
 
@@ -33,22 +63,24 @@ Extract from the PRD:
 - **Orthogonality**: pieces that can run in parallel without PR conflicts — keep them independent
 - **Acceptance criteria**: concrete, verifiable conditions for each piece
 
-## The label gates everything — set it LAST
+## The label is the trigger — this skill NEVER applies it
 
-This is the load-bearing invariant of the whole skill. admiral's discoverer
-picks up any sub-issue that carries the pickup label (the team's configured
+This is the load-bearing rule of the whole skill. admiral's discoverer picks
+up any sub-issue that carries the pickup label (the team's configured
 `discoverer.require_label`, default `agent-ready`) in a pickable state. The
 moment a sub-issue gets that label, it can be shipped on the next discoverer
 tick.
 
-So every other setup step — parent attachment, blocking relations,
-acceptance criteria — MUST be in place before the label is added. The phases
-below are ordered to guarantee this: labels go on only in the final phase,
-after all IDs exist and all `blockedBy` relations are set.
+**Decompose only creates the issue structure — it does NOT apply the pickup
+label.** Applying the label kicks off autonomous shipping, so it is a separate,
+explicit human action: the user reviews the decomposition first, then triggers
+activation themselves (see Step 7). This skill must leave every sub-issue
+UNlabeled.
 
 Use `linear.save_issue` for everything (create when `id` is omitted, update
 when `id` is passed). It supports `parentId`, `labels`, `blockedBy`,
-`blocks`, and `state` directly.
+`blocks`, and `state` directly — but do NOT pass `labels` with the pickup
+label at any point in this skill.
 
 ## Step 4 — Create the parent issue
 
@@ -66,10 +98,10 @@ unit — the discoverer only ever picks up its sub-issues.
 
 Record the returned parent identifier.
 
-## Step 5 — Create sub-issues (no label yet)
+## Step 5 — Create sub-issues (unlabeled)
 
 For each functional piece from Step 3, create a sub-issue WITHOUT the pickup
-label:
+label (this skill never adds it — see Step 7):
 
 ```
 linear.save_issue(
@@ -117,19 +149,27 @@ relations: a sub-issue with an unresolved blocker is parked BLOCKED and
 auto-resumes once its blockers reach a completed state — so foundation ships
 first, dependents wait, naturally.
 
-## Step 7 — Add the pickup label (final step, opens the gate)
+## Step 7 — Stop. Do NOT label. Hand off activation to the user
 
-Only now, with parents attached and all blocking relations set, label every
-sub-issue so the discoverer starts picking them up:
+The issue structure is now complete (parent + sub-issues + acceptance
+criteria + blocking relations), but every sub-issue is still UNlabeled, so
+the discoverer will not touch any of it. This is intentional.
 
-```
-linear.save_issue(id: <sub-issue identifier>, labels: ["agent-ready"])
-```
+Do NOT apply the pickup label. Instead, tell the user the task is staged and
+explain how to activate it when they are ready — activation is their explicit
+trigger, made after they review the decomposition:
 
-Use the team's configured `discoverer.require_label` value (default
-`agent-ready`). Adding the label any earlier opens a race where the
-discoverer grabs an issue before its blockers exist — that is exactly the
-window this ordering closes.
+- **`/activate <parent issue>`** — the dedicated activation skill. It confirms
+  the project + parent issue with the user, then applies the pickup label. Use
+  this rather than labeling inline; it has the wrong-target safety gate.
+- **Manually**: add the pickup label (`discoverer.require_label`, default
+  `agent-ready`) to the sub-issues in Linear.
+
+Either way, because all blocking relations are already set (Step 6), labeling
+order is safe — dependents stay BLOCKED until the foundation completes.
+
+Do not apply the label yourself from within this skill, even if it seems
+convenient — activation is a separate, explicitly-triggered step.
 
 ## Step 8 — Summary
 
@@ -138,7 +178,7 @@ Report to the user:
 - Parent issue URL
 - Sub-issue URLs with acceptance criteria summary
 - Dependency chain (which sub-issue must complete before which)
-- Confirmation that blocking relations were set and the pickup label applied
+- That the task is STAGED but NOT active (no pickup label applied), and how to activate it
 
 Example summary:
 
@@ -150,13 +190,14 @@ Parent: [GEO-1] Build login feature
      └─ [GEO-5] Session management (parallel with GEO-3)
 
 Blocking relations: set (GEO-3/GEO-5 blocked by GEO-2; GEO-4 blocked by GEO-3)
-Labels: agent-ready applied to GEO-2, GEO-3, GEO-4, GEO-5
+Status: STAGED — no agent-ready label applied; nothing will ship yet.
+To activate: add the "agent-ready" label to the sub-issues (or ask me to).
 ```
 
 ## Constraints
 
-- Parent issue NEVER gets agent-ready label — it is the task definition, not a work unit
-- Only sub-issues get agent-ready label, added at the very end
+- This skill NEVER applies the pickup label — not to the parent, not to sub-issues. Creating the structure and activating it are separate actions; activation is the user's explicit trigger.
+- Parent issue is the task definition, never a work unit — it is never labeled or picked up regardless.
 - Sub-issue description = acceptance criteria, not implementation details — this is what admiral's verify loop judges against
 - If the user provides vague requirements, ask clarifying questions before decomposing
 - Do not create more than ~10 sub-issues — if a task is that large, suggest decomposing into multiple parent tasks
