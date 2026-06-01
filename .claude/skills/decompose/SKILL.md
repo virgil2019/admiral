@@ -159,15 +159,17 @@ Do NOT apply the pickup label. Instead, tell the user the task is staged and
 explain how to activate it when they are ready — activation is their explicit
 trigger, made after they review the decomposition:
 
+- **`/activate <parent issue>`** — the dedicated activation skill. It confirms
+  the project + parent issue with the user, then applies the pickup label. Use
+  this rather than labeling inline; it has the wrong-target safety gate.
 - **Manually**: add the pickup label (`discoverer.require_label`, default
-  `agent-ready`) to the sub-issues in Linear. Add it to the foundation
-  sub-issue first if they want to gate the rollout; blocked dependents can be
-  labeled at the same time since their `blockedBy` relations already hold them
-  back until the foundation completes.
+  `agent-ready`) to the sub-issues in Linear.
 
-If the user explicitly asks you (now or later) to activate the task, only then
-apply the label via `linear.save_issue(id, labels: [...])` — and because all
-blocking relations are already set (Step 6), labeling order is safe.
+Either way, because all blocking relations are already set (Step 6), labeling
+order is safe — dependents stay BLOCKED until the foundation completes.
+
+Do not apply the label yourself from within this skill, even if it seems
+convenient — activation is a separate, explicitly-triggered step.
 
 ## Step 8 — Summary
 
