@@ -276,11 +276,20 @@ type mockLinearClient struct {
 	// RemoveIssueLabel recorder (/reset)
 	RemovedLabels       []struct{ IssueID, LabelID string }
 	RemoveIssueLabelErr error
+
+	// UnassignIssue recorder (/reset)
+	UnassignedIssues []string
+	UnassignIssueErr error
 }
 
 func (m *mockLinearClient) RemoveIssueLabel(_ context.Context, issueID, labelID string) error {
 	m.RemovedLabels = append(m.RemovedLabels, struct{ IssueID, LabelID string }{issueID, labelID})
 	return m.RemoveIssueLabelErr
+}
+
+func (m *mockLinearClient) UnassignIssue(_ context.Context, issueID string) error {
+	m.UnassignedIssues = append(m.UnassignedIssues, issueID)
+	return m.UnassignIssueErr
 }
 
 func (m *mockLinearClient) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {

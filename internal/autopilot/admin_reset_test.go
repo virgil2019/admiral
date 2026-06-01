@@ -24,6 +24,7 @@ type fakeResetLinear struct {
 	labelID      string
 	stateUpdates map[string]string // issueID -> stateID
 	labelRemoved map[string]string // issueID -> labelID
+	unassigned   map[string]bool   // issueID -> unassigned
 }
 
 func (f *fakeResetLinear) GetIssue(ctx context.Context, id string) (*linear.Issue, error) {
@@ -48,6 +49,13 @@ func (f *fakeResetLinear) IssueUpdate(ctx context.Context, issueID, stateID stri
 		f.stateUpdates = map[string]string{}
 	}
 	f.stateUpdates[issueID] = stateID
+	return nil
+}
+func (f *fakeResetLinear) UnassignIssue(ctx context.Context, issueID string) error {
+	if f.unassigned == nil {
+		f.unassigned = map[string]bool{}
+	}
+	f.unassigned[issueID] = true
 	return nil
 }
 func (f *fakeResetLinear) RemoveIssueLabel(ctx context.Context, issueID, labelID string) error {
@@ -116,6 +124,9 @@ func TestRunResetTask_MergedGuardAbortsUntouched(t *testing.T) {
 	if len(lc.stateUpdates) != 0 {
 		t.Fatalf("guard should not mutate Linear state, got %v", lc.stateUpdates)
 	}
+	if len(lc.unassigned) != 0 {
+		t.Fatalf("guard should not unassign, got %v", lc.unassigned)
+	}
 	if task, _ := s.GetAdmiralTaskByIssue("sub-1"); task == nil {
 		t.Fatal("guard should not delete admiral_tasks row")
 	}
@@ -164,6 +175,9 @@ func TestRunResetTask_HappyPath(t *testing.T) {
 		}
 		if lc.labelRemoved[id] != "label-ready" {
 			t.Errorf("sub %s label not removed: %v", id, lc.labelRemoved[id])
+		}
+		if !lc.unassigned[id] {
+			t.Errorf("sub %s not unassigned", id)
 		}
 	}
 	// Only sub-1 had a PR to close.

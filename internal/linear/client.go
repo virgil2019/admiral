@@ -638,6 +638,30 @@ func (c *Client) AssignIssue(ctx context.Context, issueID, userID string) error 
 	return nil
 }
 
+// UnassignIssue clears the assignee of issueID (sets assigneeId to null).
+// The reset-task flow calls it so a reset sub-issue returns to the
+// unassigned state the discoverer requires: the discoverer scans with
+// assignee:{null:true}, so a sub still assigned to admiral stays invisible
+// to it even after re-activation (re-adding the require_label).
+func (c *Client) UnassignIssue(ctx context.Context, issueID string) error {
+	input := map[string]any{"assigneeId": nil}
+	var data struct {
+		IssueUpdate struct {
+			Success bool `json:"success"`
+		} `json:"issueUpdate"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     issueUpdateMutation,
+		Variables: map[string]any{"id": issueID, "input": input},
+	}, &data); err != nil {
+		return err
+	}
+	if !data.IssueUpdate.Success {
+		return fmt.Errorf("issueUpdate returned success=false")
+	}
+	return nil
+}
+
 // RemoveIssueLabel drops a single label (by label UUID) from an issue via
 // issueUpdate's removedLabelIds, leaving the issue's other labels intact. The
 // reset-task admin flow uses it to strip the discoverer's require_label

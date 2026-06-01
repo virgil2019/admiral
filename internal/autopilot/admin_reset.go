@@ -39,6 +39,7 @@ type resetLinear interface {
 	GetWorkflowStates(ctx context.Context, teamID string) ([]linear.WorkflowState, error)
 	GetTeamLabelID(ctx context.Context, teamID, name string) (string, error)
 	IssueUpdate(ctx context.Context, issueID, stateID string) error
+	UnassignIssue(ctx context.Context, issueID string) error
 	RemoveIssueLabel(ctx context.Context, issueID, labelID string) error
 }
 
@@ -220,6 +221,13 @@ func runResetTask(
 		}
 		if err := lc.IssueUpdate(ctx, p.sub.ID, backlogStateID); err != nil {
 			warns = append(warns, fmt.Sprintf("set state→backlog failed: %v", err))
+		}
+		// Clear the assignee: the discoverer only scans unassigned issues
+		// (assignee:{null:true}), so a sub left assigned to admiral stays
+		// invisible to it even after re-activation — the reset would never
+		// be re-picked.
+		if err := lc.UnassignIssue(ctx, p.sub.ID); err != nil {
+			warns = append(warns, fmt.Sprintf("unassign failed: %v", err))
 		}
 		if labelID != "" {
 			if err := lc.RemoveIssueLabel(ctx, p.sub.ID, labelID); err != nil {

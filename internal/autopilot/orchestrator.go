@@ -105,8 +105,10 @@ type linearClientInterface interface {
 	GetTeamLabelID(ctx context.Context, teamID, name string) (string, error)
 	CreateComment(ctx context.Context, issueID, body string) error
 
-	// /reset command (PR-B): drop the require_label from a sub-issue.
+	// /reset command (PR-B): drop the require_label from a sub-issue and
+	// clear its assignee so the discoverer can re-pick it after re-activation.
 	RemoveIssueLabel(ctx context.Context, issueID, labelID string) error
+	UnassignIssue(ctx context.Context, issueID string) error
 }
 
 type Orchestrator struct {
