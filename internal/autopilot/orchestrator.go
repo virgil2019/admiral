@@ -84,6 +84,10 @@ type storeInterface interface {
 	GetTaskVerification(parentIssueID string) (*store.TaskVerification, error)
 	BumpTaskVerificationRound(parentIssueID string) (*store.TaskVerification, error)
 	SetTaskVerificationStatus(parentIssueID, status string) error
+
+	// /reset command (PR-B): cascade-delete a task's per-issue + verify rows.
+	ResetIssueRows(issueID string) error
+	DeleteTaskVerification(parentIssueID string) error
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -100,6 +104,9 @@ type linearClientInterface interface {
 	IssueCreate(ctx context.Context, in linear.IssueCreateInput) (*linear.Issue, error)
 	GetTeamLabelID(ctx context.Context, teamID, name string) (string, error)
 	CreateComment(ctx context.Context, issueID, body string) error
+
+	// /reset command (PR-B): drop the require_label from a sub-issue.
+	RemoveIssueLabel(ctx context.Context, issueID, labelID string) error
 }
 
 type Orchestrator struct {
@@ -290,6 +297,23 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	// from an @mention inside a comment — parse it as a command on a live
 	// task, or reject as "assign first" if there's no live task yet.
 	isDelegate := ev.Action == linear.ActionCreated && ev.SourceCommentID == ""
+
+	// /reset is a parent-level command: it resets a whole task (parent + all
+	// sub-issues), and the parent issue usually has no admiral_tasks row of its
+	// own. Intercept it here, before the task==nil gate below would reject a
+	// command on a row-less parent. A genuine delegate/assign is never /reset.
+	//
+	// This fires for any @mention whose first token is /reset, including on a
+	// sub-issue (where it'll report "no sub-issues") or an AWAITING_INPUT task
+	// (where a reply literally starting with /reset is treated as the command,
+	// not the answer). Both are acceptable: /reset is always a command, and
+	// mentioning it anywhere but the parent task is a no-op-with-explanation.
+	if !isDelegate {
+		if name, remainder, ok := parseMentionCommand(text); ok && name == "reset" {
+			o.dispatchReset(ev, remainder)
+			return
+		}
+	}
 
 	task, err := o.db.GetAdmiralTaskByIssue(ev.IssueID)
 	if err != nil {

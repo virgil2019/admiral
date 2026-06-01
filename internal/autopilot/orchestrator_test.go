@@ -272,6 +272,15 @@ type mockLinearClient struct {
 	CreatedComments   []struct{ IssueID, Body string }
 	CreateCommentErr  error
 	GetIssueByID      map[string]*linear.Issue // per-id GetIssue override (sub titles)
+
+	// RemoveIssueLabel recorder (/reset)
+	RemovedLabels       []struct{ IssueID, LabelID string }
+	RemoveIssueLabelErr error
+}
+
+func (m *mockLinearClient) RemoveIssueLabel(_ context.Context, issueID, labelID string) error {
+	m.RemovedLabels = append(m.RemovedLabels, struct{ IssueID, LabelID string }{issueID, labelID})
+	return m.RemoveIssueLabelErr
 }
 
 func (m *mockLinearClient) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {
@@ -424,6 +433,22 @@ type mockStore struct {
 	BumpCalls               []string
 	SetStatusCalls          []struct{ ParentID, Status string }
 	SetStatusErr            error
+
+	// /reset cascade recorders (PR-B)
+	ResetIssueRowsCalls       []string
+	ResetIssueRowsErr         error
+	DeletedTaskVerifications  []string
+	DeleteTaskVerificationErr error
+}
+
+func (m *mockStore) ResetIssueRows(issueID string) error {
+	m.ResetIssueRowsCalls = append(m.ResetIssueRowsCalls, issueID)
+	return m.ResetIssueRowsErr
+}
+
+func (m *mockStore) DeleteTaskVerification(parentIssueID string) error {
+	m.DeletedTaskVerifications = append(m.DeletedTaskVerifications, parentIssueID)
+	return m.DeleteTaskVerificationErr
 }
 
 func (m *mockStore) AnyAutopilotJobActive() (bool, string, error) {
