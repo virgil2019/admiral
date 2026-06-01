@@ -11,17 +11,47 @@ Break a task into a Linear issue hierarchy ready for the admiral autonomous loop
 
 Confirm you have Linear MCP available. If `linear.save_issue` is not available, tell the user and stop.
 
-## Step 1 — Confirm PRD is ready
+## Step 1 — Confirm the PRD exists
 
 Ask the user to confirm the requirements doc (design doc, PRD, issue description, or equivalent) is ready and accessible. Do not proceed until confirmed.
 
 If the user says the doc is not ready, stop and tell them to prepare it first.
 
-## Step 2 — Clarify if needed
+## Step 2 — Gate on detail: is the PRD decomposable?
 
-Read the PRD. If anything is ambiguous (scope, acceptance criteria, non-obvious decisions), use the Clarify tool to ask the user to clarify before decomposing.
+The PRD must be detailed enough to decompose well. The test is not length —
+it is this single meta-principle:
 
-You may resolve ambiguities yourself if you can infer the intent from context — only ask when genuinely unclear.
+> **A PRD is detailed enough when every functional piece you would split out
+> can be given a concrete, verifiable acceptance criterion — a black-box
+> condition a reviewer (or admiral's verify judge) can check a PR against
+> without guessing intent.**
+
+Why this matters: the acceptance criteria you write become each sub-issue's
+description, and that is the ONLY thing admiral's verify loop judges the
+shipped work against. Vague criteria → the judge cannot tell done from
+not-done → the loop cannot converge. A thin PRD does not fail loudly; it
+silently produces sub-issues nobody can verify.
+
+So, before decomposing, mentally draft an acceptance criterion for each piece
+you intend to split out. Wherever you **cannot** write a concrete, testable
+one — because the PRD is silent, vague, or self-contradictory there — that is
+a gap in the document, not something to paper over.
+
+For each gap, either:
+- **Infer it** if the intent is genuinely unambiguous from context (state the
+  assumption you are making), or
+- **Ask the user** via the Clarify tool to supply the missing detail, or offer
+  to draft the missing spec for them to confirm.
+
+Do NOT proceed to create issues while any intended sub-issue would have a
+vague or missing acceptance criterion. Resolve every gap first — refine the
+PRD with the user until each piece is concretely verifiable. Only then move on.
+
+A useful prompt to the user when the doc is too thin: list the specific
+questions whose answers you need to write testable criteria (e.g. "what is the
+expected response when the id is unknown — 404 or empty 200?"), rather than a
+generic "please add more detail".
 
 ## Step 3 — Analyze the requirements
 
