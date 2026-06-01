@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
@@ -88,6 +89,74 @@ func baseFakeLinear() *fakeResetLinear {
 		},
 		states:  []linear.WorkflowState{{ID: "state-backlog", Name: "Backlog", Type: "backlog"}},
 		labelID: "label-ready",
+	}
+}
+
+func TestGhReadWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
+	calls := 0
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		calls++
+		if calls < 3 {
+			return `Post "https://api.github.com/graphql": EOF`, fmt.Errorf("exit status 1")
+		}
+		return `{"state":"OPEN"}`, nil
+	}
+	out, err := ghReadWithRetry(context.Background(), gh, []time.Duration{0, 0, 0}, "pr", "view", "x")
+	if err != nil {
+		t.Fatalf("expected success after retries, got %v", err)
+	}
+	if out != `{"state":"OPEN"}` {
+		t.Fatalf("unexpected out: %s", out)
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 calls (2 transient + 1 ok), got %d", calls)
+	}
+}
+
+func TestGhReadWithRetry_NonTransientNoRetry(t *testing.T) {
+	calls := 0
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		calls++
+		return "HTTP 404: Not Found", fmt.Errorf("exit status 1")
+	}
+	_, err := ghReadWithRetry(context.Background(), gh, []time.Duration{0, 0, 0}, "pr", "view", "x")
+	if err == nil {
+		t.Fatal("expected error for non-transient failure")
+	}
+	if calls != 1 {
+		t.Fatalf("non-transient should not retry, got %d calls", calls)
+	}
+}
+
+func TestGhReadWithRetry_ExhaustsReturnsError(t *testing.T) {
+	calls := 0
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		calls++
+		return `dial tcp: i/o timeout`, fmt.Errorf("exit status 1")
+	}
+	_, err := ghReadWithRetry(context.Background(), gh, []time.Duration{0, 0}, "pr", "view", "x")
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 calls (1 + 2 retries), got %d", calls)
+	}
+}
+
+func TestGhReadWithRetry_RespectsContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before the first backoff sleep
+	calls := 0
+	gh := func(_ context.Context, args ...string) (string, error) {
+		calls++
+		return `dial tcp: i/o timeout`, fmt.Errorf("exit status 1")
+	}
+	_, err := ghReadWithRetry(ctx, gh, []time.Duration{time.Hour}, "pr", "view", "x")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 call before cancellation aborts the backoff, got %d", calls)
 	}
 }
 

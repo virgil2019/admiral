@@ -126,7 +126,7 @@ func (c *Client) ghReadRetry(ctx context.Context, args ...string) (string, error
 		if lastErr == nil {
 			return out, nil
 		}
-		if !isTransientGhFailure(out, lastErr) || attempt == len(ghReadRetryDelays) {
+		if !IsTransientGhFailure(out, lastErr) || attempt == len(ghReadRetryDelays) {
 			return out, lastErr
 		}
 		select {
@@ -138,7 +138,7 @@ func (c *Client) ghReadRetry(ctx context.Context, args ...string) (string, error
 	return out, lastErr
 }
 
-// isTransientGhFailure inspects gh's combined output for patterns
+// IsTransientGhFailure inspects gh's combined output for patterns
 // that suggest a retry is worthwhile. gh itself does not classify
 // these — it just exits non-zero and prints the upstream error
 // verbatim, so we pattern-match on the substring shapes admiral has
@@ -161,7 +161,7 @@ func (c *Client) ghReadRetry(ctx context.Context, args ...string) (string, error
 // "could not resolve" — those are permanent and a retry just wastes
 // time. The PR-not-resolvable path is already handled at the call
 // site (isPRNotResolvable), so we don't need to also filter it here.
-func isTransientGhFailure(output string, err error) bool {
+func IsTransientGhFailure(output string, err error) bool {
 	if err == nil {
 		return false
 	}

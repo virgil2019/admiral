@@ -346,8 +346,8 @@ func TestIsTransientGhFailure(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := isTransientGhFailure(c.output, c.err); got != c.want {
-				t.Errorf("isTransientGhFailure(%q, %v) = %v, want %v",
+			if got := IsTransientGhFailure(c.output, c.err); got != c.want {
+				t.Errorf("IsTransientGhFailure(%q, %v) = %v, want %v",
 					c.output, c.err, got, c.want)
 			}
 		})
