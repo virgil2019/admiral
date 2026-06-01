@@ -242,6 +242,11 @@ const issueQuery = `query Issue($id: String!) {
   }
 }`
 
+// ErrIssueNotFound is returned (wrapped) by GetIssue when Linear has no issue
+// with the given id, letting callers distinguish a genuine 404 from a
+// transport/GraphQL error via errors.Is.
+var ErrIssueNotFound = errors.New("issue not found")
+
 func (c *Client) GetIssue(ctx context.Context, id string) (*Issue, error) {
 	var data struct {
 		Issue *struct {
@@ -286,7 +291,7 @@ func (c *Client) GetIssue(ctx context.Context, id string) (*Issue, error) {
 		return nil, err
 	}
 	if data.Issue == nil || data.Issue.ID == "" {
-		return nil, fmt.Errorf("issue %s not found", id)
+		return nil, fmt.Errorf("%w: %s", ErrIssueNotFound, id)
 	}
 	out := &Issue{
 		ID:          data.Issue.ID,
@@ -616,6 +621,33 @@ func (c *Client) IssueUpdate(ctx context.Context, issueID, stateID string) error
 // discoverer service to self-assign issues it elects to take.
 func (c *Client) AssignIssue(ctx context.Context, issueID, userID string) error {
 	input := map[string]any{"assigneeId": userID}
+	var data struct {
+		IssueUpdate struct {
+			Success bool `json:"success"`
+		} `json:"issueUpdate"`
+	}
+	if err := c.do(ctx, graphQLRequest{
+		Query:     issueUpdateMutation,
+		Variables: map[string]any{"id": issueID, "input": input},
+	}, &data); err != nil {
+		return err
+	}
+	if !data.IssueUpdate.Success {
+		return fmt.Errorf("issueUpdate returned success=false")
+	}
+	return nil
+}
+
+// RemoveIssueLabel drops a single label (by label UUID) from an issue via
+// issueUpdate's removedLabelIds, leaving the issue's other labels intact. The
+// reset-task admin flow uses it to strip the discoverer's require_label
+// ("agent-ready") so a reset sub-issue returns to a staged / un-activated
+// state. No-op on Linear's side if the issue doesn't carry the label.
+//
+// Callers resolve the label name to a UUID with GetTeamLabelID first
+// (mirroring the planner), since issueUpdate operates on label IDs, not names.
+func (c *Client) RemoveIssueLabel(ctx context.Context, issueID, labelID string) error {
+	input := map[string]any{"removedLabelIds": []string{labelID}}
 	var data struct {
 		IssueUpdate struct {
 			Success bool `json:"success"`

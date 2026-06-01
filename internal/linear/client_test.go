@@ -118,6 +118,36 @@ func TestAssignIssue(t *testing.T) {
 	}
 }
 
+func TestRemoveIssueLabel(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueUpdate": map[string]any{"success": true},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if err := c.RemoveIssueLabel(context.Background(), "issue-9", "label-ready"); err != nil {
+		t.Fatalf("RemoveIssueLabel failed: %v", err)
+	}
+	vars := receivedBody["variables"].(map[string]any)
+	input := vars["input"].(map[string]any)
+	removed, ok := input["removedLabelIds"].([]any)
+	if !ok || len(removed) != 1 || removed[0] != "label-ready" {
+		t.Errorf("expected removedLabelIds [label-ready], got %v", input["removedLabelIds"])
+	}
+	if vars["id"] != "issue-9" {
+		t.Errorf("expected id 'issue-9', got %v", vars["id"])
+	}
+}
+
 func TestIssueCreate(t *testing.T) {
 	var receivedBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
