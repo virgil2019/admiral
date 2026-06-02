@@ -282,6 +282,35 @@ query { projects { nodes { id name } } }
 An issue without a project assigned is **rejected** at pre-flight. If
 one product spans multiple repos, create one Linear project per repo.
 
+### One-time GitHub setup (PR review-fix)
+
+admiral closes the loop on the PRs it opens: when a reviewer leaves
+feedback, admiral receives it via a **GitHub webhook** and runs claude to
+address the comments. This is **separate from the Linear webhook** and must
+be configured **per repo** (GitHub → repo **Settings → Webhooks → Add
+webhook**). Without it, admiral opens PRs but never reacts to reviews.
+
+- **Payload URL**: `https://<your-tunnel>/github/webhook`
+  — note the `/github/webhook` path. It's distinct from Linear's `/webhook`,
+  but served on the **same** `autopilot.listen_addr` (port 8787). Don't point
+  it at Linear's path.
+- **Content type**: `application/json` (required — admiral parses JSON).
+- **Secret**: must match `autopilot.gh_webhook_secret`
+  (admiral verifies `X-Hub-Signature-256`).
+- **Which events**: the default "Just the push event" will NOT work. Choose
+  **"Let me select individual events"** and check **all three**:
+  - **Pull request reviews** (`pull_request_review`)
+  - **Pull request review comments** (`pull_request_review_comment`)
+  - **Issue comments** (`issue_comment` — PR conversation comments are issue_comments)
+
+  Missing any one means admiral silently never sees that class of feedback.
+
+> **Single-account caveat**: admiral drops events authored by its own bot
+> identity (`autopilot.gh_bot_login`) to avoid self-trigger loops. If the
+> human reviewer uses the **same** GitHub account as `gh_bot_login`, their
+> review comments get dropped too. Either review from a different account,
+> or leave `gh_bot_login` empty (the self-comment sentinel still guards loops).
+
 ### Run
 
 ```yaml
@@ -293,6 +322,8 @@ autopilot:
   listen_addr: ":8787"        # webhook receiver (Linear → this port)
   admin_listen_addr: "127.0.0.1:8788"  # admin API/UI (localhost only by default)
   admin_token: "change-me"    # static token for admin auth (Bearer or cookie)
+  gh_webhook_secret: "change-me"  # must match the GitHub webhook secret (X-Hub-Signature-256)
+  gh_bot_login: "my-bot-account"  # admiral's GitHub login; events it authors are filtered (empty = single-account, rely on sentinel)
   repo_dir: "/path/to/your/repo"
   repos:
     - project_id: "..."
