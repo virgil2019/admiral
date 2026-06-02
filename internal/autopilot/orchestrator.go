@@ -2423,8 +2423,15 @@ func (f *flow) ensurePR(issue *linear.Issue) (string, error) {
 }
 
 func (f *flow) lookupPR() (string, error) {
-	out, err := captureCmd(f.ctx, f.worktreePath,
-		f.o.cfg.GhBin, "pr", "list",
+	// Retry on transient gh failures (GitHub GraphQL EOF / 5xx / connection
+	// reset): a single network blip here must not fail the whole job and leave
+	// an already-created PR orphaned — which would also stall every sub-issue
+	// blocked on this one. Mirrors the reset merged-PR guard's retry.
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		return captureCmd(ctx, f.worktreePath, f.o.cfg.GhBin, args...)
+	}
+	out, err := ghReadWithRetry(f.ctx, gh, ghReadDelays,
+		"pr", "list",
 		"--head", f.branch,
 		"--state", "open",
 		"--json", "url",
