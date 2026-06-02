@@ -15,16 +15,17 @@ import (
 	"github.com/georgehuang/admiral/internal/store"
 )
 
-// resetGhReadDelays is the backoff schedule for transient gh *read* failures
-// during a reset, mirroring internal/github's ghReadRetry. The merged-PR guard
-// must not abort the whole reset on a transient network blip (e.g. a GitHub
-// GraphQL EOF) — only on a real, persistent failure.
-var resetGhReadDelays = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+// ghReadDelays is the backoff schedule for transient gh *read* failures
+// (EOF / 5xx / connection reset), mirroring internal/github's ghReadRetry.
+// Shared by the reset merged-PR guard and the main-flow PR lookup so a
+// transient network blip (e.g. a GitHub GraphQL EOF) doesn't abort an
+// operation that would otherwise succeed — only a real, persistent failure does.
+var ghReadDelays = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
 // ghReadWithRetry runs a gh read command, retrying on transient failures
 // (EOF / 5xx / connection reset / i/o timeout) per the given backoff. A
 // non-transient error, or transient failures that outlast the schedule, return
-// the last error — so callers (the merged-PR guard) still fail safe.
+// the last error — so callers still fail safe on a genuine failure.
 func ghReadWithRetry(ctx context.Context, gh ghRunner, delays []time.Duration, args ...string) (string, error) {
 	var (
 		out string
@@ -321,7 +322,7 @@ func resolveBacklogStateID(ctx context.Context, lc resetLinear, teamID string) (
 // prIsMerged reports whether the PR at prURL is in the MERGED state, via
 // `gh pr view <url> --json state`.
 func prIsMerged(ctx context.Context, gh ghRunner, prURL string) (bool, error) {
-	out, err := ghReadWithRetry(ctx, gh, resetGhReadDelays, "pr", "view", prURL, "--json", "state")
+	out, err := ghReadWithRetry(ctx, gh, ghReadDelays, "pr", "view", prURL, "--json", "state")
 	if err != nil {
 		return false, fmt.Errorf("gh pr view: %v (output: %s)", err, truncate(out, 200))
 	}
