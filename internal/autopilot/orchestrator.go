@@ -1477,30 +1477,87 @@ func (f *flow) executeResumeFromTimeout() error {
 }
 
 // ensureWorktree re-enters the worktree if it still exists, or recreates it
-// on the original branch if it was cleaned up.
+// on the original branch if it was cleaned up. After the worktree is ready,
+// it fetches origin/<branch> and refuses to proceed if origin has commits
+// that are not ancestors of HEAD — i.e. someone pushed to the branch while
+// admiral's previous run was timed out. Auto-rebase isn't safe (claude's
+// unpushed work could conflict with the external commits), so this surfaces
+// the divergence as an error and lets the caller mark the task failed.
 func (f *flow) ensureWorktree() error {
 	if _, err := os.Stat(f.job.WorktreePath); err == nil {
 		f.worktreePath = f.job.WorktreePath
 		f.branch = f.job.Branch
+	} else {
+		// Worktree was cleaned up; recreate it on the original branch.
+		// Local refs/heads/<branch> still has admiral's prior commits in the
+		// parent repo's object store (worktree removal doesn't delete refs),
+		// so checking out the local branch ref preserves work in progress.
+		cmd := exec.Command("git", "fetch", "origin", f.job.Branch)
+		cmd.Dir = f.repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git fetch %s: %w (%s)", f.job.Branch, err, out)
+		}
+
+		cmd = exec.Command("git", "worktree", "add", f.job.WorktreePath, f.job.Branch)
+		cmd.Dir = f.repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git worktree add: %w (%s)", err, out)
+		}
+
+		f.worktreePath = f.job.WorktreePath
+		f.branch = f.job.Branch
+	}
+
+	if err := f.checkBranchDiverged(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// errBranchDiverged is the sentinel wrapped into the error returned by
+// checkBranchDiverged when origin has commits not in HEAD. Used by markFailed
+// to keep the worktree on disk so the user can manually rebase and push.
+var errBranchDiverged = errors.New("branch diverged")
+
+// checkBranchDiverged fetches origin/<branch> and returns an error wrapping
+// errBranchDiverged if origin has commits that are not in the worktree's HEAD.
+// The reuse path of ensureWorktree doesn't fetch on its own, so this also
+// covers the case where the worktree was kept across a timed-out run while
+// someone pushed externally.
+//
+// Precondition: origin/<branch> must exist (i.e. admiral has pushed the branch
+// in a prior run). If it doesn't, `git fetch` fails before merge-base is
+// reached and the caller sees the wrapped fetch error.
+func (f *flow) checkBranchDiverged() error {
+	if f.branch == "" {
+		return fmt.Errorf("checkBranchDiverged: f.branch is empty")
+	}
+	cmd := exec.Command("git", "fetch", "origin", f.branch)
+	cmd.Dir = f.worktreePath
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git fetch origin %s in worktree: %w (%s)", f.branch, err, out)
+	}
+
+	// `merge-base --is-ancestor origin/<branch> HEAD` exits 0 when origin is
+	// an ancestor of HEAD (local equal or ahead — push will fast-forward) and
+	// 1 when origin has commits HEAD doesn't have (push would be rejected).
+	originRef := "origin/" + f.branch
+	cmd = exec.Command("git", "merge-base", "--is-ancestor", originRef, "HEAD")
+	cmd.Dir = f.worktreePath
+	err := cmd.Run()
+	if err == nil {
 		return nil
 	}
-
-	// Worktree was cleaned up; recreate it on the original branch.
-	cmd := exec.Command("git", "fetch", "origin", f.job.Branch)
-	cmd.Dir = f.repoDir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git fetch %s: %w (%s)", f.job.Branch, err, out)
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return fmt.Errorf(
+			"%w: %s has commits not in the resume worktree at %s (external push?); "+
+				"admiral will not auto-rebase. Inside that worktree, run "+
+				"`git pull --rebase origin %s` and resolve conflicts, then "+
+				"`git push origin %s`. admiral's task is marked failed and will not retry",
+			errBranchDiverged, originRef, f.worktreePath, f.branch, f.branch)
 	}
-
-	cmd = exec.Command("git", "worktree", "add", f.job.WorktreePath, f.job.Branch)
-	cmd.Dir = f.repoDir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git worktree add: %w (%s)", err, out)
-	}
-
-	f.worktreePath = f.job.WorktreePath
-	f.branch = f.job.Branch
-	return nil
+	return fmt.Errorf("git merge-base --is-ancestor %s HEAD: %w", originRef, err)
 }
 
 // runClaudeResume spawns `claude -p --resume` in stream-json mode inside the worktree.
@@ -1762,6 +1819,15 @@ func (f *flow) markFailed(runErr error) {
 			j.State = store.JobStateDoneThreadInconsistent
 		})
 		_ = f.addInconsistencyFooter(ctx)
+	}
+	// On branch divergence the error message instructs the user to rebase
+	// inside the worktree and push manually — keep it on disk so that
+	// instruction is actionable. The worktree will be cleaned up on the next
+	// admiral task lifecycle (e.g. /rerun) that reuses or replaces it.
+	if errors.Is(runErr, errBranchDiverged) {
+		f.o.logger.Info("mark_failed_keep_worktree_for_manual_rebase",
+			"session", f.ev.SessionID, "worktree", f.worktreePath)
+		return
 	}
 	f.cleanupWorktree(cleanupArchive)
 }
