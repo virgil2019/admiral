@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -505,5 +507,184 @@ func TestPostReviewHandledNotice_PostsExpectedBody(t *testing.T) {
 	}
 	if !strings.Contains(body, task.PRURL) {
 		t.Errorf("handled notice missing PR URL: %q", body)
+	}
+}
+
+// reviewWorktreeFixture sets up a bare origin repo with one commit on
+// `linear/test`, a local clone whose local branch ref points at that commit,
+// and an "advancer" working copy used to push extra commits to origin so the
+// local clone can be made deliberately stale.
+type reviewWorktreeFixture struct {
+	originDir   string // bare repo
+	localDir    string // clone — passed to ensureReviewWorktree as repoDir
+	advancerDir string // separate clone used to push new commits to origin
+	branch      string
+}
+
+func setupReviewWorktreeFixture(t *testing.T) *reviewWorktreeFixture {
+	t.Helper()
+	root := t.TempDir()
+	originDir := filepath.Join(root, "origin.git")
+	localDir := filepath.Join(root, "local")
+	advancerDir := filepath.Join(root, "advancer")
+	branch := "linear/test"
+
+	mustGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s in %s: %v: %s", strings.Join(args, " "), dir, err, out)
+		}
+	}
+	probe := exec.Command("git", "--version")
+	if err := probe.Run(); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+
+	mustGit(root, "init", "--bare", originDir)
+
+	// seed dir: build the initial commit, push to origin.
+	seedDir := filepath.Join(root, "seed")
+	if err := os.MkdirAll(seedDir, 0o755); err != nil {
+		t.Fatalf("mkdir seed: %v", err)
+	}
+	mustGit(seedDir, "init", "-b", "main")
+	mustGit(seedDir, "config", "user.email", "test@test.com")
+	mustGit(seedDir, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(seedDir, "README"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	mustGit(seedDir, "add", "README")
+	mustGit(seedDir, "commit", "-m", "v1")
+	mustGit(seedDir, "checkout", "-b", branch)
+	mustGit(seedDir, "remote", "add", "origin", originDir)
+	mustGit(seedDir, "push", "origin", branch)
+
+	// localDir: the clone admiral operates on. Cloning creates
+	// refs/heads/<branch> pointing at the same commit as origin/<branch>.
+	mustGit(root, "clone", originDir, localDir)
+	mustGit(localDir, "config", "user.email", "test@test.com")
+	mustGit(localDir, "config", "user.name", "test")
+	mustGit(localDir, "fetch", "origin", branch)
+	mustGit(localDir, "branch", branch, "origin/"+branch)
+
+	// advancerDir: separate clone used to push "external" commits to origin,
+	// simulating a human or another admiral session moving the branch forward.
+	mustGit(root, "clone", "-b", branch, originDir, advancerDir)
+	mustGit(advancerDir, "config", "user.email", "advancer@test.com")
+	mustGit(advancerDir, "config", "user.name", "advancer")
+
+	return &reviewWorktreeFixture{
+		originDir:   originDir,
+		localDir:    localDir,
+		advancerDir: advancerDir,
+		branch:      branch,
+	}
+}
+
+// advance pushes a new commit to origin from advancerDir and returns the new
+// commit SHA on origin/<branch>.
+func (f *reviewWorktreeFixture) advance(t *testing.T, content string) string {
+	t.Helper()
+	mustGit := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s in %s: %v: %s", strings.Join(args, " "), dir, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if err := os.WriteFile(filepath.Join(f.advancerDir, "README"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	mustGit(f.advancerDir, "add", "README")
+	mustGit(f.advancerDir, "commit", "-m", "advance:"+content)
+	mustGit(f.advancerDir, "push", "origin", f.branch)
+	// Read the new origin tip from the bare repo.
+	return mustGit(f.originDir, "rev-parse", f.branch)
+}
+
+func headOf(t *testing.T, dir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD in %s: %v: %s", dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// Reuse path: worktree exists on disk but origin advanced. ensureReviewWorktree
+// must hard-reset the worktree to origin tip so claude edits the current code.
+func TestEnsureReviewWorktree_ReuseSyncsToOrigin(t *testing.T) {
+	f := setupReviewWorktreeFixture(t)
+	worktreePath := filepath.Join(f.localDir, ".worktrees", "review-test")
+	// Create the worktree at the stale local branch ref.
+	cmd := exec.Command("git", "worktree", "add", worktreePath, f.branch)
+	cmd.Dir = f.localDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed worktree: %v: %s", err, out)
+	}
+
+	newTip := f.advance(t, "v2\n")
+	// Confirm the worktree is now stale.
+	if headOf(t, worktreePath) == newTip {
+		t.Fatalf("precondition: worktree should be stale before ensureReviewWorktree")
+	}
+	// Drop a stray uncommitted file to verify clean -fd removes it.
+	if err := os.WriteFile(filepath.Join(worktreePath, "stray"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write stray: %v", err)
+	}
+
+	task := &store.AdmiralTask{Branch: f.branch, WorktreePath: worktreePath}
+	got, err := ensureReviewWorktree(context.Background(), f.localDir, task)
+	if err != nil {
+		t.Fatalf("ensureReviewWorktree: %v", err)
+	}
+	if got != worktreePath {
+		t.Errorf("worktree path: got %q want %q", got, worktreePath)
+	}
+	if h := headOf(t, worktreePath); h != newTip {
+		t.Errorf("worktree HEAD: got %s want %s (origin tip)", h, newTip)
+	}
+	if _, err := os.Stat(filepath.Join(worktreePath, "stray")); !os.IsNotExist(err) {
+		t.Errorf("stray file should have been cleaned, got err=%v", err)
+	}
+}
+
+// Rebuild path: worktree dir is gone but local refs/heads/<branch> is stale.
+// ensureReviewWorktree must reset the local branch ref to origin/<branch> via
+// `worktree add -B` so the new checkout starts at origin tip.
+func TestEnsureReviewWorktree_RebuildSyncsStaleLocalRef(t *testing.T) {
+	f := setupReviewWorktreeFixture(t)
+	newTip := f.advance(t, "v2\n")
+	worktreePath := filepath.Join(f.localDir, ".worktrees", "review-test")
+
+	task := &store.AdmiralTask{Branch: f.branch, WorktreePath: worktreePath}
+	got, err := ensureReviewWorktree(context.Background(), f.localDir, task)
+	if err != nil {
+		t.Fatalf("ensureReviewWorktree: %v", err)
+	}
+	if got != worktreePath {
+		t.Errorf("worktree path: got %q want %q", got, worktreePath)
+	}
+	if h := headOf(t, worktreePath); h != newTip {
+		t.Errorf("worktree HEAD: got %s want %s (origin tip)", h, newTip)
+	}
+	// Direct invariant: local refs/heads/<branch> was force-aligned to origin
+	// tip. Guards against a future refactor that uses --detach (HEAD would
+	// still match but the local ref would stay stale).
+	cmd := exec.Command("git", "rev-parse", f.branch)
+	cmd.Dir = f.localDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse %s: %v: %s", f.branch, err, out)
+	}
+	if localRef := strings.TrimSpace(string(out)); localRef != newTip {
+		t.Errorf("local refs/heads/%s: got %s want %s", f.branch, localRef, newTip)
 	}
 }

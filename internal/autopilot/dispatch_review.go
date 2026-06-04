@@ -154,9 +154,27 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 	}
 
 	if pushErr := runCmd(ctx, worktreePath, "git", "push", "origin", task.Branch); pushErr != nil {
-		o.logger.Warn("review_run_push_failed",
+		o.logger.Error("review_run_push_failed",
 			"pr", task.PRURL, "branch", task.Branch, "err", pushErr)
-		output += "\n\n(note: push to origin failed — commits are local only)"
+		// Discard claude's local-only commits so the next review run starts
+		// from origin instead of compounding the divergence. ensureReviewWorktree
+		// already fetched at the start of this run; fetch once more in case the
+		// remote moved between then and now.
+		if fetchErr := runCmd(ctx, worktreePath, "git", "fetch", "origin", task.Branch); fetchErr != nil {
+			o.logger.Warn("review_run_push_cleanup_fetch_failed",
+				"pr", task.PRURL, "branch", task.Branch, "err", fetchErr)
+		}
+		if resetErr := runCmd(ctx, worktreePath, "git", "reset", "--hard", "origin/"+task.Branch); resetErr != nil {
+			o.logger.Warn("review_run_push_cleanup_reset_failed",
+				"pr", task.PRURL, "branch", task.Branch, "err", resetErr)
+		}
+		if cleanErr := runCmd(ctx, worktreePath, "git", "clean", "-fd"); cleanErr != nil {
+			o.logger.Warn("review_run_push_cleanup_clean_failed",
+				"pr", task.PRURL, "branch", task.Branch, "err", cleanErr)
+		}
+		output += "\n\n(note: push to origin failed — `" + task.Branch +
+			"` on origin has commits admiral didn't see. " +
+			"Local commits were discarded; trigger the review again to retry.)"
 	}
 
 	if output == "" {
@@ -187,14 +205,29 @@ func (o *Orchestrator) resolveRepoForReview(ctx context.Context, task *store.Adm
 	return repo.RepoDir, repo.BaseBranch, nil
 }
 
-// ensureReviewWorktree returns a ready worktree path for task.Branch. If
-// task.WorktreePath still exists on disk it is reused directly. Otherwise
-// the branch is fetched from origin and a new worktree is created at the
-// recorded path (or a derived path when WorktreePath is empty).
+// ensureReviewWorktree returns a ready worktree path for task.Branch synced
+// to origin/<branch>. Both the reuse path (worktree already on disk) and the
+// rebuild path force the worktree to the freshly-fetched origin tip — if the
+// review run worked off a stale base, `git push` later would be rejected as
+// non-fast-forward and claude's edits would be wasted.
 func ensureReviewWorktree(ctx context.Context, repoDir string, task *store.AdmiralTask) (string, error) {
+	if err := runCmd(ctx, repoDir, "git", "fetch", "origin", task.Branch); err != nil {
+		return "", fmt.Errorf("git fetch %s: %w", task.Branch, err)
+	}
+
+	originRef := "origin/" + task.Branch
 	worktreePath := task.WorktreePath
 	if worktreePath != "" {
 		if _, err := os.Stat(worktreePath); err == nil {
+			// Reuse: hard-reset to origin. The review worktree is admiral-owned;
+			// any residue from a prior run must be discarded so claude edits
+			// the actual current tip, not yesterday's snapshot.
+			if err := runCmd(ctx, worktreePath, "git", "reset", "--hard", originRef); err != nil {
+				return "", fmt.Errorf("git reset --hard %s: %w", originRef, err)
+			}
+			if err := runCmd(ctx, worktreePath, "git", "clean", "-fd"); err != nil {
+				return "", fmt.Errorf("git clean -fd: %w", err)
+			}
 			return worktreePath, nil
 		}
 	}
@@ -212,10 +245,11 @@ func ensureReviewWorktree(ctx context.Context, repoDir string, task *store.Admir
 	// Remove any stale worktree registration before recreating.
 	_ = runCmd(ctx, repoDir, "git", "worktree", "remove", "--force", worktreePath)
 
-	if err := runCmd(ctx, repoDir, "git", "fetch", "origin", task.Branch); err != nil {
-		return "", fmt.Errorf("git fetch %s: %w", task.Branch, err)
-	}
-	if err := runCmd(ctx, repoDir, "git", "worktree", "add", worktreePath, task.Branch); err != nil {
+	// -B resets refs/heads/<branch> to origin/<branch>. Without it, an
+	// existing local branch ref that fell behind origin would be used as
+	// the checkout point — the exact stale-base bug that triggers
+	// non-fast-forward push rejection later.
+	if err := runCmd(ctx, repoDir, "git", "worktree", "add", "-B", task.Branch, worktreePath, originRef); err != nil {
 		return "", fmt.Errorf("git worktree add: %w", err)
 	}
 	return worktreePath, nil
