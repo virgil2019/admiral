@@ -2,9 +2,11 @@ package autopilot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1696,64 +1698,251 @@ func TestHandlePrompted_UnknownCommand_PreservesState(t *testing.T) {
 }
 
 // ---- Tests for ensureWorktree ----
+//
+// remoteFixture sets up a bare origin, a local clone, and an advancer clone
+// for pushing external commits. ensureWorktree's contract: reuse the worktree
+// if on disk, else rebuild from the local branch ref so admiral's prior
+// unpushed commits are preserved; then fetch and refuse to proceed if origin
+// has commits the worktree doesn't know about.
 
-func TestEnsureWorktree_AlreadyExists(t *testing.T) {
-	tmp := t.TempDir()
-	worktreePath := filepath.Join(tmp, "existing-worktree")
-	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-		t.Fatalf("mkdir failed: %v", err)
+type remoteFixture struct {
+	originDir   string
+	localDir    string
+	advancerDir string
+	branch      string
+}
+
+func setupRemoteFixture(t *testing.T) *remoteFixture {
+	t.Helper()
+	if err := exec.Command("git", "--version").Run(); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	mustGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s in %s: %v: %s", strings.Join(args, " "), dir, err, out)
+		}
 	}
 
-	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: tmp}, logger: slog.Default()}
-	f := &flow{
-		o: o,
-		job: &store.AutopilotJob{
-			WorktreePath: worktreePath,
-			Branch:       "linear/test-branch",
-		},
-	}
+	root := t.TempDir()
+	originDir := filepath.Join(root, "origin.git")
+	localDir := filepath.Join(root, "local")
+	advancerDir := filepath.Join(root, "advancer")
+	branch := "linear/test"
 
-	err := f.ensureWorktree()
-	if err != nil {
-		t.Fatalf("ensureWorktree failed: %v", err)
+	mustGit(root, "init", "--bare", originDir)
+
+	seedDir := filepath.Join(root, "seed")
+	if err := os.MkdirAll(seedDir, 0o755); err != nil {
+		t.Fatalf("mkdir seed: %v", err)
 	}
-	if f.worktreePath != worktreePath {
-		t.Errorf("worktreePath = %q, want %q", f.worktreePath, worktreePath)
+	mustGit(seedDir, "init", "-b", "main")
+	mustGit(seedDir, "config", "user.email", "test@test.com")
+	mustGit(seedDir, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(seedDir, "README"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
 	}
-	if f.branch != "linear/test-branch" {
-		t.Errorf("branch = %q, want %q", f.branch, "linear/test-branch")
+	mustGit(seedDir, "add", "README")
+	mustGit(seedDir, "commit", "-m", "v1")
+	mustGit(seedDir, "checkout", "-b", branch)
+	mustGit(seedDir, "remote", "add", "origin", originDir)
+	mustGit(seedDir, "push", "origin", branch)
+
+	mustGit(root, "clone", originDir, localDir)
+	mustGit(localDir, "config", "user.email", "test@test.com")
+	mustGit(localDir, "config", "user.name", "test")
+	mustGit(localDir, "fetch", "origin", branch)
+	mustGit(localDir, "branch", branch, "origin/"+branch)
+
+	mustGit(root, "clone", "-b", branch, originDir, advancerDir)
+	mustGit(advancerDir, "config", "user.email", "advancer@test.com")
+	mustGit(advancerDir, "config", "user.name", "advancer")
+
+	return &remoteFixture{
+		originDir:   originDir,
+		localDir:    localDir,
+		advancerDir: advancerDir,
+		branch:      branch,
 	}
 }
 
-func TestEnsureWorktree_NeedsRebuild(t *testing.T) {
-	// Test that ensureWorktree sets the correct paths when worktree doesn't exist.
-	// The actual git operations are tested separately in integration tests.
-	tmp := t.TempDir()
-	worktreePath := filepath.Join(tmp, "nonexistent-worktree")
+// advance pushes a commit to origin from advancerDir, simulating a human or
+// another admiral session moving the branch forward.
+func (f *remoteFixture) advance(t *testing.T, content string) string {
+	t.Helper()
+	mustGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s in %s: %v: %s", strings.Join(args, " "), dir, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(f.advancerDir, "README"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	mustGit(f.advancerDir, "add", "README")
+	mustGit(f.advancerDir, "commit", "-m", "advance:"+content)
+	mustGit(f.advancerDir, "push", "origin", f.branch)
+	cmd := exec.Command("git", "rev-parse", f.branch)
+	cmd.Dir = f.originDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse %s in %s: %v: %s", f.branch, f.originDir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
 
-	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: tmp}, logger: slog.Default()}
-	f := &flow{
-		o: o,
+func gitHead(t *testing.T, dir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD in %s: %v: %s", dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// resumeWorktreeAt creates a worktree at <path> checked out at <branch> in the
+// given local repo, returning the path. Used to seed the reuse path.
+func resumeWorktreeAt(t *testing.T, localDir, branch, path string) {
+	t.Helper()
+	cmd := exec.Command("git", "worktree", "add", path, branch)
+	cmd.Dir = localDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed worktree at %s: %v: %s", path, err, out)
+	}
+}
+
+// commitInWorktree adds a file and commits it inside worktreePath, returning
+// the new HEAD SHA. Used to put the worktree ahead of origin (the normal state
+// after a timed-out claude run that committed but never pushed).
+func commitInWorktree(t *testing.T, worktreePath, filename, content, msg string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(worktreePath, filename), []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", filename, err)
+	}
+	for _, args := range [][]string{
+		{"add", filename},
+		{"commit", "-m", msg},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = worktreePath
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s in %s: %v: %s", strings.Join(args, " "), worktreePath, err, out)
+		}
+	}
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = worktreePath
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD in %s: %v: %s", worktreePath, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// newEnsureWorktreeFlow builds a minimal flow suitable for driving
+// ensureWorktree against a real fixture. The orchestrator only needs to exist;
+// ensureWorktree doesn't touch the store/Linear/logger fields that matter.
+func newEnsureWorktreeFlow(repoDir, branch, worktreePath string) *flow {
+	o := &Orchestrator{logger: slog.Default()}
+	return &flow{
+		o:       o,
+		repoDir: repoDir,
 		job: &store.AutopilotJob{
 			WorktreePath: worktreePath,
-			Branch:       "linear/test-branch",
+			Branch:       branch,
 		},
 	}
+}
 
-	// Worktree doesn't exist, so ensureWorktree will try to rebuild.
-	// We expect it to attempt git fetch/worktree add, which will fail
-	// in this test environment without a real remote.
-	if _, err := os.Stat(worktreePath); err == nil {
-		t.Fatalf("worktree should not exist yet")
+// Reuse, local ahead of origin (the normal timed-out → resume state).
+// Origin is unchanged; the worktree has admiral's unpushed commit. push will
+// fast-forward, so ensureWorktree must succeed.
+func TestEnsureWorktree_ReuseLocalAheadOK(t *testing.T) {
+	fx := setupRemoteFixture(t)
+	worktreePath := filepath.Join(fx.localDir, ".worktrees", "resume-test")
+	resumeWorktreeAt(t, fx.localDir, fx.branch, worktreePath)
+	localHead := commitInWorktree(t, worktreePath, "claude.txt", "wip", "claude wip")
+
+	f := newEnsureWorktreeFlow(fx.localDir, fx.branch, worktreePath)
+	if err := f.ensureWorktree(); err != nil {
+		t.Fatalf("ensureWorktree: %v", err)
 	}
+	if f.worktreePath != worktreePath {
+		t.Errorf("worktreePath: got %q want %q", f.worktreePath, worktreePath)
+	}
+	if h := gitHead(t, worktreePath); h != localHead {
+		t.Errorf("worktree HEAD: got %s want %s (local should still be ahead)", h, localHead)
+	}
+}
 
-	// This will fail on git fetch since we don't have a real remote,
-	// but it verifies the code path is correct.
+// Reuse, branch diverged: claude committed locally but someone else pushed a
+// disjoint commit to origin. ensureWorktree must refuse to proceed — auto-
+// rebase isn't safe, the user has to intervene.
+func TestEnsureWorktree_ReuseDivergedErrors(t *testing.T) {
+	fx := setupRemoteFixture(t)
+	worktreePath := filepath.Join(fx.localDir, ".worktrees", "resume-test")
+	resumeWorktreeAt(t, fx.localDir, fx.branch, worktreePath)
+	commitInWorktree(t, worktreePath, "claude.txt", "wip", "claude wip")
+	fx.advance(t, "external\n") // origin moves to a commit the worktree doesn't have
+
+	f := newEnsureWorktreeFlow(fx.localDir, fx.branch, worktreePath)
 	err := f.ensureWorktree()
 	if err == nil {
-		t.Log("ensureWorktree succeeded (unexpected in this env)")
-	} else {
-		t.Logf("ensureWorktree failed as expected in test env: %v", err)
+		t.Fatal("expected ensureWorktree to error on divergence, got nil")
+	}
+	if !errors.Is(err, errBranchDiverged) {
+		t.Errorf("error should wrap errBranchDiverged so markFailed can keep the worktree; got %q", err.Error())
+	}
+	// The user-actionable message must call out the worktree path so the
+	// "rebase inside that worktree" instruction is actionable.
+	if !strings.Contains(err.Error(), worktreePath) {
+		t.Errorf("error should include worktree path %q; got %q", worktreePath, err.Error())
+	}
+}
+
+// Reuse, local equal to origin: neither side moved since the prior run.
+// Should pass — origin is an ancestor of HEAD (equal counts as ancestor).
+func TestEnsureWorktree_ReuseEqualOK(t *testing.T) {
+	fx := setupRemoteFixture(t)
+	worktreePath := filepath.Join(fx.localDir, ".worktrees", "resume-test")
+	resumeWorktreeAt(t, fx.localDir, fx.branch, worktreePath)
+
+	f := newEnsureWorktreeFlow(fx.localDir, fx.branch, worktreePath)
+	if err := f.ensureWorktree(); err != nil {
+		t.Fatalf("ensureWorktree: %v", err)
+	}
+}
+
+// Rebuild path: the worktree directory was cleaned up but the local branch
+// ref still has admiral's prior commits in the parent repo's object store.
+// `git worktree add <path> <branch>` re-checks out those local commits;
+// ensureWorktree's divergence check should not error because origin is at the
+// original base (still an ancestor of the local tip).
+func TestEnsureWorktree_RebuildPreservesLocalCommits(t *testing.T) {
+	fx := setupRemoteFixture(t)
+	stagingPath := filepath.Join(fx.localDir, ".worktrees", "resume-test-staging")
+	resumeWorktreeAt(t, fx.localDir, fx.branch, stagingPath)
+	localHead := commitInWorktree(t, stagingPath, "claude.txt", "wip", "claude wip")
+	// Remove the staging worktree directory but keep the local branch ref it
+	// advanced — that's the state ensureWorktree's rebuild branch handles.
+	cmd := exec.Command("git", "worktree", "remove", "--force", stagingPath)
+	cmd.Dir = fx.localDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("remove staging worktree: %v: %s", err, out)
+	}
+
+	rebuildPath := filepath.Join(fx.localDir, ".worktrees", "resume-test")
+	f := newEnsureWorktreeFlow(fx.localDir, fx.branch, rebuildPath)
+	if err := f.ensureWorktree(); err != nil {
+		t.Fatalf("ensureWorktree (rebuild): %v", err)
+	}
+	if h := gitHead(t, rebuildPath); h != localHead {
+		t.Errorf("rebuilt worktree HEAD: got %s want %s (local commit must be preserved)", h, localHead)
 	}
 }
 
