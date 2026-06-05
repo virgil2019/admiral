@@ -1,6 +1,6 @@
 ---
 name: decompose
-description: Decompose a task into a Linear issue hierarchy for the admiral autonomous loop — one parent issue holding the PRD, plus orthogonal sub-issues (foundation-first, dependency-ordered) each with acceptance criteria, wired with blocking relations. Creates the issues only; it deliberately does NOT apply the pickup label, so nothing is shipped until the user explicitly activates the task. Invoke when the user says "/decompose", "decompose this", "拆任务", "拆分到 Linear", "break this down into issues", or wants to turn a PRD/design doc into admiral-ready Linear sub-issues. Requires the Linear MCP.
+description: Decompose a task into a Linear issue hierarchy for the admiral autonomous loop — one parent issue holding the PRD, plus orthogonal sub-issues (foundation-first, dependency-ordered) each with acceptance criteria, wired with blocking relations. Classifies each sub-issue as agent-doable or human-only and tags the agent-doable ones with the `agent-task` label. Deliberately does NOT apply the pickup (`agent-ready`) label — nothing is shipped until the user explicitly activates the task. Invoke when the user says "/decompose", "decompose this", "拆任务", "拆分到 Linear", "break this down into issues", or wants to turn a PRD/design doc into admiral-ready Linear sub-issues. Requires the Linear MCP.
 ---
 
 # Decompose
@@ -62,25 +62,62 @@ Extract from the PRD:
 - **Dependencies**: which pieces must be done before others (framework before plugins, data models before business logic, etc.)
 - **Orthogonality**: pieces that can run in parallel without PR conflicts — keep them independent
 - **Acceptance criteria**: concrete, verifiable conditions for each piece
+- **Executor**: for each piece, decide whether it is **agent-doable** or **human-only** (see Step 3.5)
 
-## The label is the trigger — this skill NEVER applies it
+## Step 3.5 — Classify each piece: agent-task vs human-only
 
-This is the load-bearing rule of the whole skill. admiral's discoverer picks
-up any sub-issue that carries the pickup label (the team's configured
-`discoverer.require_label`, default `agent-ready`) in a pickable state. The
-moment a sub-issue gets that label, it can be shipped on the next discoverer
-tick.
+For every functional piece you intend to split out, decide who can execute it.
+This classification is orthogonal to the pickup trigger — it answers "is
+admiral capable of doing this?", not "should admiral start now?".
 
-**Decompose only creates the issue structure — it does NOT apply the pickup
-label.** Applying the label kicks off autonomous shipping, so it is a separate,
-explicit human action: the user reviews the decomposition first, then triggers
-activation themselves (see Step 7). This skill must leave every sub-issue
-UNlabeled.
+**agent-task** — implementable by admiral autonomously:
+- Writing or editing code in the repo
+- Mechanical refactors / renames
+- Adding tests, fixtures, config files
+- Scripted migrations, dependency bumps
+- Doc / comment updates that don't require new design decisions
+
+**human-only** — requires a human:
+- UX / visual design decisions, wireframes, mockups
+- User research, interviews, stakeholder sync
+- Vendor / legal / compliance coordination
+- Infrastructure or architecture decisions that need human judgment
+- Anything requiring access or accounts admiral doesn't have
+
+A sub-issue that is "mostly code but needs one design decision first" should
+usually be **split**: the design decision becomes its own human-only sub-issue
+that blocks the implementation sub-issue. Mixing executors inside one issue
+defeats the classification.
+
+Acceptance criteria are required for **both** types — every sub-issue needs a
+black-box "done" condition. The only difference is the judge: agent-task
+issues are judged by admiral's verify loop; human-only issues are judged by a
+human (PR review, deliverable handoff, Linear comment, etc.). Write the
+criteria the same way regardless.
+
+## The two label layers — what this skill does and doesn't apply
+
+admiral's skill-layer pipeline uses **two orthogonal labels** on sub-issues:
+
+1. **`agent-task`** (classification, applied by THIS skill) — marks a
+   sub-issue as something admiral is capable of doing. Set in Step 5 based
+   on the Step 3.5 classification. Stable metadata: stays on the issue for
+   its lifetime.
+2. **`agent-ready`** (pickup trigger, applied by `activate`, NOT here) —
+   the team's configured `discoverer.require_label`. The moment a sub-issue
+   gets this label, admiral's discoverer can ship it on the next tick.
+
+**Decompose applies `agent-task` to agent-doable sub-issues; it NEVER
+applies `agent-ready`.** Applying the pickup trigger kicks off autonomous
+shipping, so it is a separate, explicit human action: the user reviews the
+decomposition first, then runs `activate` (Step 7). Human-only sub-issues
+carry neither label.
 
 Use `linear.save_issue` for everything (create when `id` is omitted, update
 when `id` is passed). It supports `parentId`, `labels`, `blockedBy`,
-`blocks`, and `state` directly — but do NOT pass `labels` with the pickup
-label at any point in this skill.
+`blocks`, and `state` directly — pass `labels: ["agent-task"]` only on
+agent-doable sub-issues, and NEVER pass the pickup label (`agent-ready`) at
+any point in this skill.
 
 ## Step 4 — Create the parent issue
 
@@ -98,10 +135,35 @@ unit — the discoverer only ever picks up its sub-issues.
 
 Record the returned parent identifier.
 
-## Step 5 — Create sub-issues (unlabeled)
+## Step 4.5 — Ensure the `agent-task` label exists in the team
 
-For each functional piece from Step 3, create a sub-issue WITHOUT the pickup
-label (this skill never adds it — see Step 7):
+Before creating sub-issues, make sure the `agent-task` label exists in the
+team you'll be writing to. `linear.save_issue(..., labels: ["agent-task"])`
+will fail if the label has not been created — Linear's MCP does not
+auto-create labels.
+
+```
+linear.list_issue_labels(team: <team-id>)
+```
+
+If `agent-task` is NOT in the returned list, create it:
+
+```
+linear.create_issue_label(team: <team-id>, name: "agent-task",
+                          description: "Sub-issue is implementable by admiral (vs human-only).")
+```
+
+Do this once per team per session. If `agent-task` already exists, do nothing
+and move on. Skip this step entirely if every functional piece from Step 3.5
+was classified as human-only — no sub-issue will carry the label, so creation
+is unnecessary (but still harmless).
+
+## Step 5 — Create sub-issues (with `agent-task` for agent-doable pieces only)
+
+For each functional piece from Step 3, create a sub-issue. Apply the
+`agent-task` label IFF the piece was classified as agent-doable in Step 3.5.
+Human-only sub-issues get NO labels here. NEVER apply the pickup label
+(`agent-ready`) in this skill — that is `activate`'s job (Step 7).
 
 ```
 linear.save_issue(
@@ -109,13 +171,15 @@ linear.save_issue(
   project:     <same project>,
   parentId:    <parent identifier>,
   title:       <sub-task name>,
-  description: <acceptance criteria — concrete, verifiable conditions this sub-issue's PR must meet>,
+  description: <acceptance criteria — concrete, verifiable "done" condition for this sub-issue
+                (judged by admiral verify for agent-task issues, by a human for human-only issues)>,
+  labels:      <["agent-task"] for agent-doable; omit / [] for human-only>,
   state:       <a pickable state — see note>,
 )
 ```
 
-Record every sub-issue identifier. Do this for ALL sub-issues before moving
-on, so their IDs exist for the blocking step.
+Record every sub-issue identifier (and its classification). Do this for ALL
+sub-issues before moving on, so their IDs exist for the blocking step.
 
 **Decompose so that:**
 
@@ -128,6 +192,12 @@ on, so their IDs exist for the blocking step.
    an interface so each owns its own files.
 3. **At most ~10 sub-issues.** If the task needs more, it should be multiple
    parent tasks — tell the user.
+4. **Human-only sub-issues sit in the same graph** — block agent-task
+   sub-issues on them whenever an upstream human decision is required (e.g.
+   "design login screen" blocks "implement login screen"). admiral's
+   BLOCKED gate is executor-agnostic: once a human closes the upstream
+   issue in Linear, the downstream agent-task auto-unblocks on the next
+   discoverer tick.
 
 **Note on state:** the sub-issue must land in a state whose type is in the
 discoverer's `state_types` (default `backlog` / `unstarted`) or it won't be
@@ -149,26 +219,30 @@ relations: a sub-issue with an unresolved blocker is parked BLOCKED and
 auto-resumes once its blockers reach a completed state — so foundation ships
 first, dependents wait, naturally.
 
-## Step 7 — Stop. Do NOT label. Hand off activation to the user
+## Step 7 — Stop. Do NOT apply `agent-ready`. Hand off activation to the user
 
 The issue structure is now complete (parent + sub-issues + acceptance
-criteria + blocking relations), but every sub-issue is still UNlabeled, so
-the discoverer will not touch any of it. This is intentional.
+criteria + `agent-task` labels on agent-doable issues + blocking relations).
+But no sub-issue carries the pickup trigger (`agent-ready`), so the discoverer
+will not touch any of it yet. This is intentional.
 
-Do NOT apply the pickup label. Instead, tell the user the task is staged and
+Do NOT apply `agent-ready`. Instead, tell the user the task is staged and
 explain how to activate it when they are ready — activation is their explicit
 trigger, made after they review the decomposition:
 
-- **`/activate <parent issue>`** — the dedicated activation skill. It confirms
-  the project + parent issue with the user, then applies the pickup label. Use
-  this rather than labeling inline; it has the wrong-target safety gate.
-- **Manually**: add the pickup label (`discoverer.require_label`, default
-  `agent-ready`) to the sub-issues in Linear.
+- **`/activate <parent issue>`** — the dedicated activation skill. It
+  confirms the project + parent issue with the user, then applies
+  `agent-ready` only to sub-issues that carry `agent-task` (human-only ones
+  are surfaced as "skipped"). Use this rather than labeling inline; it has
+  the wrong-target safety gate.
+- **Manually**: add `agent-ready` (the pickup label,
+  `discoverer.require_label`) to specific sub-issues in Linear.
 
 Either way, because all blocking relations are already set (Step 6), labeling
-order is safe — dependents stay BLOCKED until the foundation completes.
+order is safe — dependents stay BLOCKED until their upstream sub-issues
+(agent or human) reach a completed state.
 
-Do not apply the label yourself from within this skill, even if it seems
+Do not apply `agent-ready` yourself from within this skill, even if it seems
 convenient — activation is a separate, explicitly-triggered step.
 
 ## Step 8 — Summary
@@ -176,28 +250,35 @@ convenient — activation is a separate, explicitly-triggered step.
 Report to the user:
 
 - Parent issue URL
-- Sub-issue URLs with acceptance criteria summary
+- Sub-issue URLs with acceptance criteria summary, marked `[agent-task]` or `[human-only]`
 - Dependency chain (which sub-issue must complete before which)
-- That the task is STAGED but NOT active (no pickup label applied), and how to activate it
+- Counts: how many `agent-task` vs how many `human-only`
+- That the task is STAGED but NOT active (no `agent-ready` label applied), and how to activate it
 
 Example summary:
 
 ```
 Parent: [GEO-1] Build login feature
-  └─ [GEO-2] Data models + auth interfaces (foundation)
-     └─ [GEO-3] Email/password auth (core)
-        └─ [GEO-4] OAuth integration (dependent)
-     └─ [GEO-5] Session management (parallel with GEO-3)
+  ├─ [GEO-2] Data models + auth interfaces (foundation)        [agent-task]
+  ├─ [GEO-3] Email/password auth (core)                        [agent-task]
+  ├─ [GEO-4] OAuth integration                                 [agent-task]
+  ├─ [GEO-5] Session management (parallel with GEO-3)          [agent-task]
+  └─ [GEO-6] Visual design for login screen (precedes GEO-3)   [human-only]
 
-Blocking relations: set (GEO-3/GEO-5 blocked by GEO-2; GEO-4 blocked by GEO-3)
+Blocking relations: set
+  GEO-3/GEO-5 blocked by GEO-2
+  GEO-4 blocked by GEO-3
+  GEO-3 blocked by GEO-6  (waits for human design before admiral can implement)
+
+Classification: 4 agent-task, 1 human-only
 Status: STAGED — no agent-ready label applied; nothing will ship yet.
-To activate: add the "agent-ready" label to the sub-issues (or ask me to).
+To activate: /activate GEO-1   (will label the 4 agent-task issues with agent-ready; GEO-6 is for a human)
 ```
 
 ## Constraints
 
-- This skill NEVER applies the pickup label — not to the parent, not to sub-issues. Creating the structure and activating it are separate actions; activation is the user's explicit trigger.
-- Parent issue is the task definition, never a work unit — it is never labeled or picked up regardless.
-- Sub-issue description = acceptance criteria, not implementation details — this is what admiral's verify loop judges against
-- If the user provides vague requirements, ask clarifying questions before decomposing
-- Do not create more than ~10 sub-issues — if a task is that large, suggest decomposing into multiple parent tasks
+- This skill applies `agent-task` to agent-doable sub-issues and NEVER applies the pickup label (`agent-ready`) — not to the parent, not to sub-issues. Activation is the user's explicit trigger via `/activate`.
+- Parent issue is the task definition, never a work unit — it is never labeled (no `agent-task`, no `agent-ready`) and never picked up.
+- Sub-issue description = acceptance criteria, not implementation details — required for both agent-task and human-only issues (judged by admiral vs by a human respectively).
+- If the user provides vague requirements, ask clarifying questions before decomposing.
+- Do not create more than ~10 sub-issues — if a task is that large, suggest decomposing into multiple parent tasks.
