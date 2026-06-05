@@ -2525,6 +2525,144 @@ func TestClassifyGhCreateError(t *testing.T) {
 	}
 }
 
+// TestGhCreateWithRetry_RetriesTransientThenSucceeds covers the failure mode
+// from the original incident (admiral job failed with a GraphQL "unexpected
+// EOF" during `gh pr create`'s internal check-existing-PR step): the first
+// attempt should backoff + retry on transient errors, the second should
+// succeed.
+func TestGhCreateWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
+	calls := 0
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		calls++
+		if calls < 2 {
+			return `Post "https://api.github.com/graphql": unexpected EOF`, fmt.Errorf("exit status 1")
+		}
+		return "https://github.com/owner/repo/pull/42\n", nil
+	}
+	out, err := ghCreateWithRetry(context.Background(), gh, []time.Duration{0, 0, 0},
+		"pr", "create", "--base", "main", "--head", "feat/x")
+	if err != nil {
+		t.Fatalf("expected success after retry, got %v", err)
+	}
+	if !strings.Contains(out, "pull/42") {
+		t.Fatalf("unexpected out: %s", out)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls (1 transient + 1 ok), got %d", calls)
+	}
+}
+
+// TestGhCreateWithRetry_ExhaustsReturnsError ensures a persistent transient
+// failure surfaces as a real error once the backoff schedule is exhausted —
+// so a chronically-flaky network doesn't loop forever.
+func TestGhCreateWithRetry_ExhaustsReturnsError(t *testing.T) {
+	calls := 0
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		calls++
+		return `Post "https://api.github.com/graphql": unexpected EOF`, fmt.Errorf("exit status 1")
+	}
+	out, err := ghCreateWithRetry(context.Background(), gh, []time.Duration{0, 0},
+		"pr", "create", "--base", "main", "--head", "feat/x")
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 calls (1 + 2 retries), got %d", calls)
+	}
+	// Output preserved so the caller's classifyGhCreateError dispatch + error
+	// message can still see the upstream stderr.
+	if !strings.Contains(out, "unexpected EOF") {
+		t.Fatalf("expected EOF text preserved in out: %s", out)
+	}
+}
+
+// TestGhCreateWithRetry_NonTransientNoRetry covers the soft failure shapes
+// (already-exists / no-commits-between) and the fatal fall-through: none
+// should retry — they're not network blips, and retrying "already exists"
+// would just waste time before the caller's lookupPR recovery.
+func TestGhCreateWithRetry_NonTransientNoRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  string
+	}{
+		{
+			name: "already exists",
+			out:  `a pull request for branch "feat/x" into branch "main" already exists`,
+		},
+		{
+			name: "no commits between",
+			out:  "pull request create failed: GraphQL: No commits between main and feat/x (createPullRequest)",
+		},
+		{
+			name: "fatal auth",
+			out:  "error: GraphQL: Resource not accessible by integration",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			gh := func(ctx context.Context, args ...string) (string, error) {
+				calls++
+				return tc.out, fmt.Errorf("exit status 1")
+			}
+			_, err := ghCreateWithRetry(context.Background(), gh, []time.Duration{0, 0, 0},
+				"pr", "create", "--base", "main", "--head", "feat/x")
+			if err == nil {
+				t.Fatal("expected error from non-transient failure")
+			}
+			if calls != 1 {
+				t.Fatalf("non-transient must not retry, got %d calls", calls)
+			}
+		})
+	}
+}
+
+// TestGhCreateWithRetry_TransientThenAlreadyExistsStopsRetrying covers the
+// post-EOF idempotency path: attempt 1 dies with a transient error mid-create
+// (mutation may or may not have committed server-side), attempt 2 sees
+// "already exists" — the helper must hand that back to the caller without
+// further retry so ensurePR's lookupPR recovery branch can run.
+func TestGhCreateWithRetry_TransientThenAlreadyExistsStopsRetrying(t *testing.T) {
+	calls := 0
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		calls++
+		if calls == 1 {
+			return `Post "https://api.github.com/graphql": unexpected EOF`, fmt.Errorf("exit status 1")
+		}
+		return `a pull request for branch "feat/x" into branch "main" already exists`, fmt.Errorf("exit status 1")
+	}
+	out, err := ghCreateWithRetry(context.Background(), gh, []time.Duration{0, 0, 0},
+		"pr", "create", "--base", "main", "--head", "feat/x")
+	if err == nil {
+		t.Fatal("expected error to surface so the caller dispatch can run")
+	}
+	if !strings.Contains(out, "already exists") {
+		t.Fatalf("expected already-exists output preserved for caller, got: %s", out)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls (1 transient + 1 non-transient stop), got %d", calls)
+	}
+}
+
+// TestGhCreateWithRetry_RespectsContextCancellation guards against the
+// backoff sleep ignoring a cancelled context (which would defer abort by up
+// to the longest delay in the schedule).
+func TestGhCreateWithRetry_RespectsContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls := 0
+	gh := func(_ context.Context, args ...string) (string, error) {
+		calls++
+		return `Post "https://api.github.com/graphql": unexpected EOF`, fmt.Errorf("exit status 1")
+	}
+	_, err := ghCreateWithRetry(ctx, gh, []time.Duration{time.Hour}, "pr", "create")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 call before cancellation aborts the backoff, got %d", calls)
+	}
+}
+
 // ---- GEO-50 dispatch tests (PR-B-v1) ----
 
 // TestDispatch_FirstTimeAssign_DispatchesTask verifies that a delegate

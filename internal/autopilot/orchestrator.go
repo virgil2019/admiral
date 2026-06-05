@@ -2435,6 +2435,46 @@ func classifyGhCreateError(combined string) ghCreateErrorKind {
 	return ghCreateFatal
 }
 
+// ghCreateWithRetry runs `gh pr create`, retrying ONLY on transient failures
+// (EOF / 5xx / connection reset / i/o timeout) per the given backoff. Soft
+// shapes classified by classifyGhCreateError (ghCreateNoCommits /
+// ghCreateAlreadyExists) and any other non-transient error are returned on
+// the first attempt — the caller still handles them via its existing dispatch.
+//
+// Retries are safe under all three transient-failure positions:
+//   - EOF on the internal "check existing PR" GraphQL read (no mutation yet):
+//     the retry is a fresh attempt.
+//   - EOF after the create mutation reached the server but the response was
+//     dropped: the retry sees "already exists" and ensurePR recovers the URL
+//     via lookupPR — no duplicate PR.
+//   - EOF before the mutation reached the server: the retry creates the PR
+//     for the first time.
+//
+// Intentionally near-identical to ghReadWithRetry (admin_reset.go) — kept as
+// a separate name so call-site reads carry the create-specific idempotency
+// reasoning above. Any change to one should be mirrored in the other.
+func ghCreateWithRetry(ctx context.Context, gh ghRunner, delays []time.Duration, args ...string) (string, error) {
+	var (
+		out string
+		err error
+	)
+	for attempt := 0; attempt <= len(delays); attempt++ {
+		out, err = gh(ctx, args...)
+		if err == nil {
+			return out, nil
+		}
+		if !ghpkg.IsTransientGhFailure(out, err) || attempt == len(delays) {
+			return out, err
+		}
+		select {
+		case <-ctx.Done():
+			return out, ctx.Err()
+		case <-time.After(delays[attempt]):
+		}
+	}
+	return out, err
+}
+
 // ensurePR returns the URL of an open PR with HEAD = the working branch.
 // If claude already opened one, we use that. Otherwise fall back to
 // `gh pr create`. Two benign failure modes from `gh pr create` are
@@ -2457,8 +2497,11 @@ func (f *flow) ensurePR(issue *linear.Issue) (string, error) {
 	}
 	body := fmt.Sprintf("Autopilot run for %s — %s\n\n%s",
 		issue.Identifier, issue.URL, truncate(issue.Description, 4000))
-	out, err := captureCmd(f.ctx, f.worktreePath,
-		f.o.cfg.GhBin, "pr", "create",
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		return captureCmd(ctx, f.worktreePath, f.o.cfg.GhBin, args...)
+	}
+	out, err := ghCreateWithRetry(f.ctx, gh, ghReadDelays,
+		"pr", "create",
 		"--base", f.baseBranch,
 		"--head", f.branch,
 		"--title", fmt.Sprintf("[%s] %s", issue.Identifier, issue.Title),
