@@ -138,15 +138,22 @@ proceeding.
 After explicit confirmation, add `agent-ready` to each chosen **agent-task**
 sub-issue. Skip human-only issues entirely.
 
+`labels` semantics in the Linear MCP can vary between merge and replace —
+do not rely on either. **Always pass the full label set** (the issue's
+existing labels plus `agent-ready`) on the `save_issue` call. You already
+gathered each sub-issue's current labels in Step 2, so reuse those — no
+extra fetch required.
+
 ```
-linear.save_issue(id: <sub-issue identifier>, labels: ["agent-ready"])
+linear.save_issue(
+  id:     <sub-issue identifier>,
+  labels: [<each existing label of this sub-issue, including agent-task>, "agent-ready"],
+)
 ```
 
-`labels` is additive in admiral's usage here — you are adding the pickup
-label, not replacing the issue's existing labels (`agent-task` must stay).
-Confirm the MCP merges rather than overwrites; if it overwrites, include the
-issue's existing labels (including `agent-task`) in the call so none are
-lost.
+This is safe whether the MCP merges or overwrites: the final label set is
+correct either way, and `agent-task` (plus any other pre-existing labels)
+is preserved.
 
 Never label the parent issue — it is the task definition, never picked up.
 Never put `agent-ready` on a human-only sub-issue.
