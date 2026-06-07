@@ -57,6 +57,10 @@ func main() {
 	if err := seedRepos(db, &cfg.Autopilot, logger); err != nil {
 		logger.Warn("repos_seed_failed", "err", err)
 	}
+	// One-shot soft nudge: any repo without verify_cmd silently falls back to
+	// diff-only L2 verify, which cannot catch build/compile errors. Operators
+	// often miss this in config until something breaks.
+	warnReposMissingVerifyCmd(db, logger)
 
 	// Build Linear client and optionally wire token refresh.
 	lc := linear.NewClient(cfg.Linear.APIBase, cfg.Linear.APIToken)
@@ -272,10 +276,32 @@ func seedRepos(db *store.Store, apCfg *config.Autopilot, logger *slog.Logger) er
 			RepoDir:     r.RepoDir,
 			BaseBranch:  r.BaseBranch,
 			Enabled:     true,
+			VerifyCmd:   r.VerifyCmd,
 		}
 		if err := db.UpsertRepo(repo); err != nil {
 			return fmt.Errorf("upsert repo %s: %w", r.ProjectID, err)
 		}
 	}
 	return nil
+}
+
+// warnReposMissingVerifyCmd emits a one-shot WARN per repo whose verify_cmd
+// is empty. L2 verify falls back to diff-only LLM judgment for these repos —
+// build / compile errors will not be caught by admiral's autonomous loop on
+// them until the operator configures a verify command (e.g. "swift build",
+// "go test ./..."). Called once at boot after repos are loaded.
+func warnReposMissingVerifyCmd(db *store.Store, logger *slog.Logger) {
+	repos, err := db.ListRepos()
+	if err != nil {
+		logger.Warn("verify_cmd_boot_check_list_failed", "err", err)
+		return
+	}
+	for _, r := range repos {
+		if strings.TrimSpace(r.VerifyCmd) == "" {
+			logger.Warn("verify_cmd_unconfigured",
+				"project_id", r.ProjectID,
+				"project_name", r.ProjectName,
+				"hint", "L2 verify will judge from diff text only; build/compile errors will not be detected for this repo. Set autopilot.repos[].verify_cmd to enable the hard gate.")
+		}
+	}
 }

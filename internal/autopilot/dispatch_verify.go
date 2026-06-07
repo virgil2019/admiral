@@ -40,11 +40,14 @@ type verifyGap struct {
 
 // verifyMaterial is the input to buildVerifyPrompt: the task's PRD (the
 // parent issue's description, the ground-truth requirements) plus what was
-// actually shipped for each sub-issue.
+// actually shipped for each sub-issue. Optionally also the result of running
+// the repo's configured verify command — fed to the judge as a hard input so
+// build/compile errors cannot land complete=true via diff-only judgment.
 type verifyMaterial struct {
 	ParentIdentifier string
 	PRD              string
 	Subs             []verifySubMaterial
+	BuildResult      *buildResultMaterial
 }
 
 type verifySubMaterial struct {
@@ -52,6 +55,37 @@ type verifySubMaterial struct {
 	Title      string
 	PRURL      string
 	Diff       string
+}
+
+// buildResultMaterial describes the result of running the repo's verify_cmd
+// at L2 verify time. Always present when a verify_cmd is configured; nil
+// when the repo has no verify_cmd (verify falls back to diff-only LLM
+// judgment for that repo — see warnReposMissingVerifyCmd in
+// cmd/admiral-autopilot/main.go).
+type buildResultMaterial struct {
+	// Command is the shell string admiral ran (echoed into the prompt so
+	// the judge can name it in any "Build/test failure" gap).
+	Command string
+	// ExitCode is the process exit code. 0 = build/test passed.
+	ExitCode int
+	// Output is the (capped, tail-truncated) combined stdout+stderr.
+	Output string
+	// TimedOut is true when the verify command was killed by the timeout
+	// rather than exiting on its own.
+	TimedOut bool
+	// LaunchErr is non-empty when the verify command could not be launched
+	// at all (sh missing, IO error). ExitCode is then not meaningful.
+	LaunchErr string
+}
+
+// passed reports whether the build/test result counts as a clean pass.
+// Anything other than exit code 0 (timeout, launch error, non-zero exit)
+// is a fail.
+func (b *buildResultMaterial) passed() bool {
+	if b == nil {
+		return false
+	}
+	return b.LaunchErr == "" && !b.TimedOut && b.ExitCode == 0
 }
 
 // buildVerifyPrompt renders the L2 verification prompt. It instructs the
@@ -80,6 +114,29 @@ func buildVerifyPrompt(m verifyMaterial) string {
 			b.WriteString(diff)
 			b.WriteString("\n```\n")
 		}
+	}
+	if br := m.BuildResult; br != nil {
+		b.WriteString("\n## Project build / test result (from admiral, hard input)\n\n")
+		fmt.Fprintf(&b, "admiral ran the configured verify command BEFORE asking you to judge.\n")
+		fmt.Fprintf(&b, "Command: `%s`\n", br.Command)
+		switch {
+		case br.LaunchErr != "":
+			fmt.Fprintf(&b, "Launch error: %s (the command could NOT be run; treat as a non-passing build)\n", br.LaunchErr)
+		case br.TimedOut:
+			b.WriteString("Result: TIMED OUT (treat as a non-passing build)\n")
+		default:
+			fmt.Fprintf(&b, "Exit code: %d\n", br.ExitCode)
+		}
+		if out := strings.TrimSpace(br.Output); out != "" {
+			b.WriteString("Output tail (combined stdout+stderr, capped):\n```\n")
+			b.WriteString(out)
+			b.WriteString("\n```\n")
+		} else {
+			b.WriteString("(no output captured)\n")
+		}
+		b.WriteString(`
+**Hard rule on the build result:** if the result above is anything other than a clean exit code 0 (i.e. non-zero exit, launch error, or timeout), you MUST set "complete": false and include one gap whose title starts with "Build/test failure" describing the error from the output above. Do NOT mark the task complete while the build is broken — admiral will reject an inconsistent verdict.
+`)
 	}
 	b.WriteString(`
 Judge whether the shipped work, taken together, fully satisfies the ORIGINAL REQUIREMENTS.
@@ -201,10 +258,41 @@ func (o *Orchestrator) runVerify(parentID string) {
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 
-	mat, repoDir, teamID, projectID, err := o.gatherVerifyMaterial(ctx, parentID)
+	mat, repoDir, teamID, projectID, verifyCmd, err := o.gatherVerifyMaterial(ctx, parentID)
 	if err != nil {
 		o.logger.Error("verify_gather_failed", "parent", parentID, "err", err)
 		return
+	}
+
+	// Hard gate: when a verify_cmd is configured for this repo, admiral runs
+	// it BEFORE the judge and threads the result into the prompt. The judge
+	// is told to treat a non-zero exit as a forced complete=false; admiral
+	// then enforces that decision after parse (see overrideVerdictOnBuildFail
+	// below) so a slip-up in the LLM cannot land a "complete" task with a
+	// broken build. Repos without verify_cmd skip this step — verify falls
+	// back to the original diff-only behavior (warned about at boot).
+	if verifyCmd != "" {
+		br := runRepoVerify(ctx, repoDir, verifyCmd, o.cfg.MaxRunSeconds)
+		mat.BuildResult = &buildResultMaterial{
+			Command:  verifyCmd,
+			ExitCode: br.ExitCode,
+			Output:   br.Output,
+			TimedOut: br.TimedOut,
+		}
+		if br.Err != nil && !br.TimedOut {
+			// Launch / IO failure (NOT a non-zero process exit). Surface so the
+			// judge can see something went wrong, but keep going — the prompt
+			// will still let the judge file ordinary gaps if it can spot any.
+			mat.BuildResult.LaunchErr = br.Err.Error()
+			o.logger.Warn("verify_build_launch_failed",
+				"parent", parentID, "err", br.Err)
+		} else if br.TimedOut {
+			o.logger.Warn("verify_build_timed_out",
+				"parent", parentID, "timeout_sec", o.cfg.MaxRunSeconds)
+		} else {
+			o.logger.Info("verify_build_run",
+				"parent", parentID, "exit_code", br.ExitCode, "output_bytes", len(br.Output))
+		}
 	}
 
 	raw, err := o.verifyRunner(ctx, repoDir, buildVerifyPrompt(mat))
@@ -218,7 +306,63 @@ func (o *Orchestrator) runVerify(parentID string) {
 		return
 	}
 
+	// Defense in depth: when admiral observed a non-passing build, the parent
+	// task is NOT complete regardless of what the judge said. Override and
+	// synthesize a Build/test failure gap so the verify loop re-spins on a fix
+	// PR. The judge prompt already requires this on its own; this enforces it.
+	overrideVerdictOnBuildFail(verdict, mat.BuildResult)
+
 	o.applyVerifyVerdict(ctx, parentID, teamID, projectID, verdict)
+}
+
+// overrideVerdictOnBuildFail enforces the "non-passing build ⇒ not complete"
+// invariant on the parsed verdict. Mutates v in place: forces Complete=false
+// and ensures at least one gap describes the build failure when no existing
+// gap mentions it. The judge prompt asks for this behavior; this is admiral
+// guaranteeing it.
+func overrideVerdictOnBuildFail(v *verifyVerdict, br *buildResultMaterial) {
+	if br == nil || br.passed() {
+		return
+	}
+	v.Complete = false
+	for _, g := range v.Gaps {
+		if strings.Contains(strings.ToLower(g.Title), "build") ||
+			strings.Contains(strings.ToLower(g.Title), "test failure") ||
+			strings.Contains(strings.ToLower(g.Title), "compile") {
+			return // judge already filed a build/test/compile gap; don't duplicate
+		}
+	}
+	v.Gaps = append(v.Gaps, verifyGap{
+		Title:              "Build/test failure",
+		Description:        renderBuildFailureGapBody(br),
+		AcceptanceCriteria: fmt.Sprintf("The configured verify command (`%s`) exits 0.", br.Command),
+	})
+}
+
+// renderBuildFailureGapBody is the description body of an admiral-synthesized
+// Build/test failure gap. Names the command admiral ran, the exit / timeout /
+// launch outcome, and the captured tail output so the fix-PR agent has the
+// error in hand without re-running the build itself.
+func renderBuildFailureGapBody(br *buildResultMaterial) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "admiral ran the configured verify command (`%s`) before judging this task and observed:\n\n",
+		br.Command)
+	switch {
+	case br.LaunchErr != "":
+		fmt.Fprintf(&b, "**Could not launch the verify command**: %s\n\n", br.LaunchErr)
+	case br.TimedOut:
+		b.WriteString("**The verify command timed out.** Output captured so far is below.\n\n")
+	default:
+		fmt.Fprintf(&b, "**Exit code: %d**\n\n", br.ExitCode)
+	}
+	if out := strings.TrimSpace(br.Output); out != "" {
+		b.WriteString("Output tail:\n\n```\n")
+		b.WriteString(out)
+		b.WriteString("\n```\n")
+	} else {
+		b.WriteString("(no output captured)\n")
+	}
+	return b.String()
 }
 
 // gatherVerifyMaterial assembles the verify prompt's inputs: the parent
@@ -227,22 +371,24 @@ func (o *Orchestrator) runVerify(parentID string) {
 // admiral_tasks row; the diff from GitHub. Both are best-effort per sub — a
 // sub shipped by a human (no admiral task) still appears in the prompt, just
 // without a diff. Returns the repo dir (claude's cwd), the parent's team and
-// project ids (used by the apply step).
-func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string) (mat verifyMaterial, repoDir, teamID, projectID string, err error) {
+// project ids (used by the apply step), and the repo's configured
+// verify_cmd ("" when none is set — runVerify then skips the build hard gate
+// and verify degrades to diff-only judgment).
+func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string) (mat verifyMaterial, repoDir, teamID, projectID, verifyCmd string, err error) {
 	parent, err := o.lc.GetIssue(ctx, parentID)
 	if err != nil {
-		return verifyMaterial{}, "", "", "", fmt.Errorf("get parent issue: %w", err)
+		return verifyMaterial{}, "", "", "", "", fmt.Errorf("get parent issue: %w", err)
 	}
 	repo, err := o.db.GetRepoByProjectID(parent.ProjectID)
 	if err != nil {
-		return verifyMaterial{}, "", "", "", fmt.Errorf("get repo for project %s: %w", parent.ProjectID, err)
+		return verifyMaterial{}, "", "", "", "", fmt.Errorf("get repo for project %s: %w", parent.ProjectID, err)
 	}
 	if repo == nil {
-		return verifyMaterial{}, "", "", "", fmt.Errorf("no repo configured for project %s", parent.ProjectID)
+		return verifyMaterial{}, "", "", "", "", fmt.Errorf("no repo configured for project %s", parent.ProjectID)
 	}
 	subs, err := o.lc.GetSubIssues(ctx, parentID)
 	if err != nil {
-		return verifyMaterial{}, "", "", "", fmt.Errorf("get sub-issues: %w", err)
+		return verifyMaterial{}, "", "", "", "", fmt.Errorf("get sub-issues: %w", err)
 	}
 
 	mat = verifyMaterial{
@@ -270,7 +416,7 @@ func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string
 		}
 		mat.Subs = append(mat.Subs, sm)
 	}
-	return mat, repo.RepoDir, parent.TeamID, parent.ProjectID, nil
+	return mat, repo.RepoDir, parent.TeamID, parent.ProjectID, repo.VerifyCmd, nil
 }
 
 // applyVerifyVerdict acts on the judge's verdict. complete → flip the parent

@@ -425,3 +425,38 @@ func TestLoadPickupRules_MissingFile(t *testing.T) {
 		t.Error("expected error for missing config file")
 	}
 }
+
+func TestLoadAutopilot_RepoVerifyCmdRoundTrip(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repos:
+    - project_id: "proj-with-cmd"
+      project_name: "WithVerifyCmd"
+      repo_dir: "` + t.TempDir() + `"
+      verify_cmd: "swift build && swift test"
+    - project_id: "proj-without-cmd"
+      project_name: "NoVerifyCmd"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if got := len(cfg.Autopilot.Repos); got != 2 {
+		t.Fatalf("Repos count: got %d, want 2", got)
+	}
+	if got := cfg.Autopilot.Repos[0].VerifyCmd; got != "swift build && swift test" {
+		t.Errorf("Repos[0].VerifyCmd: got %q", got)
+	}
+	if got := cfg.Autopilot.Repos[1].VerifyCmd; got != "" {
+		t.Errorf("Repos[1].VerifyCmd: got %q, want empty (omitted in YAML)", got)
+	}
+}

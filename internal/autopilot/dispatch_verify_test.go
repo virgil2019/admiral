@@ -75,12 +75,15 @@ func TestGatherVerifyMaterial(t *testing.T) {
 	pr := &mockPRClient{getDiffVal: "+ login code"}
 	o := newVerifyOrchestrator(db, lc, pr, 3, nil)
 
-	mat, repoDir, teamID, projectID, err := o.gatherVerifyMaterial(context.Background(), "p1")
+	mat, repoDir, teamID, projectID, verifyCmd, err := o.gatherVerifyMaterial(context.Background(), "p1")
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}
 	if repoDir != "/repo" || teamID != "team-1" || projectID != "proj-1" {
 		t.Errorf("unexpected repo/team/project: %q %q %q", repoDir, teamID, projectID)
+	}
+	if verifyCmd != "" {
+		t.Errorf("expected empty verifyCmd (none configured in mock repo), got %q", verifyCmd)
 	}
 	if mat.PRD != "Build login" || len(mat.Subs) != 1 {
 		t.Fatalf("unexpected material: %+v", mat)
@@ -308,5 +311,218 @@ func TestBuildVerifyPrompt_NoSubs(t *testing.T) {
 	p := buildVerifyPrompt(verifyMaterial{PRD: "do things"})
 	if !strings.Contains(p, "no sub-task diffs available") {
 		t.Error("expected a marker when there are no subs")
+	}
+}
+
+// --- build result rendering (verify_cmd integration) ---
+
+// TestBuildVerifyPrompt_NoBuildResult guards the backward-compat path: when
+// the repo has no verify_cmd configured, BuildResult is nil and the prompt
+// must NOT include the build section. Existing pre-#161 behavior preserved.
+func TestBuildVerifyPrompt_NoBuildResult(t *testing.T) {
+	p := buildVerifyPrompt(verifyMaterial{
+		ParentIdentifier: "GEO-10",
+		PRD:              "do things",
+		BuildResult:      nil,
+	})
+	if strings.Contains(p, "Project build / test result") {
+		t.Errorf("did not expect a build section when BuildResult is nil; got:\n%s", p)
+	}
+	if strings.Contains(p, "Hard rule on the build result") {
+		t.Error("hard-rule line leaked into the no-build-result prompt")
+	}
+}
+
+func TestBuildVerifyPrompt_BuildPassed(t *testing.T) {
+	p := buildVerifyPrompt(verifyMaterial{
+		ParentIdentifier: "GEO-10",
+		PRD:              "do things",
+		BuildResult: &buildResultMaterial{
+			Command:  "swift build",
+			ExitCode: 0,
+			Output:   "Build complete!\n",
+		},
+	})
+	for _, want := range []string{
+		"Project build / test result",
+		"Command: `swift build`",
+		"Exit code: 0",
+		"Build complete!",
+		"Hard rule on the build result", // judge must still see the rule
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("prompt missing %q", want)
+		}
+	}
+}
+
+func TestBuildVerifyPrompt_BuildFailed(t *testing.T) {
+	p := buildVerifyPrompt(verifyMaterial{
+		ParentIdentifier: "GEO-10",
+		PRD:              "do things",
+		BuildResult: &buildResultMaterial{
+			Command:  "swift build",
+			ExitCode: 1,
+			Output:   "error: cannot convert Binding<String?> to Binding<String>\n",
+		},
+	})
+	for _, want := range []string{
+		"Exit code: 1",
+		"cannot convert Binding<String?>",
+		"you MUST set",        // hard instruction
+		"Build/test failure",  // judge is named the gap title to use
+		"admiral will reject", // defense-in-depth signaled
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("prompt missing %q", want)
+		}
+	}
+}
+
+func TestBuildVerifyPrompt_BuildTimedOut(t *testing.T) {
+	p := buildVerifyPrompt(verifyMaterial{
+		PRD: "do things",
+		BuildResult: &buildResultMaterial{
+			Command:  "go test ./...",
+			TimedOut: true,
+			Output:   "...running TestBigCompile",
+		},
+	})
+	if !strings.Contains(p, "TIMED OUT") {
+		t.Errorf("prompt missing TIMED OUT marker: %s", p)
+	}
+}
+
+func TestBuildVerifyPrompt_BuildLaunchError(t *testing.T) {
+	p := buildVerifyPrompt(verifyMaterial{
+		PRD: "do things",
+		BuildResult: &buildResultMaterial{
+			Command:   "swift build",
+			LaunchErr: "exec: \"sh\": executable file not found in $PATH",
+		},
+	})
+	if !strings.Contains(p, "Launch error:") {
+		t.Errorf("prompt missing launch-error marker: %s", p)
+	}
+}
+
+// --- overrideVerdictOnBuildFail ---
+
+func TestOverrideVerdictOnBuildFail_NoBuildResult(t *testing.T) {
+	v := &verifyVerdict{Complete: true, Summary: "looks fine"}
+	overrideVerdictOnBuildFail(v, nil)
+	if !v.Complete {
+		t.Error("nil BuildResult must NOT touch the verdict")
+	}
+	if len(v.Gaps) != 0 {
+		t.Error("nil BuildResult must NOT synthesize a gap")
+	}
+}
+
+func TestOverrideVerdictOnBuildFail_BuildPassed(t *testing.T) {
+	v := &verifyVerdict{Complete: true, Summary: "looks fine"}
+	overrideVerdictOnBuildFail(v, &buildResultMaterial{Command: "swift build", ExitCode: 0})
+	if !v.Complete {
+		t.Error("passing build must NOT flip complete=true")
+	}
+	if len(v.Gaps) != 0 {
+		t.Error("passing build must NOT synthesize a gap")
+	}
+}
+
+func TestOverrideVerdictOnBuildFail_BuildFailedJudgeSaidComplete(t *testing.T) {
+	// Hostile case: build failed (exit != 0) but judge slipped up and
+	// returned complete=true with no gaps. admiral must force complete=false
+	// AND synthesize a Build/test failure gap so applyVerifyVerdict has
+	// something to file (parseVerifyVerdict rejects complete=false + 0 gaps).
+	v := &verifyVerdict{Complete: true, Summary: "all good"}
+	overrideVerdictOnBuildFail(v, &buildResultMaterial{
+		Command:  "swift build",
+		ExitCode: 1,
+		Output:   "error: type mismatch",
+	})
+	if v.Complete {
+		t.Error("failed build must override complete=true → false")
+	}
+	if len(v.Gaps) != 1 {
+		t.Fatalf("expected 1 synthesized gap, got %d: %#v", len(v.Gaps), v.Gaps)
+	}
+	g := v.Gaps[0]
+	if !strings.Contains(strings.ToLower(g.Title), "build") {
+		t.Errorf("synthesized gap title not build-related: %q", g.Title)
+	}
+	if !strings.Contains(g.Description, "swift build") {
+		t.Errorf("gap description must name the command: %q", g.Description)
+	}
+	if !strings.Contains(g.Description, "error: type mismatch") {
+		t.Errorf("gap description must include the output tail: %q", g.Description)
+	}
+	if !strings.Contains(g.AcceptanceCriteria, "exits 0") {
+		t.Errorf("gap AC must require the verify cmd to pass: %q", g.AcceptanceCriteria)
+	}
+}
+
+func TestOverrideVerdictOnBuildFail_BuildFailedJudgeAlreadyFiledBuildGap(t *testing.T) {
+	// Friendly case: judge correctly followed the prompt and filed its own
+	// Build/test failure gap. admiral must NOT duplicate it — flip complete
+	// (no-op already) and leave the gap list as-is.
+	existing := verifyGap{
+		Title:              "Build/test failure: Swift type mismatch",
+		Description:        "judge-written body",
+		AcceptanceCriteria: "swift build passes",
+	}
+	v := &verifyVerdict{Complete: false, Summary: "broken", Gaps: []verifyGap{existing}}
+	overrideVerdictOnBuildFail(v, &buildResultMaterial{Command: "swift build", ExitCode: 1, Output: "boom"})
+	if v.Complete {
+		t.Error("complete must remain false on failed build")
+	}
+	if len(v.Gaps) != 1 {
+		t.Fatalf("expected exactly 1 gap (no duplicate synthesis), got %d", len(v.Gaps))
+	}
+	if v.Gaps[0].Title != existing.Title {
+		t.Errorf("admiral overwrote judge's gap; want %q got %q", existing.Title, v.Gaps[0].Title)
+	}
+}
+
+func TestOverrideVerdictOnBuildFail_BuildTimedOut(t *testing.T) {
+	v := &verifyVerdict{Complete: true}
+	overrideVerdictOnBuildFail(v, &buildResultMaterial{Command: "swift build", TimedOut: true})
+	if v.Complete {
+		t.Error("timed-out build counts as non-passing → complete must be false")
+	}
+	if len(v.Gaps) != 1 {
+		t.Fatalf("expected synthesized gap on timeout, got %d", len(v.Gaps))
+	}
+}
+
+func TestOverrideVerdictOnBuildFail_LaunchErr(t *testing.T) {
+	v := &verifyVerdict{Complete: true}
+	overrideVerdictOnBuildFail(v, &buildResultMaterial{Command: "swift build", LaunchErr: "exec failed"})
+	if v.Complete {
+		t.Error("launch-err build counts as non-passing → complete must be false")
+	}
+	if len(v.Gaps) != 1 {
+		t.Fatalf("expected synthesized gap on launch-err, got %d", len(v.Gaps))
+	}
+}
+
+func TestBuildResultMaterial_Passed(t *testing.T) {
+	cases := []struct {
+		name string
+		br   *buildResultMaterial
+		want bool
+	}{
+		{"nil", nil, false},
+		{"exit0", &buildResultMaterial{ExitCode: 0}, true},
+		{"exit-nonzero", &buildResultMaterial{ExitCode: 1}, false},
+		{"timed-out", &buildResultMaterial{TimedOut: true}, false},
+		{"launch-err", &buildResultMaterial{LaunchErr: "x"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.br.passed(); got != tc.want {
+				t.Errorf("passed() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

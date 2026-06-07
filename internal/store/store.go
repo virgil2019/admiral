@@ -386,6 +386,17 @@ CREATE TABLE IF NOT EXISTS task_verifications (
 );
 `
 
+// migration0020 adds the per-repo verify command. autopilot's L2 verify
+// runs this command in the repo before invoking the LLM judge, so the
+// judge has the actual build/test exit code + output as hard input rather
+// than judging "did we ship the work?" from diff text alone. Empty string
+// (the column default) means "no verify command configured" — verify
+// degrades to its pre-migration behavior (judge reads diffs only) and
+// admiral logs a one-shot WARN at boot.
+const migration0020 = `
+ALTER TABLE repos ADD COLUMN verify_cmd TEXT NOT NULL DEFAULT '';
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -411,6 +422,7 @@ var migrations = []migration{
 	{17, migration0017},
 	{18, migration0018},
 	{19, migration0019},
+	{20, migration0020},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -1785,12 +1797,17 @@ type Repo struct {
 	BaseBranch      string
 	Enabled         bool
 	AutoPickEnabled bool
+	// VerifyCmd is the shell command admiral's L2 verify runs in the repo
+	// before invoking the LLM judge (e.g. "swift build", "go test ./...").
+	// Empty = no verify command configured → verify degrades to diff-only
+	// judgment and admiral logs a one-shot WARN at boot.
+	VerifyCmd string
 }
 
 // ListRepos returns all repos ordered by project_name.
 func (s *Store) ListRepos() ([]Repo, error) {
 	rows, err := s.DB.Query(`
-		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled
+		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd
 		FROM repos ORDER BY project_name ASC
 	`)
 	if err != nil {
@@ -1801,7 +1818,7 @@ func (s *Store) ListRepos() ([]Repo, error) {
 	for rows.Next() {
 		var r Repo
 		var enabled, autoPick int
-		if err := rows.Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick); err != nil {
+		if err := rows.Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick, &r.VerifyCmd); err != nil {
 			return nil, err
 		}
 		r.Enabled = enabled == 1
@@ -1817,9 +1834,9 @@ func (s *Store) GetRepoByProjectID(projectID string) (*Repo, error) {
 	var r Repo
 	var enabled, autoPick int
 	err := s.DB.QueryRow(`
-		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled
+		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd
 		FROM repos WHERE project_id=?
-	`, projectID).Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick)
+	`, projectID).Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick, &r.VerifyCmd)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1843,16 +1860,17 @@ func (s *Store) UpsertRepo(r Repo) error {
 		autoPick = 1
 	}
 	_, err := s.DB.Exec(`
-		INSERT INTO repos(project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO repos(project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(project_id) DO UPDATE SET
 			project_name=excluded.project_name,
 			repo_dir=excluded.repo_dir,
 			base_branch=excluded.base_branch,
 			enabled=excluded.enabled,
 			auto_pick_enabled=excluded.auto_pick_enabled,
+			verify_cmd=excluded.verify_cmd,
 			updated_at=excluded.updated_at
-	`, r.ProjectID, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, autoPick, now, now)
+	`, r.ProjectID, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, autoPick, r.VerifyCmd, now, now)
 	return err
 }
 
