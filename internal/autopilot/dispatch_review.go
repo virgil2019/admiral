@@ -144,7 +144,7 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 		return
 	}
 
-	prompt := buildReviewPrompt(task.PRURL, task.Branch, baseBranch, reviewBody, diff)
+	prompt := buildReviewPrompt(o.cfg.ReviewSkill, task.PRURL, task.Branch, baseBranch, reviewBody, diff)
 
 	output, err := runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, worktreePath, prompt, o.logger)
 	if err != nil {
@@ -427,9 +427,16 @@ func (o *Orchestrator) postReviewLinearNotice(task *store.AdmiralTask, a linear.
 }
 
 // buildReviewPrompt constructs the prompt passed to claude when addressing a
-// PR review comment.
-func buildReviewPrompt(prURL, branch, baseBranch, reviewBody, diff string) string {
+// PR review comment. When skill is non-empty, the prompt starts with
+// "/<skill>\n\n" so claude enters that skill's flow before reading the
+// reviewer feedback below — typically used to plug in OMC's UltraQA
+// (`oh-my-claudecode:ultraqa`) for a real build/test/fix loop on the fix
+// worktree. Empty skill leaves the prompt unprefixed (pre-PR behavior).
+func buildReviewPrompt(skill, prURL, branch, baseBranch, reviewBody, diff string) string {
 	var b strings.Builder
+	if skill != "" {
+		fmt.Fprintf(&b, "/%s\n\n", skill)
+	}
 	fmt.Fprintf(&b, "A reviewer has left feedback on PR %s (branch: %s, base: %s).\n\n",
 		prURL, branch, baseBranch)
 	if reviewBody != "" {

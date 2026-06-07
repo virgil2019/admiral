@@ -151,6 +151,14 @@ type Autopilot struct {
 	// AutopilotSkill is the skill name passed to claude -p (`--skill <name>` or
 	// "/<name>" prefix in the prompt). Default: empty (no skill).
 	AutopilotSkill string `yaml:"autopilot_skill"`
+	// ReviewSkill is the same idea as AutopilotSkill but for the review-dispatch
+	// path (claude addressing reviewer feedback on an open PR). When set, the
+	// review prompt starts with "/<ReviewSkill>" so claude enters that skill's
+	// flow — typically `oh-my-claudecode:ultraqa` to drive a build/test/fix
+	// loop on the fix worktree. Default: empty (no skill prefix). The prompt
+	// still carries the inline "run the project build before committing"
+	// instruction from PR #163 either way.
+	ReviewSkill string `yaml:"review_skill"`
 	// GhBin is the absolute path to the `gh` CLI used for the PR fallback.
 	// Default: "gh" (PATH).
 	GhBin string `yaml:"gh_bin"`
