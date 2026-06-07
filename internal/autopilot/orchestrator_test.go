@@ -69,13 +69,16 @@ func TestBuildPrompt_AssignNoContext(t *testing.T) {
 	if !strings.Contains(p, "(assigned, no explicit prompt") {
 		t.Errorf("missing assign placeholder:\n%s", p)
 	}
-	if !strings.Contains(p, "git push -u origin \"linear/tst-1\"") &&
-		!strings.Contains(p, "git push -u origin linear/tst-1") {
-		t.Errorf("missing branch in operating procedure:\n%s", p)
+	if !strings.Contains(p, "linear/tst-1") {
+		t.Errorf("missing branch reference in operating procedure:\n%s", p)
 	}
-	if !strings.Contains(p, "--base \"main\"") &&
-		!strings.Contains(p, "--base main") {
-		t.Errorf("missing base branch in operating procedure:\n%s", p)
+	// admiral hard gate (#161 first-run slice): the prompt MUST tell claude to
+	// not push and not open a PR — admiral owns those after the build gate.
+	if !strings.Contains(p, "Do NOT run `git push`") {
+		t.Errorf("operating procedure should forbid `git push`:\n%s", p)
+	}
+	if !strings.Contains(p, "do NOT run `gh pr create`") {
+		t.Errorf("operating procedure should forbid `gh pr create`:\n%s", p)
 	}
 }
 
