@@ -1,6 +1,6 @@
 ---
 name: decompose
-description: Decompose a task into Linear issues for the admiral autonomous loop. Takes a parent reference — an existing Linear issue (sub-issues are created under it), the special sentinel `project` (top-level issues are created directly under the project, no Linear parent), or a title for a new parent to create on confirmation. Classifies sub-issues as agent-doable or human-only and tags agent-doable ones with `agent-task`. Top-level issues (in `project` mode) stay unlabeled — they are features, future-decomposable into ship-able slices. Deliberately does NOT apply the pickup (`agent-ready`) label — nothing is shipped until the user explicitly activates the task. Invoke when the user says "/decompose", "decompose this", "拆任务", "拆分到 Linear", "break this down into issues", or wants to turn a PRD / design doc / project description into admiral-ready Linear issues. Requires the Linear MCP.
+description: Decompose a task into Linear issues for the admiral autonomous loop. Takes a parent reference — an existing Linear issue (sub-issues are created under it), the special sentinel `top-level` (with `project` accepted as a legacy alias; top-level issues are created directly under the project, no Linear parent), or a title for a new parent to create on confirmation. Classifies sub-issues as agent-doable or human-only and tags agent-doable ones with `agent-task`. Top-level issues stay unlabeled — they are features, future-decomposable into ship-able slices. Deliberately does NOT apply the pickup (`agent-ready`) label — nothing is shipped until the user explicitly activates the task. Invoke when the user says "/decompose", "decompose this", "拆任务", "拆分到 Linear", "break this down into issues", or wants to turn a PRD / design doc / project description into admiral-ready Linear issues. Requires the Linear MCP.
 ---
 
 # Decompose
@@ -27,26 +27,33 @@ Linear writes. The valid shapes:
 | User intent | Examples | Resolution → mode |
 |---|---|---|
 | **Existing issue** — slice under it | `/decompose GEO-5`, URL, "decompose this issue" with a clear ref | `linear.get_issue(GEO-5)` to verify exists → **sub-issue mode**. PRD source = the issue's `description`. |
-| **Project root** — produce top-level features | `/decompose project`, `/decompose --top-level`, "拆 project", "为 project 创建 issues" | No Linear parent → **top-level mode**. PRD source = conversation content provided by the user. |
+| **Project root** — produce top-level features | `/decompose top-level`, `/decompose --top-level`, "拆 project / 顶层", "为 project 创建 issues"; `/decompose project` / `--project` / `--project-root` accepted as legacy aliases | No Linear parent → **top-level mode**. PRD source = conversation content provided by the user. |
 | **Title for a new parent** — issue doesn't exist yet | `/decompose "Build login feature"`, "拆: build login" with no matching ID | `linear.list_issues(query: "<title>")` to search. Zero matches → **create-then-sub-issue mode** (Step 4 will confirm + create). Multiple matches → ask user to pick. Exactly one match → treat as existing. |
 | **Nothing given** | bare `/decompose` | Infer from conversation context. If a recent Linear issue / project / title is clearly the intent, propose it back to the user and wait for confirmation. If not clear, ask explicitly. **Never guess silently.** |
 
 Identifier heuristics (the LLM applies these to disambiguate the user's input):
 - Looks like `[A-Z]+-\d+` or a `linear.app/...` URL → treat as an issue
   reference.
-- Literal `project` / `top-level` / `--project` / "顶层" → top-level mode.
+- Literal `top-level` / `--top-level` / "顶层" → top-level mode. Legacy aliases also accepted: `project` / `--project` / `--project-root` (the canonical name avoids overloading Linear's own `project` field, but accept either to be ergonomic).
 - Anything else, especially quoted strings or phrases → title text; search.
 
 Rules:
 - **Always confirm before any Linear write.** Step 1 is read-only
   (`get_issue`, `list_issues`). Writes happen only in Steps 4 and 6, and
   Step 4 always asks first.
-- If the user gave a sentinel like `project`, also resolve which project —
-  usually the one tied to the current repo per admiral's config, but ask if
-  ambiguous.
+- If the user gave a top-level sentinel (`top-level`, `project`, etc.),
+  also resolve which project — usually the one tied to the current repo
+  per admiral's config, but ask if ambiguous.
 - Record the resolved **attachment mode** (one of: `sub-issue-mode`,
   `top-level-mode`, `create-then-sub-issue-mode`) and the chosen
   `team` / `project` ids. Every later step branches on the mode.
+- **PRD content pre-check** (top-level mode and create-then-sub-issue mode
+  only): in these modes the PRD source is conversation content, not an
+  existing Linear issue. If the user has not provided PRD content in this
+  conversation yet, ask for it now BEFORE moving to Step 2. Step 2's
+  detail gate is the wrong place to discover the user never typed a
+  PRD — that produces a confusing back-and-forth. (Sub-issue mode skips
+  this check: the PRD comes from the existing issue's `description`.)
 
 ## Step 2 — Gate on detail: is the PRD decomposable?
 
@@ -304,6 +311,10 @@ intentional.
 >   carrying `agent-task` (human-only ones are surfaced as skipped).
 >   Recommended path; has wrong-target safety gate.
 > - **Manually**: add `agent-ready` to specific sub-issues in Linear.
+>   **You are responsible for skipping human-only sub-issues** — admiral's
+>   discoverer cannot tell `agent-task` from human-only and will try to
+>   ship anything carrying `agent-ready`. `/activate` enforces this check;
+>   the manual path does not.
 
 **Top-level mode** — there is no direct activation; the next step is
 per-feature slicing:
