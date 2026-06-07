@@ -295,6 +295,7 @@ func TestBuildReviewPrompt_ContainsKeyParts(t *testing.T) {
 		"Fix the off-by-one error.",
 		"diff",
 		"Do NOT open a new PR",
+		"Do not commit broken code",
 	}
 	for _, want := range checks {
 		if !strings.Contains(p, want) {

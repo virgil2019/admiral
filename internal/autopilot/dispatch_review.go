@@ -439,6 +439,10 @@ func buildReviewPrompt(prURL, branch, baseBranch, reviewBody, diff string) strin
 		fmt.Fprintf(&b, "PR diff for context:\n```diff\n%s\n```\n\n", diff)
 	}
 	b.WriteString("Please address the review feedback by making the appropriate code changes in this repository. ")
+	b.WriteString("Before committing, run the project's build / test command " +
+		"(e.g. `swift build`, `go build ./...`, `cargo build`, `npm test` — whichever this repo uses; " +
+		"check the repo's README or common build files if unsure) and ensure it passes. " +
+		"Do not commit broken code. ")
 	fmt.Fprintf(&b, "Stage and commit your changes to branch %q. Do NOT open a new PR.\n", branch)
 	b.WriteString("Summarize what you changed in 1–3 sentences for the review reply.")
 	return b.String()
