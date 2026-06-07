@@ -426,6 +426,61 @@ func TestLoadPickupRules_MissingFile(t *testing.T) {
 	}
 }
 
+func TestLoadAutopilot_ReviewSkillRoundTrip(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  autopilot_skill: "oh-my-claudecode:autopilot"
+  review_skill: "oh-my-claudecode:ultraqa"
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if got := cfg.Autopilot.ReviewSkill; got != "oh-my-claudecode:ultraqa" {
+		t.Errorf("ReviewSkill: got %q", got)
+	}
+	if got := cfg.Autopilot.AutopilotSkill; got != "oh-my-claudecode:autopilot" {
+		t.Errorf("AutopilotSkill: got %q (regression — should still round-trip)", got)
+	}
+}
+
+func TestLoadAutopilot_ReviewSkillDefaultEmpty(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if cfg.Autopilot.ReviewSkill != "" {
+		t.Errorf("ReviewSkill should default to empty when omitted; got %q", cfg.Autopilot.ReviewSkill)
+	}
+}
+
 func TestLoadAutopilot_RepoVerifyCmdRoundTrip(t *testing.T) {
 	bin := os.Args[0]
 	body := `

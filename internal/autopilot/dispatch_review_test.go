@@ -282,6 +282,7 @@ func TestExtractReviewBody_IssueComment(t *testing.T) {
 
 func TestBuildReviewPrompt_ContainsKeyParts(t *testing.T) {
 	p := buildReviewPrompt(
+		"", // skill: empty for this test — exercise the "no prefix" path
 		"https://github.com/owner/repo/pull/5",
 		"linear/geo-5",
 		"main",
@@ -305,17 +306,64 @@ func TestBuildReviewPrompt_ContainsKeyParts(t *testing.T) {
 }
 
 func TestBuildReviewPrompt_NoDiff(t *testing.T) {
-	p := buildReviewPrompt("https://github.com/owner/repo/pull/6", "linear/geo-6", "main", "nit", "")
+	p := buildReviewPrompt("", "https://github.com/owner/repo/pull/6", "linear/geo-6", "main", "nit", "")
 	if strings.Contains(p, "```diff") {
 		t.Error("expected no diff block when diff is empty")
 	}
 }
 
 func TestBuildReviewPrompt_NoReviewBody(t *testing.T) {
-	p := buildReviewPrompt("https://github.com/owner/repo/pull/7", "linear/geo-7", "main", "", "some diff")
+	p := buildReviewPrompt("", "https://github.com/owner/repo/pull/7", "linear/geo-7", "main", "", "some diff")
 	if strings.Contains(p, "Review comment:") {
 		t.Error("expected no review comment section when body is empty")
 	}
+}
+
+func TestBuildReviewPrompt_SkillPrefixWhenSet(t *testing.T) {
+	p := buildReviewPrompt(
+		"oh-my-claudecode:ultraqa",
+		"https://github.com/owner/repo/pull/8",
+		"linear/geo-8",
+		"main",
+		"check the loop",
+		"",
+	)
+	if !strings.HasPrefix(p, "/oh-my-claudecode:ultraqa\n\n") {
+		t.Errorf("expected /<skill> prefix at the top of the prompt; first 80 chars: %q", p[:min(80, len(p))])
+	}
+	// The rest of the prompt body must still land — the skill prefix is
+	// additive, not a replacement.
+	for _, want := range []string{
+		"reviewer has left feedback",
+		"check the loop",
+		"Do NOT open a new PR",
+		"Do not commit broken code", // PR #163's inline build instruction stays
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("prompt missing %q (skill prefix should be additive)", want)
+		}
+	}
+}
+
+func TestBuildReviewPrompt_NoSkillPrefixWhenEmpty(t *testing.T) {
+	p := buildReviewPrompt(
+		"", // explicitly empty
+		"https://github.com/owner/repo/pull/9",
+		"linear/geo-9",
+		"main",
+		"nit",
+		"",
+	)
+	if strings.HasPrefix(p, "/") {
+		t.Errorf("empty skill must NOT prepend any /<skill> prefix; got start: %q", p[:min(40, len(p))])
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // --- review state extraction ---
