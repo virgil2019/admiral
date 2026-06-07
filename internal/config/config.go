@@ -237,6 +237,13 @@ type RepoConfig struct {
 	RepoDir string `yaml:"repo_dir"`
 	// BaseBranch is the branch new worktrees are forked from. Default: "main".
 	BaseBranch string `yaml:"base_branch"`
+	// VerifyCmd is the shell command admiral's L2 verify runs in the repo
+	// (via `sh -c`) before invoking the LLM judge — e.g. `"swift build"`,
+	// `"go build ./... && go test ./..."`. The exit code + tail output is
+	// fed to the judge as hard input. Empty = no verify command configured
+	// → L2 verify degrades to diff-only judgment and admiral logs a
+	// one-shot WARN at boot for this repo.
+	VerifyCmd string `yaml:"verify_cmd"`
 }
 
 type Launch struct {
