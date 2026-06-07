@@ -10,3 +10,4 @@ config.yaml
 .task.md
 .env
 .tasks/
+.worktrees/
