@@ -426,6 +426,57 @@ func TestLoadPickupRules_MissingFile(t *testing.T) {
 	}
 }
 
+func TestLoadAutopilot_VerifyMaxRetriesRoundTrip(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  verify_max_retries: 5
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if got := cfg.Autopilot.VerifyMaxRetries; got != 5 {
+		t.Errorf("VerifyMaxRetries: got %d, want 5", got)
+	}
+}
+
+func TestLoadAutopilot_VerifyMaxRetriesDefault(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if got := cfg.Autopilot.VerifyMaxRetries; got != 2 {
+		t.Errorf("VerifyMaxRetries should default to 2 when omitted; got %d", got)
+	}
+}
+
 func TestLoadAutopilot_ReviewSkillRoundTrip(t *testing.T) {
 	bin := os.Args[0]
 	body := `

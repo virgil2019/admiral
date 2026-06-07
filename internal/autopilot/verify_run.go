@@ -126,3 +126,139 @@ func capTail(b []byte, n int) string {
 	}
 	return fmt.Sprintf("... (output truncated to last %d bytes of %d) ...\n", n, len(b)) + string(b[len(b)-n:])
 }
+
+// VerifyRetryResult is what runVerifyWithRetry returns. Separates the
+// observable outcome (Passed) from diagnostic context (LastBuildOutput,
+// LastClaudeReply, Attempts) and launch failures (LaunchErr).
+type VerifyRetryResult struct {
+	// Passed is true when some build attempt exited 0. False otherwise — the
+	// caller MUST NOT push when this is false.
+	Passed bool
+	// Attempts is the number of build invocations actually made — at least 1
+	// (the initial verify after claude's first run), at most maxRetries+1.
+	Attempts int
+	// LastBuildOutput is the capped tail of the last build's combined
+	// stdout+stderr. Set on both pass and fail (for success-side telemetry +
+	// failure-side reporting to the user).
+	LastBuildOutput string
+	// LastClaudeReply is the trimmed stdout from the last claude retry run.
+	// Empty when no retry happened (i.e. Attempts == 1).
+	LastClaudeReply string
+	// LaunchErr is set when a build or claude invocation could not be launched
+	// at all (sh missing, claude binary missing, IO error). When non-empty,
+	// Passed is false and the loop bailed early — the caller should treat
+	// this as a runtime problem, not a build failure.
+	LaunchErr string
+}
+
+// runVerifyWithRetry is admiral's hard gate around the verify_cmd. Designed
+// to be called AFTER an initial claude run has already produced commits in
+// worktreePath:
+//
+//  1. Run verifyCmd via runRepoVerify.
+//  2. Exit 0 → return Passed=true.
+//  3. Non-zero / timeout → if retries remain, call claudeRunner with a retry
+//     prompt naming the failure + asking for a fix-forward commit. Loop.
+//  4. Out of retries → return Passed=false. Caller MUST NOT push.
+//
+// claudeRunner is a closure the caller injects so this helper does not have
+// to know about claude binaries, skills, or per-path prompt scaffolding. The
+// caller wires its own claude invocation (typically `runClaudeForReview` /
+// `runClaudeForAutopilot` with whatever skill prefix applies). claudeRunner's
+// returned output is captured into LastClaudeReply for the caller's reply
+// channel (PR comment / Linear thread).
+//
+// Empty verifyCmd is a programmer error — the caller MUST check + skip
+// upstream (this helper exists to gate, not to decide whether gating is
+// enabled).
+func runVerifyWithRetry(
+	ctx context.Context,
+	worktreePath, verifyCmd string,
+	buildTimeoutSec, maxRetries int,
+	claudeRunner func(ctx context.Context, wt, prompt string) (output string, err error),
+) VerifyRetryResult {
+	verifyCmd = strings.TrimSpace(verifyCmd)
+	if verifyCmd == "" {
+		return VerifyRetryResult{LaunchErr: "runVerifyWithRetry: empty verifyCmd (caller must check + skip)"}
+	}
+	if claudeRunner == nil {
+		return VerifyRetryResult{LaunchErr: "runVerifyWithRetry: nil claudeRunner"}
+	}
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+
+	result := VerifyRetryResult{}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		br := runRepoVerify(ctx, worktreePath, verifyCmd, buildTimeoutSec)
+		result.Attempts = attempt + 1
+		result.LastBuildOutput = br.Output
+
+		// Build launched + exited cleanly → done, regardless of retry budget.
+		if br.Err == nil && !br.TimedOut && br.ExitCode == 0 {
+			result.Passed = true
+			return result
+		}
+
+		// Distinguish "build couldn't run at all" (LaunchErr) from "build ran
+		// and reported failure" (drop into retry). A launch error is a runtime
+		// problem the caller must surface differently — retry won't help when
+		// sh is missing.
+		if br.Err != nil && !br.TimedOut {
+			// Real launch failure (vs ExitError, which runRepoVerify already
+			// folds into ExitCode). Bail.
+			result.LaunchErr = br.Err.Error()
+			return result
+		}
+
+		// We have a real build failure (non-zero exit OR timeout). If we've
+		// used our last retry attempt, give up.
+		if attempt == maxRetries {
+			return result
+		}
+
+		// Retry: ask claude to fix the build, then loop back to verify.
+		retryPrompt := buildVerifyRetryPrompt(verifyCmd, br, attempt+1, maxRetries+1)
+		claudeOut, claudeErr := claudeRunner(ctx, worktreePath, retryPrompt)
+		result.LastClaudeReply = claudeOut
+		if claudeErr != nil {
+			// claude itself couldn't run (binary missing, context cancelled).
+			// Without a successful retry run, the next verify would just repeat
+			// the same failure. Bail with LaunchErr.
+			result.LaunchErr = fmt.Sprintf("claude retry attempt %d failed to run: %v", attempt+1, claudeErr)
+			return result
+		}
+	}
+
+	return result
+}
+
+// buildVerifyRetryPrompt is the generic "your previous attempt's build failed,
+// fix it" prompt fed to claude between verify rounds. Intentionally path-
+// agnostic: claude has the worktree state (including its own prior commits)
+// to figure out what was being attempted. Path-specific framing belongs in
+// the INITIAL prompt (set up by `buildReviewPrompt` / `buildPrompt`).
+func buildVerifyRetryPrompt(verifyCmd string, br VerifyRunResult, attempt, total int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "admiral just ran the configured verify command in this worktree and it FAILED. ")
+	fmt.Fprintf(&b, "Retry attempt %d of %d.\n\n", attempt, total)
+	fmt.Fprintf(&b, "Command: `%s`\n", verifyCmd)
+	switch {
+	case br.TimedOut:
+		b.WriteString("Result: TIMED OUT (treat as a non-passing build)\n\n")
+	default:
+		fmt.Fprintf(&b, "Exit code: %d\n\n", br.ExitCode)
+	}
+	if out := strings.TrimSpace(br.Output); out != "" {
+		b.WriteString("Output tail (combined stdout+stderr, capped):\n```\n")
+		b.WriteString(out)
+		b.WriteString("\n```\n\n")
+	} else {
+		b.WriteString("(no output captured)\n\n")
+	}
+	b.WriteString("Diagnose the failure, fix the code, and stage + commit the fix on this branch. ")
+	b.WriteString("Your previous commit(s) from this session are still in place; fix forward — do NOT revert or open a new PR. ")
+	b.WriteString("The verify command MUST exit 0 before the change can ship. Summarize what you changed in 1–3 sentences.")
+	return b.String()
+}

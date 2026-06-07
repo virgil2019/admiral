@@ -159,6 +159,13 @@ type Autopilot struct {
 	// still carries the inline "run the project build before committing"
 	// instruction from PR #163 either way.
 	ReviewSkill string `yaml:"review_skill"`
+	// VerifyMaxRetries is how many extra fix-attempts admiral allows on top of
+	// claude's initial run when the configured repo verify_cmd fails: 0 means
+	// no retry (verify once, fail-stops), 2 means up to 2 retries (3 total
+	// build attempts). Used by the review-dispatch hard gate and the planned
+	// first-run hard gate. Defaults to 2 when unset / zero — set explicitly
+	// (e.g. 0 to disable) if you want different behavior.
+	VerifyMaxRetries int `yaml:"verify_max_retries"`
 	// GhBin is the absolute path to the `gh` CLI used for the PR fallback.
 	// Default: "gh" (PATH).
 	GhBin string `yaml:"gh_bin"`
@@ -468,6 +475,13 @@ func (c *Config) validateAutopilotAndExpand() error {
 	// Note: we do NOT call expandTilde on AdminToken — it's a secret, not a path.
 	if c.Autopilot.MaxRunSeconds <= 0 {
 		c.Autopilot.MaxRunSeconds = 1800
+	}
+	if c.Autopilot.VerifyMaxRetries <= 0 {
+		// 0 retries (1-shot build) gives up on every claude first-attempt
+		// imperfection, which defeats the point of the gate. Default 2 means
+		// 3 build attempts total. Operators who want the 1-shot behavior can
+		// drop verify_cmd entirely to disable the gate.
+		c.Autopilot.VerifyMaxRetries = 2
 	}
 	if c.Autopilot.VerifyMaxRounds <= 0 {
 		c.Autopilot.VerifyMaxRounds = DefaultVerifyMaxRounds

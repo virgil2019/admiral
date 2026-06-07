@@ -126,7 +126,7 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 		// Non-fatal: proceed without diff context.
 	}
 
-	repoDir, baseBranch, err := o.resolveRepoForReview(ctx, task)
+	repoDir, baseBranch, verifyCmd, err := o.resolveRepoForReview(ctx, task)
 	if err != nil {
 		o.logger.Error("review_run_resolve_repo_failed",
 			"issue", task.IssueIdentifier, "err", err)
@@ -151,6 +151,53 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 		o.logger.Error("review_run_claude_failed", "pr", task.PRURL, "err", err)
 		_ = replier.Fail(ctx, fmt.Sprintf("admiral: review run failed: %v", err))
 		return
+	}
+
+	// Build hard gate (closes the review-dispatch slice of #161 / 漏洞 2 hard
+	// form). When the repo has verify_cmd set, admiral runs it AFTER claude's
+	// initial pass. On a non-passing build the gate retries claude up to
+	// VerifyMaxRetries times with a fix-forward prompt; only on a clean exit 0
+	// does the change get pushed. Repos without verify_cmd skip the gate
+	// entirely (preserves pre-PR behavior; prompt-level layers from #163/#165
+	// remain).
+	gateAttempts := 0
+	if verifyCmd != "" {
+		claudeRunner := func(ctx context.Context, wt, retryPrompt string) (string, error) {
+			fullPrompt := retryPrompt
+			if o.cfg.ReviewSkill != "" {
+				fullPrompt = "/" + o.cfg.ReviewSkill + "\n\n" + retryPrompt
+			}
+			return runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, wt, fullPrompt, o.logger)
+		}
+		gate := runVerifyWithRetry(ctx, worktreePath, verifyCmd, o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries, claudeRunner)
+		gateAttempts = gate.Attempts
+		if !gate.Passed {
+			o.logger.Warn("review_run_build_gate_failed",
+				"pr", task.PRURL, "branch", task.Branch,
+				"attempts", gate.Attempts,
+				"launch_err", gate.LaunchErr)
+			failMsg := fmt.Sprintf(
+				"admiral could not get the build to pass after %d attempt(s). The change has NOT been pushed.\n\n"+
+					"Verify command: `%s`\nLast build output tail:\n```\n%s\n```",
+				gate.Attempts, verifyCmd, strings.TrimSpace(gate.LastBuildOutput))
+			if gate.LaunchErr != "" {
+				failMsg += fmt.Sprintf("\n\nadmiral launch error: %s", gate.LaunchErr)
+			}
+			_ = replier.Fail(ctx, failMsg)
+			// Mirror the PR-side notice on the Linear thread so the issue
+			// creator is aware without having to watch the PR tab.
+			o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
+				"admiral build gate failed for PR %s after %d attempt(s). Manual review needed.",
+				task.PRURL, gate.Attempts)))
+			return
+		}
+		// Retry produced a fresher summary that reflects the FINAL passing
+		// commit; surface it to the reviewer.
+		if gate.LastClaudeReply != "" {
+			output = gate.LastClaudeReply
+		}
+		o.logger.Info("review_run_build_gate_passed",
+			"pr", task.PRURL, "branch", task.Branch, "attempts", gate.Attempts)
 	}
 
 	if pushErr := runCmd(ctx, worktreePath, "git", "push", "origin", task.Branch); pushErr != nil {
@@ -180,6 +227,11 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 	if output == "" {
 		output = "addressed"
 	}
+	if gateAttempts > 0 {
+		// Surface the attempt count so reviewers can tell at a glance whether
+		// the fix landed cleanly (1 attempt) or needed retries (2+).
+		output += fmt.Sprintf("\n\n_(admiral build gate: passed after %d attempt(s))_", gateAttempts)
+	}
 	_ = replier.Reply(ctx, output)
 
 	// Best-effort: notify the Linear thread that the review has been addressed
@@ -189,20 +241,21 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 }
 
 // resolveRepoForReview fetches the Linear issue for the task and returns the
-// configured repo directory and base branch.
-func (o *Orchestrator) resolveRepoForReview(ctx context.Context, task *store.AdmiralTask) (repoDir, baseBranch string, err error) {
+// configured repo directory, base branch, and verify command (empty when no
+// build hard gate is configured for the repo).
+func (o *Orchestrator) resolveRepoForReview(ctx context.Context, task *store.AdmiralTask) (repoDir, baseBranch, verifyCmd string, err error) {
 	issue, err := o.lc.GetIssue(ctx, task.IssueID)
 	if err != nil {
-		return "", "", fmt.Errorf("get issue: %w", err)
+		return "", "", "", fmt.Errorf("get issue: %w", err)
 	}
 	repo, err := o.db.GetRepoByProjectID(issue.ProjectID)
 	if err != nil {
-		return "", "", fmt.Errorf("get repo for project %s: %w", issue.ProjectID, err)
+		return "", "", "", fmt.Errorf("get repo for project %s: %w", issue.ProjectID, err)
 	}
 	if repo == nil {
-		return "", "", fmt.Errorf("no repo configured for project %s", issue.ProjectID)
+		return "", "", "", fmt.Errorf("no repo configured for project %s", issue.ProjectID)
 	}
-	return repo.RepoDir, repo.BaseBranch, nil
+	return repo.RepoDir, repo.BaseBranch, repo.VerifyCmd, nil
 }
 
 // ensureReviewWorktree returns a ready worktree path for task.Branch synced
