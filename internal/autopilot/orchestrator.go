@@ -1057,6 +1057,7 @@ type flow struct {
 	teamID          string
 	repoDir         string
 	baseBranch      string
+	verifyCmd       string // configured `verify_cmd` for this run's repo; empty = build hard gate disabled
 
 	// attemptN is the admiral_tasks attempt counter for this run.
 	// attemptN == 1 → first run on linear/<id>.
@@ -1154,6 +1155,7 @@ func (f *flow) execute() error {
 	}
 	f.repoDir = repo.RepoDir
 	f.baseBranch = repo.BaseBranch
+	f.verifyCmd = repo.VerifyCmd
 	worktreeName := "linear-" + sanitizeForPath(issue.Identifier)
 	f.branch = branchName(issue)
 	// /rerun: append `-rerun-<N>` to both branch and worktree so a new
@@ -1277,6 +1279,70 @@ func (f *flow) execute() error {
 		return f.parkAwaitingInput()
 	}
 
+	// Build hard gate (closes the first-run slice of #161 / 漏洞 1). When the
+	// repo has verify_cmd configured, admiral runs it in the worktree AFTER
+	// claude's commit and retries fix-forward up to VerifyMaxRetries times.
+	// Only a clean exit 0 advances to ensurePR. On failure admiral does NOT
+	// open a PR — failure is surfaced on the Linear thread for a human pickup,
+	// and any branch claude may have pushed against the prompt is cleaned up.
+	// Repos without verify_cmd skip the gate entirely (preserves pre-PR
+	// behavior; prompt-level layers via autopilot_skill remain).
+	gateAttempts := 0
+	if f.verifyCmd != "" {
+		f.postActivity(linear.Action("build_gate",
+			fmt.Sprintf("verify_cmd=%s, max_retries=%d", f.verifyCmd, f.o.cfg.VerifyMaxRetries),
+			""))
+		claudeRunner := func(ctx context.Context, wt, retryPrompt string) (string, error) {
+			fullPrompt := retryPrompt
+			if f.o.cfg.AutopilotSkill != "" {
+				fullPrompt = "/" + f.o.cfg.AutopilotSkill + "\n\n" + retryPrompt
+			}
+			return runClaudeForReview(ctx, f.o.cfg.ClaudeBin, f.o.cfg.MaxRunSeconds, wt, fullPrompt, f.o.logger)
+		}
+		gate := runVerifyWithRetry(f.ctx, f.worktreePath, f.verifyCmd, f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, claudeRunner)
+		gateAttempts = gate.Attempts
+		if !gate.Passed {
+			f.o.logger.Warn("first_run_build_gate_failed",
+				"issue", issue.Identifier, "branch", f.branch,
+				"attempts", gate.Attempts, "launch_err", gate.LaunchErr)
+			// Best-effort: if claude defied the prompt and pushed, remove the
+			// remote branch so no broken state sits on origin. Most calls will
+			// no-op (branch never pushed) — that's a benign Debug log, not a
+			// warn.
+			if delErr := runCmd(f.ctx, f.worktreePath, "git", "push", "origin", "--delete", f.branch); delErr != nil {
+				f.o.logger.Debug("first_run_gate_fail_no_remote_branch_to_delete",
+					"branch", f.branch, "err", delErr)
+			} else {
+				f.o.logger.Info("first_run_gate_fail_cleaned_remote_branch", "branch", f.branch)
+			}
+			body := fmt.Sprintf(
+				"admiral could not get the build to pass after %d attempt(s). No PR opened.\n\n"+
+					"Verify command: `%s`\nLast build output tail:\n```\n%s\n```",
+				gate.Attempts, f.verifyCmd, strings.TrimSpace(gate.LastBuildOutput))
+			if gate.LaunchErr != "" {
+				body += fmt.Sprintf("\n\nadmiral launch error: %s", gate.LaunchErr)
+			}
+			f.postActivity(linear.ErrorActivity(body))
+			now := time.Now().UTC().Format(time.RFC3339)
+			gateErrMsg := fmt.Sprintf("build gate failed after %d attempt(s)", gate.Attempts)
+			f.persistAdmiralTask(func(t *store.AdmiralTask) {
+				t.State = store.JobStateFailed
+				t.FinishedAt = now
+				t.Error = gateErrMsg
+			})
+			if jerr := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+				j.State = store.JobStateFailed
+				j.FinishedAt = now
+				j.Error = gateErrMsg
+			}); jerr != nil {
+				f.o.logger.Warn("update_job_state_on_gate_fail", "err", jerr)
+			}
+			return fmt.Errorf("%s", gateErrMsg)
+		}
+		f.o.logger.Info("first_run_build_gate_passed",
+			"issue", issue.Identifier, "branch", f.branch, "attempts", gate.Attempts)
+	}
+
 	f.postActivity(linear.Action("ensure_pr",
 		fmt.Sprintf("gh pr (%s -> %s)", f.branch, f.baseBranch),
 		""))
@@ -1320,6 +1386,11 @@ func (f *flow) execute() error {
 		doneBody = fmt.Sprintf(
 			"%sDone. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
 			mention, prURL, f.worktreePath, f.branch)
+	}
+	if gateAttempts > 0 {
+		// Tell reviewers whether the change landed cleanly (1 attempt) or
+		// needed retry rounds (2+).
+		doneBody += fmt.Sprintf("\n\n_(admiral build gate: passed after %d attempt(s))_", gateAttempts)
 	}
 	if err := f.postActivityWithRetry(linear.Response(doneBody)); err != nil {
 		f.o.logger.Error("final_activity_push_failed",
@@ -2639,7 +2710,9 @@ func buildPrompt(skill string, i *linear.Issue, ev linear.AgentEvent, branch, ba
 ## Operating procedure (you MUST follow this exactly)
 
 You are running inside a fresh git worktree on branch %q, forked from %q.
-Your final deliverable is a pull request. Do these steps in order:
+Your job is to edit and commit the change LOCALLY. admiral will run the
+project's build / tests (if configured) after you exit, then push + open
+the PR itself.
 
 1. Edit files as needed to address the issue above.
 2. Stage your changes: `+"`git add -A`"+`
@@ -2648,13 +2721,12 @@ Your final deliverable is a pull request. Do these steps in order:
 3. Commit with a clear conventional message referencing %s:
    `+"`git commit -m \"<type>(<scope>): <summary> (%s)\""+`
    (e.g. `+"`feat: add hello-world line to README (%s)`"+`).
-4. Push the branch: `+"`git push -u origin %s`"+`
-5. Open the PR: `+"`gh pr create --base %s --head %s --title \"[%s] %s\" --body \"<short summary plus the issue link>\"`"+`
-6. Print the PR URL on a line by itself, then exit.
+4. Exit.
 
-Do not skip any step. If you have nothing to change, still create a tiny
-no-op commit (e.g. clarify a comment) so a PR can be opened — admiral's
-flow expects a PR per session.
+Do NOT run `+"`git push`"+` and do NOT run `+"`gh pr create`"+` yourself —
+admiral owns those after its build/test hard gate. If you have nothing to
+change, still create a tiny no-op commit (e.g. clarify a comment) so admiral
+has something to ship — admiral's flow expects one commit per session.
 
 ## Asking the user a question (ask_user MCP tool)
 
@@ -2672,9 +2744,7 @@ Admiral will resume this session automatically once the user replies.
 Only use ask_user when truly blocked; never use it as a confirmation step.
 `,
 		branch, baseBranch,
-		i.Identifier, i.Identifier, i.Identifier,
-		branch,
-		baseBranch, branch, i.Identifier, i.Title)
+		i.Identifier, i.Identifier, i.Identifier)
 	return sb.String()
 }
 
