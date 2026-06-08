@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/georgehuang/admiral/internal/config"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
@@ -143,10 +144,14 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 			task.Branch, err))
 		return
 	}
+	if err := applyBotIdentityToWorktree(ctx, worktreePath, o.cfg.BotIdentity); err != nil {
+		o.logger.Warn("review_run_bot_identity_apply_failed",
+			"pr", task.PRURL, "branch", task.Branch, "err", err)
+	}
 
 	prompt := buildReviewPrompt(o.cfg.ReviewSkill, task.PRURL, task.Branch, baseBranch, reviewBody, diff)
 
-	output, err := runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, worktreePath, prompt, o.logger)
+	output, err := runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, worktreePath, prompt, o.cfg.BotIdentity, o.logger)
 	if err != nil {
 		o.logger.Error("review_run_claude_failed", "pr", task.PRURL, "err", err)
 		_ = replier.Fail(ctx, fmt.Sprintf("admiral: review run failed: %v", err))
@@ -167,7 +172,7 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 			if o.cfg.ReviewSkill != "" {
 				fullPrompt = "/" + o.cfg.ReviewSkill + "\n\n" + retryPrompt
 			}
-			return runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, wt, fullPrompt, o.logger)
+			return runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, wt, fullPrompt, o.cfg.BotIdentity, o.logger)
 		}
 		gate := runVerifyWithRetry(ctx, worktreePath, verifyCmd, o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries, claudeRunner)
 		gateAttempts = gate.Attempts
@@ -312,7 +317,7 @@ func ensureReviewWorktree(ctx context.Context, repoDir string, task *store.Admir
 // in the worktree and captures stdout as the text reply. Plain text output
 // mode is used (no stream-json) because progress streaming to a PR comment
 // doesn't apply.
-func runClaudeForReview(ctx context.Context, claudeBin string, maxRunSeconds int, worktreePath, prompt string, logger *slog.Logger) (string, error) {
+func runClaudeForReview(ctx context.Context, claudeBin string, maxRunSeconds int, worktreePath, prompt string, botIdentity config.BotIdentity, logger *slog.Logger) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(maxRunSeconds)*time.Second)
 	defer cancel()
 
@@ -323,7 +328,7 @@ func runClaudeForReview(ctx context.Context, claudeBin string, maxRunSeconds int
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 5 * time.Second
 	cmd.Dir = worktreePath
-	cmd.Env = os.Environ()
+	cmd.Env = appendBotIdentityEnv(os.Environ(), botIdentity)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

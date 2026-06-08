@@ -1297,7 +1297,7 @@ func (f *flow) execute() error {
 			if f.o.cfg.AutopilotSkill != "" {
 				fullPrompt = "/" + f.o.cfg.AutopilotSkill + "\n\n" + retryPrompt
 			}
-			return runClaudeForReview(ctx, f.o.cfg.ClaudeBin, f.o.cfg.MaxRunSeconds, wt, fullPrompt, f.o.logger)
+			return runClaudeForReview(ctx, f.o.cfg.ClaudeBin, f.o.cfg.MaxRunSeconds, wt, fullPrompt, f.o.cfg.BotIdentity, f.o.logger)
 		}
 		gate := runVerifyWithRetry(f.ctx, f.worktreePath, f.verifyCmd, f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, claudeRunner)
 		gateAttempts = gate.Attempts
@@ -1579,6 +1579,11 @@ func (f *flow) ensureWorktree() error {
 		f.branch = f.job.Branch
 	}
 
+	if err := applyBotIdentityToWorktree(f.ctx, f.worktreePath, f.o.cfg.BotIdentity); err != nil {
+		f.o.logger.Warn("autopilot_bot_identity_apply_failed",
+			"session", f.ev.SessionID, "branch", f.branch, "err", err)
+	}
+
 	if err := f.checkBranchDiverged(); err != nil {
 		return err
 	}
@@ -1650,7 +1655,7 @@ func (f *flow) runClaudeResume(userMessage string) error {
 	defer cancel()
 	cmd := exec.CommandContext(cctx, f.o.cfg.ClaudeBin, args...)
 	cmd.Dir = f.worktreePath
-	cmd.Env = append(os.Environ(),
+	cmd.Env = appendBotIdentityEnv(append(os.Environ(),
 		"CLAUDE_AUTOPILOT_ISSUE="+f.ev.IssueIdentifier,
 		"CLAUDE_AUTOPILOT_SESSION="+f.ev.SessionID,
 		"ADMIRAL_DB_PATH="+f.o.dbPath,
@@ -1659,7 +1664,7 @@ func (f *flow) runClaudeResume(userMessage string) error {
 		"ADMIRAL_LINEAR_SESSION="+f.ev.SessionID,
 		"ADMIRAL_CLAUDE_SESSION="+f.job.ClaudeSessionID,
 		"ADMIRAL_WORKTREE_PATH="+f.worktreePath,
-	)
+	), f.o.cfg.BotIdentity)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -2133,6 +2138,10 @@ func (f *flow) createWorktree() error {
 		"-b", f.branch, f.worktreePath, "origin/"+base); err != nil {
 		return fmt.Errorf("git worktree add: %w", err)
 	}
+	if err := applyBotIdentityToWorktree(f.ctx, f.worktreePath, f.o.cfg.BotIdentity); err != nil {
+		f.o.logger.Warn("autopilot_bot_identity_apply_failed",
+			"session", f.ev.SessionID, "branch", f.branch, "err", err)
+	}
 	return nil
 }
 
@@ -2176,7 +2185,7 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	}
 	cmd.WaitDelay = 5 * time.Second
 	cmd.Dir = f.worktreePath
-	cmd.Env = append(os.Environ(),
+	cmd.Env = appendBotIdentityEnv(append(os.Environ(),
 		"CLAUDE_AUTOPILOT_ISSUE="+issue.Identifier,
 		"CLAUDE_AUTOPILOT_SESSION="+f.ev.SessionID,
 		// Inherited by admiral-mcp-ask subprocess (via claude's env).
@@ -2186,7 +2195,7 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 		"ADMIRAL_LINEAR_SESSION="+f.ev.SessionID,
 		"ADMIRAL_CLAUDE_SESSION="+claudeSessionID,
 		"ADMIRAL_WORKTREE_PATH="+f.worktreePath,
-	)
+	), f.o.cfg.BotIdentity)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

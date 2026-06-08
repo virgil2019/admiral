@@ -61,6 +61,7 @@ func main() {
 	// diff-only L2 verify, which cannot catch build/compile errors. Operators
 	// often miss this in config until something breaks.
 	warnReposMissingVerifyCmd(db, logger)
+	warnBotIdentityUnset(&cfg.Autopilot, logger)
 
 	// Build Linear client and optionally wire token refresh.
 	lc := linear.NewClient(cfg.Linear.APIBase, cfg.Linear.APIToken)
@@ -304,4 +305,18 @@ func warnReposMissingVerifyCmd(db *store.Store, logger *slog.Logger) {
 				"hint", "L2 verify will judge from diff text only; build/compile errors will not be detected for this repo. Set autopilot.repos[].verify_cmd to enable the hard gate.")
 		}
 	}
+}
+
+// warnBotIdentityUnset emits a single boot-time WARN when autopilot.bot_identity
+// is not configured. Without it, every commit admiral pushes inherits whatever
+// `user.name` / `user.email` the runtime user's git config carries — typically
+// the operator's own identity, making admiral-authored commits indistinguishable
+// from human ones (#162). Admiral still functions; this is purely an attribution
+// nudge.
+func warnBotIdentityUnset(cfg *config.Autopilot, logger *slog.Logger) {
+	if cfg.BotIdentity.IsSet() {
+		return
+	}
+	logger.Warn("bot_identity_unconfigured",
+		"hint", "admiral commits will inherit the runtime user's git config (likely the operator's identity). Set autopilot.bot_identity.{name,email} to attribute commits to a dedicated bot.")
 }
