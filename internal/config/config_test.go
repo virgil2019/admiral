@@ -566,3 +566,81 @@ storage:
 		t.Errorf("Repos[1].VerifyCmd: got %q, want empty (omitted in YAML)", got)
 	}
 }
+
+func TestLoadAutopilot_BotIdentityRoundTrip(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  bot_identity:
+    name: "admiral-bot"
+    email: "admiral-bot@example.com"
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if got := cfg.Autopilot.BotIdentity.Name; got != "admiral-bot" {
+		t.Errorf("BotIdentity.Name: got %q", got)
+	}
+	if got := cfg.Autopilot.BotIdentity.Email; got != "admiral-bot@example.com" {
+		t.Errorf("BotIdentity.Email: got %q", got)
+	}
+	if !cfg.Autopilot.BotIdentity.IsSet() {
+		t.Errorf("IsSet should be true when both fields are set")
+	}
+}
+
+func TestLoadAutopilot_BotIdentityDefaultEmpty(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if cfg.Autopilot.BotIdentity.IsSet() {
+		t.Errorf("BotIdentity should be unset when omitted in YAML; got %+v", cfg.Autopilot.BotIdentity)
+	}
+}
+
+func TestBotIdentity_IsSet(t *testing.T) {
+	cases := []struct {
+		name string
+		id   BotIdentity
+		want bool
+	}{
+		{"both set", BotIdentity{Name: "a", Email: "b@c"}, true},
+		{"only name", BotIdentity{Name: "a"}, false},
+		{"only email", BotIdentity{Email: "b@c"}, false},
+		{"both empty", BotIdentity{}, false},
+		{"whitespace-only", BotIdentity{Name: "  ", Email: "\t"}, false},
+	}
+	for _, tc := range cases {
+		if got := tc.id.IsSet(); got != tc.want {
+			t.Errorf("%s: IsSet() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

@@ -186,6 +186,17 @@ type Autopilot struct {
 	// filter out self-triggered events so admiral does not respond to its
 	// own PR comments. Empty disables self-filtering.
 	GhBotLogin string `yaml:"gh_bot_login"`
+	// BotIdentity is the git author + committer admiral uses when claude
+	// commits inside an autopilot or review worktree (per #162). When set,
+	// admiral writes worktree-local `user.name` / `user.email` after every
+	// `git worktree add` AND injects GIT_AUTHOR_*/GIT_COMMITTER_* env vars
+	// at claude launch (env beats config in git's precedence, so the env
+	// override is the belt-and-braces guarantee — if a worktree reuse path
+	// somehow skipped the config write, commits still tag as the bot). When
+	// not configured, admiral falls through to the runtime user's git
+	// config — the pre-#162 behavior that caused indistinguishable bot/
+	// human attribution.
+	BotIdentity BotIdentity `yaml:"bot_identity"`
 	// MaxRunSeconds caps a single claude -p invocation. Default: 1800 (30 min).
 	MaxRunSeconds int `yaml:"max_run_seconds"`
 	// VerifyMaxRounds bounds the autonomous L2 verification loop: how many
@@ -239,6 +250,20 @@ type Autopilot struct {
 	// admin server is disabled (v0.5 fail-safe). May also be set via
 	// ADMIRAL_ADMIN_TOKEN env var (env takes priority over config).
 	AdminToken string `yaml:"admin_token"`
+}
+
+// BotIdentity is the git author + committer admiral injects into commits made
+// through worktree runs. Both fields must be non-empty for the identity to
+// take effect; if either is empty admiral leaves git config alone (no-op,
+// pre-#162 behavior).
+type BotIdentity struct {
+	Name  string `yaml:"name"`
+	Email string `yaml:"email"`
+}
+
+// IsSet reports whether both Name and Email are non-empty (after trim).
+func (b BotIdentity) IsSet() bool {
+	return strings.TrimSpace(b.Name) != "" && strings.TrimSpace(b.Email) != ""
 }
 
 // RepoConfig describes a single Linear project → repo mapping.

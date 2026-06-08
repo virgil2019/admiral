@@ -1848,10 +1848,12 @@ func commitInWorktree(t *testing.T, worktreePath, filename, content, msg string)
 }
 
 // newEnsureWorktreeFlow builds a minimal flow suitable for driving
-// ensureWorktree against a real fixture. The orchestrator only needs to exist;
-// ensureWorktree doesn't touch the store/Linear/logger fields that matter.
+// ensureWorktree against a real fixture. The orchestrator needs a non-nil
+// cfg so the bot-identity apply step can read its (empty) BotIdentity field
+// without panicking; the empty value short-circuits the apply, matching the
+// pre-#162 no-bot behavior.
 func newEnsureWorktreeFlow(repoDir, branch, worktreePath string) *flow {
-	o := &Orchestrator{logger: slog.Default()}
+	o := &Orchestrator{logger: slog.Default(), cfg: &config.Autopilot{}}
 	return &flow{
 		o:       o,
 		repoDir: repoDir,
