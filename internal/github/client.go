@@ -154,6 +154,12 @@ func (c *Client) ghReadRetry(ctx context.Context, args ...string) (string, error
 //     elsewhere in gh output (e.g. in commit messages).
 //   - "connection reset"   — RST mid-stream
 //   - "i/o timeout"        — request deadline exceeded at transport
+//   - "tls handshake timeout" — Go HTTP transport: TLS handshake phase
+//     timed out before the application request was sent. Distinct from
+//     "i/o timeout" (which fires on the request body / response read)
+//     and from "Client.Timeout" (the overall HTTP client deadline).
+//     Seen in production when GitHub or Linear's edge is briefly slow
+//     to negotiate TLS; the next attempt almost always succeeds.
 //   - "503"/"502"/"504"    — gateway/availability hiccups
 //   - "rate limit"         — API rate limit (backoff helps modestly)
 //
@@ -171,6 +177,7 @@ func IsTransientGhFailure(output string, err error) bool {
 		`": eof`,
 		"connection reset",
 		"i/o timeout",
+		"tls handshake timeout",
 		"503",
 		"502",
 		"504",
