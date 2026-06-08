@@ -64,17 +64,12 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	userID := cfg.Discoverer.AdmiralUserID
-	if userID == "" {
-		v, err := lc.GetViewer(ctx)
-		if err != nil {
-			logger.Error("viewer_lookup_failed",
-				"err", err,
-				"hint", "set discoverer.admiral_user_id explicitly to skip viewer lookup")
-			os.Exit(1)
-		}
-		userID = v.ID
-		logger.Info("admiral_user_resolved", "user_id", v.ID, "name", v.Name)
+	userID, err := discoverer.ResolveAdmiralUserID(ctx, cfg.Discoverer.AdmiralUserID, lc, db, logger)
+	if err != nil {
+		logger.Error("viewer_lookup_failed",
+			"err", err,
+			"hint", "set discoverer.admiral_user_id explicitly to skip viewer lookup, or delete the cached row if it is stale (KV key: "+discoverer.AdmiralUserIDKVKey+")")
+		os.Exit(1)
 	}
 
 	judgeEnabled := cfg.Discoverer.Judge.Enabled != nil && *cfg.Discoverer.Judge.Enabled
