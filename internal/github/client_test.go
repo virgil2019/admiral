@@ -335,6 +335,11 @@ func TestIsTransientGhFailure(t *testing.T) {
 		{"EOF in PR title", "EOF detection", bang, false},
 		{"connection reset", "read tcp ... connection reset by peer", bang, true},
 		{"i/o timeout", "Get ...: i/o timeout", bang, true},
+		// Real-world output shape from the GEO-128 incident — gh prints the
+		// Go HTTP transport error verbatim when GitHub's edge is slow to
+		// negotiate TLS.
+		{"tls handshake timeout", `Post "https://api.github.com/graphql": net/http: TLS handshake timeout`, bang, true},
+		{"tls handshake timeout mixed case", "net/http: TLS Handshake Timeout", bang, true},
 		{"503", "HTTP 503: Service Unavailable", bang, true},
 		{"502", "HTTP 502: Bad Gateway", bang, true},
 		{"504", "HTTP 504: Gateway Timeout", bang, true},
