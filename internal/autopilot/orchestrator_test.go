@@ -285,6 +285,12 @@ type mockLinearClient struct {
 	// UnassignIssue recorder (/reset)
 	UnassignedIssues []string
 	UnassignIssueErr error
+
+	// Product verify overrides.
+	TopLevelIssues    []linear.Issue
+	TopLevelIssuesErr error
+	ProjectTeamID     string
+	ProjectTeamIDErr  error
 }
 
 func (m *mockLinearClient) RemoveIssueLabel(_ context.Context, issueID, labelID string) error {
@@ -370,6 +376,14 @@ func (m *mockLinearClient) CreateComment(_ context.Context, issueID, body string
 	return m.CreateCommentErr
 }
 
+func (m *mockLinearClient) ListProjectTopLevelIssues(_ context.Context, _ string) ([]linear.Issue, error) {
+	return m.TopLevelIssues, m.TopLevelIssuesErr
+}
+
+func (m *mockLinearClient) GetProjectTeamID(_ context.Context, _ string) (string, error) {
+	return m.ProjectTeamID, m.ProjectTeamIDErr
+}
+
 // mockStore implements storeInterface for testing.
 type mockStore struct {
 	Active     bool
@@ -447,6 +461,15 @@ type mockStore struct {
 	BumpCalls               []string
 	SetStatusCalls          []struct{ ParentID, Status string }
 	SetStatusErr            error
+
+	// product_verifications
+	ProductVerification        *store.ProductVerification
+	ProductVerificationErr     error
+	BumpedProductVerification  *store.ProductVerification
+	BumpProductVerificationErr error
+	ProductBumpCalls           []string
+	ProductSetStatusCalls      []struct{ ProjectID, Status string }
+	ProductSetStatusErr        error
 
 	// /reset cascade recorders (PR-B)
 	ResetIssueRowsCalls       []string
@@ -643,6 +666,24 @@ func (m *mockStore) SetTaskVerificationStatus(parentIssueID, status string) erro
 	m.SetStatusCalls = append(m.SetStatusCalls, struct{ ParentID, Status string }{parentIssueID, status})
 	m.mu.Unlock()
 	return m.SetStatusErr
+}
+
+func (m *mockStore) GetProductVerification(projectID string) (*store.ProductVerification, error) {
+	return m.ProductVerification, m.ProductVerificationErr
+}
+
+func (m *mockStore) BumpProductVerificationRound(projectID string) (*store.ProductVerification, error) {
+	m.mu.Lock()
+	m.ProductBumpCalls = append(m.ProductBumpCalls, projectID)
+	m.mu.Unlock()
+	return m.BumpedProductVerification, m.BumpProductVerificationErr
+}
+
+func (m *mockStore) SetProductVerificationStatus(projectID, status string) error {
+	m.mu.Lock()
+	m.ProductSetStatusCalls = append(m.ProductSetStatusCalls, struct{ ProjectID, Status string }{projectID, status})
+	m.mu.Unlock()
+	return m.ProductSetStatusErr
 }
 
 // fakeGhProbe is a deterministic ghProbe for tests. Configure the maps
