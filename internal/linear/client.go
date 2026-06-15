@@ -53,6 +53,7 @@ type Issue struct {
 	Description string
 	URL         string
 	StateName   string
+	StateType   string
 	Priority    int
 	AssigneeID  string
 	TeamID      string
@@ -1021,7 +1022,11 @@ type SearchFilter struct {
 	StateTypes     []string
 	RequireLabel   string
 	UnassignedOnly bool
-	Limit          int
+	// TopLevelOnly restricts the search to issues with no parent (i.e.
+	// top-level "feature" issues directly under a project, not sub-issues).
+	// Used by product-level verify to enumerate a project's features.
+	TopLevelOnly bool
+	Limit        int
 }
 
 const searchIssuesQuery = `query SearchIssues($filter: IssueFilter, $first: Int!) {
@@ -1061,6 +1066,9 @@ func (c *Client) SearchAssignableIssues(ctx context.Context, f SearchFilter) ([]
 	}
 	if f.UnassignedOnly {
 		filter["assignee"] = map[string]any{"null": true}
+	}
+	if f.TopLevelOnly {
+		filter["parent"] = map[string]any{"null": true}
 	}
 	limit := f.Limit
 	if limit <= 0 {
@@ -1118,6 +1126,7 @@ func (c *Client) SearchAssignableIssues(ctx context.Context, f SearchFilter) ([]
 		}
 		if n.State != nil {
 			iss.StateName = n.State.Name
+			iss.StateType = n.State.Type
 		}
 		if n.Assignee != nil {
 			iss.AssigneeID = n.Assignee.ID
@@ -1134,6 +1143,20 @@ func (c *Client) SearchAssignableIssues(ctx context.Context, f SearchFilter) ([]
 		out = append(out, iss)
 	}
 	return out, nil
+}
+
+// ListProjectTopLevelIssues returns all top-level issues (no parent) of a
+// project — the project's "features" — with their state name/type so the
+// product-level verify judge can tell which features are shipped. Reuses
+// SearchAssignableIssues with a top-level filter and no assignee/state/label
+// narrowing. The 250 cap matches the search ceiling; a project with more
+// top-level features than that is far beyond any realistic product.
+func (c *Client) ListProjectTopLevelIssues(ctx context.Context, projectID string) ([]Issue, error) {
+	return c.SearchAssignableIssues(ctx, SearchFilter{
+		ProjectIDs:   []string{projectID},
+		TopLevelOnly: true,
+		Limit:        250,
+	})
 }
 
 func truncate(s string, n int) string {

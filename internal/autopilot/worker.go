@@ -153,6 +153,11 @@ func (w *Worker) dispatch(ctx context.Context, row *store.EventInboxRow) {
 		return
 	}
 
+	if row.Source == "product-verify" {
+		w.dispatchProductVerify(ctx, row)
+		return
+	}
+
 	var ev linear.AgentEvent
 	if err := json.Unmarshal([]byte(row.PayloadJSON), &ev); err != nil {
 		w.logger.Error("worker_parse_payload_failed",
@@ -197,6 +202,25 @@ func (w *Worker) dispatchVerify(ctx context.Context, row *store.EventInboxRow) {
 		}
 	}()
 	w.orch.HandleVerifyEvent(ctx, row.SessionID)
+	if err := w.db.MarkEventDone(row.WebhookID); err != nil {
+		w.logger.Error("worker_mark_done_failed", "err", err, "webhook_id", row.WebhookID)
+	}
+}
+
+// dispatchProductVerify handles a source='product-verify' event: the row's
+// session_id carries the Linear project id of a product to verify against its
+// repo documentation. HandleProductVerifyEvent returns quickly (guard is
+// synchronous, the judge run is on a background goroutine), so the event is
+// marked done immediately — events_inbox tracks delivery only, while the
+// product_verifications row tracks loop state. Mirrors dispatchVerify.
+func (w *Worker) dispatchProductVerify(ctx context.Context, row *store.EventInboxRow) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("worker_panic", "panic", r, "webhook_id", row.WebhookID)
+			_ = w.db.MarkEventFailed(row.WebhookID, panicToString(r), false)
+		}
+	}()
+	w.orch.HandleProductVerifyEvent(ctx, row.SessionID)
 	if err := w.db.MarkEventDone(row.WebhookID); err != nil {
 		w.logger.Error("worker_mark_done_failed", "err", err, "webhook_id", row.WebhookID)
 	}

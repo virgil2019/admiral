@@ -1054,7 +1054,76 @@ func (s *adminServer) serveMux() *http.ServeMux {
 	mux.HandleFunc("/admin/load", s.loadHandler)
 	mux.HandleFunc("/admin/health", s.healthHandler)
 	mux.HandleFunc("/admin/reset-task", s.resetTaskHandler)
+	mux.HandleFunc("/admin/product-verify", s.productVerifyHandler)
 	return mux
+}
+
+// productVerifyRequest is the JSON body for POST /admin/product-verify.
+type productVerifyRequest struct {
+	ProjectID string `json:"project_id"`
+}
+
+// productVerifyResponse is the JSON shape returned by the trigger.
+type productVerifyResponse struct {
+	ProjectID string `json:"project_id"`
+	Enqueued  bool   `json:"enqueued"`
+}
+
+// productVerifyHandler is the MVP manual trigger for product-level
+// verification: it enqueues a source="product-verify" event carrying the
+// project id, which the worker routes to HandleProductVerifyEvent. The
+// webhook id includes a nanosecond timestamp so repeated manual triggers each
+// fire (events_inbox dedups on webhook_id via INSERT-OR-IGNORE). Accepts the
+// project id via JSON body or form field. This is the pluggable trigger's
+// MVP; auto conditions (all-issues-done / sentinel-issue-done) enqueue the
+// same source later.
+func (s *adminServer) productVerifyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	var req productVerifyRequest
+	isForm := strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") ||
+		strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") ||
+		r.Header.Get("HX-Request") == "true"
+	if isForm {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, `{"error":"parse form failed"}`, http.StatusBadRequest)
+			return
+		}
+		req.ProjectID = r.Form.Get("project_id")
+	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"bad json body"}`, http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.ProjectID) == "" {
+		http.Error(w, `{"error":"project_id is required"}`, http.StatusBadRequest)
+		return
+	}
+	// Reject products with no configured repo up front — verify would fail in
+	// gather anyway, and the caller gets a clear 400 instead of a silent log.
+	repo, err := s.db.GetRepoByProjectID(req.ProjectID)
+	if err != nil {
+		s.logger.Warn("product_verify_trigger_repo_lookup_failed", "project", req.ProjectID, "err", err)
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	if repo == nil {
+		http.Error(w, `{"error":"no repo configured for that project"}`, http.StatusBadRequest)
+		return
+	}
+	webhookID := fmt.Sprintf("product-verify-%s-%d", req.ProjectID, time.Now().UnixNano())
+	enqueued, err := s.db.EnqueueEventWithSource(
+		"product-verify", webhookID, "product_verify.manual", req.ProjectID, req.ProjectID, "{}", "")
+	if err != nil {
+		s.logger.Warn("product_verify_trigger_enqueue_failed", "project", req.ProjectID, "err", err)
+		http.Error(w, `{"error":"enqueue failed"}`, http.StatusInternalServerError)
+		return
+	}
+	s.logger.Info("product_verify_triggered", "project", req.ProjectID, "enqueued", enqueued)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(productVerifyResponse{ProjectID: req.ProjectID, Enqueued: enqueued})
 }
 
 // reposDispatchHandler dispatches all /admin/repos/* requests.

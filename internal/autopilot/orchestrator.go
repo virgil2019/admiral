@@ -85,6 +85,11 @@ type storeInterface interface {
 	BumpTaskVerificationRound(parentIssueID string) (*store.TaskVerification, error)
 	SetTaskVerificationStatus(parentIssueID, status string) error
 
+	// product_verifications: the autonomous product-level verification loop.
+	GetProductVerification(projectID string) (*store.ProductVerification, error)
+	BumpProductVerificationRound(projectID string) (*store.ProductVerification, error)
+	SetProductVerificationStatus(projectID, status string) error
+
 	// /reset command (PR-B): cascade-delete a task's per-issue + verify rows.
 	ResetIssueRows(issueID string) error
 	DeleteTaskVerification(parentIssueID string) error
@@ -109,6 +114,11 @@ type linearClientInterface interface {
 	// clear its assignee so the discoverer can re-pick it after re-activation.
 	RemoveIssueLabel(ctx context.Context, issueID, labelID string) error
 	UnassignIssue(ctx context.Context, issueID string) error
+
+	// Product-level verify: enumerate a project's top-level "feature" issues
+	// and resolve its team for filing gap features.
+	ListProjectTopLevelIssues(ctx context.Context, projectID string) ([]linear.Issue, error)
+	GetProjectTeamID(ctx context.Context, projectID string) (string, error)
 }
 
 type Orchestrator struct {
@@ -158,6 +168,11 @@ type Orchestrator struct {
 	// runClaudeForVerify; tests inject a stub so the guard/apply logic is
 	// exercised without spawning a real claude process.
 	verifyRunner func(ctx context.Context, repoDir, prompt string) (string, error)
+
+	// productVerifyRunner runs the headless product-level verify judge. Same
+	// read-only signature as verifyRunner (defaults to runClaudeForVerify); a
+	// separate field lets tests stub product verify independently of L2.
+	productVerifyRunner func(ctx context.Context, repoDir, prompt string) (string, error)
 }
 
 // SetVerifyPickupRules wires the discoverer's pickup gates (require_label +
@@ -192,6 +207,9 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		prClient: ghpkg.NewClient(cfg.GhToken),
 	}
 	o.verifyRunner = func(ctx context.Context, repoDir, prompt string) (string, error) {
+		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, o.logger)
+	}
+	o.productVerifyRunner = func(ctx context.Context, repoDir, prompt string) (string, error) {
 		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, o.logger)
 	}
 	o.blockerWatcher = newBlockerWatcher(o, cfg.BlockerPollInterval)
