@@ -397,6 +397,37 @@ const migration0020 = `
 ALTER TABLE repos ADD COLUMN verify_cmd TEXT NOT NULL DEFAULT '';
 `
 
+// migration0021 adds the per-repo product-documentation path. autopilot's
+// product-level verify reads this file/dir (the complete product spec, which
+// lives in the repo alongside the code) as the ground truth it judges the
+// project's shipped features against. Empty string (the column default)
+// means "no path configured" — product verify then instructs the judge to
+// discover the product doc itself (README / docs/ / PRD), mirroring how
+// verify_cmd degrades. Path is relative to the repo root.
+const migration0021 = `
+ALTER TABLE repos ADD COLUMN product_doc_path TEXT NOT NULL DEFAULT '';
+`
+
+// migration0022 backs the autonomous product-level verification loop. A
+// product maps 1:1 to a Linear project; when triggered, a headless agent
+// judges the whole project's shipped top-level features against the repo's
+// product documentation and files any missing feature as a new top-level
+// issue. product_verifications tracks, per project, the same round/status
+// machinery as task_verifications (migration0019):
+//   - rounds: bounds the self-converging loop (gaps → feature issues →
+//     ship → re-verify); past the cap it escalates to a human.
+//   - status: 'active' while the loop runs; 'escalated' / 'closed' are
+//     terminal and stop further triggers for that project.
+const migration0022 = `
+CREATE TABLE IF NOT EXISTS product_verifications (
+    project_id  TEXT PRIMARY KEY,
+    rounds      INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'active'
+                  CHECK (status IN ('active', 'escalated', 'closed')),
+    updated_at  TEXT NOT NULL
+);
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -423,6 +454,8 @@ var migrations = []migration{
 	{18, migration0018},
 	{19, migration0019},
 	{20, migration0020},
+	{21, migration0021},
+	{22, migration0022},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -1802,12 +1835,18 @@ type Repo struct {
 	// Empty = no verify command configured → verify degrades to diff-only
 	// judgment and admiral logs a one-shot WARN at boot.
 	VerifyCmd string
+	// ProductDocPath is the repo-relative path to the complete product
+	// documentation (file or directory) that autopilot's product-level
+	// verify judges the project's shipped features against. Empty = no path
+	// configured → product verify instructs the judge to discover the doc
+	// itself (README / docs/ / PRD), mirroring VerifyCmd's degradation.
+	ProductDocPath string
 }
 
 // ListRepos returns all repos ordered by project_name.
 func (s *Store) ListRepos() ([]Repo, error) {
 	rows, err := s.DB.Query(`
-		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd
+		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, product_doc_path
 		FROM repos ORDER BY project_name ASC
 	`)
 	if err != nil {
@@ -1818,7 +1857,7 @@ func (s *Store) ListRepos() ([]Repo, error) {
 	for rows.Next() {
 		var r Repo
 		var enabled, autoPick int
-		if err := rows.Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick, &r.VerifyCmd); err != nil {
+		if err := rows.Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick, &r.VerifyCmd, &r.ProductDocPath); err != nil {
 			return nil, err
 		}
 		r.Enabled = enabled == 1
@@ -1834,9 +1873,9 @@ func (s *Store) GetRepoByProjectID(projectID string) (*Repo, error) {
 	var r Repo
 	var enabled, autoPick int
 	err := s.DB.QueryRow(`
-		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd
+		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, product_doc_path
 		FROM repos WHERE project_id=?
-	`, projectID).Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick, &r.VerifyCmd)
+	`, projectID).Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick, &r.VerifyCmd, &r.ProductDocPath)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1860,8 +1899,8 @@ func (s *Store) UpsertRepo(r Repo) error {
 		autoPick = 1
 	}
 	_, err := s.DB.Exec(`
-		INSERT INTO repos(project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO repos(project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, product_doc_path, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(project_id) DO UPDATE SET
 			project_name=excluded.project_name,
 			repo_dir=excluded.repo_dir,
@@ -1869,8 +1908,9 @@ func (s *Store) UpsertRepo(r Repo) error {
 			enabled=excluded.enabled,
 			auto_pick_enabled=excluded.auto_pick_enabled,
 			verify_cmd=excluded.verify_cmd,
+			product_doc_path=excluded.product_doc_path,
 			updated_at=excluded.updated_at
-	`, r.ProjectID, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, autoPick, r.VerifyCmd, now, now)
+	`, r.ProjectID, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, autoPick, r.VerifyCmd, r.ProductDocPath, now, now)
 	return err
 }
 
