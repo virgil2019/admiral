@@ -80,7 +80,7 @@ Rules:
   chosen `team` / `project` ids. Every later step branches on the mode.
 - **Level-3 guard (sub-issue mode).** Before slicing under an existing issue,
   check whether that issue is **itself already a sub-issue** — `get_issue`
-  returns its `parent`; if `parent` is non-empty, the issue is an L2 slice.
+  exposes the issue's parent reference; if it has a parent, the issue is an L2 slice.
   Decomposing it would create an L3 issue, which **breaks the verify cascade**
   (a merged L3 walks up only to its L2 parent — the L2's completion never
   propagates to the L1, so the task never auto-verifies). STOP and tell the
@@ -136,53 +136,62 @@ the conversation PRD is used only to *create* features in the first state.
 
 ### Flow
 
-1. Resolve the project (Step 1 rules). Enumerate existing L1 issues to
-   determine the state above.
-1a. **Granularity gate on existing top-level issues (do this before slicing
-   anything).** A top-level issue existing does NOT mean it's a feature to
-   slice. Classify each unsliced top-level issue:
-   - **Coarse feature** — broad goal, would naturally break into several
-     independently-shippable slices, no single crisp PR-sized "done" → plan
-     L2 slices for it (proceed to step 2).
-   - **Already a slice** — single PR's worth of work with a concrete,
-     verifiable acceptance criterion (often already in a started/done state, or
-     grouped under a Linear **milestone** alongside peers). Do NOT slice it —
-     slicing would create an L3 issue and break the verify cascade. Leave it as
-     is and surface it as "already slice-grained — not sliced".
-   If MOST top-level issues are slice-grained, the project isn't organized as
-   feature→slice at all (milestone-grouped flat slices is a different, valid
-   shape — admiral just won't task-verify them, since nothing walks up from a
-   parentless issue). Say so and stop; do not invent a feature layer or slice
-   slices. This is the recursive-mode counterpart of Step 1's granularity sanity.
-2. **Plan only (no writes):**
-   - First state: plan L1 features from the PRD, then for each feature plan its
-     L2 slices (acceptance criteria + agent-task/human-only classification +
-     intra-feature blocking) per Steps 2/3/3.5.
-   - Existing-features states: for each top-level issue classified **coarse
-     feature** in 1a, plan its L2 slices from the issue's `description`. Skip
-     the ones classified **already a slice**.
-3. **thin-PRD flag.** If a feature's PRD/description is too thin to write
-   concrete, verifiable slice criteria (the Step 2 gate fails for it), do NOT
-   emit guess-work slices. Flag that feature and either ask the user to enrich
-   it or mark it "feature-only — slice later", and exclude it from this pass.
-4. **Size guard.** If the full plan is large (rough thresholds: > ~8 features,
-   or > ~30 total issues), warn the user and offer to materialize in
-   feature-batches rather than all at once — still batched (no per-feature
-   manual command), just split into a few reviewable chunks so neither the
-   acceptance-criteria quality nor the human review degrades. The "~10 issues
-   per pass" quality rationale (Step 6) still holds *per feature's slices*.
-5. **One consolidated review.** Present the entire planned tree — features →
-   slices, labels, blocking edges, and any flags (thin-PRD deferrals, size
-   batching, and 1a "already slice-grained — not sliced" items) — and wait for
-   a single explicit approval. This is the real gate (after approval, `activate`
-   can ship it), so it must not be a rubber stamp.
-6. **Materialize on approval** by running Steps 4–7 across the plan: create the
-   L1 features that don't exist yet (Step 4-style, unlabelled), then the L2
-   slices under every in-scope feature (Step 6 sub-issue form, `agent-task` on
-   agent-doable slices), then wire blocking (Step 7).
-7. **Stop at Step 8** — do not apply `agent-ready`. Report the full tree
-   (Step 9), noting any features deferred via thin-PRD flag or size batching,
-   and any top-level issues left untouched as already slice-grained (1a).
+This mode runs its own sequence (labelled **R1–R7** to avoid colliding with the
+global Step numbers); where it reuses a global Step it says so explicitly.
+
+- **R1 — Resolve + detect state.** Resolve the project (Step 1 rules). Enumerate
+  the project's **top-level issues**, counting only issues whose `parent` is
+  empty — a returned issue with a non-empty `parent` is an L2 slice, exclude it
+  (same deterministic test as the Step 1 level-3 guard). From these, determine
+  the state in the table above. Throughout R1–R7, **"unsliced top-level issue"
+  means a top-level issue with zero sub-issues** (matching the state table);
+  features that already have any sub-issue are treated as sliced and skipped.
+- **R2 — Granularity gate (before slicing anything).** A top-level issue
+  existing does NOT make it a feature to slice. Classify each *unsliced*
+  top-level issue:
+  - **Coarse feature** — broad goal, would naturally break into several
+    independently-shippable slices, no single crisp PR-sized "done" → plan L2
+    slices for it (R3).
+  - **Already a slice** — single PR's worth of work with a concrete, verifiable
+    acceptance criterion (often already started/done, or grouped under a Linear
+    **milestone** alongside peers). Do NOT slice it — slicing would create an L3
+    issue and break the verify cascade. Leave it and surface it as "already
+    slice-grained — not sliced".
+  If MOST top-level issues are slice-grained, the project isn't organized as
+  feature→slice at all (milestone-grouped flat slices is a different, valid
+  shape — admiral just won't task-verify them, since nothing walks up from a
+  parentless issue). Say so and stop; do not invent a feature layer or slice
+  slices. This is the recursive-mode counterpart of Step 1's granularity sanity.
+- **R3 — Plan only (no writes):**
+  - No-features state: plan L1 features from the PRD, then for each feature plan
+    its L2 slices (acceptance criteria + agent-task/human-only classification +
+    intra-feature blocking) per global Steps 2/3/3.5.
+  - Existing-features states: for each top-level issue classified **coarse
+    feature** in R2, plan its L2 slices from the issue's `description`. Skip the
+    ones classified **already a slice**.
+- **R4 — thin-PRD flag.** If a feature's PRD/description is too thin to write
+  concrete, verifiable slice criteria (the global Step 2 gate fails for it), do
+  NOT emit guess-work slices. Flag that feature and either ask the user to
+  enrich it or mark it "feature-only — slice later", and exclude it from this
+  pass.
+- **R5 — Size guard.** If the full plan is large (rough thresholds: > ~8
+  features, or > ~30 total issues), warn the user and offer to materialize in
+  feature-batches rather than all at once — still batched (no per-feature manual
+  command), just split into a few reviewable chunks so neither the
+  acceptance-criteria quality nor the human review degrades. The "~10 issues per
+  pass" cap (global Step 6 / Constraints) applies here *per feature's slices*.
+- **R6 — One consolidated review.** Present the entire planned tree — features →
+  slices, labels, blocking edges, and any flags (thin-PRD deferrals, size
+  batching, and R2 "already slice-grained — not sliced" items) — and wait for a
+  single explicit approval. This is the real gate (after approval, `activate`
+  can ship it), so it must not be a rubber stamp.
+- **R7 — Materialize on approval, then stop.** Run global Steps 4–7 across the
+  plan: create the L1 features that don't exist yet (Step 4-style, unlabelled),
+  then the L2 slices under every in-scope feature (Step 6 sub-issue form,
+  `agent-task` on agent-doable slices), then wire blocking (Step 7). Then **stop
+  at global Step 8** — do not apply `agent-ready`. Report the full tree (Step 9),
+  noting any features deferred via thin-PRD flag (R4) or size batching (R5), and
+  any top-level issues left untouched as already slice-grained (R2).
 
 ## Step 2 — Gate on detail: is the PRD decomposable?
 
@@ -397,7 +406,9 @@ step.
    interface so each owns its own files.
 3. **At most ~10 issues per pass.** If you need more, suggest the user
    split into multiple decomposition passes (e.g. multiple top-level
-   features, each later sliced separately).
+   features, each later sliced separately). This is the single source of
+   truth for the cap; recursive mode (R5) applies it *per feature's slices*
+   and batches a large tree rather than overriding it.
 4. **Human-only sub-issues sit in the same graph** (any slice-producing mode) —
    block agent-task sub-issues on them when an upstream human decision is
    required (e.g. "design login screen" blocks "implement login screen").
