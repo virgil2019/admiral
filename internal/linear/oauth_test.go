@@ -3,9 +3,13 @@ package linear
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 )
 
@@ -129,6 +133,133 @@ func TestExchangeCode_HTTPError(t *testing.T) {
 	}
 	if !contains(errStr, "The authorization code has expired") {
 		t.Errorf("error contains %q: %v", "The authorization code has expired", errStr)
+	}
+}
+
+// TestExchangeCode_RetriesTransientEOF drops the first connection before
+// responding (the client sees io.EOF), then succeeds — the exact failure
+// shape that motivated the retry. A single transport EOF must not fail the
+// one-shot exchange.
+func TestExchangeCode_RetriesTransientEOF(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("ResponseWriter is not a Hijacker")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("hijack: %v", err)
+			}
+			conn.Close() // drop without responding → client sees EOF
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"access_token": "tok-after-retry"})
+	}))
+	defer srv.Close()
+
+	resp, err := ExchangeCode(context.Background(), srv.URL, "id", "secret", "http://127.0.0.1:8080/callback", "code")
+	if err != nil {
+		t.Fatalf("ExchangeCode failed after transient EOF: %v", err)
+	}
+	if resp.AccessToken != "tok-after-retry" {
+		t.Errorf("AccessToken = %q, want %q", resp.AccessToken, "tok-after-retry")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Errorf("attempts = %d, want 2 (1 EOF + 1 success)", got)
+	}
+}
+
+// TestExchangeCode_RetriesTransient5xx retries a 503 then succeeds — the
+// code is not consumed on a 5xx, so the retry is safe.
+func TestExchangeCode_RetriesTransient5xx(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"access_token": "tok-after-503"})
+	}))
+	defer srv.Close()
+
+	resp, err := ExchangeCode(context.Background(), srv.URL, "id", "secret", "http://127.0.0.1:8080/callback", "code")
+	if err != nil {
+		t.Fatalf("ExchangeCode failed after transient 503: %v", err)
+	}
+	if resp.AccessToken != "tok-after-503" {
+		t.Errorf("AccessToken = %q, want %q", resp.AccessToken, "tok-after-503")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Errorf("attempts = %d, want 2", got)
+	}
+}
+
+// TestExchangeCode_NoRetryOn4xx ensures a permanent 4xx (e.g. invalid_grant)
+// is returned immediately without burning retries — a retry would just
+// waste time on a code that is already dead.
+func TestExchangeCode_NoRetryOn4xx(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "invalid_grant"})
+	}))
+	defer srv.Close()
+
+	_, err := ExchangeCode(context.Background(), srv.URL, "id", "secret", "http://127.0.0.1:8080/callback", "code")
+	if err == nil {
+		t.Fatal("expected error for 400, got nil")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Errorf("attempts = %d, want 1 (4xx must not retry)", got)
+	}
+}
+
+// TestExchangeCode_Exhausts5xx confirms the loop terminates and returns the
+// last error after exhausting all attempts on a persistent 5xx.
+func TestExchangeCode_Exhausts5xx(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	_, err := ExchangeCode(context.Background(), srv.URL, "id", "secret", "http://127.0.0.1:8080/callback", "code")
+	if err == nil {
+		t.Fatal("expected error after exhausting retries, got nil")
+	}
+	if got := atomic.LoadInt32(&attempts); got != tokenMaxAttempts {
+		t.Errorf("attempts = %d, want %d", got, tokenMaxAttempts)
+	}
+}
+
+func TestIsTransientHTTPErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"plain io.EOF", io.EOF, true},
+		{"wrapped io.EOF", fmt.Errorf(`Post "https://api.linear.app/oauth/token": %w`, io.EOF), true},
+		{"unexpected EOF", io.ErrUnexpectedEOF, true},
+		{"deadline exceeded", context.DeadlineExceeded, true},
+		{"connection reset", errors.New("read tcp 1.2.3.4:5->6.7.8.9:443: connection reset by peer"), true},
+		{"tls handshake timeout", errors.New("net/http: TLS handshake timeout"), true},
+		{"permanent error", errors.New("invalid_grant"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTransientHTTPErr(tc.err); got != tc.want {
+				t.Errorf("isTransientHTTPErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 
