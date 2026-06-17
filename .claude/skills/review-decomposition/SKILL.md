@@ -37,7 +37,11 @@ The invariants this skill checks against — all verified in admiral's code:
   `canceled` (PR closed unmerged) blocks the parent's task-verify **forever** —
   by design, a human must resolve it.
 - **Blockers** (`BlockerWatcher`): an issue with an unresolved `blockedBy` is
-  parked until every blocker reaches a completed state.
+  parked until every blocker reaches a **completed _or canceled_** state — both
+  count as resolved. Note the asymmetry with task-verify: `canceled` *resolves*
+  a blocker (the dependent unblocks) but does NOT count toward `allSubsCompleted`
+  (a canceled sub stalls the parent's verify forever). Same state type, opposite
+  effect in the two subsystems.
 
 ## Before you start
 
@@ -140,9 +144,11 @@ issue(s) and the invariant it violates.
 - **[CRITICAL] Cycle in `blockedBy`** — A blocks B blocks A (directly or
   transitively). Every issue in the cycle is parked forever. Remediation: break
   the cycle.
-- **[MEDIUM] Blocker pointing at a canceled/invalid issue** — a `blockedBy`
-  whose blocker is canceled or deleted: the dependent never unblocks (a canceled
-  blocker never reaches completed). Remediation: drop or repoint the edge.
+- **[LOW] Dangling blocker edge** — a `blockedBy` pointing at a deleted issue.
+  (A *canceled* blocker is NOT a problem: admiral treats `canceled` as resolved,
+  so the dependent unblocks normally — do not flag canceled blockers.) A deleted
+  blocker is skipped by admiral's resolver too, so this is advisory only:
+  confirm the dependency was intentionally dropped, not lost.
 - **[LOW] Missing/implied dependencies** — a foundation slice (shared types,
   framework, data model) that others clearly need but nothing blocks on; or
   parallel slices that look like they touch the same files (PR-conflict risk).
