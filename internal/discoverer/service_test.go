@@ -227,6 +227,12 @@ func (s *fakeStore) EnqueueEventWithSource(source, webhookID, action, sessionID,
 type fakePR struct {
 	statuses map[string]PRStatus
 	err      error
+	// merged records every PR URL passed to MergePR, in call order, so
+	// tests can assert the auto-merge gate fired (or didn't).
+	merged []string
+	// mergeErr, when set, makes MergePR fail — used to test the
+	// fall-through-to-Reviewed path on a merge failure.
+	mergeErr error
 }
 
 func (p *fakePR) GetPRStatus(_ context.Context, prURL string) (PRStatus, error) {
@@ -234,6 +240,14 @@ func (p *fakePR) GetPRStatus(_ context.Context, prURL string) (PRStatus, error) 
 		return PRStatus{}, p.err
 	}
 	return p.statuses[prURL], nil
+}
+
+func (p *fakePR) MergePR(_ context.Context, prURL string) error {
+	if p.mergeErr != nil {
+		return p.mergeErr
+	}
+	p.merged = append(p.merged, prURL)
+	return nil
 }
 
 type fakeJudge struct {

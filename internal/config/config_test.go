@@ -386,6 +386,49 @@ discoverer:
 	}
 }
 
+func TestLoadDiscoverer_AutoMergeDefaultsOff(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+autopilot:
+  claude_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+discoverer:
+  require_label: "agent-ready"
+`
+	cfg, err := LoadDiscoverer(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadDiscoverer: %v", err)
+	}
+	if cfg.Discoverer.AutoMerge {
+		t.Error("AutoMerge default: got true, want false (opt-in safety gate)")
+	}
+}
+
+func TestLoadDiscoverer_AutoMergeEnabled(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+autopilot:
+  claude_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+discoverer:
+  require_label: "agent-ready"
+  auto_merge: true
+`
+	cfg, err := LoadDiscoverer(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadDiscoverer: %v", err)
+	}
+	if !cfg.Discoverer.AutoMerge {
+		t.Error("AutoMerge: got false, want true")
+	}
+}
+
 func TestLoadPickupRules_Defaults(t *testing.T) {
 	// No discoverer block at all → defaults apply, no drift from the
 	// discoverer's own state_types default.

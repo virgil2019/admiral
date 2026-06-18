@@ -89,6 +89,7 @@ func main() {
 			InReview: cfg.Discoverer.LinearStates.InReview,
 			Reviewed: cfg.Discoverer.LinearStates.Reviewed,
 		},
+		AutoMerge: cfg.Discoverer.AutoMerge,
 	}, lc, &prAdapter{c: ghClient}, db, nil, logger)
 
 	logger.Info("admiral-discoverer starting",
@@ -133,7 +134,13 @@ func (a *prAdapter) GetPRStatus(ctx context.Context, prURL string) (discoverer.P
 		State:             s.State,
 		MergedAt:          s.MergedAt,
 		HasApprovedReview: s.HasApprovedReview,
+		Mergeable:         s.Mergeable,
+		ChecksState:       s.ChecksState,
 	}, nil
+}
+
+func (a *prAdapter) MergePR(ctx context.Context, prURL string) error {
+	return a.c.MergePR(ctx, prURL)
 }
 
 func newLogger(c config.Logging) *slog.Logger {

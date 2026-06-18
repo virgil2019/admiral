@@ -40,6 +40,12 @@ type Config struct {
 	MaxPickPerRound int
 	AdmiralUserID   string
 	Judge           JudgeConfig
+	// AutoMerge, when true, lets the state-advance phase squash-merge an
+	// approved + mergeable + CI-green PR instead of parking it in the
+	// Reviewed state for a human. Opt-in (default false): merging is an
+	// outward-facing, near-irreversible action, so it stays off until a
+	// deployment explicitly turns it on.
+	AutoMerge bool
 	// LinearStates maps the admiral workflow stages onto Linear
 	// workflow-state names. Empty entries are skipped (transition is
 	// not pushed to Linear). The merged-PR transition does not consult
@@ -84,6 +90,10 @@ type linearClient interface {
 // state-advance polling.
 type prClient interface {
 	GetPRStatus(ctx context.Context, prURL string) (PRStatus, error)
+	// MergePR squash-merges the PR and deletes its branch. Called only
+	// when AutoMerge is on and the gate (approved + mergeable + CI-green)
+	// is satisfied.
+	MergePR(ctx context.Context, prURL string) error
 }
 
 // PRStatus is the discoverer's view of a GitHub PR. cmd/admiral-discoverer
@@ -94,6 +104,11 @@ type PRStatus struct {
 	State             string
 	MergedAt          string
 	HasApprovedReview bool
+	// Mergeable is gh's verdict: "MERGEABLE" / "CONFLICTING" / "UNKNOWN".
+	Mergeable string
+	// ChecksState is the folded CI verdict: "passing" / "failing" /
+	// "pending" / "none". See github.deriveChecksState.
+	ChecksState string
 }
 
 // taskRegistry is the slice of the store the discoverer needs:

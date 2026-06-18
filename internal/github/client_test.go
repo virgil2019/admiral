@@ -240,6 +240,114 @@ func TestGetDiff_EmptyPRURLRejected(t *testing.T) {
 	}
 }
 
+func TestGetPRStatus_ParsesMergeableAndChecks(t *testing.T) {
+	fr := &fakeRunner{stdout: `{
+		"state":"OPEN",
+		"mergedAt":"",
+		"mergeable":"MERGEABLE",
+		"latestReviews":[{"state":"APPROVED"}],
+		"statusCheckRollup":[
+			{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},
+			{"__typename":"StatusContext","state":"SUCCESS"}
+		]
+	}`}
+	c := newTestClient("tok", fr)
+
+	st, err := c.GetPRStatus(context.Background(), "https://github.com/x/y/pull/9")
+	if err != nil {
+		t.Fatalf("GetPRStatus: %v", err)
+	}
+	if st.State != "OPEN" || !st.HasApprovedReview {
+		t.Errorf("state/approval: %+v", st)
+	}
+	if st.Mergeable != "MERGEABLE" {
+		t.Errorf("mergeable: got %q, want MERGEABLE", st.Mergeable)
+	}
+	if st.ChecksState != "passing" {
+		t.Errorf("checks: got %q, want passing", st.ChecksState)
+	}
+	want := []string{"pr", "view", "https://github.com/x/y/pull/9", "--json", "state,mergedAt,latestReviews,mergeable,statusCheckRollup"}
+	if !equalSlice(fr.gotArgs, want) {
+		t.Errorf("args mismatch:\n got %v\nwant %v", fr.gotArgs, want)
+	}
+}
+
+func TestDeriveChecksState(t *testing.T) {
+	cases := []struct {
+		name   string
+		rollup []checkRollupEntry
+		want   string
+	}{
+		{"empty", nil, "none"},
+		{"all success", []checkRollupEntry{
+			{Typename: "CheckRun", Status: "COMPLETED", Conclusion: "SUCCESS"},
+			{Typename: "StatusContext", State: "SUCCESS"},
+		}, "passing"},
+		{"success+skipped+neutral", []checkRollupEntry{
+			{Typename: "CheckRun", Status: "COMPLETED", Conclusion: "SKIPPED"},
+			{Typename: "CheckRun", Status: "COMPLETED", Conclusion: "NEUTRAL"},
+		}, "passing"},
+		{"one failure", []checkRollupEntry{
+			{Typename: "CheckRun", Status: "COMPLETED", Conclusion: "SUCCESS"},
+			{Typename: "CheckRun", Status: "COMPLETED", Conclusion: "FAILURE"},
+		}, "failing"},
+		{"statuscontext error", []checkRollupEntry{
+			{Typename: "StatusContext", State: "ERROR"},
+		}, "failing"},
+		{"checkrun in progress", []checkRollupEntry{
+			{Typename: "CheckRun", Status: "IN_PROGRESS"},
+		}, "pending"},
+		{"statuscontext pending", []checkRollupEntry{
+			{Typename: "StatusContext", State: "PENDING"},
+		}, "pending"},
+		{"failing beats pending", []checkRollupEntry{
+			{Typename: "CheckRun", Status: "IN_PROGRESS"},
+			{Typename: "CheckRun", Status: "COMPLETED", Conclusion: "FAILURE"},
+		}, "failing"},
+		{"unknown shape is pending", []checkRollupEntry{
+			{Typename: "Mystery"},
+		}, "pending"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := deriveChecksState(tc.rollup); got != tc.want {
+				t.Errorf("deriveChecksState = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMergePR_Composition(t *testing.T) {
+	fr := &fakeRunner{stdout: "✓ Squashed and merged\n"}
+	c := newTestClient("tok-abc", fr)
+
+	if err := c.MergePR(context.Background(), "https://github.com/x/y/pull/9"); err != nil {
+		t.Fatalf("MergePR: %v", err)
+	}
+	want := []string{"pr", "merge", "https://github.com/x/y/pull/9", "--squash", "--delete-branch"}
+	if !equalSlice(fr.gotArgs, want) {
+		t.Errorf("args mismatch:\n got %v\nwant %v", fr.gotArgs, want)
+	}
+	if len(fr.gotEnv) != 1 || fr.gotEnv[0] != "GH_TOKEN=tok-abc" {
+		t.Errorf("env: got %v, want [GH_TOKEN=tok-abc]", fr.gotEnv)
+	}
+}
+
+func TestMergePR_EmptyPRURLRejected(t *testing.T) {
+	c := newTestClient("tok", &fakeRunner{})
+	if err := c.MergePR(context.Background(), ""); err == nil {
+		t.Fatal("expected error for empty prURL, got nil")
+	}
+}
+
+func TestMergePR_PropagatesError(t *testing.T) {
+	fr := &fakeRunner{stdout: "Pull request is not mergeable", err: errors.New("exit status 1")}
+	c := newTestClient("tok", fr)
+	if err := c.MergePR(context.Background(), "https://github.com/x/y/pull/9"); err == nil {
+		t.Fatal("expected error when gh fails, got nil")
+	}
+}
+
 func TestIsPRNotResolvable(t *testing.T) {
 	cases := []struct {
 		out  string

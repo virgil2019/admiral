@@ -49,6 +49,16 @@ type PRStatus struct {
 	// HasApprovedReview is true when the PR has at least one current
 	// approval review (latestReviews .state == "APPROVED").
 	HasApprovedReview bool
+	// Mergeable is gh's mergeability verdict: "MERGEABLE" (no conflicts),
+	// "CONFLICTING", or "UNKNOWN" (GitHub still computing). Only
+	// "MERGEABLE" is safe to auto-merge.
+	Mergeable string
+	// ChecksState summarises the PR's statusCheckRollup into one of:
+	// "passing" (all concluded checks succeeded), "failing" (≥1 check
+	// failed/errored/was cancelled), "pending" (≥1 check still running),
+	// or "none" (no checks configured on the PR). Derived by
+	// deriveChecksState.
+	ChecksState string
 }
 
 // runner is the indirection that lets tests substitute the gh subprocess
@@ -292,7 +302,7 @@ func (c *Client) GetPRStatus(ctx context.Context, prURL string) (PRStatus, error
 	if strings.TrimSpace(prURL) == "" {
 		return PRStatus{}, fmt.Errorf("github: GetPRStatus: empty prURL")
 	}
-	out, err := c.ghReadRetry(ctx, "pr", "view", prURL, "--json", "state,mergedAt,latestReviews")
+	out, err := c.ghReadRetry(ctx, "pr", "view", prURL, "--json", "state,mergedAt,latestReviews,mergeable,statusCheckRollup")
 	if err != nil {
 		if isPRNotResolvable(out) {
 			return PRStatus{}, nil
@@ -302,14 +312,21 @@ func (c *Client) GetPRStatus(ctx context.Context, prURL string) (PRStatus, error
 	var v struct {
 		State         string `json:"state"`
 		MergedAt      string `json:"mergedAt"`
+		Mergeable     string `json:"mergeable"`
 		LatestReviews []struct {
 			State string `json:"state"`
 		} `json:"latestReviews"`
+		StatusCheckRollup []checkRollupEntry `json:"statusCheckRollup"`
 	}
 	if err := json.Unmarshal([]byte(out), &v); err != nil {
 		return PRStatus{}, fmt.Errorf("parse gh pr view output: %w (raw: %s)", err, truncate(out, 200))
 	}
-	status := PRStatus{State: v.State, MergedAt: v.MergedAt}
+	status := PRStatus{
+		State:       v.State,
+		MergedAt:    v.MergedAt,
+		Mergeable:   v.Mergeable,
+		ChecksState: deriveChecksState(v.StatusCheckRollup),
+	}
 	for _, r := range v.LatestReviews {
 		if strings.EqualFold(r.State, "APPROVED") {
 			status.HasApprovedReview = true
@@ -317,6 +334,112 @@ func (c *Client) GetPRStatus(ctx context.Context, prURL string) (PRStatus, error
 		}
 	}
 	return status, nil
+}
+
+// checkRollupEntry is one element of gh's statusCheckRollup array. The
+// two shapes GitHub returns carry their result in different fields:
+// a CheckRun (GitHub Actions / Checks API) reports status+conclusion;
+// a StatusContext (legacy commit-status API) reports a single state.
+type checkRollupEntry struct {
+	Typename   string `json:"__typename"`
+	Status     string `json:"status"`     // CheckRun: QUEUED/IN_PROGRESS/COMPLETED
+	Conclusion string `json:"conclusion"` // CheckRun: SUCCESS/FAILURE/NEUTRAL/...
+	State      string `json:"state"`      // StatusContext: SUCCESS/FAILURE/PENDING/ERROR
+}
+
+// deriveChecksState folds a PR's statusCheckRollup into a single verdict
+// for the auto-merge gate. Precedence is failing > pending > passing: a
+// single non-success check blocks the merge outright, an in-flight check
+// means "not yet", and only an all-green (or check-free) PR is mergeable.
+// An empty rollup is "none" — a repo with no CI configured, which the
+// gate treats as clear (the approval is then the sole signal).
+//
+// This is a CHEAP CLIENT-SIDE PRE-FILTER, not the authority: GitHub's
+// branch protection is the real gate, enforced when MergePR runs
+// `gh pr merge` (a protected branch rejects an immediate merge that
+// doesn't satisfy its required-reviews/required-checks rules). So a
+// "none"/"passing" verdict here only means "worth attempting" — a repo
+// whose required check hasn't yet populated the rollup still reads as
+// clear, and the merge then correctly fails at the branch-protection
+// backstop and falls through to the next tick.
+func deriveChecksState(rollup []checkRollupEntry) string {
+	if len(rollup) == 0 {
+		return "none"
+	}
+	failing, pending := false, false
+	for _, c := range rollup {
+		switch c.Typename {
+		case "CheckRun":
+			if c.Status != "COMPLETED" {
+				pending = true
+				continue
+			}
+			switch c.Conclusion {
+			case "SUCCESS", "NEUTRAL", "SKIPPED":
+				// counts as passing
+			default:
+				// Any non-success conclusion blocks the merge:
+				// FAILURE/CANCELLED/TIMED_OUT/STARTUP_FAILURE/STALE are
+				// outright failures; ACTION_REQUIRED (a workflow awaiting
+				// manual approval) is not a red build but is deliberately
+				// withheld too — admiral should not auto-merge a PR that a
+				// human still has to act on.
+				failing = true
+			}
+		case "StatusContext":
+			switch c.State {
+			case "SUCCESS":
+				// counts as passing
+			case "PENDING", "EXPECTED":
+				pending = true
+			default: // FAILURE/ERROR
+				failing = true
+			}
+		default:
+			// Unknown rollup shape: be conservative and treat as not-yet-clear
+			// rather than silently passing a check admiral can't classify.
+			pending = true
+		}
+	}
+	switch {
+	case failing:
+		return "failing"
+	case pending:
+		return "pending"
+	default:
+		return "passing"
+	}
+}
+
+// MergePR squash-merges the PR and deletes its head branch via
+// `gh pr merge <url> --squash --delete-branch`. Used by the discoverer's
+// auto-merge gate once a PR is approved, mergeable, and CI-green.
+//
+// Deliberately NO --admin: admiral merges as an ordinary collaborator,
+// subject to the branch's protection rules. This is the authoritative
+// safety gate (required reviews / required checks), and the discoverer's
+// client-side gate is only a pre-filter. Do not add --admin to "make
+// auto-merge work" — that would bypass the very protection this feature
+// relies on.
+//
+// Uses c.gh (not c.ghReadRetry) on purpose: a merge is a non-idempotent
+// write. gh exits non-zero when the PR is not actually mergeable (red
+// checks, conflicts, already merged, protection unsatisfied), so the
+// gate's pre-check plus this hard failure are both backstops — a failed
+// merge leaves the PR open for the next tick to retry. One benign edge:
+// if the squash succeeds but --delete-branch then fails, gh exits
+// non-zero and the caller logs auto_merge_failed, but the PR is already
+// MERGED — the next tick's GetPRStatus sees MERGED and advanceMerged
+// self-heals, so the only cost is a spurious warning + one tick.
+func (c *Client) MergePR(ctx context.Context, prURL string) error {
+	if strings.TrimSpace(prURL) == "" {
+		return fmt.Errorf("github: MergePR: empty prURL")
+	}
+	out, err := c.gh(ctx, "pr", "merge", prURL, "--squash", "--delete-branch")
+	if err != nil {
+		return fmt.Errorf("gh pr merge %s: %w (output: %s)", prURL, err, truncate(out, 200))
+	}
+	return nil
 }
 
 // GetDiff shells out to `gh pr diff <url>` and returns the raw unified
