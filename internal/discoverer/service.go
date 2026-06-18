@@ -290,6 +290,20 @@ func (s *Service) consider(ctx context.Context, iss linear.Issue) bool {
 		)
 	}
 
+	// Skip parent issues. An issue with sub-issues is a "task", not a
+	// shippable leaf: assigning it runs autopilot against the whole task and
+	// merges a PR that flips the parent to a completed Linear state, bypassing
+	// the sub-issue completeness gate the verify loop enforces (allSubsCompleted).
+	// Normally only the convention "a parent never carries the pickup label"
+	// keeps parents out of the candidate set; this is the structural backstop
+	// for when that convention is broken (manual labelling, hierarchy that
+	// gained children after activation, or require_label left empty). Like the
+	// blocker gate we do NOT upsert a pick row, so a parent that later loses its
+	// children re-evaluates on the next tick.
+	if s.isParentIssue(ctx, iss) {
+		return false
+	}
+
 	// Skip issues with unresolved blocked_by relations before the judge so we
 	// don't pay claude -p cost on something autopilot would just park as
 	// BLOCKED. We deliberately do NOT upsert a pick row here: leaving picks
@@ -376,6 +390,30 @@ func (s *Service) hasUnresolvedBlockers(ctx context.Context, iss linear.Issue) b
 	s.logger.Info("skip_blocked",
 		"issue", iss.Identifier,
 		"blockers", ids,
+	)
+	return true
+}
+
+// isParentIssue reports whether iss has any sub-issues, i.e. it is a parent
+// "task" rather than a shippable leaf. Pickup must skip parents (see consider).
+// On a Linear API error it returns true (fail-closed): wrongly skipping a real
+// leaf this tick is cheap — the next scan re-evaluates it — whereas wrongly
+// assigning a parent is the exact failure this guard exists to prevent.
+func (s *Service) isParentIssue(ctx context.Context, iss linear.Issue) bool {
+	sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	subs, err := s.linear.GetSubIssues(sctx, iss.ID)
+	if err != nil {
+		s.logger.Warn("subissue_check_failed_skipping",
+			"issue", iss.Identifier, "err", err)
+		return true
+	}
+	if len(subs) == 0 {
+		return false
+	}
+	s.logger.Info("skip_parent_issue",
+		"issue", iss.Identifier,
+		"sub_issues", len(subs),
 	)
 	return true
 }

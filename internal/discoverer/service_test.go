@@ -457,6 +457,59 @@ func TestConsiderUnblockedAssigns(t *testing.T) {
 	}
 }
 
+func TestConsiderSkipsParentIssue(t *testing.T) {
+	lc := &fakeLinear{
+		subIssues: map[string][]linear.SubIssue{
+			"iss-parent": {{ID: "sub-1", Identifier: "GEO-21"}},
+		},
+	}
+	ts := newFakeStore()
+	svc := newSvc(Config{AdmiralUserID: "u-1"}, lc, ts, nil)
+	if svc.consider(context.Background(), linear.Issue{ID: "iss-parent", Identifier: "GEO-20", StateName: "Todo"}) {
+		t.Fatal("expected consider to skip a parent issue (has sub-issues)")
+	}
+	if len(lc.assignedIDs()) != 0 {
+		t.Fatal("AssignIssue must not be called for a parent issue")
+	}
+	if _, ok := ts.picks["iss-parent"]; ok {
+		t.Fatal("picks row must not be written for a parent (so next tick re-evaluates)")
+	}
+}
+
+func TestConsiderParentCheckRunsBeforeJudge(t *testing.T) {
+	lc := &fakeLinear{
+		subIssues: map[string][]linear.SubIssue{
+			"iss-parent2": {{ID: "sub-1", Identifier: "GEO-31"}},
+		},
+	}
+	ts := newFakeStore()
+	j := &fakeJudge{verdicts: map[string]Verdict{"iss-parent2": {Decision: "yes"}}}
+	svc := newSvc(Config{
+		AdmiralUserID: "u-1",
+		Judge:         JudgeConfig{Enabled: true},
+	}, lc, ts, j)
+	if svc.consider(context.Background(), linear.Issue{ID: "iss-parent2", Identifier: "GEO-30"}) {
+		t.Fatal("expected consider to skip a parent issue")
+	}
+	if j.calls != 0 {
+		t.Errorf("judge must not be invoked for a parent issue, got %d calls", j.calls)
+	}
+}
+
+func TestConsiderParentCheckFailsClosed(t *testing.T) {
+	// Unlike the blocker gate (fail-open), an error resolving sub-issues must
+	// fail CLOSED: skip rather than risk assigning a parent.
+	lc := &fakeLinear{subIssuesErr: errors.New("linear 5xx")}
+	ts := newFakeStore()
+	svc := newSvc(Config{AdmiralUserID: "u-1"}, lc, ts, nil)
+	if svc.consider(context.Background(), linear.Issue{ID: "iss-err2", Identifier: "GEO-32", StateName: "Todo"}) {
+		t.Fatal("expected consider to fail-closed (skip) on sub-issue API error")
+	}
+	if len(lc.assignedIDs()) != 0 {
+		t.Fatal("AssignIssue must not be called when the sub-issue check errored")
+	}
+}
+
 func TestTickRespectsMaxPickPerRound(t *testing.T) {
 	lc := &fakeLinear{
 		scanRet: []linear.Issue{
