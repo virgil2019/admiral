@@ -2,6 +2,7 @@ package discoverer
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/georgehuang/admiral/internal/linear"
@@ -155,6 +156,179 @@ func TestAdvanceOpenWithoutApprovalWritesInReview(t *testing.T) {
 
 	if len(lc.issueUpdates) != 1 || lc.issueUpdates[0].StateID != "s-review" {
 		t.Fatalf("expected IssueUpdate to s-review, got %+v", lc.issueUpdates)
+	}
+}
+
+func TestAutoMergeReadyGate(t *testing.T) {
+	cases := []struct {
+		name string
+		st   PRStatus
+		want bool
+	}{
+		{"approved+mergeable+passing", PRStatus{HasApprovedReview: true, Mergeable: "MERGEABLE", ChecksState: "passing"}, true},
+		{"approved+mergeable+none", PRStatus{HasApprovedReview: true, Mergeable: "MERGEABLE", ChecksState: "none"}, true},
+		{"approved+mergeable+failing", PRStatus{HasApprovedReview: true, Mergeable: "MERGEABLE", ChecksState: "failing"}, false},
+		{"approved+mergeable+pending", PRStatus{HasApprovedReview: true, Mergeable: "MERGEABLE", ChecksState: "pending"}, false},
+		{"approved+conflicting+passing", PRStatus{HasApprovedReview: true, Mergeable: "CONFLICTING", ChecksState: "passing"}, false},
+		{"approved+unknown+passing", PRStatus{HasApprovedReview: true, Mergeable: "UNKNOWN", ChecksState: "passing"}, false},
+		{"unapproved+mergeable+passing", PRStatus{HasApprovedReview: false, Mergeable: "MERGEABLE", ChecksState: "passing"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := autoMergeReady(tc.st); got != tc.want {
+				t.Errorf("autoMergeReady(%+v) = %v, want %v", tc.st, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAutoMergeFiresWhenGatePasses: AutoMerge on + gate clear → the PR is
+// merged AND the merged path runs the same tick (Linear → completed, task
+// → DONE_MERGED), instead of parking in Reviewed.
+func TestAutoMergeFiresWhenGatePasses(t *testing.T) {
+	prURL := newPRURL()
+	task := newGEOTaskDone(prURL)
+	ts := newFakeStore()
+	ts.tasksByState[task.IssueID] = &task
+
+	lc := &fakeLinear{}
+	lc.issues = map[string]*linear.Issue{"iss-A": newGEOIssue("In Review")}
+	seedTeamGEO(lc)
+
+	pr := &fakePR{statuses: map[string]PRStatus{
+		prURL: {State: "OPEN", HasApprovedReview: true, Mergeable: "MERGEABLE", ChecksState: "passing"},
+	}}
+
+	cfg := Config{
+		AdmiralUserID: "u-1",
+		AutoMerge:     true,
+		LinearStates:  LinearStateMap{InReview: "In Review", Reviewed: "Reviewed"},
+	}
+	svc := newSvcWithPR(cfg, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if len(pr.merged) != 1 || pr.merged[0] != prURL {
+		t.Fatalf("expected MergePR(%q) once, got %+v", prURL, pr.merged)
+	}
+	if len(lc.issueUpdates) != 1 || lc.issueUpdates[0].StateID != "s-done" {
+		t.Fatalf("expected IssueUpdate to s-done (merged path), got %+v", lc.issueUpdates)
+	}
+	if ts.tasksByState["iss-A"].State != store.JobStateDoneMerged {
+		t.Errorf("task state: got %q, want DONE_MERGED", ts.tasksByState["iss-A"].State)
+	}
+}
+
+// TestAutoMergeDisabledParksInReviewed: with AutoMerge off, an approved +
+// mergeable + green PR is NOT merged — it stays in the Reviewed state for a
+// human, the pre-existing behavior.
+func TestAutoMergeDisabledParksInReviewed(t *testing.T) {
+	prURL := newPRURL()
+	task := newGEOTaskDone(prURL)
+	ts := newFakeStore()
+	ts.tasksByState[task.IssueID] = &task
+
+	lc := &fakeLinear{}
+	lc.issues = map[string]*linear.Issue{"iss-A": newGEOIssue("In Progress")}
+	seedTeamGEO(lc)
+
+	pr := &fakePR{statuses: map[string]PRStatus{
+		prURL: {State: "OPEN", HasApprovedReview: true, Mergeable: "MERGEABLE", ChecksState: "passing"},
+	}}
+
+	cfg := Config{
+		AdmiralUserID: "u-1",
+		AutoMerge:     false,
+		LinearStates:  LinearStateMap{InReview: "In Review", Reviewed: "Reviewed"},
+	}
+	svc := newSvcWithPR(cfg, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if len(pr.merged) != 0 {
+		t.Fatalf("AutoMerge off: expected no merge, got %+v", pr.merged)
+	}
+	if len(lc.issueUpdates) != 1 || lc.issueUpdates[0].StateID != "s-reviewed" {
+		t.Fatalf("expected IssueUpdate to s-reviewed, got %+v", lc.issueUpdates)
+	}
+	if ts.tasksByState["iss-A"].State != store.JobStateDone {
+		t.Errorf("task state: got %q, want DONE (unchanged)", ts.tasksByState["iss-A"].State)
+	}
+}
+
+// TestAutoMergeFallsThroughOnMergeError: gate passes but the merge call
+// fails (e.g. branch protection rejected it) → no terminal transition, the
+// PR falls through to the Reviewed push so the next tick retries.
+func TestAutoMergeFallsThroughOnMergeError(t *testing.T) {
+	prURL := newPRURL()
+	task := newGEOTaskDone(prURL)
+	ts := newFakeStore()
+	ts.tasksByState[task.IssueID] = &task
+
+	lc := &fakeLinear{}
+	lc.issues = map[string]*linear.Issue{"iss-A": newGEOIssue("In Progress")}
+	seedTeamGEO(lc)
+
+	pr := &fakePR{
+		statuses: map[string]PRStatus{
+			prURL: {State: "OPEN", HasApprovedReview: true, Mergeable: "MERGEABLE", ChecksState: "passing"},
+		},
+		mergeErr: context.DeadlineExceeded,
+	}
+
+	cfg := Config{
+		AdmiralUserID: "u-1",
+		AutoMerge:     true,
+		LinearStates:  LinearStateMap{InReview: "In Review", Reviewed: "Reviewed"},
+	}
+	svc := newSvcWithPR(cfg, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if len(lc.issueUpdates) != 1 || lc.issueUpdates[0].StateID != "s-reviewed" {
+		t.Fatalf("expected fall-through IssueUpdate to s-reviewed, got %+v", lc.issueUpdates)
+	}
+	if ts.tasksByState["iss-A"].State != store.JobStateDone {
+		t.Errorf("task state: got %q, want DONE (no terminal transition on merge failure)", ts.tasksByState["iss-A"].State)
+	}
+}
+
+// TestAutoMergeBranchProtectionBackstop documents the real safety
+// boundary: the client-side gate is only a pre-filter, so it can pass on
+// a PR whose required status check hasn't reported into the rollup yet
+// (ChecksState=="none"/"passing"). The authoritative gate is GitHub
+// branch protection, which rejects the immediate `gh pr merge` — surfaced
+// here as a MergePR error. admiral must NOT mark the task merged; it falls
+// through to Reviewed and the next tick retries once checks settle.
+func TestAutoMergeBranchProtectionBackstop(t *testing.T) {
+	prURL := newPRURL()
+	task := newGEOTaskDone(prURL)
+	ts := newFakeStore()
+	ts.tasksByState[task.IssueID] = &task
+
+	lc := &fakeLinear{}
+	lc.issues = map[string]*linear.Issue{"iss-A": newGEOIssue("In Progress")}
+	seedTeamGEO(lc)
+
+	pr := &fakePR{
+		statuses: map[string]PRStatus{
+			// Gate clears client-side: approved, mergeable, no checks in rollup.
+			prURL: {State: "OPEN", HasApprovedReview: true, Mergeable: "MERGEABLE", ChecksState: "none"},
+		},
+		// gh rejects the immediate merge — required status check is expected.
+		mergeErr: errors.New("Pull request is not mergeable: the base branch requires all commits to be signed; required status check \"ci\" is expected"),
+	}
+
+	cfg := Config{
+		AdmiralUserID: "u-1",
+		AutoMerge:     true,
+		LinearStates:  LinearStateMap{InReview: "In Review", Reviewed: "Reviewed"},
+	}
+	svc := newSvcWithPR(cfg, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if len(lc.issueUpdates) != 1 || lc.issueUpdates[0].StateID != "s-reviewed" {
+		t.Fatalf("expected fall-through IssueUpdate to s-reviewed, got %+v", lc.issueUpdates)
+	}
+	if ts.tasksByState["iss-A"].State != store.JobStateDone {
+		t.Errorf("task state: got %q, want DONE (branch protection blocked the merge)", ts.tasksByState["iss-A"].State)
 	}
 }
 

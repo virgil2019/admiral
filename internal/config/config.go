@@ -68,6 +68,26 @@ type Discoverer struct {
 	// Linear.canceled) bypass this map and use Linear's state.type as
 	// the stable target, so the defaults work without any config.
 	LinearStates DiscovererLinearStates `yaml:"linear_states"`
+	// AutoMerge lets the state-advance phase squash-merge an approved,
+	// mergeable, CI-green PR (deleting its branch) instead of parking it
+	// in the Reviewed state for a human to merge. Opt-in safety gate:
+	// default false because merging is outward-facing and near-
+	// irreversible. Turn on only for projects where admiral is trusted
+	// to ship without a human merge click.
+	//
+	// PREREQUISITE — branch protection. admiral's client-side gate
+	// (approved + mergeable + CI-green) is only a pre-filter; the
+	// authoritative gate is the GitHub branch protection rule, which
+	// `gh pr merge` (run WITHOUT --admin) is subject to. Before enabling
+	// auto_merge, configure branch protection on the base branch with:
+	//   - required approving reviews, AND "Dismiss stale pull request
+	//     approvals when new commits are pushed" — otherwise an approval
+	//     of an earlier commit stays current and admiral can merge code
+	//     pushed after the review.
+	//   - required status checks for any CI that must pass — admiral's
+	//     own checks-rollup read can miss a required check that hasn't
+	//     reported yet, so branch protection is what actually enforces it.
+	AutoMerge bool `yaml:"auto_merge"`
 }
 
 // DiscovererLinearStates is the optional Linear-state-name map used by

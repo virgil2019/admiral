@@ -116,7 +116,7 @@ func (s *Service) advanceOne(ctx context.Context, t *store.AdmiralTask, enabled 
 	case "CLOSED":
 		s.advanceCancelled(ctx, t, issue)
 	case "OPEN":
-		s.advanceOpen(ctx, t, issue, status.HasApprovedReview)
+		s.advanceOpen(ctx, t, issue, status)
 	}
 }
 
@@ -235,9 +235,27 @@ func (s *Service) advanceCancelled(ctx context.Context, t *store.AdmiralTask, is
 		"issue", t.IssueIdentifier, "pr", t.PRURL)
 }
 
-func (s *Service) advanceOpen(ctx context.Context, t *store.AdmiralTask, issue *linear.Issue, hasApproval bool) {
+func (s *Service) advanceOpen(ctx context.Context, t *store.AdmiralTask, issue *linear.Issue, status PRStatus) {
+	// Auto-merge gate: when enabled and the PR is approved + mergeable +
+	// CI-green, squash-merge it and short-circuit into the merged path
+	// (Linear completed + verify enqueue) this same tick instead of
+	// parking in Reviewed for a human. A merge failure falls through to
+	// the normal Reviewed push so the next tick retries.
+	if s.cfg.AutoMerge && autoMergeReady(status) {
+		if err := s.pr.MergePR(ctx, t.PRURL); err != nil {
+			s.logger.Warn("auto_merge_failed",
+				"issue", t.IssueIdentifier, "pr", t.PRURL, "err", err)
+			// fall through to the Reviewed push below
+		} else {
+			s.logger.Info("auto_merged",
+				"issue", t.IssueIdentifier, "pr", t.PRURL)
+			s.advanceMerged(ctx, t, issue)
+			return
+		}
+	}
+
 	var target string
-	if hasApproval {
+	if status.HasApprovedReview {
 		target = s.cfg.LinearStates.Reviewed
 	} else {
 		target = s.cfg.LinearStates.InReview
@@ -249,6 +267,28 @@ func (s *Service) advanceOpen(ctx context.Context, t *store.AdmiralTask, issue *
 		s.logger.Warn("state_advance_linear_open_failed",
 			"issue", t.IssueIdentifier, "target", target, "err", err)
 	}
+}
+
+// autoMergeReady reports whether an OPEN PR clears the auto-merge gate:
+// an approving review, no merge conflicts (Mergeable=="MERGEABLE"), and
+// CI either all-green or absent ("none"). A "pending"/"failing" checks
+// state or a "CONFLICTING"/"UNKNOWN" mergeability holds the merge back —
+// the next tick re-evaluates once GitHub settles.
+//
+// This is a pre-filter, not the authority: GitHub branch protection is
+// what actually enforces required reviews/checks at merge time (MergePR
+// runs `gh pr merge` without --admin). So a PR clearing this gate may
+// still be rejected by `gh pr merge` — that rejection is expected and
+// falls through to the Reviewed push. See the auto_merge config docs for
+// the branch-protection prerequisites this gate assumes.
+func autoMergeReady(st PRStatus) bool {
+	if !st.HasApprovedReview {
+		return false
+	}
+	if st.Mergeable != "MERGEABLE" {
+		return false
+	}
+	return st.ChecksState == "passing" || st.ChecksState == "none"
 }
 
 // pushLinearStateByType pushes the issue's Linear workflow state to the

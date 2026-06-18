@@ -149,6 +149,23 @@ discoverer:
   require_label: "agent-ready"
   # Cap per scan round; should be <= autopilot.max_concurrent_runs.
   max_pick_per_round: 3
+  # When true, the state-advance phase squash-merges (and deletes the
+  # branch of) an OPEN PR once it is approved + mergeable + CI-green,
+  # instead of parking it in the Reviewed state for a human to merge.
+  # Opt-in safety gate: default false because merging is outward-facing
+  # and near-irreversible. Turn on only where admiral is trusted to ship
+  # without a human merge click.
+  #
+  # PREREQUISITE — branch protection. admiral's gate (approved + mergeable
+  # + CI-green) is only a pre-filter; the real authority is the GitHub
+  # branch protection rule, which `gh pr merge` is subject to (admiral
+  # never uses --admin, so it cannot bypass protection). Before enabling,
+  # protect the base branch with:
+  #   - required approving reviews + "Dismiss stale approvals on new
+  #     commits" — else a stale approval lets post-review commits merge.
+  #   - required status checks — admiral's checks read can miss a required
+  #     check that hasn't reported yet; protection is what enforces it.
+  auto_merge: false
   # admiral's Linear user UUID. If empty, resolved from `viewer { id }`
   # on startup (no per-scan cost).
   # admiral_user_id: ""
