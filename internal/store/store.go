@@ -428,6 +428,15 @@ CREATE TABLE IF NOT EXISTS product_verifications (
 );
 `
 
+// migration0023 records the verify judge's one-line summary on every
+// task_verifications round. Upper-layer verifies (parents of the just-
+// completed parent, cascade hop) read it as the "what was shipped" digest
+// for an intermediate sub whose work isn't a single PR diff. Empty string
+// (the column default) means no summary has been written yet for this row.
+const migration0023 = `
+ALTER TABLE task_verifications ADD COLUMN summary TEXT NOT NULL DEFAULT '';
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -456,6 +465,7 @@ var migrations = []migration{
 	{20, migration0020},
 	{21, migration0021},
 	{22, migration0022},
+	{23, migration0023},
 }
 
 func tableExists(db *sql.DB, name string) bool {

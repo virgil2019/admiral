@@ -293,7 +293,7 @@ func (s *Service) consider(ctx context.Context, iss linear.Issue) bool {
 	// Skip parent issues. An issue with sub-issues is a "task", not a
 	// shippable leaf: assigning it runs autopilot against the whole task and
 	// merges a PR that flips the parent to a completed Linear state, bypassing
-	// the sub-issue completeness gate the verify loop enforces (allSubsCompleted).
+	// the sub-issue completeness gate the verify loop enforces (cascade.AllSubsCompleted).
 	// Normally only the convention "a parent never carries the pickup label"
 	// keeps parents out of the candidate set; this is the structural backstop
 	// for when that convention is broken (manual labelling, hierarchy that
