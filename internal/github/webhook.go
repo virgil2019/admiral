@@ -126,7 +126,7 @@ type rawReviewEvent struct {
 		} `json:"user"`
 	} `json:"review,omitempty"`
 	Comment *struct {
-		ID   int64 `json:"id"`
+		ID   int64  `json:"id"`
 		Body string `json:"body"`
 		User struct {
 			Login string `json:"login"`

@@ -131,7 +131,7 @@ type featureGetMaterialsArgs struct {
 // agent should treat a missing or empty `issues` list as a signal
 // to re-decompose or to prompt the user, not as "everything passed".
 type featureGetMaterialsResult struct {
-	Feature *featurePayload      `json:"feature"`
+	Feature *featurePayload       `json:"feature"`
 	Issues  []featureIssuePayload `json:"issues"`
 }
 
@@ -150,9 +150,9 @@ type featurePayload struct {
 }
 
 type featureIssuePayload struct {
-	LinearIssueID       string `json:"linear_issue_id"`
-	AcceptanceCriteria  string `json:"acceptance_criteria"`
-	CreatedAt           string `json:"created_at"`
+	LinearIssueID      string `json:"linear_issue_id"`
+	AcceptanceCriteria string `json:"acceptance_criteria"`
+	CreatedAt          string `json:"created_at"`
 }
 
 // --- issue_list_by_feature ---
@@ -170,7 +170,7 @@ type issueRowPayload struct {
 	LinearIssueID      string `json:"linear_issue_id"`
 	IssueIdentifier    string `json:"issue_identifier,omitempty"` // "GEO-50"
 	AcceptanceCriteria string `json:"acceptance_criteria"`
-	State              string `json:"state,omitempty"`            // admiral_tasks.state, or "" when admiral hasn't started yet
+	State              string `json:"state,omitempty"` // admiral_tasks.state, or "" when admiral hasn't started yet
 	PRURL              string `json:"pr_url,omitempty"`
 }
 

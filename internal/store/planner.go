@@ -24,23 +24,23 @@ var ErrInvalidVerdict = errors.New("invalid PR verdict")
 // acceptance against the user's intent (not against any spec the
 // agent itself wrote).
 type Feature struct {
-	ID                string
-	Name              string
-	LinearProjectID   string
-	RequirementsText  string
-	SourceAgent       string // "claude" / "codex" / "" — telemetry
-	CreatedAt         string // RFC3339 UTC
-	ClosedAt          string // RFC3339 UTC; "" while open
+	ID               string
+	Name             string
+	LinearProjectID  string
+	RequirementsText string
+	SourceAgent      string // "claude" / "codex" / "" — telemetry
+	CreatedAt        string // RFC3339 UTC
+	ClosedAt         string // RFC3339 UTC; "" while open
 }
 
 // FeatureIssue is the L1 acceptance contract for a single Linear
 // issue inside a feature. Written by the host agent at decomposition
 // time and read back at PR-verification time as the judging standard.
 type FeatureIssue struct {
-	FeatureID           string
-	LinearIssueID       string
-	AcceptanceCriteria  string
-	CreatedAt           string
+	FeatureID          string
+	LinearIssueID      string
+	AcceptanceCriteria string
+	CreatedAt          string
 }
 
 // PRVerdict enumerates the L1 outcomes the planner can submit to a
@@ -213,6 +213,7 @@ func (s *Store) ListFeaturesByName(name string) ([]Feature, error) {
 //   - (true, nil)               — feature was open, now closed.
 //   - (false, nil)              — feature already closed (idempotent no-op).
 //   - (false, ErrFeatureNotFound) — id does not exist (likely caller bug).
+//
 // The atomic UPDATE...WHERE closed_at IS NULL handles the open→closed
 // transition race-free; the lookup afterwards is only consulted when
 // nothing was updated, to distinguish "already closed" from "missing".
