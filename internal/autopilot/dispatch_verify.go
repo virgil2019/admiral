@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -263,11 +264,54 @@ func (o *Orchestrator) HandleVerifyEvent(ctx context.Context, parentID string) {
 	go o.runVerify(parentID)
 }
 
+// acceptanceCriteriaHeadingRE matches a markdown H2 "## Acceptance Criteria"
+// heading line. Strict: H2 only (H1 / H3+ are NOT matched — those are
+// non-conventional and easy to write by accident), case-insensitive, leading
+// whitespace on the line tolerated, and a word boundary is required after
+// "criteria" so the heading text can be exactly that or extended ("##
+// Acceptance Criteria (must hold for v2)") but a typo like
+// "AcceptanceCriteria" does not match.
+var acceptanceCriteriaHeadingRE = regexp.MustCompile(`(?im)^[ \t]*##[ \t]+acceptance[ \t]+criteria\b`)
+
+// hasAcceptanceCriteriaSection reports whether desc carries the conventional
+// "## Acceptance Criteria" H2 heading that marks a non-leaf parent's
+// black-box done conditions. Drives the auto-pass branch in runVerify:
+// absent → admiral treats this layer as an organizational wrapper and
+// short-circuits to a passing verdict. See the decompose / review-
+// decomposition SKILL.md docs for the convention this enforces.
+func hasAcceptanceCriteriaSection(desc string) bool {
+	return acceptanceCriteriaHeadingRE.MatchString(desc)
+}
+
 // runVerify is the background goroutine for one verification round: gather
 // materials → headless judge → apply the verdict. It owns its own run slot
 // and timeout ctx (same budget as the review/autopilot claude runs). Every
 // failure logs and returns, leaving the verification 'active' for a later
 // retry.
+//
+// Auto-pass short-circuit: a non-leaf parent whose description carries no
+// '## Acceptance Criteria' heading AND has at least one sub-issue is, by
+// convention, an organizational wrapper (no layer-specific acceptance to
+// check; its children's verifications carry the substantive judgment). We
+// synthesize a Complete=true verdict and call applyVerifyVerdict directly,
+// skipping BOTH the verify_cmd build gate AND the LLM judge — each child's
+// PR already ran the build through CI, and there's nothing for the judge to
+// evaluate without a criteria section.
+//
+// Two preconditions gate the auto-pass:
+//   - len(mat.Subs) > 0: a wrapper with no children has no "its children
+//     carry the judgment" — there's nothing to inherit, so this falls
+//     through to the LLM judge (which will see an empty sub list and file
+//     a gap or complete based on the PRD alone).
+//   - HasAcceptanceCriteriaSection is false: a parent with an explicit
+//     criteria section has declared its own done-conditions; respect that.
+//
+// Round accounting: HandleVerifyEvent bumps the round counter BEFORE this
+// function runs, so the auto-pass branch still consumes one round even
+// though no LLM work happened. The terminal-status short-circuit on
+// re-trigger (HandleVerifyEvent skips closed/escalated rows) prevents the
+// round cap from being hit by repeated re-enqueues of a stable auto-passed
+// wrapper — once closed, the verify row is no longer eligible to run again.
 func (o *Orchestrator) runVerify(parentID string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -285,6 +329,33 @@ func (o *Orchestrator) runVerify(parentID string) {
 	mat, repoDir, teamID, projectID, verifyCmd, err := o.gatherVerifyMaterial(ctx, parentID)
 	if err != nil {
 		o.logger.Error("verify_gather_failed", "parent", parentID, "err", err)
+		return
+	}
+
+	// Auto-pass: a parent description without the conventional
+	// '## Acceptance Criteria' H2 heading AND with at least one sub-issue
+	// is an organizational wrapper — its children's verifications are the
+	// only substantive judgment, and this layer just cascades up.
+	// Synthesize a Complete=true verdict and hand straight to
+	// applyVerifyVerdict (which flips Linear + persists the summary +
+	// walks cascade one hop). Skips the verify_cmd build gate AND the LLM
+	// judge: children already ran the build through their own PR CIs, and
+	// there's nothing to judge without acceptance criteria.
+	//
+	// The len(mat.Subs) > 0 gate prevents the "wrapper with no children"
+	// footgun: a parent that declares no AC heading AND has nothing under
+	// it cannot inherit any judgment, so auto-passing it would silently
+	// mark an empty task as done. Such parents fall through to the LLM
+	// judge, which sees an empty sub list and will file a gap or complete
+	// based on the PRD alone.
+	if !hasAcceptanceCriteriaSection(mat.PRD) && len(mat.Subs) > 0 {
+		o.logger.Info("verify_auto_pass",
+			"parent", parentID, "identifier", mat.ParentIdentifier)
+		o.applyVerifyVerdict(ctx, parentID, mat.ParentIdentifier, teamID, projectID,
+			&verifyVerdict{
+				Complete: true,
+				Summary:  "auto-pass: parent description has no '## Acceptance Criteria' section; treated as organizational wrapper",
+			})
 		return
 	}
 
