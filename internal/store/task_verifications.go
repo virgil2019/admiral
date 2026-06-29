@@ -30,11 +30,14 @@ func isValidTaskVerifyStatus(s string) bool {
 
 // TaskVerification tracks the autonomous verification loop for one parent
 // "task" issue. Rounds bounds the self-converging loop; Status gates whether
-// the loop is still running. See migration0019.
+// the loop is still running. Summary captures the latest judge's one-line
+// verdict (consumed by an upper-layer verify hop as the digest of an
+// intermediate sub's shipped work). See migration0019 / migration0023.
 type TaskVerification struct {
 	ParentIssueID string
 	Rounds        int
 	Status        string
+	Summary       string
 	UpdatedAt     string // RFC3339 UTC
 }
 
@@ -43,9 +46,9 @@ type TaskVerification struct {
 func (s *Store) GetTaskVerification(parentIssueID string) (*TaskVerification, error) {
 	var tv TaskVerification
 	err := s.DB.QueryRow(`
-		SELECT parent_issue_id, rounds, status, updated_at
+		SELECT parent_issue_id, rounds, status, summary, updated_at
 		FROM task_verifications WHERE parent_issue_id=?
-	`, parentIssueID).Scan(&tv.ParentIssueID, &tv.Rounds, &tv.Status, &tv.UpdatedAt)
+	`, parentIssueID).Scan(&tv.ParentIssueID, &tv.Rounds, &tv.Status, &tv.Summary, &tv.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -78,6 +81,28 @@ func (s *Store) BumpTaskVerificationRound(parentIssueID string) (*TaskVerificati
 	// connection (MaxOpenConns=1, see Open): no other writer can interleave
 	// between the UPSERT and this SELECT.
 	return s.GetTaskVerification(parentIssueID)
+}
+
+// SetTaskVerificationSummary stores the judge's one-line summary from the
+// most recent verify round for a parent issue. Errors if no row exists —
+// callers are expected to have BumpTaskVerificationRound'd first (the verify
+// dispatcher always does, so this is a defensive invariant).
+func (s *Store) SetTaskVerificationSummary(parentIssueID, summary string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.DB.Exec(`
+		UPDATE task_verifications SET summary=?, updated_at=? WHERE parent_issue_id=?
+	`, summary, now, parentIssueID)
+	if err != nil {
+		return fmt.Errorf("set task verification summary: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set task verification summary: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("task verification for %s not found", parentIssueID)
+	}
+	return nil
 }
 
 // SetTaskVerificationStatus moves a parent issue's verification to a

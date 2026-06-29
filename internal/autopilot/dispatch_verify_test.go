@@ -101,7 +101,7 @@ func TestApplyVerifyVerdict_CompleteClosesTask(t *testing.T) {
 	db := &mockStore{}
 	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, nil)
 
-	o.applyVerifyVerdict(context.Background(), "p1", "team-1", "proj-1",
+	o.applyVerifyVerdict(context.Background(), "p1", "GEO-1", "team-1", "proj-1",
 		&verifyVerdict{Complete: true, Summary: "all shipped"})
 
 	if len(lc.IssueUpdateCalls) != 1 || lc.IssueUpdateCalls[0].StateID != "st-done" {
@@ -125,7 +125,7 @@ func TestApplyVerifyVerdict_GapsFileSubIssues(t *testing.T) {
 	o.verifyLabel = "agent-ready"
 	o.verifyStateTypes = []string{"backlog"}
 
-	o.applyVerifyVerdict(context.Background(), "p1", "team-1", "proj-1", &verifyVerdict{
+	o.applyVerifyVerdict(context.Background(), "p1", "GEO-1", "team-1", "proj-1", &verifyVerdict{
 		Complete: false,
 		Gaps: []verifyGap{
 			{Title: "Add logout", Description: "no logout", AcceptanceCriteria: "DELETE /session clears cookie"},
@@ -151,6 +151,112 @@ func TestApplyVerifyVerdict_GapsFileSubIssues(t *testing.T) {
 	}
 }
 
+func TestApplyVerifyVerdict_CompleteCascadesToGrandparent(t *testing.T) {
+	// Three-level tree: grandparent (G) → parent (P) → leaves L1, L2.
+	// L1, L2 already shipped + L1 just triggered P's verify; verdict is
+	// complete. After applying, the cascade hop must enqueue a verify
+	// event for G — assuming G's other children (just P here) are now
+	// completed too.
+	lc := &mockLinearClient{
+		WorkflowStates: []linear.WorkflowState{{ID: "st-done", Type: "completed", Position: 0}},
+		ParentByChild:  map[string]string{"P": "G"},
+		SubIssuesByParent: map[string][]linear.SubIssue{
+			"G": {{ID: "P", Identifier: "GEO-P", StateType: "completed"}},
+		},
+	}
+	db := &mockStore{}
+	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, nil)
+
+	o.applyVerifyVerdict(context.Background(), "P", "GEO-P", "team-1", "proj-1",
+		&verifyVerdict{Complete: true, Summary: "P shipped its sub-tasks"})
+
+	if len(db.Enqueued) != 1 {
+		t.Fatalf("expected one cascade enqueue, got %+v", db.Enqueued)
+	}
+	e := db.Enqueued[0]
+	if e.Source != "verify" || e.IssueID != "G" || e.SessionID != "G" {
+		t.Errorf("cascade event misrouted: %+v", e)
+	}
+	if e.WebhookID != "verify-G-P" {
+		t.Errorf("webhook_id = %q, want verify-G-P (each hop's trigger differs)", e.WebhookID)
+	}
+	// Summary must be persisted for upper-layer verify to pick up later.
+	if len(db.SetSummaryCalls) != 1 ||
+		db.SetSummaryCalls[0].ParentID != "P" ||
+		db.SetSummaryCalls[0].Summary != "P shipped its sub-tasks" {
+		t.Errorf("summary not persisted: %+v", db.SetSummaryCalls)
+	}
+}
+
+func TestApplyVerifyVerdict_CompleteStopsAtTopOfTree(t *testing.T) {
+	// P has no parent — applying the complete verdict must NOT enqueue.
+	lc := &mockLinearClient{
+		WorkflowStates: []linear.WorkflowState{{ID: "st-done", Type: "completed", Position: 0}},
+		ParentByChild:  map[string]string{}, // no parent for P
+	}
+	db := &mockStore{}
+	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, nil)
+
+	o.applyVerifyVerdict(context.Background(), "P", "GEO-P", "team-1", "proj-1",
+		&verifyVerdict{Complete: true, Summary: "top-of-tree task done"})
+
+	if len(db.Enqueued) != 0 {
+		t.Errorf("top-of-tree must not cascade, got %+v", db.Enqueued)
+	}
+	if len(db.SetSummaryCalls) != 1 {
+		t.Errorf("summary should still be persisted at top-of-tree, got %+v", db.SetSummaryCalls)
+	}
+}
+
+func TestApplyVerifyVerdict_CompleteDoesNotCascadeWhenSiblingIncomplete(t *testing.T) {
+	// G has two children: P (just completed) and SibP (still in flight).
+	// The cascade walk reads G's children and finds SibP incomplete, so
+	// no verify enqueues for G yet — it'll re-check when SibP finishes.
+	lc := &mockLinearClient{
+		WorkflowStates: []linear.WorkflowState{{ID: "st-done", Type: "completed", Position: 0}},
+		ParentByChild:  map[string]string{"P": "G"},
+		SubIssuesByParent: map[string][]linear.SubIssue{
+			"G": {
+				{ID: "P", StateType: "completed"},
+				{ID: "SibP", StateType: "started"},
+			},
+		},
+	}
+	db := &mockStore{}
+	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, nil)
+
+	o.applyVerifyVerdict(context.Background(), "P", "GEO-P", "team-1", "proj-1",
+		&verifyVerdict{Complete: true, Summary: "P done; sibling still pending"})
+
+	if len(db.Enqueued) != 0 {
+		t.Errorf("must not cascade while a G-child is incomplete, got %+v", db.Enqueued)
+	}
+}
+
+func TestApplyVerifyVerdict_GapsPersistSummary(t *testing.T) {
+	// Even on a not-complete verdict (gaps filed), the judge's summary is
+	// persisted so the same row carries the latest digest for any
+	// upper-layer verify that later reads it.
+	lc := &mockLinearClient{
+		WorkflowStates: []linear.WorkflowState{{ID: "st-backlog", Type: "backlog", Position: 0}},
+		TeamLabelID:    "lbl-agent-ready",
+	}
+	db := &mockStore{}
+	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, nil)
+	o.verifyLabel = "agent-ready"
+	o.verifyStateTypes = []string{"backlog"}
+
+	o.applyVerifyVerdict(context.Background(), "p1", "GEO-1", "team-1", "proj-1", &verifyVerdict{
+		Complete: false,
+		Summary:  "missing logout",
+		Gaps:     []verifyGap{{Title: "Add logout", Description: "no logout"}},
+	})
+
+	if len(db.SetSummaryCalls) != 1 || db.SetSummaryCalls[0].Summary != "missing logout" {
+		t.Errorf("summary not persisted on gaps branch: %+v", db.SetSummaryCalls)
+	}
+}
+
 func TestApplyVerifyVerdict_UnpickableGatesEscalate(t *testing.T) {
 	// Label gate configured but unresolvable (GetTeamLabelID returns "") →
 	// filing orphan follow-ups would stall the loop, so escalate instead.
@@ -160,7 +266,7 @@ func TestApplyVerifyVerdict_UnpickableGatesEscalate(t *testing.T) {
 	o.verifyLabel = "agent-ready"
 	o.verifyStateTypes = nil // state gate unconfigured = valid, skipped
 
-	o.applyVerifyVerdict(context.Background(), "p1", "team-1", "proj-1", &verifyVerdict{
+	o.applyVerifyVerdict(context.Background(), "p1", "GEO-1", "team-1", "proj-1", &verifyVerdict{
 		Complete: false,
 		Gaps:     []verifyGap{{Title: "Add logout", Description: "no logout"}},
 	})

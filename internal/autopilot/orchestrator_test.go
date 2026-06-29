@@ -269,6 +269,7 @@ type mockLinearClient struct {
 	// Verify loop (C4) overrides.
 	SubIssues         []linear.SubIssue
 	SubIssuesErr      error
+	SubIssuesByParent map[string][]linear.SubIssue // per-parent override (cascade tests)
 	IssueCreateResult *linear.Issue
 	IssueCreateErr    error
 	IssueCreateInputs []linear.IssueCreateInput
@@ -277,6 +278,10 @@ type mockLinearClient struct {
 	CreatedComments   []struct{ IssueID, Body string }
 	CreateCommentErr  error
 	GetIssueByID      map[string]*linear.Issue // per-id GetIssue override (sub titles)
+
+	// Cascade walk (GetParentID) override.
+	ParentByChild  map[string]string
+	GetParentIDErr error
 
 	// RemoveIssueLabel recorder (/reset)
 	RemovedLabels       []struct{ IssueID, LabelID string }
@@ -352,8 +357,24 @@ func (m *mockLinearClient) GetIssueBlockers(_ context.Context, _ string) ([]line
 	return m.IssueBlockers, m.IssueBlockersErr
 }
 
-func (m *mockLinearClient) GetSubIssues(_ context.Context, _ string) ([]linear.SubIssue, error) {
-	return m.SubIssues, m.SubIssuesErr
+func (m *mockLinearClient) GetSubIssues(_ context.Context, parentID string) ([]linear.SubIssue, error) {
+	if m.SubIssuesErr != nil {
+		return nil, m.SubIssuesErr
+	}
+	if m.SubIssuesByParent != nil {
+		if subs, ok := m.SubIssuesByParent[parentID]; ok {
+			return subs, nil
+		}
+		return nil, nil
+	}
+	return m.SubIssues, nil
+}
+
+func (m *mockLinearClient) GetParentID(_ context.Context, childID string) (string, error) {
+	if m.GetParentIDErr != nil {
+		return "", m.GetParentIDErr
+	}
+	return m.ParentByChild[childID], nil
 }
 
 func (m *mockLinearClient) IssueCreate(_ context.Context, in linear.IssueCreateInput) (*linear.Issue, error) {
@@ -461,6 +482,14 @@ type mockStore struct {
 	BumpCalls               []string
 	SetStatusCalls          []struct{ ParentID, Status string }
 	SetStatusErr            error
+	SetSummaryCalls         []struct{ ParentID, Summary string }
+	SetSummaryErr           error
+
+	// EnqueueEventWithSource recorder (cascade hop in applyVerifyVerdict).
+	Enqueued       []enqueuedEvent
+	EnqueueFresh   bool
+	EnqueueFreshOK bool // when true, EnqueueFresh is the returned freshness; when false, defaults to true
+	EnqueueErr     error
 
 	// product_verifications
 	ProductVerification        *store.ProductVerification
@@ -666,6 +695,41 @@ func (m *mockStore) SetTaskVerificationStatus(parentIssueID, status string) erro
 	m.SetStatusCalls = append(m.SetStatusCalls, struct{ ParentID, Status string }{parentIssueID, status})
 	m.mu.Unlock()
 	return m.SetStatusErr
+}
+
+func (m *mockStore) SetTaskVerificationSummary(parentIssueID, summary string) error {
+	m.mu.Lock()
+	m.SetSummaryCalls = append(m.SetSummaryCalls, struct{ ParentID, Summary string }{parentIssueID, summary})
+	m.mu.Unlock()
+	return m.SetSummaryErr
+}
+
+// enqueuedEvent captures one EnqueueEventWithSource call by mockStore, used by
+// cascade-hop tests to assert the verify event for the next level up was filed.
+type enqueuedEvent struct {
+	Source     string
+	WebhookID  string
+	Action     string
+	SessionID  string
+	IssueID    string
+	Payload    string
+	DeliveryID string
+}
+
+func (m *mockStore) EnqueueEventWithSource(source, webhookID, action, sessionID, issueID, payloadJSON, commentID string) (bool, error) {
+	m.mu.Lock()
+	m.Enqueued = append(m.Enqueued, enqueuedEvent{
+		Source: source, WebhookID: webhookID, Action: action,
+		SessionID: sessionID, IssueID: issueID, Payload: payloadJSON, DeliveryID: commentID,
+	})
+	m.mu.Unlock()
+	if m.EnqueueErr != nil {
+		return false, m.EnqueueErr
+	}
+	if m.EnqueueFreshOK {
+		return m.EnqueueFresh, nil
+	}
+	return true, nil
 }
 
 func (m *mockStore) GetProductVerification(projectID string) (*store.ProductVerification, error) {

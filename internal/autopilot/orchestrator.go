@@ -84,6 +84,14 @@ type storeInterface interface {
 	GetTaskVerification(parentIssueID string) (*store.TaskVerification, error)
 	BumpTaskVerificationRound(parentIssueID string) (*store.TaskVerification, error)
 	SetTaskVerificationStatus(parentIssueID, status string) error
+	SetTaskVerificationSummary(parentIssueID, summary string) error
+
+	// EnqueueEventWithSource is the queue write the verify-cascade hop
+	// uses: when applyVerifyVerdict closes a parent, the same helper the
+	// discoverer uses for leaf merges fires a verify event for the next
+	// level up (when one exists and its siblings are all completed). See
+	// internal/cascade.
+	EnqueueEventWithSource(source, webhookID, action, sessionID, issueID, payloadJSON, commentID string) (bool, error)
 
 	// product_verifications: the autonomous product-level verification loop.
 	GetProductVerification(projectID string) (*store.ProductVerification, error)
@@ -105,6 +113,9 @@ type linearClientInterface interface {
 
 	// Verify loop (C4): enumerate a task's sub-issues, file follow-up gaps
 	// as sub-issues, and escalate to a human via a parent-issue comment.
+	// GetParentID is the cascade walk hop: when a parent's own verify
+	// passes, we check whether ITS parent's siblings are all completed.
+	GetParentID(ctx context.Context, childID string) (string, error)
 	GetSubIssues(ctx context.Context, parentID string) ([]linear.SubIssue, error)
 	IssueCreate(ctx context.Context, in linear.IssueCreateInput) (*linear.Issue, error)
 	GetTeamLabelID(ctx context.Context, teamID, name string) (string, error)

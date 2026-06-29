@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/georgehuang/admiral/internal/cascade"
 	"github.com/georgehuang/admiral/internal/config"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
@@ -312,7 +313,7 @@ func (o *Orchestrator) runVerify(parentID string) {
 	// PR. The judge prompt already requires this on its own; this enforces it.
 	overrideVerdictOnBuildFail(verdict, mat.BuildResult)
 
-	o.applyVerifyVerdict(ctx, parentID, teamID, projectID, verdict)
+	o.applyVerifyVerdict(ctx, parentID, mat.ParentIdentifier, teamID, projectID, verdict)
 }
 
 // overrideVerdictOnBuildFail enforces the "non-passing build ⇒ not complete"
@@ -420,11 +421,42 @@ func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string
 }
 
 // applyVerifyVerdict acts on the judge's verdict. complete → flip the parent
-// to a completed-type Linear state and mark the verification closed (no
-// further verify events act on it). gaps → file each as a follow-up
-// sub-issue in a pickable state with the discoverer's label, leaving the
-// verification 'active' so the re-shipped fixes trigger another round.
-func (o *Orchestrator) applyVerifyVerdict(ctx context.Context, parentID, teamID, projectID string, v *verifyVerdict) {
+// to a completed-type Linear state, mark the verification closed (no further
+// verify events act on it), and cascade one hop up (when this parent itself
+// sits under another parent whose other children are all done, trigger the
+// upper layer's verify). gaps → file each as a follow-up sub-issue in a
+// pickable state with the discoverer's label, leaving the verification
+// 'active' so the re-shipped fixes trigger another round.
+//
+// In both branches the judge's one-line summary is persisted on the
+// task_verifications row before any other action. An upper-layer verify
+// run reads it via gatherVerifyMaterial as the digest of THIS parent's
+// shipped work (an intermediate parent has no single PR diff of its own —
+// its "shipped work" is the union of its children, summarized here).
+//
+// Summary write order: BEFORE the Linear flip on purpose. If the flip
+// fails the row stays 'active' and re-verifies next round, at which point
+// the freshly-computed summary overwrites — so the column always reflects
+// the latest judgment, never a stale earlier round. (The alternative —
+// write summary after the flip — would leave a closed row with the prior
+// round's summary visible to upper-layer cascade reads if the flip itself
+// failed downstream.)
+//
+// parentIdentifier is the parent's human-readable Linear identifier
+// (e.g. "GEO-12") used only for log narrative; the cascade walk hands
+// it to the helper for clean enqueue log lines instead of UUIDs.
+func (o *Orchestrator) applyVerifyVerdict(ctx context.Context, parentID, parentIdentifier, teamID, projectID string, v *verifyVerdict) {
+	if err := o.db.SetTaskVerificationSummary(parentID, v.Summary); err != nil {
+		// All paths to applyVerifyVerdict go through HandleVerifyEvent →
+		// BumpTaskVerificationRound, which guarantees the row exists. A
+		// failure here is a defensive-invariant violation (caller bypassed
+		// the bump, or DB transport error). Surface loudly and abort so
+		// the cascade does not fire against a row that can't carry the
+		// digest the upper hop will read.
+		o.logger.Error("verify_set_summary_failed", "parent", parentID, "err", err)
+		return
+	}
+
 	if v.Complete {
 		stateID, err := o.stateIDByType(ctx, teamID, "completed")
 		if err != nil {
@@ -446,6 +478,13 @@ func (o *Orchestrator) applyVerifyVerdict(ctx context.Context, parentID, teamID,
 			o.logger.Error("verify_complete_set_status_failed", "parent", parentID, "err", err)
 		}
 		o.logger.Info("verify_task_complete", "parent", parentID, "summary", v.Summary)
+
+		// Cascade: this parent's verify just passed, so it is now the
+		// "just-completed" child relative to ITS parent. The same helper
+		// the discoverer uses for leaf merges walks one hop further up.
+		// Top-of-tree (no parent) and incomplete-siblings cases short-
+		// circuit inside the helper.
+		cascade.MaybeEnqueueVerify(ctx, o.lc, o.db, o.logger, parentID, parentIdentifier)
 		return
 	}
 
