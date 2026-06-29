@@ -32,13 +32,15 @@ The invariants this skill checks against — all verified in admiral's code:
   *leaf* issue matching `RequireLabel` + a `StateTypes` state + unassigned. It
   is hierarchy-blind for labels but skips any issue that has sub-issues —
   non-leaves are never shipped, regardless of label.
-- **Task-verify cascades recursively** (`internal/discoverer/state_advance.go`):
+- **Task-verify cascades recursively** (`internal/cascade/cascade.go`):
   a merged leaf walks up to its parent; when every direct sibling is in a
   **completed** state, the parent task is verified. When the parent itself
   task-verifies, the same check fires at the grandparent — recursion continues
   up the tree. A non-leaf with no `## Acceptance Criteria` section in its
   description is auto-passed at that layer (organizational pass-through) and
-  cascade continues. The **topmost non-leaf** under the project verifies
+  cascade continues **provided the wrapper has at least one sub-issue —
+  without children there is no inherited judgment, so it falls through to
+  the LLM judge**. The **topmost non-leaf** under the project verifies
   itself in the same way once all its children complete; cascade then stops
   there (no project-level verify above it). A **top-level leaf** (parentless
   leaf, no children) is a different case — it ships but never task-verifies:
@@ -156,13 +158,24 @@ issue(s) and the invariant it violates.
   a non-leaf whose description reads like real task-feature acceptance content
   (concrete done-conditions, not pure organizational/milestone framing) but
   carries no `## Acceptance Criteria` heading. Without the heading, admiral
-  auto-passes that layer — the criteria are present but never judged. Common
-  cause: a leaf that gained sub-children later (became a non-leaf
+  auto-passes that layer — the criteria are present but never judged.
+  Common cause: a leaf that gained sub-children later (became a non-leaf
   retroactively), so its old leaf-style description (a flat criterion) sits
   at the top of the body without the convention's heading. Remediation: add
   the `## Acceptance Criteria` heading above the existing content, or — if
-  this non-leaf is genuinely a pure organizational wrapper — leave as-is and
-  ignore the finding.
+  this non-leaf is genuinely a pure organizational wrapper — leave as-is
+  and ignore the finding. (Leave-as-is is only safe when the wrapper has
+  at least one sub-issue; without children, see the next finding.)
+- **[MEDIUM] Non-leaf with zero sub-issues and no `## Acceptance Criteria` heading** —
+  a parent with neither children nor its own criteria section. Auto-pass
+  needs both: no heading declares it an organizational wrapper, but the
+  wrapper also needs children to inherit judgment from. Without either, it
+  falls through to the LLM judge, which sees an empty sub list and may
+  file gaps or complete based on the PRD alone. Almost always a wrapper
+  whose children haven't been added yet, or a leaf demoted to non-leaf
+  whose children were removed. Remediation: add the sub-issues the wrapper
+  exists to organize, or add a `## Acceptance Criteria` heading so the
+  judge has something concrete to ground its judgment in.
 - **[LOW] human-only issue with no clear deliverable** — same gap, judged by a
   human; still worth a concrete done-condition.
 

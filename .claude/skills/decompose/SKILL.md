@@ -50,15 +50,18 @@ Project                     ← the PRODUCT (product-tier acceptance enumerates 
   black-box "done" conditions. Present → admiral runs the LLM judge against
   those criteria. Absent → admiral auto-passes that layer and cascades up
   (useful for milestone-only wrappers that just organize children, no
-  layer-specific acceptance to check). Leaves don't need this heading —
-  their whole description IS the acceptance criterion, per Step 2. **Leaf
+  layer-specific acceptance to check) **provided the wrapper has at least
+  one sub-issue — without children there is no inherited judgment, so it
+  falls through to the LLM judge**. Leaves don't need this heading — their
+  whole description IS the acceptance criterion, per Step 2. **Leaf
   → non-leaf transition:** when an existing leaf gets sub-children added
   (via re-decompose), it becomes a non-leaf and its old leaf-style
   description (a flat acceptance criterion) no longer matches the auto-pass
   detector. To make verify actually judge against that criterion, reformat
   the description by adding a `## Acceptance Criteria` heading above it.
   To keep the transitioned issue as a pure organizational wrapper, leave
-  the description as-is (auto-pass takes over).
+  the description as-is — auto-pass takes over (the transitioned wrapper
+  now has sub-issues, satisfying the guard).
 - **Executable work belongs in leaves.** A non-leaf with concrete,
   code-sized scope is a sign the work should *be* a leaf, not a parent of
   one. The discoverer only picks up leaves; if a single-PR slice sits at an
@@ -367,9 +370,11 @@ admiral's verify judge reads. To make verify actually run for this parent
 (rather than auto-pass), include an explicit `## Acceptance Criteria`
 heading in the description with the black-box "done" conditions for the
 parent as a whole. Without that heading, the parent's verify is treated as
-"organizational wrapper" — it auto-passes and cascades up the tree. For a
-task-feature with real acceptance criteria, include the heading; for a
-pure milestone / grouping node, omit it.
+"organizational wrapper" — it auto-passes and cascades up the tree
+**provided the wrapper has at least one sub-issue — without children
+there is no inherited judgment, so it falls through to the LLM judge**.
+For a task-feature with real acceptance criteria, include the heading; for
+a pure milestone / grouping node, omit it.
 
 Record the returned identifier — this is the parent for the rest of the flow.
 Do NOT label the parent. The parent is the task definition, never a work
@@ -430,7 +435,7 @@ linear.save_issue(
   project:     <project identifier>,
   // NO parentId — issue attaches directly to the project
   title:       <feature name>,
-  description: <mini-PRD for this feature — enough that a future /decompose <this-issue> has a verifiable doc to slice. Include an explicit `## Acceptance Criteria` section if you want admiral's verify judge to evaluate this feature's done-ness once its children all complete; omit the heading if this is a pure milestone / grouping node (verify auto-passes and cascades up).>,
+  description: <mini-PRD for this feature — enough that a future /decompose <this-issue> has a verifiable doc to slice. Include an explicit `## Acceptance Criteria` section if you want admiral's verify judge to evaluate this feature's done-ness once its children all complete; omit the heading if this is a pure milestone / grouping node (verify auto-passes and cascades up, **provided the feature has at least one sub-issue when verify fires** — without children there is no inherited judgment, so it falls through to the LLM judge).>,
   // NO labels — top-level issues carry neither agent-task nor agent-ready
   state:       <a pickable state — see note>,
 )
@@ -594,6 +599,7 @@ To activate per feature: /activate GEO-10  (then GEO-11, GEO-12 …)
 - Parents / top-level issues / features are never labeled (no `agent-task`, no `agent-ready`) and never picked up by the discoverer.
 - Implicit parent/feature creation happens only in the create-then-sub-issue branch and in recursive mode's "no features yet" state — both after explicit user confirmation (Step 4 / the recursive consolidated review). Otherwise this skill WRITES sub-issues / top-level issues only — it never creates parents implicitly.
 - **Tree of arbitrary depth: leaves are work, non-leaves are verification.** Any non-leaf can itself be decomposed further. Each non-leaf's description is the PRD that admiral's verify judge reads; include a `## Acceptance Criteria` heading to make verify run that layer (otherwise it auto-passes and cascades up). Never strand executable single-PR scope at a non-leaf level — the discoverer only picks up leaves.
+- **Auto-pass needs children, not just a missing heading.** A non-leaf with no `## Acceptance Criteria` section auto-passes only when it has at least one sub-issue. A wrapper with neither heading nor children has no inherited judgment and falls through to the LLM judge — see `review-decomposition` for the audit-side view.
 - Sub-issue description = acceptance criteria, not implementation details — required for both agent-task and human-only issues (judged by admiral vs by a human respectively). Top-level description = mini-PRD for the feature (must support future slicing).
 - If the user provides vague requirements, ask clarifying questions before decomposing.
 - Do not create more than ~10 issues in one pass — if a task is that large, suggest splitting into multiple decomposition passes (or, in top-level mode, multiple project decompositions). Recursive mode plans many features at once but still respects this per-feature (≤ ~10 slices each) and uses its size guard to batch a large tree into reviewable chunks.
