@@ -476,6 +476,7 @@ type mockStore struct {
 
 	// task_verifications (C4) overrides.
 	TaskVerification        *store.TaskVerification
+	TaskVerificationByID    map[string]*store.TaskVerification // per-parent override; preferred over TaskVerification when set
 	TaskVerificationErr     error
 	BumpedTaskVerification  *store.TaskVerification
 	BumpTaskVerificationErr error
@@ -680,7 +681,20 @@ func (m *mockStore) GetPendingQuestionByID(id string) (*store.PendingQuestion, e
 func (m *mockStore) CancelOpenPendingQuestionsForIssue(issueID string) error { return nil }
 
 func (m *mockStore) GetTaskVerification(parentIssueID string) (*store.TaskVerification, error) {
-	return m.TaskVerification, m.TaskVerificationErr
+	if m.TaskVerificationErr != nil {
+		return nil, m.TaskVerificationErr
+	}
+	if m.TaskVerificationByID != nil {
+		// Map mode is exclusive: an absent key means "no verification for
+		// this parent", not "fall through to the singular default" — avoids
+		// tests accidentally leaking the singular value to subs it wasn't
+		// meant for.
+		if tv, ok := m.TaskVerificationByID[parentIssueID]; ok {
+			return tv, nil
+		}
+		return nil, nil
+	}
+	return m.TaskVerification, nil
 }
 
 func (m *mockStore) BumpTaskVerificationRound(parentIssueID string) (*store.TaskVerification, error) {

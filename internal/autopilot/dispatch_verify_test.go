@@ -420,6 +420,148 @@ func TestBuildVerifyPrompt_NoSubs(t *testing.T) {
 	}
 }
 
+func TestBuildVerifyPrompt_IntermediateSummary(t *testing.T) {
+	// A non-leaf sub has no diff but does have a VerifySummary from its
+	// own verify. The prompt should surface the summary as evidence of
+	// what was shipped, not the "(diff unavailable)" fallback.
+	p := buildVerifyPrompt(verifyMaterial{
+		ParentIdentifier: "GEO-10",
+		PRD:              "Build login feature.",
+		Subs: []verifySubMaterial{
+			{Identifier: "GEO-11", Title: "email form", PRURL: "https://gh/pr/1", Diff: "+ form"},
+			{Identifier: "GEO-12", Title: "session subtree", VerifySummary: "session lifecycle shipped: create + revoke + expiry"},
+		},
+	})
+	for _, want := range []string{
+		"GEO-12: session subtree",
+		"Internal sub-task (verified, no single PR)",
+		"Verified summary:",
+		"> session lifecycle shipped: create + revoke + expiry",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("intermediate-sub prompt missing %q\n%s", want, p)
+		}
+	}
+	if strings.Contains(p, "(diff unavailable)") {
+		t.Error("intermediate sub with a summary should not show '(diff unavailable)' fallback")
+	}
+}
+
+func TestBuildVerifyPrompt_DiffOverSummary(t *testing.T) {
+	// When BOTH Diff and VerifySummary are set (rare — admiral_task
+	// exists for a sub that also has its own task_verifications row),
+	// the diff is the stronger evidence and must take priority.
+	p := buildVerifyPrompt(verifyMaterial{
+		PRD: "do things",
+		Subs: []verifySubMaterial{{
+			Identifier:    "GEO-11",
+			Title:         "leaf with prior verify",
+			PRURL:         "https://gh/pr/1",
+			Diff:          "+ actual code change",
+			VerifySummary: "shipped earlier per cascade",
+		}},
+	})
+	if !strings.Contains(p, "+ actual code change") {
+		t.Error("expected diff to win when both Diff and VerifySummary present")
+	}
+	if strings.Contains(p, "Verified summary:") {
+		t.Error("must not render Verified summary block when a real diff is available")
+	}
+}
+
+func TestBuildVerifyPrompt_DiffUnavailableFallback(t *testing.T) {
+	// Default arm: sub has PRURL but no Diff and no VerifySummary (a
+	// human-shipped item whose diff couldn't be fetched, or pre-verify
+	// state). Must still emit the PR link AND the "(diff unavailable)"
+	// marker so the judge knows something existed but the body is empty.
+	p := buildVerifyPrompt(verifyMaterial{
+		PRD: "do things",
+		Subs: []verifySubMaterial{{
+			Identifier: "GEO-13", Title: "human-shipped", PRURL: "https://gh/pr/2",
+		}},
+	})
+	if !strings.Contains(p, "PR: https://gh/pr/2") {
+		t.Errorf("expected PR url in fallback arm, prompt:\n%s", p)
+	}
+	if !strings.Contains(p, "(diff unavailable)") {
+		t.Errorf("expected '(diff unavailable)' marker in fallback arm, prompt:\n%s", p)
+	}
+}
+
+// TestGatherVerifyMaterial_IntermediateSubFallsBackToSummary covers the
+// happy path: a sub with NO admiral_task triggers GetTaskVerification and
+// surfaces the prior round's summary into the upper-layer material.
+func TestGatherVerifyMaterial_IntermediateSubFallsBackToSummary(t *testing.T) {
+	parent := &linear.Issue{Identifier: "GEO-G", Description: "Feature parent", TeamID: "team-1", ProjectID: "proj-1"}
+	lc := &mockLinearClient{
+		GetIssueByID: map[string]*linear.Issue{
+			"G": parent,
+			"P": {Identifier: "GEO-P", Title: "intermediate task"},
+		},
+		SubIssues: []linear.SubIssue{
+			{ID: "P", Identifier: "GEO-P", StateType: "completed"},
+		},
+	}
+	db := &mockStore{
+		Repo: &store.Repo{RepoDir: "/repo"},
+		// Force GetAdmiralTaskByIssue to return nil for ANY id by leaving
+		// AdmiralTask unset — that simulates "no admiral_task for this sub".
+		AdmiralTask: nil,
+		TaskVerificationByID: map[string]*store.TaskVerification{
+			"P": {ParentIssueID: "P", Status: store.TaskVerifyClosed, Summary: "P shipped its sub-tree"},
+		},
+	}
+	pr := &mockPRClient{}
+	o := newVerifyOrchestrator(db, lc, pr, 3, nil)
+
+	mat, _, _, _, _, err := o.gatherVerifyMaterial(context.Background(), "G")
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	if len(mat.Subs) != 1 {
+		t.Fatalf("expected 1 sub in material, got %d", len(mat.Subs))
+	}
+	got := mat.Subs[0]
+	if got.VerifySummary != "P shipped its sub-tree" {
+		t.Errorf("expected intermediate sub to carry verify summary, got %+v", got)
+	}
+	if got.Diff != "" || got.PRURL != "" {
+		t.Errorf("intermediate sub must have empty Diff/PRURL: %+v", got)
+	}
+}
+
+func TestGatherVerifyMaterial_IntermediateSubSkipsActiveVerification(t *testing.T) {
+	// Only a CLOSED verification's summary should be surfaced. An
+	// 'active' row means the sub-tree is still mid-loop; its summary may
+	// still describe gaps. Don't propagate it as completed evidence.
+	parent := &linear.Issue{Identifier: "GEO-G", Description: "Feature parent", TeamID: "team-1", ProjectID: "proj-1"}
+	lc := &mockLinearClient{
+		GetIssueByID: map[string]*linear.Issue{
+			"G": parent,
+			"P": {Identifier: "GEO-P", Title: "intermediate task"},
+		},
+		SubIssues: []linear.SubIssue{
+			{ID: "P", Identifier: "GEO-P", StateType: "started"},
+		},
+	}
+	db := &mockStore{
+		Repo:        &store.Repo{RepoDir: "/repo"},
+		AdmiralTask: nil,
+		TaskVerificationByID: map[string]*store.TaskVerification{
+			"P": {ParentIssueID: "P", Status: store.TaskVerifyActive, Summary: "partial work"},
+		},
+	}
+	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, nil)
+
+	mat, _, _, _, _, err := o.gatherVerifyMaterial(context.Background(), "G")
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	if got := mat.Subs[0]; got.VerifySummary != "" {
+		t.Errorf("active verification must not propagate summary, got %q", got.VerifySummary)
+	}
+}
+
 // --- build result rendering (verify_cmd integration) ---
 
 // TestBuildVerifyPrompt_NoBuildResult guards the backward-compat path: when
