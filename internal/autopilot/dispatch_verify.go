@@ -56,6 +56,14 @@ type verifySubMaterial struct {
 	Title      string
 	PRURL      string
 	Diff       string
+	// VerifySummary is the one-line digest of an intermediate (non-leaf)
+	// sub's already-verified work, sourced from task_verifications.summary
+	// (PR-2 persists it on every verify pass; PR-3 reads it here). Used
+	// when the sub has no single PR diff of its own — i.e. it's itself a
+	// decomposed parent whose subtree shipped piece by piece. Empty for
+	// leaves (their Diff carries the shipped work) and for any sub whose
+	// verification hasn't reached 'closed' yet.
+	VerifySummary string
 }
 
 // buildResultMaterial describes the result of running the repo's verify_cmd
@@ -104,16 +112,31 @@ func buildVerifyPrompt(m verifyMaterial) string {
 	}
 	for _, s := range m.Subs {
 		fmt.Fprintf(&b, "\n### %s: %s\n", s.Identifier, s.Title)
-		if s.PRURL != "" {
-			fmt.Fprintf(&b, "PR: %s\n", s.PRURL)
-		}
 		diff := strings.TrimSpace(s.Diff)
-		if diff == "" {
-			b.WriteString("(diff unavailable)\n")
-		} else {
+		summary := strings.TrimSpace(s.VerifySummary)
+		switch {
+		case diff != "":
+			// Leaf: actual PR diff is the strongest evidence.
+			if s.PRURL != "" {
+				fmt.Fprintf(&b, "PR: %s\n", s.PRURL)
+			}
 			b.WriteString("```diff\n")
 			b.WriteString(diff)
 			b.WriteString("\n```\n")
+		case summary != "":
+			// Intermediate parent: no single PR to point at; the sub's
+			// own verify already judged its sub-tree complete and recorded
+			// the digest. Surface that so the upper-layer judge inherits
+			// the prior judgment as evidence of "what was shipped here".
+			b.WriteString("Internal sub-task (verified, no single PR)\n")
+			b.WriteString("Verified summary:\n\n> ")
+			b.WriteString(summary)
+			b.WriteString("\n")
+		default:
+			if s.PRURL != "" {
+				fmt.Fprintf(&b, "PR: %s\n", s.PRURL)
+			}
+			b.WriteString("(diff unavailable)\n")
 		}
 	}
 	if br := m.BuildResult; br != nil {
@@ -413,6 +436,34 @@ func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string
 			} else {
 				o.logger.Warn("verify_get_diff_failed",
 					"sub", sub.Identifier, "pr", task.PRURL, "err", derr)
+			}
+		} else {
+			// Sub has no admiral_task/PR of its own → it may be an
+			// intermediate parent (itself a decomposed task). Its
+			// "shipped work" is the union of its sub-tree, already
+			// verified once and summarised into task_verifications.summary.
+			// Surface that digest so the upper-layer judge sees a real
+			// description of what was delivered instead of "(diff
+			// unavailable)".
+			//
+			// Status gate: only 'closed' verifications surface their
+			// summary. 'active' = still mid-loop, the summary may describe
+			// gaps that aren't yet resolved. 'escalated' = the sub-tree
+			// gave up; surfacing its last-round digest could mislead the
+			// upper judge into treating gap-prose as evidence of shipped
+			// work. Both intentionally fall through to the empty/PR-only
+			// rendering so the upper-layer judge can decide accordingly.
+			//
+			// Priority: PR diff > verify summary > empty. When both diff
+			// and summary are present (admiral_task exists AND the sub
+			// itself was verified — uncommon), the diff path above already
+			// fired; this branch only runs when it didn't.
+			tv, vErr := o.db.GetTaskVerification(sub.ID)
+			if vErr != nil {
+				o.logger.Warn("verify_get_subtask_verification_failed",
+					"sub", sub.Identifier, "err", vErr)
+			} else if tv != nil && tv.Status == store.TaskVerifyClosed && tv.Summary != "" {
+				sm.VerifySummary = tv.Summary
 			}
 		}
 		mat.Subs = append(mat.Subs, sm)
