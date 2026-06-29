@@ -133,9 +133,31 @@ func (w *Worker) maybeAlert(st store.AuthErrorState) {
 	}
 }
 
-// dispatch processes a single claimed event. It parses the payload JSON,
-// calls the orchestrator, and marks the event done (or failed).
+// dispatch processes a single claimed event. Routes on row.Source:
+// "github" events go to HandleReviewEvent; everything else is treated as a
+// Linear AgentEvent and forwarded to HandleAgentEvent.
 func (w *Worker) dispatch(ctx context.Context, row *store.EventInboxRow) {
+	w.logger.Info("worker_dispatch",
+		"webhook_id", row.WebhookID,
+		"source", row.Source,
+		"action", row.Action,
+		"session", row.SessionID)
+
+	if row.Source == "github" {
+		w.dispatchReview(ctx, row)
+		return
+	}
+
+	if row.Source == "verify" {
+		w.dispatchVerify(ctx, row)
+		return
+	}
+
+	if row.Source == "product-verify" {
+		w.dispatchProductVerify(ctx, row)
+		return
+	}
+
 	var ev linear.AgentEvent
 	if err := json.Unmarshal([]byte(row.PayloadJSON), &ev); err != nil {
 		w.logger.Error("worker_parse_payload_failed",
@@ -143,11 +165,6 @@ func (w *Worker) dispatch(ctx context.Context, row *store.EventInboxRow) {
 		_ = w.db.MarkEventFailed(row.WebhookID, "parse error: "+err.Error(), false)
 		return
 	}
-
-	w.logger.Info("worker_dispatch",
-		"webhook_id", row.WebhookID,
-		"action", row.Action,
-		"session", row.SessionID)
 
 	// Dispatch is synchronous: HandleAgentEvent returns once the orchestrator
 	// has started its background goroutine (or rejected due to busy state).
@@ -166,6 +183,60 @@ func (w *Worker) dispatch(ctx context.Context, row *store.EventInboxRow) {
 	// Mark done immediately after HandleAgentEvent returns (even if the
 	// background goroutine is still running). The orchestrator owns the
 	// autopilot_jobs lifecycle; events_inbox only tracks delivery.
+	if err := w.db.MarkEventDone(row.WebhookID); err != nil {
+		w.logger.Error("worker_mark_done_failed", "err", err, "webhook_id", row.WebhookID)
+	}
+}
+
+// dispatchVerify handles a source='verify' event from the discoverer: the
+// row's session_id carries the parent issue id of a task whose sub-issues
+// have all reached completed. HandleVerifyEvent returns quickly (guard is
+// synchronous, the judge run is on a background goroutine), so the event is
+// marked done immediately after the call — events_inbox tracks delivery only,
+// while the task_verifications row tracks loop state.
+func (w *Worker) dispatchVerify(ctx context.Context, row *store.EventInboxRow) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("worker_panic", "panic", r, "webhook_id", row.WebhookID)
+			_ = w.db.MarkEventFailed(row.WebhookID, panicToString(r), false)
+		}
+	}()
+	w.orch.HandleVerifyEvent(ctx, row.SessionID)
+	if err := w.db.MarkEventDone(row.WebhookID); err != nil {
+		w.logger.Error("worker_mark_done_failed", "err", err, "webhook_id", row.WebhookID)
+	}
+}
+
+// dispatchProductVerify handles a source='product-verify' event: the row's
+// session_id carries the Linear project id of a product to verify against its
+// repo documentation. HandleProductVerifyEvent returns quickly (guard is
+// synchronous, the judge run is on a background goroutine), so the event is
+// marked done immediately — events_inbox tracks delivery only, while the
+// product_verifications row tracks loop state. Mirrors dispatchVerify.
+func (w *Worker) dispatchProductVerify(ctx context.Context, row *store.EventInboxRow) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("worker_panic", "panic", r, "webhook_id", row.WebhookID)
+			_ = w.db.MarkEventFailed(row.WebhookID, panicToString(r), false)
+		}
+	}()
+	w.orch.HandleProductVerifyEvent(ctx, row.SessionID)
+	if err := w.db.MarkEventDone(row.WebhookID); err != nil {
+		w.logger.Error("worker_mark_done_failed", "err", err, "webhook_id", row.WebhookID)
+	}
+}
+
+// dispatchReview handles a source='github' event. HandleReviewEvent returns
+// quickly (the claude run is on a background goroutine), so the event is
+// marked done immediately after the call.
+func (w *Worker) dispatchReview(ctx context.Context, row *store.EventInboxRow) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("worker_panic", "panic", r, "webhook_id", row.WebhookID)
+			_ = w.db.MarkEventFailed(row.WebhookID, panicToString(r), false)
+		}
+	}()
+	w.orch.HandleReviewEvent(ctx, row)
 	if err := w.db.MarkEventDone(row.WebhookID); err != nil {
 		w.logger.Error("worker_mark_done_failed", "err", err, "webhook_id", row.WebhookID)
 	}

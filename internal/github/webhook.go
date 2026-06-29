@@ -1,0 +1,400 @@
+// Package github implements admiral's inbound GitHub webhook surface.
+// PR #2 of the GitHub PR review feedback loop landing series: this file
+// only receives, validates, filters, and enqueues. The downstream worker
+// that consumes events_inbox rows tagged source='github' is added in a
+// later PR.
+package github
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"unicode"
+)
+
+// EventEnqueuer is the subset of *store.Store the webhook needs. Decoupled
+// so tests can inject a stub without a real DB.
+type EventEnqueuer interface {
+	EnqueueEventWithSource(source, webhookID, action, sessionID, issueID, payloadJSON, commentID string) (bool, error)
+}
+
+// Webhook is the inbound HTTP receiver for GitHub PR feedback events.
+// It validates HMAC, filters to the actionable subset
+// (pull_request_review submitted, pull_request_review_comment created,
+// issue_comment created on an open PR), drops events authored by the
+// configured bot identity (loop guard), and enqueues into events_inbox
+// so the worker can pick them up.
+type Webhook struct {
+	secret   []byte
+	botLogin string
+	store    EventEnqueuer
+	logger   *slog.Logger
+}
+
+// NewWebhook builds a Webhook. secret is the HMAC verification key
+// configured on the GitHub side. botLogin is the GitHub login of the
+// account admiral itself uses to post PR comments — any event whose
+// sender or comment author matches is dropped to avoid self-triggered
+// loops. Empty botLogin disables the self-filter (only suitable for
+// tests) and emits a startup WARN so the configuration footgun is
+// visible at process boot rather than after the first runaway loop.
+func NewWebhook(secret, botLogin string, st EventEnqueuer, logger *slog.Logger) *Webhook {
+	if botLogin == "" {
+		logger.Warn("github_webhook_no_bot_login",
+			"detail", "self-filter disabled; admiral comments can re-trigger admiral")
+	}
+	return &Webhook{
+		secret:   []byte(secret),
+		botLogin: botLogin,
+		store:    st,
+		logger:   logger,
+	}
+}
+
+// Handler returns the http.Handler that admiral mounts at /hooks/github
+// (route wiring lives in a later PR).
+func (h *Webhook) Handler() http.Handler {
+	return http.HandlerFunc(h.serveHTTP)
+}
+
+const (
+	headerSignature = "X-Hub-Signature-256"
+	headerDelivery  = "X-GitHub-Delivery"
+	headerEvent     = "X-GitHub-Event"
+
+	eventReview        = "pull_request_review"
+	eventReviewComment = "pull_request_review_comment"
+	eventIssueComment  = "issue_comment"
+
+	actionSubmitted = "submitted"
+	actionCreated   = "created"
+
+	issueStateOpen = "open"
+
+	// GitHub caps webhook payloads at 25 MiB; review events are vastly
+	// smaller. Pick a generous-but-bounded cap so a malformed sender
+	// can't exhaust memory.
+	maxBodyBytes = 5 << 20
+
+	// selfCommentSentinel is a hidden HTML-comment marker that
+	// admiral's PostComment prepends to every PR conversation comment
+	// it writes. The webhook drops any incoming issue_comment whose
+	// body starts with it, giving a deterministic self-loop guard that
+	// does not depend on `gh_bot_login` or keyword heuristics — useful
+	// in single-author repos where the bot login equals the reviewer
+	// login. Renders as nothing in the GitHub UI; visible only in raw
+	// markdown source.
+	selfCommentSentinel = "<!-- admiral:status -->"
+)
+
+// hasSelfCommentSentinel reports whether body (ignoring leading
+// whitespace, including Unicode whitespace) starts with the sentinel.
+// Shared by Client.PostComment (to avoid double-prefix) and the
+// webhook (to drop self-triggered events) so the two sides cannot
+// drift on what counts as "already sentinel-prefixed".
+func hasSelfCommentSentinel(body string) bool {
+	return strings.HasPrefix(strings.TrimLeftFunc(body, unicode.IsSpace), selfCommentSentinel)
+}
+
+// rawReviewEvent is the subset of GitHub's webhook payloads admiral
+// cares about. Covers pull_request_review, pull_request_review_comment,
+// and issue_comment — the last is shaped differently (PR info lives
+// under issue.pull_request rather than at top level).
+type rawReviewEvent struct {
+	Action      string `json:"action"`
+	PullRequest struct {
+		HTMLURL string `json:"html_url"`
+	} `json:"pull_request"`
+	Issue *struct {
+		State       string `json:"state"`
+		PullRequest *struct {
+			HTMLURL string `json:"html_url"`
+		} `json:"pull_request,omitempty"`
+	} `json:"issue,omitempty"`
+	Review *struct {
+		ID   int64 `json:"id"`
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
+	} `json:"review,omitempty"`
+	Comment *struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
+	} `json:"comment,omitempty"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+}
+
+func (h *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(rw, r.Body, maxBodyBytes))
+	if err != nil {
+		// MaxBytesReader has already flagged the response writer with a
+		// 413; calling http.Error here would trip a "superfluous
+		// WriteHeader" log. For other read errors (client disconnect,
+		// truncated body) 400 is still the right answer.
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			h.logger.Warn("github_webhook_body_too_large",
+				"remote", r.RemoteAddr, "limit", maxErr.Limit)
+			return
+		}
+		http.Error(rw, "read body", http.StatusBadRequest)
+		return
+	}
+
+	if !verifySignature(h.secret, r.Header.Get(headerSignature), body) {
+		h.logger.Warn("github_webhook_bad_signature", "remote", r.RemoteAddr)
+		http.Error(rw, "bad signature", http.StatusUnauthorized)
+		return
+	}
+
+	deliveryID := r.Header.Get(headerDelivery)
+	eventType := r.Header.Get(headerEvent)
+
+	// Always 200 once the signature passes — GitHub retries on non-2xx
+	// and admiral's filtering decisions (wrong event / wrong action /
+	// self-loop) are not retry-worthy.
+	rw.WriteHeader(http.StatusOK)
+	_, _ = rw.Write([]byte("ok"))
+
+	// events_inbox keys on (webhook_id) for primary dedup. An empty
+	// delivery id from a real GitHub event would be a protocol violation
+	// (the header is always set); if absent we'd collide future empty-id
+	// events into the same row. Drop instead of enqueuing junk.
+	if deliveryID == "" {
+		h.logger.Warn("github_webhook_missing_delivery_header",
+			"event", eventType, "remote", r.RemoteAddr)
+		return
+	}
+
+	if eventType != eventReview && eventType != eventReviewComment && eventType != eventIssueComment {
+		h.logger.Debug("github_webhook_skip_event",
+			"event", eventType, "delivery", deliveryID)
+		return
+	}
+
+	var p rawReviewEvent
+	if err := json.Unmarshal(body, &p); err != nil {
+		h.logger.Warn("github_webhook_bad_payload",
+			"err", err, "delivery", deliveryID, "event", eventType)
+		return
+	}
+
+	switch eventType {
+	case eventReview:
+		if p.Action != actionSubmitted {
+			h.logger.Debug("github_webhook_skip_action",
+				"event", eventType, "action", p.Action, "delivery", deliveryID)
+			return
+		}
+	case eventReviewComment, eventIssueComment:
+		if p.Action != actionCreated {
+			h.logger.Debug("github_webhook_skip_action",
+				"event", eventType, "action", p.Action, "delivery", deliveryID)
+			return
+		}
+	}
+
+	// issue_comment fires on both issue and PR comments; admiral only
+	// handles PR comments (PR is open) AND only when the body looks like
+	// reviewer feedback. Same person typically authors both the code and
+	// the review so sender-based self-filtering is unsafe here — the
+	// self-comment sentinel (added by PostComment on every outgoing
+	// comment) is the deterministic self-loop guard, and review-style
+	// keywords are the gate for everything else. Filter the rest here.
+	if eventType == eventIssueComment {
+		if p.Issue == nil || p.Issue.PullRequest == nil {
+			h.logger.Debug("github_webhook_skip_non_pr_issue_comment",
+				"delivery", deliveryID)
+			return
+		}
+		if p.Issue.State != issueStateOpen {
+			h.logger.Debug("github_webhook_skip_closed_pr_issue_comment",
+				"state", p.Issue.State, "delivery", deliveryID)
+			return
+		}
+		if p.Comment == nil {
+			h.logger.Debug("github_webhook_skip_missing_comment_payload",
+				"delivery", deliveryID)
+			return
+		}
+		if hasSelfCommentSentinel(p.Comment.Body) {
+			h.logger.Debug("github_webhook_skip_self_sentinel",
+				"delivery", deliveryID)
+			return
+		}
+		if !looksLikeReviewComment(p.Comment.Body) {
+			h.logger.Debug("github_webhook_skip_non_review_issue_comment",
+				"delivery", deliveryID)
+			return
+		}
+	}
+
+	prURL := p.PullRequest.HTMLURL
+	if eventType == eventIssueComment {
+		prURL = p.Issue.PullRequest.HTMLURL
+	}
+	if prURL == "" {
+		h.logger.Warn("github_webhook_missing_pr_url",
+			"event", eventType, "delivery", deliveryID)
+		return
+	}
+
+	var commentID int64
+	var authorLogin string
+	switch eventType {
+	case eventReview:
+		if p.Review == nil {
+			h.logger.Warn("github_webhook_missing_review",
+				"delivery", deliveryID)
+			return
+		}
+		commentID = p.Review.ID
+		authorLogin = p.Review.User.Login
+	case eventReviewComment, eventIssueComment:
+		if p.Comment == nil {
+			h.logger.Warn("github_webhook_missing_comment",
+				"delivery", deliveryID)
+			return
+		}
+		commentID = p.Comment.ID
+		authorLogin = p.Comment.User.Login
+	}
+
+	// GitHub assigns positive int64 ids; a zero id implies a corrupt or
+	// stripped payload. Letting "0" flow into events_inbox.comment_id
+	// would poison the partial unique index — any future zero-id event
+	// from this source would be silently deduped against this row.
+	if commentID == 0 {
+		h.logger.Warn("github_webhook_zero_comment_id",
+			"event", eventType, "delivery", deliveryID)
+		return
+	}
+
+	// Loop guard: skip events authored by admiral's own bot identity.
+	// Check both the top-level sender and the review/comment author —
+	// they usually match but defense in depth costs nothing.
+	if h.botLogin != "" && (p.Sender.Login == h.botLogin || authorLogin == h.botLogin) {
+		h.logger.Debug("github_webhook_skip_self",
+			"bot", h.botLogin,
+			"sender", p.Sender.Login,
+			"author", authorLogin,
+			"delivery", deliveryID)
+		return
+	}
+
+	// session_id = PR URL so ClaimNextPendingEvent's per-session_id
+	// single-flight naturally enforces "one in-flight job per PR".
+	// Linear's session_id namespace is UUIDs, structurally distinct from
+	// PR URLs, so the source-blind claim logic stays correct.
+	sessionID := prURL
+	action := eventType + "." + p.Action
+	commentIDStr := strconv.FormatInt(commentID, 10)
+
+	fresh, err := h.store.EnqueueEventWithSource(
+		"github",
+		deliveryID,
+		action,
+		sessionID,
+		"", // issue_id is resolved later by the worker via PR URL lookup
+		string(body),
+		commentIDStr,
+	)
+	if err != nil {
+		h.logger.Error("github_webhook_enqueue_failed",
+			"delivery", deliveryID, "err", err)
+		return
+	}
+	if !fresh {
+		h.logger.Debug("github_webhook_dedup",
+			"delivery", deliveryID, "comment_id", commentIDStr)
+		return
+	}
+	h.logger.Info("github_webhook_enqueued",
+		"event", eventType,
+		"action", p.Action,
+		"pr", sessionID,
+		"comment_id", commentIDStr,
+		"delivery", deliveryID)
+}
+
+// issueCommentReviewKeywordRE decides whether a plain PR conversation
+// comment (issue_comment) is review-style feedback worth running
+// admiral on. Hits any one keyword and the event passes; misses
+// everything and it's dropped at the webhook layer. The
+// self-comment sentinel is the primary self-loop guard; this keyword
+// gate is the secondary filter that drops casual chitchat ("lgtm",
+// "thanks") from real reviewers.
+//
+// Keyword shape choices:
+//   - ASCII tokens use \b word boundaries; combined with the keyword
+//     list this means "fixed" / "fixes" / "prefix" / "prefixed" do
+//     not match because they contain extra characters past the
+//     boundary, so admiral's own status comments stay below the gate
+//     even if the sentinel ever gets stripped.
+//   - CJK keywords match as plain substrings — Go's \b is ASCII-only
+//     so it never triggers between two CJK characters, making
+//     boundary anchors useless there.
+//   - (?i) lets the ASCII alternation match case-insensitively.
+//   - Loose tokens that admiral itself routinely emits ("update",
+//     "问题", "错误") are intentionally omitted to keep false-positive
+//     surface low; the sentinel + remaining keywords are enough.
+//
+// RE2 (Go's engine) is linear-time over the input, so even a 5 MiB
+// body (the maxBodyBytes cap) has no ReDoS exposure.
+var issueCommentReviewKeywordRE = regexp.MustCompile(
+	`(?i)\b(review|fix|change|modify|please)\b` +
+		`|修改|修复|改一下|请改|调整`,
+)
+
+// looksLikeReviewComment reports whether body contains any
+// review-style keyword.
+func looksLikeReviewComment(body string) bool {
+	if body == "" {
+		return false
+	}
+	return issueCommentReviewKeywordRE.MatchString(body)
+}
+
+// verifySignature decodes GitHub's "sha256=<hex>" header and does a
+// constant-time HMAC-SHA256 compare against the body.
+func verifySignature(secret []byte, header string, body []byte) bool {
+	if len(secret) == 0 || header == "" {
+		return false
+	}
+	const prefix = "sha256="
+	if !strings.HasPrefix(header, prefix) {
+		return false
+	}
+	got, err := hex.DecodeString(header[len(prefix):])
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	return hmac.Equal(got, mac.Sum(nil))
+}
+
+// SignBody is exported for tests / smoke scripts. Returns the value
+// GitHub would put in X-Hub-Signature-256 ("sha256=<hex>").
+func SignBody(secret, body []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}

@@ -12,14 +12,16 @@
   <a href="/admin/ui/">Dashboard</a>
   <a href="/admin/ui/repos">Repos</a>
   <a href="/admin/ui/jobs">Jobs</a>
+  <span id="project-switcher" hx-get="/admin/ui/_partial/project_switcher" hx-trigger="load" hx-swap="innerHTML"></span>
 </nav>
 <main>
   <h1>Repos</h1>
 
   <h2>Add Repo</h2>
   <form hx-post="/admin/repos" hx-target="#repos-table" hx-swap="innerHTML" class="add-repo-form">
-    <input name="team_id" placeholder="Project ID" required>
-    <input name="team_name" placeholder="Project Name" required>
+    <select name="team_id" required hx-get="/admin/ui/_partial/linear_projects_options" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
+      <option value="">Loading projects…</option>
+    </select>
     <input name="repo_dir" placeholder="/path/to/repo" required>
     <input name="base_branch" placeholder="main" value="main">
     <button type="submit">Add Repo</button>

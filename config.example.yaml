@@ -128,3 +128,62 @@ autopilot:
   #                  # Default is derived from storage.sqlite_path:
   #                  # e.g. ~/.local/share/admiral/job-streams
   # worker_count: 3   # max concurrent issues admiral processes; same-session events stay serialized
+
+# admiral-discoverer: standalone scanner that finds Linear issues admiral
+# can take and self-assigns them, looping back through the normal
+# Linear webhook -> autopilot path. Read by `admiral-discoverer` only.
+#
+# Running the binary (or enabling the systemd unit) is the activation
+# signal — there is no enabled flag here. Project scope is NOT
+# configured here either: the discoverer scans only those Linear
+# projects whose `auto_pick_enabled` flag is on in the
+# admiral-autopilot admin UI (repos table). Toggle it per-project there.
+discoverer:
+  # Scan cadence. Default: 10m.
+  poll_interval: 10m
+  # Linear workflow state.type values to scan. Default: ["backlog", "unstarted"].
+  state_types: ["backlog", "unstarted"]
+  # Only consider issues carrying this label. Empty disables the label
+  # filter — strongly recommended to keep set so a human curates what
+  # the scanner even sees. Default: "" (no filter).
+  require_label: "agent-ready"
+  # Cap per scan round; should be <= autopilot.max_concurrent_runs.
+  max_pick_per_round: 3
+  # When true, the state-advance phase squash-merges (and deletes the
+  # branch of) an OPEN PR once it is approved + mergeable + CI-green,
+  # instead of parking it in the Reviewed state for a human to merge.
+  # Opt-in safety gate: default false because merging is outward-facing
+  # and near-irreversible. Turn on only where admiral is trusted to ship
+  # without a human merge click.
+  #
+  # PREREQUISITE — branch protection. admiral's gate (approved + mergeable
+  # + CI-green) is only a pre-filter; the real authority is the GitHub
+  # branch protection rule, which `gh pr merge` is subject to (admiral
+  # never uses --admin, so it cannot bypass protection). Before enabling,
+  # protect the base branch with:
+  #   - required approving reviews + "Dismiss stale approvals on new
+  #     commits" — else a stale approval lets post-review commits merge.
+  #   - required status checks — admiral's checks read can miss a required
+  #     check that hasn't reported yet; protection is what enforces it.
+  auto_merge: false
+  # admiral's Linear user UUID. If empty, resolved from `viewer { id }`
+  # on startup (no per-scan cost).
+  # admiral_user_id: ""
+  judge:
+    # When true, each candidate is passed to `claude -p` for a yes/no
+    # verdict before self-assignment. Default: true.
+    enabled: true
+    # Defaults to autopilot.claude_bin when empty.
+    # claude_bin: ""
+    # Hard cap on a single judge invocation. Default: 60s.
+    timeout: 60s
+  # Linear workflow-state names for the OPEN-PR transitions the
+  # discoverer drives. Defaults to Linear's stock state names; only set
+  # if your team renamed them (or uses non-English names). The merged-PR
+  # (→ Linear type=completed) and closed-unmerged (→ Linear type=canceled)
+  # transitions always run via type fallback and need no config.
+  # linear_states:
+  #   # Default: "In Review". Pushed when admiral's PR is open and has no approval yet.
+  #   in_review: "Code Review"
+  #   # Default: "Reviewed". Pushed when admiral's PR is open and has at least one approval.
+  #   reviewed: "Approved"

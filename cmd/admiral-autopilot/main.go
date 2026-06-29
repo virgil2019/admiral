@@ -21,6 +21,7 @@ import (
 
 	"github.com/georgehuang/admiral/internal/autopilot"
 	"github.com/georgehuang/admiral/internal/config"
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 	"github.com/georgehuang/admiral/internal/tg"
@@ -56,6 +57,11 @@ func main() {
 	if err := seedRepos(db, &cfg.Autopilot, logger); err != nil {
 		logger.Warn("repos_seed_failed", "err", err)
 	}
+	// One-shot soft nudge: any repo without verify_cmd silently falls back to
+	// diff-only L2 verify, which cannot catch build/compile errors. Operators
+	// often miss this in config until something breaks.
+	warnReposMissingVerifyCmd(db, logger)
+	warnBotIdentityUnset(&cfg.Autopilot, logger)
 
 	// Build Linear client and optionally wire token refresh.
 	lc := linear.NewClient(cfg.Linear.APIBase, cfg.Linear.APIToken)
@@ -66,6 +72,16 @@ func main() {
 		logger.Info("linear_token_refresh_enabled")
 	}
 	orch := autopilot.New(&cfg.Autopilot, lc, db, logger)
+	// Plumb the discoverer's pickup gates into the verify loop so the
+	// follow-up sub-issues it files are auto-picked and re-shipped — single
+	// source of truth with the discoverer, no drift. LoadPickupRules applies
+	// the same defaults the discoverer uses (the autopilot config load path
+	// does not validate/default the discoverer block).
+	if pickup, err := config.LoadPickupRules(cfgPath); err != nil {
+		logger.Warn("verify_pickup_rules_load_failed", "err", err)
+	} else {
+		orch.SetVerifyPickupRules(pickup.RequireLabel, pickup.StateTypes)
+	}
 
 	// signal channel for the webhook to notify worker of new events
 	sig := make(chan struct{}, 1)
@@ -73,12 +89,15 @@ func main() {
 	// webhook uses the enqueue path (store + signal); onAgent is nil
 	wh := linear.NewWebhook(cfg.Linear.WebhookSecret, db, sig, logger, nil)
 
+	ghwh := ghpkg.NewWebhook(cfg.Autopilot.GhWebhookSecret, cfg.Autopilot.GhBotLogin, db, logger)
+
 	mux := http.NewServeMux()
 	// /webhook matches Linear's typical agent webhook URL convention
 	// (the path used in the existing oauth-callback.ts demo). /linear/webhook
 	// is kept as an alias.
 	mux.Handle("/webhook", wh.Handler())
 	mux.Handle("/linear/webhook", wh.Handler())
+	mux.Handle("/github/webhook", ghwh.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
@@ -107,6 +126,8 @@ func main() {
 	// the worker logs but doesn't send.
 	alerter := newAuthAlerter(cfg, db, logger)
 
+	go orch.StartBlockerWatcher(ctx)
+
 	// worker pool: N workers consume from events_inbox and dispatch to orchestrator
 	for i := 0; i < n; i++ {
 		w := autopilot.NewWorker(db, orch, logger.With("worker", i), sig)
@@ -134,7 +155,7 @@ func main() {
 		"listen", adminAddr,
 	)
 	go func() {
-		if err := autopilot.ServeAdminHTTP(adminAddr, db, lc, cfg.Autopilot.GhBin, logger, n, adminToken); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := autopilot.ServeAdminHTTP(adminAddr, db, lc, cfg.Autopilot.GhBin, logger, n, adminToken, cfg.Discoverer.RequireLabel); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("admin server failed", "err", err)
 			cancel()
 		}
@@ -256,10 +277,46 @@ func seedRepos(db *store.Store, apCfg *config.Autopilot, logger *slog.Logger) er
 			RepoDir:     r.RepoDir,
 			BaseBranch:  r.BaseBranch,
 			Enabled:     true,
+			VerifyCmd:   r.VerifyCmd,
 		}
 		if err := db.UpsertRepo(repo); err != nil {
 			return fmt.Errorf("upsert repo %s: %w", r.ProjectID, err)
 		}
 	}
 	return nil
+}
+
+// warnReposMissingVerifyCmd emits a one-shot WARN per repo whose verify_cmd
+// is empty. L2 verify falls back to diff-only LLM judgment for these repos —
+// build / compile errors will not be caught by admiral's autonomous loop on
+// them until the operator configures a verify command (e.g. "swift build",
+// "go test ./..."). Called once at boot after repos are loaded.
+func warnReposMissingVerifyCmd(db *store.Store, logger *slog.Logger) {
+	repos, err := db.ListRepos()
+	if err != nil {
+		logger.Warn("verify_cmd_boot_check_list_failed", "err", err)
+		return
+	}
+	for _, r := range repos {
+		if strings.TrimSpace(r.VerifyCmd) == "" {
+			logger.Warn("verify_cmd_unconfigured",
+				"project_id", r.ProjectID,
+				"project_name", r.ProjectName,
+				"hint", "L2 verify will judge from diff text only; build/compile errors will not be detected for this repo. Set autopilot.repos[].verify_cmd to enable the hard gate.")
+		}
+	}
+}
+
+// warnBotIdentityUnset emits a single boot-time WARN when autopilot.bot_identity
+// is not configured. Without it, every commit admiral pushes inherits whatever
+// `user.name` / `user.email` the runtime user's git config carries — typically
+// the operator's own identity, making admiral-authored commits indistinguishable
+// from human ones (#162). Admiral still functions; this is purely an attribution
+// nudge.
+func warnBotIdentityUnset(cfg *config.Autopilot, logger *slog.Logger) {
+	if cfg.BotIdentity.IsSet() {
+		return
+	}
+	logger.Warn("bot_identity_unconfigured",
+		"hint", "admiral commits will inherit the runtime user's git config (likely the operator's identity). Set autopilot.bot_identity.{name,email} to attribute commits to a dedicated bot.")
 }

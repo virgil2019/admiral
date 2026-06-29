@@ -246,6 +246,197 @@ WHERE j.issue_id != ''
 ON CONFLICT(issue_id) DO NOTHING;
 `
 
+// migration0013 widens events_inbox to support multiple webhook sources
+// (linear, github, …). source defaults to 'linear' so pre-existing rows
+// keep their semantics. comment_id is nullable; the partial unique index
+// gives per-source dedup for sources that carry a comment id (e.g. a
+// GitHub review comment) without constraining linear rows that don't.
+const migration0013 = `
+ALTER TABLE events_inbox ADD COLUMN source TEXT NOT NULL DEFAULT 'linear';
+ALTER TABLE events_inbox ADD COLUMN comment_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS events_inbox_source_comment_idx
+  ON events_inbox(source, comment_id) WHERE comment_id IS NOT NULL;
+`
+
+// migration0014 adds blocker_ids to admiral_tasks for tracking the Linear
+// issue IDs that are blocking a task in BLOCKED state.
+const migration0014 = `
+ALTER TABLE admiral_tasks ADD COLUMN blocker_ids TEXT;
+`
+
+// migration0015 introduces the pending_questions table for the async
+// ask_user HITL flow and adds pending_question_id to admiral_tasks so
+// the orchestrator can correlate an incoming Linear reply with the open
+// question that is holding the task in AWAITING_INPUT state.
+const migration0015 = `
+CREATE TABLE IF NOT EXISTS pending_questions (
+    id                   TEXT PRIMARY KEY,
+    issue_id             TEXT NOT NULL,
+    issue_identifier     TEXT NOT NULL DEFAULT '',
+    claude_session_id    TEXT NOT NULL,
+    last_event_session_id TEXT NOT NULL DEFAULT '',
+    worktree_path        TEXT NOT NULL DEFAULT '',
+    question             TEXT NOT NULL,
+    options_json         TEXT NOT NULL DEFAULT '[]',
+    created_at           TEXT NOT NULL,
+    answered_at          TEXT,
+    answer               TEXT
+);
+ALTER TABLE admiral_tasks ADD COLUMN pending_question_id TEXT;
+`
+
+// migration0016 adds the per-repo opt-in flag the admiral-discoverer
+// service reads to decide which Linear projects it is allowed to scan.
+// Default 0 (off) so existing deploys never auto-pick until the operator
+// flips the toggle in the admin UI.
+const migration0016 = `
+ALTER TABLE repos ADD COLUMN auto_pick_enabled INTEGER NOT NULL DEFAULT 0;
+`
+
+// migration0017 records every Linear issue admiral-discoverer has
+// elected to self-assign. The dedup signal is picked_state: when the
+// issue's current Linear state matches picked_state, the discoverer
+// skips it; when the state changes (an "external reset" signal from a
+// human), the row is overwritten and the issue may be picked again.
+const migration0017 = `
+CREATE TABLE IF NOT EXISTS discoverer_picks (
+    issue_id          TEXT PRIMARY KEY,
+    issue_identifier  TEXT NOT NULL,
+    picked_at         TEXT NOT NULL,
+    picked_state      TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+`
+
+// migration0018 backs the admiral-planner-mcp server: a host agent
+// (claude / codex / ...) records the requirement decomposition during
+// planning, then later reads back the spec + PR diff at verification
+// time. Three tables:
+//   - features: one row per high-level feature, 1:1 with a Linear
+//     project, holding the original requirements text as ground truth
+//     for L2 acceptance. Optional timestamps (closed_at, source_agent)
+//     use nullable TEXT + COALESCE on read, matching admiral_tasks /
+//     autopilot_jobs convention.
+//   - feature_issues: per-issue acceptance criteria written during
+//     decomposition; the standard against which L1 PR review judges.
+//     FK to features is real — PRAGMA foreign_keys=ON is enabled in
+//     Open(), so a typo'd feature_id in InsertFeatureIssue errors out
+//     instead of silently storing an orphan.
+//   - pr_verifications: audit trail of every L1 verdict the planner
+//     submitted to GitHub. Synthetic INTEGER PK lets two verdicts in
+//     the same RFC3339 second coexist (was a real risk with the
+//     earlier composite PK on (pr_url, created_at)). CHECK enforces
+//     the verdict allowlist at the DB level so a typo cannot slip in
+//     even if InsertPRVerification's in-code guard is bypassed.
+const migration0018 = `
+CREATE TABLE IF NOT EXISTS features (
+    id                 TEXT PRIMARY KEY,
+    name               TEXT NOT NULL,
+    linear_project_id  TEXT NOT NULL UNIQUE,
+    requirements_text  TEXT NOT NULL,
+    source_agent       TEXT,
+    created_at         TEXT NOT NULL,
+    closed_at          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS feature_issues (
+    feature_id           TEXT NOT NULL,
+    linear_issue_id      TEXT NOT NULL,
+    acceptance_criteria  TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    PRIMARY KEY (feature_id, linear_issue_id),
+    FOREIGN KEY (feature_id) REFERENCES features(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_feature_issues_issue
+    ON feature_issues(linear_issue_id);
+
+CREATE TABLE IF NOT EXISTS pr_verifications (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    pr_url      TEXT NOT NULL,
+    verdict     TEXT NOT NULL
+                  CHECK (verdict IN ('approve', 'request_changes', 'needs_rebase')),
+    reasoning   TEXT NOT NULL,
+    agent       TEXT,
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pr_verifications_pr_created
+    ON pr_verifications(pr_url, created_at DESC);
+`
+
+// migration0019 backs the autonomous verification loop. When every
+// sub-issue of a parent "task" issue reaches a merged state, the
+// discoverer asks a headless agent to verify the whole task against its
+// PRD. task_verifications tracks, per parent issue:
+//   - rounds: how many times verification has been triggered. The loop is
+//     self-converging (gaps → follow-up sub-issues → re-ship → re-verify),
+//     so a bound on rounds is the guard against an agent that can never
+//     satisfy its own criteria — past the cap it escalates to a human.
+//   - status: 'active' while the loop runs, 'escalated' once the round cap
+//     is hit, 'closed' once verification accepted the task. Both terminal
+//     statuses stop further triggers for that parent.
+const migration0019 = `
+CREATE TABLE IF NOT EXISTS task_verifications (
+    parent_issue_id  TEXT PRIMARY KEY,
+    rounds           INTEGER NOT NULL DEFAULT 0,
+    status           TEXT NOT NULL DEFAULT 'active'
+                       CHECK (status IN ('active', 'escalated', 'closed')),
+    updated_at       TEXT NOT NULL
+);
+`
+
+// migration0020 adds the per-repo verify command. autopilot's L2 verify
+// runs this command in the repo before invoking the LLM judge, so the
+// judge has the actual build/test exit code + output as hard input rather
+// than judging "did we ship the work?" from diff text alone. Empty string
+// (the column default) means "no verify command configured" — verify
+// degrades to its pre-migration behavior (judge reads diffs only) and
+// admiral logs a one-shot WARN at boot.
+const migration0020 = `
+ALTER TABLE repos ADD COLUMN verify_cmd TEXT NOT NULL DEFAULT '';
+`
+
+// migration0021 adds the per-repo product-documentation path. autopilot's
+// product-level verify reads this file/dir (the complete product spec, which
+// lives in the repo alongside the code) as the ground truth it judges the
+// project's shipped features against. Empty string (the column default)
+// means "no path configured" — product verify then instructs the judge to
+// discover the product doc itself (README / docs/ / PRD), mirroring how
+// verify_cmd degrades. Path is relative to the repo root.
+const migration0021 = `
+ALTER TABLE repos ADD COLUMN product_doc_path TEXT NOT NULL DEFAULT '';
+`
+
+// migration0022 backs the autonomous product-level verification loop. A
+// product maps 1:1 to a Linear project; when triggered, a headless agent
+// judges the whole project's shipped top-level features against the repo's
+// product documentation and files any missing feature as a new top-level
+// issue. product_verifications tracks, per project, the same round/status
+// machinery as task_verifications (migration0019):
+//   - rounds: bounds the self-converging loop (gaps → feature issues →
+//     ship → re-verify); past the cap it escalates to a human.
+//   - status: 'active' while the loop runs; 'escalated' / 'closed' are
+//     terminal and stop further triggers for that project.
+const migration0022 = `
+CREATE TABLE IF NOT EXISTS product_verifications (
+    project_id  TEXT PRIMARY KEY,
+    rounds      INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'active'
+                  CHECK (status IN ('active', 'escalated', 'closed')),
+    updated_at  TEXT NOT NULL
+);
+`
+
+// migration0023 records the verify judge's one-line summary on every
+// task_verifications round. Upper-layer verifies (parents of the just-
+// completed parent, cascade hop) read it as the "what was shipped" digest
+// for an intermediate sub whose work isn't a single PR diff. Empty string
+// (the column default) means no summary has been written yet for this row.
+const migration0023 = `
+ALTER TABLE task_verifications ADD COLUMN summary TEXT NOT NULL DEFAULT '';
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -264,6 +455,17 @@ var migrations = []migration{
 	{10, migration0010},
 	{11, migration0011},
 	{12, migration0012},
+	{13, migration0013},
+	{14, migration0014},
+	{15, migration0015},
+	{16, migration0016},
+	{17, migration0017},
+	{18, migration0018},
+	{19, migration0019},
+	{20, migration0020},
+	{21, migration0021},
+	{22, migration0022},
+	{23, migration0023},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -376,7 +578,8 @@ func applyMigrations(db *sql.DB) error {
 }
 
 type Store struct {
-	DB *sql.DB
+	DB   *sql.DB
+	Path string // absolute path to the SQLite file
 }
 
 func Open(path string) (*Store, error) {
@@ -409,10 +612,19 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(`PRAGMA busy_timeout=5000;`); err != nil {
 		return nil, fmt.Errorf("set busy_timeout: %w", err)
 	}
+	// SQLite defaults foreign_keys OFF — any FK declared in DDL is purely
+	// decorative without this PRAGMA. migration0018 (planner tables) is
+	// the first migration to declare an FK and relies on real enforcement
+	// to catch typo'd feature_id values in InsertFeatureIssue. No existing
+	// table declares FKs, so enabling this globally has no effect on
+	// pre-planner code paths.
+	if _, err := db.Exec(`PRAGMA foreign_keys=ON;`); err != nil {
+		return nil, fmt.Errorf("set foreign_keys: %w", err)
+	}
 	if err := applyMigrations(db); err != nil {
 		return nil, fmt.Errorf("migrations: %w", err)
 	}
-	return &Store{DB: db}, nil
+	return &Store{DB: db, Path: path}, nil
 }
 
 // Autopilot job state constants. RECEIVED -> EXECUTING -> DONE|FAILED|TIMED_OUT.
@@ -426,6 +638,15 @@ const (
 	JobStateTimedOut               = "TIMED_OUT"
 	JobStateDoneThreadInconsistent = "DONE_THREAD_INCONSISTENT"
 	JobStateCancelled              = "CANCELLED"
+	JobStateBlocked                = "BLOCKED"
+	JobStateAwaitingInput          = "AWAITING_INPUT"
+	JobStateAborted                = "ABORTED"
+	// JobStateDoneMerged is the true terminal state for a successful
+	// admiral task: the PR admiral opened was merged into the base
+	// branch on GitHub. Written by admiral-discoverer (admiral-autopilot
+	// itself does not observe merge events) when it polls a DONE task's
+	// PR and finds merged_at non-empty.
+	JobStateDoneMerged = "DONE_MERGED"
 )
 
 type AutopilotJob struct {
@@ -710,6 +931,61 @@ func (s *Store) ListJobsByIssueAndStates(issueID string, states []string) ([]Aut
 	return out, rows.Err()
 }
 
+// ListAutopilotJobsByProject returns jobs whose worktree_path lives under the
+// repo_dir of the given project_id. The link relies on the default config
+// (worktree_root relative to repo_dir, so worktrees nest under repo_dir/) —
+// callers that configure an absolute worktree_root will see no jobs match.
+// projectID == "" is treated as no filter and behaves like ListAutopilotJobs.
+func (s *Store) ListAutopilotJobsByProject(projectID, status, issueID string, since *time.Time, limit int) ([]AutopilotJob, error) {
+	if projectID == "" {
+		return s.ListAutopilotJobs(status, issueID, since, limit)
+	}
+	query := `
+		SELECT j.agent_session_id, j.issue_id, j.issue_identifier, j.state,
+		       COALESCE(j.worktree_path,''), COALESCE(j.branch,''),
+		       COALESCE(j.pr_url,''), COALESCE(j.error,''),
+		       j.started_at, COALESCE(j.finished_at,''),
+		       COALESCE(j.stream_log_path,''),
+		       COALESCE(j.claude_session_id,'')
+		FROM autopilot_jobs j
+		JOIN repos r ON j.worktree_path LIKE rtrim(r.repo_dir, '/') || '/%'
+		WHERE r.project_id=?`
+	args := []any{projectID}
+	if status != "" {
+		query += " AND j.state=?"
+		args = append(args, status)
+	}
+	if issueID != "" {
+		query += " AND j.issue_id=?"
+		args = append(args, issueID)
+	}
+	if since != nil {
+		query += " AND j.started_at>=?"
+		args = append(args, since.UTC().Format(time.RFC3339))
+	}
+	query += " ORDER BY j.started_at DESC"
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AutopilotJob
+	for rows.Next() {
+		var j AutopilotJob
+		if err := rows.Scan(&j.AgentSessionID, &j.IssueID, &j.IssueIdentifier, &j.State,
+			&j.WorktreePath, &j.Branch, &j.PRURL, &j.Error, &j.StartedAt, &j.FinishedAt,
+			&j.StreamLogPath, &j.ClaudeSessionID); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 // ListAutopilotJobs returns jobs matching the given filters, ordered by started_at desc.
 func (s *Store) ListAutopilotJobs(status, issueID string, since *time.Time, limit int) ([]AutopilotJob, error) {
 	query := `
@@ -779,6 +1055,7 @@ type AdmiralTask struct {
 	FinishedAt         string
 	Error              string
 	StreamLogPath      string
+	PendingQuestionID  string // non-empty when state=AWAITING_INPUT
 }
 
 // AdmiralTaskHistory is one entry in the supersession log for an issue.
@@ -800,6 +1077,52 @@ type AdmiralTaskHistory struct {
 	SupersededReason string
 }
 
+// ListAdmiralTasksByStates returns admiral_tasks rows whose state is
+// in the given list, ordered by started_at ASC. Used by
+// admiral-discoverer to find tasks whose PRs may need Linear-state
+// advancement (e.g. all DONE tasks → poll GitHub to learn merge /
+// approval status). Returns an empty slice when states is empty.
+func (s *Store) ListAdmiralTasksByStates(states []string) ([]AdmiralTask, error) {
+	if len(states) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(states))
+	args := make([]any, len(states))
+	for i, st := range states {
+		placeholders[i] = "?"
+		args[i] = st
+	}
+	q := `
+		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(last_event_session_id,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,''),
+		       COALESCE(pending_question_id,'')
+		FROM admiral_tasks
+		WHERE state IN (` + strings.Join(placeholders, ",") + `)
+		ORDER BY started_at ASC
+	`
+	rows, err := s.DB.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AdmiralTask
+	for rows.Next() {
+		var t AdmiralTask
+		if err := rows.Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
+			&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
+			&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
+			&t.Error, &t.StreamLogPath, &t.PendingQuestionID); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // GetAdmiralTaskByIssue returns the live task row for an issue, or
 // (nil, nil) when no task has been claimed yet.
 func (s *Store) GetAdmiralTaskByIssue(issueID string) (*AdmiralTask, error) {
@@ -810,16 +1133,99 @@ func (s *Store) GetAdmiralTaskByIssue(issueID string) (*AdmiralTask, error) {
 		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
 		       COALESCE(last_event_session_id,''),
 		       started_at, COALESCE(finished_at,''),
-		       COALESCE(error,''), COALESCE(stream_log_path,'')
+		       COALESCE(error,''), COALESCE(stream_log_path,''),
+		       COALESCE(pending_question_id,'')
 		FROM admiral_tasks WHERE issue_id=?
 	`, issueID).Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
 		&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
 		&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
-		&t.Error, &t.StreamLogPath)
+		&t.Error, &t.StreamLogPath, &t.PendingQuestionID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	return &t, err
+}
+
+// GetAdmiralTaskByPRURL returns the live task row whose pr_url matches, or
+// (nil, nil) when no task has that PR. Used by the GitHub review dispatcher
+// to correlate an inbound review event with its originating admiral task.
+func (s *Store) GetAdmiralTaskByPRURL(prURL string) (*AdmiralTask, error) {
+	var t AdmiralTask
+	err := s.DB.QueryRow(`
+		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(last_event_session_id,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,''),
+		       COALESCE(pending_question_id,'')
+		FROM admiral_tasks WHERE pr_url=?
+	`, prURL).Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
+		&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
+		&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
+		&t.Error, &t.StreamLogPath, &t.PendingQuestionID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
+// BlockedTask is the minimal projection of an admiral_tasks row that the
+// blocker watcher needs to re-check and re-queue blocked tasks.
+type BlockedTask struct {
+	IssueID            string
+	IssueIdentifier    string
+	LastEventSessionID string
+	AttemptN           int
+	BlockerIDs         string // JSON array of Linear issue IDs
+}
+
+// SetAdmiralTaskBlocked transitions an existing admiral_tasks row to BLOCKED
+// and records the JSON-encoded list of blocking issue IDs.
+func (s *Store) SetAdmiralTaskBlocked(issueID, blockerIDs string) error {
+	_, err := s.DB.Exec(`
+		UPDATE admiral_tasks SET state=?, blocker_ids=? WHERE issue_id=?
+	`, JobStateBlocked, blockerIDs, issueID)
+	return err
+}
+
+// GetBlockedAdmiralTasks returns all tasks currently in BLOCKED state.
+func (s *Store) GetBlockedAdmiralTasks() ([]BlockedTask, error) {
+	rows, err := s.DB.Query(`
+		SELECT issue_id, COALESCE(issue_identifier,''),
+		       COALESCE(last_event_session_id,''), attempt_n,
+		       COALESCE(blocker_ids,'')
+		FROM admiral_tasks WHERE state=?
+	`, JobStateBlocked)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BlockedTask
+	for rows.Next() {
+		var t BlockedTask
+		if err := rows.Scan(&t.IssueID, &t.IssueIdentifier,
+			&t.LastEventSessionID, &t.AttemptN, &t.BlockerIDs); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// TransitionBlockedToReceived atomically moves a BLOCKED task back to
+// RECEIVED, clearing blocker_ids. Returns true when the row was updated
+// (i.e. it was still BLOCKED), false when another goroutine already
+// changed the state.
+func (s *Store) TransitionBlockedToReceived(issueID string) (bool, error) {
+	res, err := s.DB.Exec(`
+		UPDATE admiral_tasks SET state=?, blocker_ids=NULL WHERE issue_id=? AND state=?
+	`, JobStateReceived, issueID, JobStateBlocked)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // ClaimAdmiralTask inserts a new task row for issueID iff no row exists.
@@ -1259,10 +1665,14 @@ type EventInboxRow struct {
 	StartedAt   *time.Time
 	FinishedAt  *time.Time
 	LastError   string
+	Source      string // "linear" (default) or "github"
 }
 
-// EnqueueEvent inserts a pending row. Returns true when a fresh row was
-// inserted, false when webhook_id already existed (Linear retry / dup).
+// EnqueueEvent inserts a pending row from the Linear source. Returns true
+// when a fresh row was inserted, false when webhook_id already existed
+// (Linear retry / dup). source defaults to 'linear' via the schema, so
+// rows from this function are tagged correctly without explicit mention.
+// New non-Linear callers should use EnqueueEventWithSource.
 func (s *Store) EnqueueEvent(webhookID, action, sessionID, issueID, payloadJSON string) (bool, error) {
 	now := time.Now().UTC()
 	result, err := s.DB.Exec(`
@@ -1275,6 +1685,36 @@ func (s *Store) EnqueueEvent(webhookID, action, sessionID, issueID, payloadJSON 
 		return false, err
 	}
 	// Check if we actually inserted (RowsAffected=0 means conflict)
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// EnqueueEventWithSource inserts a pending row for any webhook source.
+// Returns true when fresh, false on either webhook_id collision (primary
+// dedup) or (source, comment_id) collision (secondary dedup for sources
+// that re-deliver the same comment under a new delivery id). Pass
+// commentID="" to skip comment-based dedup — the partial unique index
+// only constrains rows with a non-NULL comment_id.
+func (s *Store) EnqueueEventWithSource(source, webhookID, action, sessionID, issueID, payloadJSON, commentID string) (bool, error) {
+	now := time.Now().UTC()
+	// Empty commentID maps to SQL NULL so the partial unique index
+	// (WHERE comment_id IS NOT NULL) does not constrain it.
+	var commentArg interface{}
+	if commentID != "" {
+		commentArg = commentID
+	}
+	result, err := s.DB.Exec(`
+		INSERT OR IGNORE INTO events_inbox(
+			webhook_id, action, session_id, issue_id, payload_json,
+			status, attempts, received_at, source, comment_id
+		) VALUES(?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+	`, webhookID, action, sessionID, issueID, payloadJSON, now.Unix(), source, commentArg)
+	if err != nil {
+		return false, err
+	}
 	n, err := result.RowsAffected()
 	if err != nil {
 		return false, err
@@ -1302,7 +1742,8 @@ func (s *Store) ClaimNextPendingEvent() (*EventInboxRow, error) {
 		       status, attempts, received_at,
 		       COALESCE(started_at, 0),
 		       COALESCE(finished_at, 0),
-		       COALESCE(last_error, '')
+		       COALESCE(last_error, ''),
+		       COALESCE(source, 'linear')
 		FROM events_inbox
 		WHERE status = 'pending'
 		  AND session_id NOT IN (
@@ -1313,6 +1754,7 @@ func (s *Store) ClaimNextPendingEvent() (*EventInboxRow, error) {
 	`).Scan(
 		&row.WebhookID, &row.Action, &row.SessionID, &row.IssueID, &row.PayloadJSON,
 		&row.Status, &row.Attempts, &receivedUnix, &startedUnix, &finishedUnix, &row.LastError,
+		&row.Source,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1392,17 +1834,29 @@ func (s *Store) CountPendingEvents() (int, error) {
 
 // Repo holds a Linear project → repo mapping.
 type Repo struct {
-	ProjectID   string
-	ProjectName string
-	RepoDir     string
-	BaseBranch  string
-	Enabled     bool
+	ProjectID       string
+	ProjectName     string
+	RepoDir         string
+	BaseBranch      string
+	Enabled         bool
+	AutoPickEnabled bool
+	// VerifyCmd is the shell command admiral's L2 verify runs in the repo
+	// before invoking the LLM judge (e.g. "swift build", "go test ./...").
+	// Empty = no verify command configured → verify degrades to diff-only
+	// judgment and admiral logs a one-shot WARN at boot.
+	VerifyCmd string
+	// ProductDocPath is the repo-relative path to the complete product
+	// documentation (file or directory) that autopilot's product-level
+	// verify judges the project's shipped features against. Empty = no path
+	// configured → product verify instructs the judge to discover the doc
+	// itself (README / docs/ / PRD), mirroring VerifyCmd's degradation.
+	ProductDocPath string
 }
 
 // ListRepos returns all repos ordered by project_name.
 func (s *Store) ListRepos() ([]Repo, error) {
 	rows, err := s.DB.Query(`
-		SELECT project_id, project_name, repo_dir, base_branch, enabled
+		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, product_doc_path
 		FROM repos ORDER BY project_name ASC
 	`)
 	if err != nil {
@@ -1412,11 +1866,12 @@ func (s *Store) ListRepos() ([]Repo, error) {
 	var out []Repo
 	for rows.Next() {
 		var r Repo
-		var enabled int
-		if err := rows.Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled); err != nil {
+		var enabled, autoPick int
+		if err := rows.Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick, &r.VerifyCmd, &r.ProductDocPath); err != nil {
 			return nil, err
 		}
 		r.Enabled = enabled == 1
+		r.AutoPickEnabled = autoPick == 1
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -1426,11 +1881,11 @@ func (s *Store) ListRepos() ([]Repo, error) {
 // Returns (nil, nil) when no repo is configured for that project.
 func (s *Store) GetRepoByProjectID(projectID string) (*Repo, error) {
 	var r Repo
-	var enabled int
+	var enabled, autoPick int
 	err := s.DB.QueryRow(`
-		SELECT project_id, project_name, repo_dir, base_branch, enabled
+		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, product_doc_path
 		FROM repos WHERE project_id=?
-	`, projectID).Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled)
+	`, projectID).Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick, &r.VerifyCmd, &r.ProductDocPath)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1438,6 +1893,7 @@ func (s *Store) GetRepoByProjectID(projectID string) (*Repo, error) {
 		return nil, err
 	}
 	r.Enabled = enabled == 1
+	r.AutoPickEnabled = autoPick == 1
 	return &r, nil
 }
 
@@ -1448,16 +1904,23 @@ func (s *Store) UpsertRepo(r Repo) error {
 	if r.Enabled {
 		enabled = 1
 	}
+	autoPick := 0
+	if r.AutoPickEnabled {
+		autoPick = 1
+	}
 	_, err := s.DB.Exec(`
-		INSERT INTO repos(project_id, project_name, repo_dir, base_branch, enabled, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO repos(project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, product_doc_path, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(project_id) DO UPDATE SET
 			project_name=excluded.project_name,
 			repo_dir=excluded.repo_dir,
 			base_branch=excluded.base_branch,
 			enabled=excluded.enabled,
+			auto_pick_enabled=excluded.auto_pick_enabled,
+			verify_cmd=excluded.verify_cmd,
+			product_doc_path=excluded.product_doc_path,
 			updated_at=excluded.updated_at
-	`, r.ProjectID, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, now, now)
+	`, r.ProjectID, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, autoPick, r.VerifyCmd, r.ProductDocPath, now, now)
 	return err
 }
 
@@ -1465,4 +1928,285 @@ func (s *Store) UpsertRepo(r Repo) error {
 func (s *Store) DeleteRepo(projectID string) error {
 	_, err := s.DB.Exec(`DELETE FROM repos WHERE project_id=?`, projectID)
 	return err
+}
+
+// ListAutoPickEnabledProjectIDs returns the project IDs of repos that
+// are both enabled (auto_pick implies enabled) AND opted-in to the
+// discoverer's auto-pick scan. Drives the discoverer's per-tick scope.
+func (s *Store) ListAutoPickEnabledProjectIDs() ([]string, error) {
+	rows, err := s.DB.Query(`
+		SELECT project_id FROM repos
+		WHERE enabled=1 AND auto_pick_enabled=1
+		ORDER BY project_name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// --- discoverer_picks ---
+
+// DiscovererPick is one row in the discoverer_picks table: a record
+// that admiral-discoverer has elected to self-assign this issue at
+// least once. When picked_state still matches the issue's current
+// Linear state, the discoverer treats the issue as "already handled"
+// and skips. When the state diverges (external reset), the row is
+// overwritten on the next pick.
+type DiscovererPick struct {
+	IssueID         string
+	IssueIdentifier string
+	PickedAt        string
+	PickedState     string
+	UpdatedAt       string
+}
+
+// GetDiscovererPick returns the pick record for an issue, or (nil, nil)
+// when none exists.
+func (s *Store) GetDiscovererPick(issueID string) (*DiscovererPick, error) {
+	var p DiscovererPick
+	err := s.DB.QueryRow(`
+		SELECT issue_id, issue_identifier, picked_at, picked_state, updated_at
+		FROM discoverer_picks WHERE issue_id=?
+	`, issueID).Scan(&p.IssueID, &p.IssueIdentifier, &p.PickedAt, &p.PickedState, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// UpsertDiscovererPick records (or refreshes) a pick. Used both for
+// the initial assign and for re-picks after an external state reset.
+func (s *Store) UpsertDiscovererPick(p DiscovererPick) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if p.PickedAt == "" {
+		p.PickedAt = now
+	}
+	_, err := s.DB.Exec(`
+		INSERT INTO discoverer_picks(issue_id, issue_identifier, picked_at, picked_state, updated_at)
+		VALUES(?, ?, ?, ?, ?)
+		ON CONFLICT(issue_id) DO UPDATE SET
+			issue_identifier=excluded.issue_identifier,
+			picked_at=excluded.picked_at,
+			picked_state=excluded.picked_state,
+			updated_at=excluded.updated_at
+	`, p.IssueID, p.IssueIdentifier, p.PickedAt, p.PickedState, now)
+	return err
+}
+
+// --- pending_questions (HITL ask_user flow) ---
+
+// PendingQuestion is a question that a claude run has asked the user via
+// Linear thread. The run has exited and the task is in AWAITING_INPUT state.
+// When answered_at is non-empty the question has been resolved.
+type PendingQuestion struct {
+	ID                 string
+	IssueID            string
+	IssueIdentifier    string
+	ClaudeSessionID    string
+	LastEventSessionID string
+	WorktreePath       string
+	Question           string
+	OptionsJSON        string // JSON array of option strings, may be empty
+	CreatedAt          string
+	AnsweredAt         string // empty when still open
+	Answer             string // empty when still open
+}
+
+// InsertPendingQuestion records a new open question from a claude run.
+// id must be a fresh UUID (generated by the caller or MCP tool).
+func (s *Store) InsertPendingQuestion(q PendingQuestion) error {
+	_, err := s.DB.Exec(`
+		INSERT INTO pending_questions(
+			id, issue_id, issue_identifier, claude_session_id,
+			last_event_session_id, worktree_path,
+			question, options_json, created_at
+		) VALUES(?,?,?,?,?,?,?,?,?)
+	`, q.ID, q.IssueID, q.IssueIdentifier, q.ClaudeSessionID,
+		q.LastEventSessionID, q.WorktreePath,
+		q.Question, q.OptionsJSON, q.CreatedAt)
+	return err
+}
+
+// GetOpenPendingQuestionByIssue returns the most recent unanswered question
+// for an issue, or (nil, nil) when none exists.
+func (s *Store) GetOpenPendingQuestionByIssue(issueID string) (*PendingQuestion, error) {
+	var q PendingQuestion
+	err := s.DB.QueryRow(`
+		SELECT id, issue_id, COALESCE(issue_identifier,''), claude_session_id,
+		       COALESCE(last_event_session_id,''), COALESCE(worktree_path,''),
+		       question, COALESCE(options_json,'[]'), created_at,
+		       COALESCE(answered_at,''), COALESCE(answer,'')
+		FROM pending_questions
+		WHERE issue_id=? AND answered_at IS NULL
+		ORDER BY created_at DESC LIMIT 1
+	`, issueID).Scan(&q.ID, &q.IssueID, &q.IssueIdentifier, &q.ClaudeSessionID,
+		&q.LastEventSessionID, &q.WorktreePath,
+		&q.Question, &q.OptionsJSON, &q.CreatedAt,
+		&q.AnsweredAt, &q.Answer)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &q, err
+}
+
+// GetPendingQuestionByID returns a pending question by its UUID, or
+// (nil, nil) when not found. Used by dispatchAwaitingReply to look up
+// the exact question correlated to the task via task.PendingQuestionID.
+func (s *Store) GetPendingQuestionByID(id string) (*PendingQuestion, error) {
+	var q PendingQuestion
+	err := s.DB.QueryRow(`
+		SELECT id, issue_id, COALESCE(issue_identifier,''), claude_session_id,
+		       COALESCE(last_event_session_id,''), COALESCE(worktree_path,''),
+		       question, COALESCE(options_json,'[]'), created_at,
+		       COALESCE(answered_at,''), COALESCE(answer,'')
+		FROM pending_questions WHERE id=?
+	`, id).Scan(&q.ID, &q.IssueID, &q.IssueIdentifier, &q.ClaudeSessionID,
+		&q.LastEventSessionID, &q.WorktreePath,
+		&q.Question, &q.OptionsJSON, &q.CreatedAt,
+		&q.AnsweredAt, &q.Answer)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &q, err
+}
+
+// CancelOpenPendingQuestionsForIssue marks all unanswered questions for an
+// issue as cancelled. Called by dispatchRerun to clean up orphaned questions
+// before superseding the task row.
+func (s *Store) CancelOpenPendingQuestionsForIssue(issueID string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.DB.Exec(`
+		UPDATE pending_questions
+		SET answered_at=?, answer='<superseded>'
+		WHERE issue_id=? AND answered_at IS NULL
+	`, now, issueID)
+	return err
+}
+
+// AnswerPendingQuestion records the user's reply and timestamps it.
+func (s *Store) AnswerPendingQuestion(id, answer string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.DB.Exec(`
+		UPDATE pending_questions SET answered_at=?, answer=? WHERE id=? AND answered_at IS NULL
+	`, now, answer, id)
+	return err
+}
+
+// SetAdmiralTaskAwaitingInput transitions a task to AWAITING_INPUT and
+// records the pending question ID so the resume path can look it up.
+func (s *Store) SetAdmiralTaskAwaitingInput(issueID, pendingQuestionID string) error {
+	_, err := s.DB.Exec(`
+		UPDATE admiral_tasks SET state=?, pending_question_id=? WHERE issue_id=?
+	`, JobStateAwaitingInput, pendingQuestionID, issueID)
+	return err
+}
+
+// TransitionAwaitingInputToExecuting atomically moves an AWAITING_INPUT task
+// back to EXECUTING. Returns true when the row was updated (i.e. this caller
+// won the race), false when another goroutine already changed the state.
+func (s *Store) TransitionAwaitingInputToExecuting(issueID string) (bool, error) {
+	res, err := s.DB.Exec(`
+		UPDATE admiral_tasks
+		SET state=?, pending_question_id=NULL
+		WHERE issue_id=? AND state=?
+	`, JobStateExecuting, issueID, JobStateAwaitingInput)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// --- admin: stale awaiting-input job queries ---
+
+// AwaitingInputJob is a denormalised view of a task stuck in AWAITING_INPUT,
+// enriched with the pending question details needed for the admin CLI.
+type AwaitingInputJob struct {
+	IssueID          string
+	IssueIdentifier  string
+	WorktreePath     string
+	Branch           string
+	LastEventSession string // for posting a Linear comment on abort
+	PendingQuestion  string
+	PendingCreatedAt string // RFC3339; age is computed from this
+}
+
+// ListAwaitingInputJobs returns all tasks in AWAITING_INPUT state, optionally
+// filtered to those whose pending question was created more than olderThan ago.
+// Results are sorted oldest-first.
+func (s *Store) ListAwaitingInputJobs(olderThan time.Duration) ([]AwaitingInputJob, error) {
+	cutoff := ""
+	if olderThan > 0 {
+		cutoff = time.Now().UTC().Add(-olderThan).Format(time.RFC3339)
+	}
+	// LEFT JOIN so orphan tasks (pending_question_id is NULL or stale) are
+	// still visible. When a cutoff is set we include:
+	//   - tasks with a linked question older than the cutoff, AND
+	//   - tasks with no linked question at all (orphans — stuck even longer).
+	// Rows where the linked question is newer than the cutoff are excluded.
+	// NULL created_at sorts last (NULLS LAST via the IS NULL trick).
+	query := `
+		SELECT t.issue_id, COALESCE(t.issue_identifier,''),
+		       COALESCE(t.worktree_path,''), COALESCE(t.branch,''),
+		       COALESCE(t.last_event_session_id,''),
+		       COALESCE(pq.question,''), COALESCE(pq.created_at,'')
+		FROM admiral_tasks t
+		LEFT JOIN pending_questions pq ON pq.id = t.pending_question_id
+		WHERE t.state = ?`
+	args := []any{JobStateAwaitingInput}
+	if cutoff != "" {
+		query += " AND (pq.created_at IS NULL OR pq.created_at <= ?)"
+		args = append(args, cutoff)
+	}
+	query += " ORDER BY pq.created_at IS NULL, pq.created_at ASC"
+	rows, err := s.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AwaitingInputJob
+	for rows.Next() {
+		var j AwaitingInputJob
+		if err := rows.Scan(&j.IssueID, &j.IssueIdentifier,
+			&j.WorktreePath, &j.Branch, &j.LastEventSession,
+			&j.PendingQuestion, &j.PendingCreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// AbortAdmiralTask transitions a task from AWAITING_INPUT to ABORTED and
+// cancels its open pending question. Returns false if the task was not in
+// AWAITING_INPUT (already resumed or aborted by another caller).
+func (s *Store) AbortAdmiralTask(issueID string) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.DB.Exec(`
+		UPDATE admiral_tasks
+		SET state=?, pending_question_id=NULL, finished_at=?
+		WHERE issue_id=? AND state=?
+	`, JobStateAborted, now, issueID, JobStateAwaitingInput)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return false, nil
+	}
+	_ = s.CancelOpenPendingQuestionsForIssue(issueID)
+	return true, nil
 }

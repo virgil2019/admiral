@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -763,5 +764,161 @@ func TestMigration0012_SkipsEmptyIssueID(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("admiral_tasks should not contain rows from empty issue_id; got %d", count)
+	}
+}
+
+// helpers for awaiting-input tests
+
+func setupAwaitingInput(t *testing.T, s *Store, issueID, identifier, sessionID, pendingID, question string) {
+	t.Helper()
+	if _, err := s.ClaimAdmiralTask(issueID, identifier, sessionID); err != nil {
+		t.Fatalf("claim %s: %v", issueID, err)
+	}
+	q := PendingQuestion{
+		ID:                 pendingID,
+		IssueID:            issueID,
+		IssueIdentifier:    identifier,
+		ClaudeSessionID:    "claude-session-" + issueID,
+		LastEventSessionID: sessionID,
+		WorktreePath:       "/worktrees/" + issueID,
+		Question:           question,
+		OptionsJSON:        "[]",
+		CreatedAt:          time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := s.InsertPendingQuestion(q); err != nil {
+		t.Fatalf("insert pq %s: %v", issueID, err)
+	}
+	if err := s.SetAdmiralTaskAwaitingInput(issueID, pendingID); err != nil {
+		t.Fatalf("set awaiting_input %s: %v", issueID, err)
+	}
+}
+
+func TestListAwaitingInputJobs_Empty(t *testing.T) {
+	s := newTestStore(t)
+	jobs, err := s.ListAwaitingInputJobs(0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("expected 0 jobs, got %d", len(jobs))
+	}
+}
+
+func TestListAwaitingInputJobs_ReturnsAll(t *testing.T) {
+	s := newTestStore(t)
+	setupAwaitingInput(t, s, "issue-1", "GEO-1", "sess-1", "pq-1", "v1 or v2?")
+	setupAwaitingInput(t, s, "issue-2", "GEO-2", "sess-2", "pq-2", "which branch?")
+
+	jobs, err := s.ListAwaitingInputJobs(0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(jobs))
+	}
+	ids := map[string]bool{}
+	for _, j := range jobs {
+		ids[j.IssueIdentifier] = true
+		if j.PendingQuestion == "" {
+			t.Errorf("empty question for %s", j.IssueIdentifier)
+		}
+	}
+	if !ids["GEO-1"] || !ids["GEO-2"] {
+		t.Errorf("missing expected identifiers: %v", ids)
+	}
+}
+
+func TestListAwaitingInputJobs_OlderThanFilters(t *testing.T) {
+	s := newTestStore(t)
+	// pq-old: created in the past (should appear with --older-than 1d)
+	if _, err := s.ClaimAdmiralTask("issue-old", "GEO-OLD", "sess-old"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	qOld := PendingQuestion{
+		ID: "pq-old", IssueID: "issue-old", IssueIdentifier: "GEO-OLD",
+		ClaudeSessionID: "c-old", LastEventSessionID: "sess-old",
+		WorktreePath: "/wt/old", Question: "old question", OptionsJSON: "[]",
+		CreatedAt: "2020-01-01T00:00:00Z",
+	}
+	if err := s.InsertPendingQuestion(qOld); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := s.SetAdmiralTaskAwaitingInput("issue-old", "pq-old"); err != nil {
+		t.Fatalf("set awaiting: %v", err)
+	}
+
+	// pq-new: just created (should NOT appear with --older-than 1d)
+	setupAwaitingInput(t, s, "issue-new", "GEO-NEW", "sess-new", "pq-new", "new question")
+
+	// No filter: both appear.
+	all, err := s.ListAwaitingInputJobs(0)
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	if len(all) != 2 {
+		t.Errorf("no-filter: expected 2, got %d", len(all))
+	}
+
+	// --older-than 1 day: only the old one.
+	filtered, err := s.ListAwaitingInputJobs(24 * time.Hour)
+	if err != nil {
+		t.Fatalf("list filtered: %v", err)
+	}
+	if len(filtered) != 1 {
+		t.Errorf("filtered: expected 1, got %d", len(filtered))
+	}
+	if filtered[0].IssueIdentifier != "GEO-OLD" {
+		t.Errorf("wrong job returned: %s", filtered[0].IssueIdentifier)
+	}
+}
+
+func TestAbortAdmiralTask_Roundtrip(t *testing.T) {
+	s := newTestStore(t)
+	setupAwaitingInput(t, s, "issue-abort", "GEO-ABORT", "sess-abort", "pq-abort", "abort me?")
+
+	ok, err := s.AbortAdmiralTask("issue-abort")
+	if err != nil {
+		t.Fatalf("abort: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected ok=true, got false")
+	}
+
+	got, err := s.GetAdmiralTaskByIssue("issue-abort")
+	if err != nil || got == nil {
+		t.Fatalf("get after abort: got=%v err=%v", got, err)
+	}
+	if got.State != JobStateAborted {
+		t.Errorf("state: got %q want ABORTED", got.State)
+	}
+	if got.PendingQuestionID != "" {
+		t.Errorf("pending_question_id should be cleared; got %q", got.PendingQuestionID)
+	}
+	if got.FinishedAt == "" {
+		t.Errorf("finished_at should be set after abort")
+	}
+
+	// Pending question should be cancelled.
+	pq, err := s.GetOpenPendingQuestionByIssue("issue-abort")
+	if err != nil {
+		t.Fatalf("get pq: %v", err)
+	}
+	if pq != nil {
+		t.Errorf("expected no open pending_question after abort, got: %+v", pq)
+	}
+}
+
+func TestAbortAdmiralTask_NotAwaitingInput(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.ClaimAdmiralTask("issue-exec", "GEO-EXEC", "sess-exec"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	// Task is in RECEIVED state — abort should return false.
+	ok, err := s.AbortAdmiralTask("issue-exec")
+	if err != nil {
+		t.Fatalf("abort: %v", err)
+	}
+	if ok {
+		t.Errorf("expected ok=false for non-awaiting-input task")
 	}
 }

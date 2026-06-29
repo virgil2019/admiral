@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -23,10 +24,93 @@ type Config struct {
 	Logging          Logging     `yaml:"logging"`
 	Linear           Linear      `yaml:"linear"`
 	Autopilot        Autopilot   `yaml:"autopilot"`
+	Discoverer       Discoverer  `yaml:"discoverer"`
 
 	// Warnings collects non-fatal config notices (e.g. deprecated key
 	// usage). Populated during Load; main.go logs them after open.
 	Warnings []string `yaml:"-"`
+}
+
+// Discoverer configures the admiral-discoverer binary: a standalone
+// service that scans Linear for assignable issues, runs an optional
+// `claude -p` judge, and self-assigns matches to admiral. Designed to
+// be split off into its own repo later — keep it independent of
+// Autopilot fields.
+//
+// Project scope is NOT here — admiral-discoverer reads the list of
+// auto-pick projects from the repos table (toggled in the admin UI).
+// The decision to run discoverer at all is made by whoever starts the
+// binary (or enables the systemd unit); there is no in-config gate.
+type Discoverer struct {
+	// PollInterval is the gap between Linear scans. Default: 10m.
+	PollInterval time.Duration `yaml:"poll_interval"`
+	// StateTypes filters by Linear workflow state.type. Default:
+	// ["backlog", "unstarted"].
+	StateTypes []string `yaml:"state_types"`
+	// RequireLabel restricts candidates to issues carrying this label.
+	// Empty = no label requirement; loud warning logged on boot since
+	// "no label + judge off" is a foot-gun (auto-assigns everything in
+	// scope). Recommended: "agent-ready".
+	RequireLabel string `yaml:"require_label"`
+	// MaxPickPerRound caps how many issues a single scan round will
+	// self-assign. Should be ≤ autopilot.max_concurrent_runs to avoid
+	// backing up events_inbox. Default: 3.
+	MaxPickPerRound int `yaml:"max_pick_per_round"`
+	// AdmiralUserID is admiral's Linear user UUID. If empty, the
+	// binary resolves it from `viewer { id }` at startup.
+	AdmiralUserID string `yaml:"admiral_user_id"`
+	// Judge configures the optional `claude -p` filter applied to each
+	// candidate before self-assignment.
+	Judge DiscovererJudge `yaml:"judge"`
+	// LinearStates maps admiral lifecycle stages onto Linear workflow
+	// state names. Empty entries skip that transition. The merged-PR
+	// transition (→ Linear.completed) and PR-closed transition (→
+	// Linear.canceled) bypass this map and use Linear's state.type as
+	// the stable target, so the defaults work without any config.
+	LinearStates DiscovererLinearStates `yaml:"linear_states"`
+	// AutoMerge lets the state-advance phase squash-merge an approved,
+	// mergeable, CI-green PR (deleting its branch) instead of parking it
+	// in the Reviewed state for a human to merge. Opt-in safety gate:
+	// default false because merging is outward-facing and near-
+	// irreversible. Turn on only for projects where admiral is trusted
+	// to ship without a human merge click.
+	//
+	// PREREQUISITE — branch protection. admiral's client-side gate
+	// (approved + mergeable + CI-green) is only a pre-filter; the
+	// authoritative gate is the GitHub branch protection rule, which
+	// `gh pr merge` (run WITHOUT --admin) is subject to. Before enabling
+	// auto_merge, configure branch protection on the base branch with:
+	//   - required approving reviews, AND "Dismiss stale pull request
+	//     approvals when new commits are pushed" — otherwise an approval
+	//     of an earlier commit stays current and admiral can merge code
+	//     pushed after the review.
+	//   - required status checks for any CI that must pass — admiral's
+	//     own checks-rollup read can miss a required check that hasn't
+	//     reported yet, so branch protection is what actually enforces it.
+	AutoMerge bool `yaml:"auto_merge"`
+}
+
+// DiscovererLinearStates is the optional Linear-state-name map used by
+// the discoverer's state-advance phase.
+type DiscovererLinearStates struct {
+	// InReview is the Linear workflow state name to push when admiral's
+	// PR is open and has no approval yet. Empty = don't push.
+	InReview string `yaml:"in_review"`
+	// Reviewed is the Linear workflow state name to push when admiral's
+	// PR is open and has at least one approval. Empty = don't push.
+	Reviewed string `yaml:"reviewed"`
+}
+
+// DiscovererJudge is the per-issue LLM judge configuration.
+type DiscovererJudge struct {
+	// Enabled gates the judge step. When false, every candidate that
+	// passes the filter is self-assigned. Default: true.
+	Enabled *bool `yaml:"enabled"`
+	// ClaudeBin is the absolute path to the claude CLI. Empty inherits
+	// from autopilot.claude_bin so co-deployed installs share one path.
+	ClaudeBin string `yaml:"claude_bin"`
+	// Timeout caps a single judge invocation. Default: 60s.
+	Timeout time.Duration `yaml:"timeout"`
 }
 
 // Linear holds Linear API + webhook auth. Required by the autopilot binary;
@@ -81,9 +165,27 @@ type Autopilot struct {
 	BaseBranch string `yaml:"base_branch"`
 	// ClaudeBin is the absolute path to the `claude` CLI. Default: "claude" (PATH).
 	ClaudeBin string `yaml:"claude_bin"`
+	// McpAskBin is the path to the admiral-mcp-ask binary that provides the
+	// ask_user MCP tool to claude runs. Default: "admiral-mcp-ask" (PATH).
+	McpAskBin string `yaml:"mcp_ask_bin"`
 	// AutopilotSkill is the skill name passed to claude -p (`--skill <name>` or
 	// "/<name>" prefix in the prompt). Default: empty (no skill).
 	AutopilotSkill string `yaml:"autopilot_skill"`
+	// ReviewSkill is the same idea as AutopilotSkill but for the review-dispatch
+	// path (claude addressing reviewer feedback on an open PR). When set, the
+	// review prompt starts with "/<ReviewSkill>" so claude enters that skill's
+	// flow — typically `oh-my-claudecode:ultraqa` to drive a build/test/fix
+	// loop on the fix worktree. Default: empty (no skill prefix). The prompt
+	// still carries the inline "run the project build before committing"
+	// instruction from PR #163 either way.
+	ReviewSkill string `yaml:"review_skill"`
+	// VerifyMaxRetries is how many extra fix-attempts admiral allows on top of
+	// claude's initial run when the configured repo verify_cmd fails: 0 means
+	// no retry (verify once, fail-stops), 2 means up to 2 retries (3 total
+	// build attempts). Used by the review-dispatch hard gate and the planned
+	// first-run hard gate. Defaults to 2 when unset / zero — set explicitly
+	// (e.g. 0 to disable) if you want different behavior.
+	VerifyMaxRetries int `yaml:"verify_max_retries"`
 	// GhBin is the absolute path to the `gh` CLI used for the PR fallback.
 	// Default: "gh" (PATH).
 	GhBin string `yaml:"gh_bin"`
@@ -91,8 +193,37 @@ type Autopilot struct {
 	// distinguish admiral-authored PRs from human-authored ones in the
 	// open-PR short-circuit). Default: the login from `gh auth status`.
 	GhUser string `yaml:"gh_user"`
+	// GhToken is the personal access token admiral uses when posting PR
+	// comments and fetching PR state/diff. Empty inherits host gh auth,
+	// which is acceptable for local runs but not recommended in production
+	// (admiral's bot identity would be ambiguous).
+	GhToken string `yaml:"gh_token"`
+	// GhWebhookSecret is the HMAC-SHA256 signing secret configured on the
+	// GitHub webhook. Empty disables signature verification (only suitable
+	// for local dev/testing).
+	GhWebhookSecret string `yaml:"gh_webhook_secret"`
+	// GhBotLogin is the GitHub login of the admiral bot account. Used to
+	// filter out self-triggered events so admiral does not respond to its
+	// own PR comments. Empty disables self-filtering.
+	GhBotLogin string `yaml:"gh_bot_login"`
+	// BotIdentity is the git author + committer admiral uses when claude
+	// commits inside an autopilot or review worktree (per #162). When set,
+	// admiral writes worktree-local `user.name` / `user.email` after every
+	// `git worktree add` AND injects GIT_AUTHOR_*/GIT_COMMITTER_* env vars
+	// at claude launch (env beats config in git's precedence, so the env
+	// override is the belt-and-braces guarantee — if a worktree reuse path
+	// somehow skipped the config write, commits still tag as the bot). When
+	// not configured, admiral falls through to the runtime user's git
+	// config — the pre-#162 behavior that caused indistinguishable bot/
+	// human attribution.
+	BotIdentity BotIdentity `yaml:"bot_identity"`
 	// MaxRunSeconds caps a single claude -p invocation. Default: 1800 (30 min).
 	MaxRunSeconds int `yaml:"max_run_seconds"`
+	// VerifyMaxRounds bounds the autonomous L2 verification loop: how many
+	// times a task's parent issue may be re-verified before admiral stops
+	// filing follow-up sub-issues and escalates to a human via a Linear
+	// comment. Default: DefaultVerifyMaxRounds.
+	VerifyMaxRounds int `yaml:"verify_max_rounds"`
 	// JobStreamsDir is the directory where per-job claude stream-json files
 	// are written. Default: <sqlite_path dir>/job-streams (e.g. if
 	// sqlite_path is ~/.local/share/admiral/autopilot.db, the default is
@@ -116,6 +247,15 @@ type Autopilot struct {
 	// UpdateIssueStatus controls whether admiral updates Linear issue workflow
 	// state on task lifecycle (Backlog → Started → Completed). Default: true.
 	UpdateIssueStatus *bool `yaml:"update_issue_status"`
+	// CIWatchPollInterval is how often CI watcher polls GitHub check runs.
+	// Default: 30s.
+	CIWatchPollInterval time.Duration `yaml:"ci_watch_poll_interval"`
+	// CIWatchTimeout is how long CI watcher waits for all checks to complete.
+	// Default: 15m.
+	CIWatchTimeout time.Duration `yaml:"ci_watch_timeout"`
+	// BlockerPollInterval is how often the blocker watcher re-checks tasks that
+	// were blocked on unresolved Linear dependencies. Default: 10m.
+	BlockerPollInterval time.Duration `yaml:"blocker_poll_interval"`
 	// Repos is the list of Linear project → repo mappings. Required: must
 	// contain at least one entry. An incoming Linear issue is routed to the
 	// repo whose project_id matches issue.project.id; issues without a
@@ -132,6 +272,20 @@ type Autopilot struct {
 	AdminToken string `yaml:"admin_token"`
 }
 
+// BotIdentity is the git author + committer admiral injects into commits made
+// through worktree runs. Both fields must be non-empty for the identity to
+// take effect; if either is empty admiral leaves git config alone (no-op,
+// pre-#162 behavior).
+type BotIdentity struct {
+	Name  string `yaml:"name"`
+	Email string `yaml:"email"`
+}
+
+// IsSet reports whether both Name and Email are non-empty (after trim).
+func (b BotIdentity) IsSet() bool {
+	return strings.TrimSpace(b.Name) != "" && strings.TrimSpace(b.Email) != ""
+}
+
 // RepoConfig describes a single Linear project → repo mapping.
 type RepoConfig struct {
 	// ProjectID is the Linear project UUID. Required when configured under
@@ -143,6 +297,13 @@ type RepoConfig struct {
 	RepoDir string `yaml:"repo_dir"`
 	// BaseBranch is the branch new worktrees are forked from. Default: "main".
 	BaseBranch string `yaml:"base_branch"`
+	// VerifyCmd is the shell command admiral's L2 verify runs in the repo
+	// (via `sh -c`) before invoking the LLM judge — e.g. `"swift build"`,
+	// `"go build ./... && go test ./..."`. The exit code + tail output is
+	// fed to the judge as hard input. Empty = no verify command configured
+	// → L2 verify degrades to diff-only judgment and admiral logs a
+	// one-shot WARN at boot for this repo.
+	VerifyCmd string `yaml:"verify_cmd"`
 }
 
 type Launch struct {
@@ -219,6 +380,63 @@ func LoadAutopilot(path string) (*Config, error) {
 	return c, nil
 }
 
+// LoadDiscoverer is the entry point for cmd/admiral-discoverer. It
+// validates the linear / discoverer / storage / logging blocks; the
+// autopilot block is only consulted as a fallback for shared paths
+// (e.g. discoverer.judge.claude_bin defaults to autopilot.claude_bin
+// when the discoverer is co-deployed in the same config). Bridge-only
+// keys are ignored.
+func LoadDiscoverer(path string) (*Config, error) {
+	c, err := parse(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validateDiscovererAndExpand(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// DefaultVerifyMaxRounds is the default cap on the autonomous verification
+// loop. Exported so the autopilot orchestrator's defensive fallback shares
+// the single source of truth with the config default applied here.
+const DefaultVerifyMaxRounds = 3
+
+// defaultStateTypes is the discoverer's default Linear workflow-state.type
+// filter. Shared by validateDiscovererAndExpand and LoadPickupRules so the
+// planner and the discoverer can't drift on what "pickable" means.
+func defaultStateTypes() []string {
+	return []string{"backlog", "unstarted"}
+}
+
+// PickupRules is the subset of discoverer config the planner needs so the
+// issues it creates satisfy the discoverer's pickup gates (require_label +
+// state_types). Loaded without validating the linear / storage blocks —
+// admiral-planner-mcp reads its Linear token from the DB and has no storage
+// config, so the full discoverer validation doesn't apply to it.
+type PickupRules struct {
+	RequireLabel string
+	StateTypes   []string
+}
+
+// LoadPickupRules reads just the discoverer pickup rules from a config file,
+// applying the same defaults as the discoverer itself. Used by
+// admiral-planner-mcp to label / state issues so they get auto-discovered.
+func LoadPickupRules(path string) (PickupRules, error) {
+	c, err := parse(path)
+	if err != nil {
+		return PickupRules{}, err
+	}
+	st := c.Discoverer.StateTypes
+	if len(st) == 0 {
+		st = defaultStateTypes()
+	}
+	return PickupRules{
+		RequireLabel: strings.TrimSpace(c.Discoverer.RequireLabel),
+		StateTypes:   st,
+	}, nil
+}
+
 func parse(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -278,6 +496,9 @@ func (c *Config) validateAutopilotAndExpand() error {
 	if _, err := exec.LookPath(c.Autopilot.ClaudeBin); err != nil {
 		return fmt.Errorf("autopilot.claude_bin not found: %w", err)
 	}
+	if strings.TrimSpace(c.Autopilot.McpAskBin) == "" {
+		c.Autopilot.McpAskBin = "admiral-mcp-ask"
+	}
 	if strings.TrimSpace(c.Autopilot.GhBin) == "" {
 		c.Autopilot.GhBin = "gh"
 	}
@@ -300,6 +521,16 @@ func (c *Config) validateAutopilotAndExpand() error {
 	if c.Autopilot.MaxRunSeconds <= 0 {
 		c.Autopilot.MaxRunSeconds = 1800
 	}
+	if c.Autopilot.VerifyMaxRetries <= 0 {
+		// 0 retries (1-shot build) gives up on every claude first-attempt
+		// imperfection, which defeats the point of the gate. Default 2 means
+		// 3 build attempts total. Operators who want the 1-shot behavior can
+		// drop verify_cmd entirely to disable the gate.
+		c.Autopilot.VerifyMaxRetries = 2
+	}
+	if c.Autopilot.VerifyMaxRounds <= 0 {
+		c.Autopilot.VerifyMaxRounds = DefaultVerifyMaxRounds
+	}
 	if strings.TrimSpace(c.Autopilot.JobStreamsDir) == "" {
 		// Default: <sqlite_path dir>/job-streams
 		c.Autopilot.JobStreamsDir = filepath.Join(filepath.Dir(c.Storage.SQLitePath), "job-streams")
@@ -321,6 +552,84 @@ func (c *Config) validateAutopilotAndExpand() error {
 	if c.Autopilot.UpdateIssueStatus == nil {
 		trueVal := true
 		c.Autopilot.UpdateIssueStatus = &trueVal
+	}
+	if c.Autopilot.CIWatchPollInterval <= 0 {
+		c.Autopilot.CIWatchPollInterval = 30 * time.Second
+	}
+	if c.Autopilot.CIWatchTimeout <= 0 {
+		c.Autopilot.CIWatchTimeout = 15 * time.Minute
+	}
+	if c.Autopilot.BlockerPollInterval <= 0 {
+		c.Autopilot.BlockerPollInterval = 10 * time.Minute
+	}
+
+	c.Storage.SQLitePath = expandTilde(c.Storage.SQLitePath)
+	if c.Storage.SQLitePath == "" {
+		c.Storage.SQLitePath = expandTilde("~/.local/share/admiral/autopilot.db")
+	}
+	c.Logging.File = expandTilde(c.Logging.File)
+	if c.Logging.Level == "" {
+		c.Logging.Level = "info"
+	}
+	return nil
+}
+
+func (c *Config) validateDiscovererAndExpand() error {
+	if strings.TrimSpace(c.Linear.APIToken) == "" {
+		return fmt.Errorf("linear.api_token is required")
+	}
+	if strings.TrimSpace(c.Linear.APIBase) == "" {
+		c.Linear.APIBase = "https://api.linear.app/graphql"
+	}
+	if strings.TrimSpace(c.Linear.RedirectURI) == "" {
+		c.Linear.RedirectURI = "http://127.0.0.1:8080/callback"
+	}
+
+	d := &c.Discoverer
+	if d.PollInterval <= 0 {
+		d.PollInterval = 10 * time.Minute
+	}
+	if len(d.StateTypes) == 0 {
+		d.StateTypes = defaultStateTypes()
+	}
+	if d.MaxPickPerRound <= 0 {
+		d.MaxPickPerRound = 3
+	}
+
+	if d.Judge.Enabled == nil {
+		trueVal := true
+		d.Judge.Enabled = &trueVal
+	}
+	if *d.Judge.Enabled {
+		if strings.TrimSpace(d.Judge.ClaudeBin) == "" {
+			d.Judge.ClaudeBin = c.Autopilot.ClaudeBin
+		}
+		if strings.TrimSpace(d.Judge.ClaudeBin) == "" {
+			d.Judge.ClaudeBin = "claude"
+		}
+		if _, err := exec.LookPath(d.Judge.ClaudeBin); err != nil {
+			return fmt.Errorf("discoverer.judge.claude_bin not found: %w", err)
+		}
+		if d.Judge.Timeout <= 0 {
+			d.Judge.Timeout = 60 * time.Second
+		}
+	}
+
+	// Default to Linear's stock workflow-state names so a deploy on a
+	// default team layout works without yaml. Operators with renamed
+	// states (or non-English teams) still override via yaml.
+	if strings.TrimSpace(d.LinearStates.InReview) == "" {
+		d.LinearStates.InReview = "In Review"
+	}
+	if strings.TrimSpace(d.LinearStates.Reviewed) == "" {
+		d.LinearStates.Reviewed = "Reviewed"
+	}
+
+	if strings.TrimSpace(d.RequireLabel) == "" && !*d.Judge.Enabled {
+		c.Warnings = append(c.Warnings,
+			"discoverer.require_label is empty AND discoverer.judge.enabled is false — "+
+				"every unassigned candidate in opted-in projects will be auto-assigned. "+
+				"Set require_label or enable the judge.")
 	}
 
 	c.Storage.SQLitePath = expandTilde(c.Storage.SQLitePath)

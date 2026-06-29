@@ -38,6 +38,8 @@ func setupTestDB(t *testing.T) *testWorkerEnv {
 		`INSERT OR IGNORE INTO linear_oauth (id, access_token, refresh_token, expires_at, updated_at) VALUES (1, '', '', '', '');`,
 		`CREATE TABLE IF NOT EXISTS events_inbox (webhook_id TEXT PRIMARY KEY, action TEXT NOT NULL, session_id TEXT NOT NULL, issue_id TEXT, payload_json TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, last_error TEXT);`,
 		`CREATE INDEX IF NOT EXISTS events_inbox_status_received ON events_inbox(status, received_at);`,
+		`ALTER TABLE events_inbox ADD COLUMN source TEXT NOT NULL DEFAULT 'linear';`,
+		`ALTER TABLE events_inbox ADD COLUMN comment_id TEXT;`,
 	}
 	for _, m := range migrations {
 		if _, err := db.Exec(m); err != nil {

@@ -334,3 +334,356 @@ storage:
 		t.Errorf("MaxConcurrentRuns env override: got %d, want 11 (env should beat config 7)", cfg.Autopilot.MaxConcurrentRuns)
 	}
 }
+
+func TestLoadDiscoverer_LinearStatesDefaults(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+autopilot:
+  claude_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+discoverer:
+  require_label: "agent-ready"
+`
+	cfg, err := LoadDiscoverer(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadDiscoverer: %v", err)
+	}
+	if cfg.Discoverer.LinearStates.InReview != "In Review" {
+		t.Errorf("InReview default: got %q, want %q", cfg.Discoverer.LinearStates.InReview, "In Review")
+	}
+	if cfg.Discoverer.LinearStates.Reviewed != "Reviewed" {
+		t.Errorf("Reviewed default: got %q, want %q", cfg.Discoverer.LinearStates.Reviewed, "Reviewed")
+	}
+}
+
+func TestLoadDiscoverer_LinearStatesOverride(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+autopilot:
+  claude_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+discoverer:
+  require_label: "agent-ready"
+  linear_states:
+    in_review: "Code Review"
+    reviewed: "Approved"
+`
+	cfg, err := LoadDiscoverer(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadDiscoverer: %v", err)
+	}
+	if cfg.Discoverer.LinearStates.InReview != "Code Review" {
+		t.Errorf("InReview override: got %q, want %q", cfg.Discoverer.LinearStates.InReview, "Code Review")
+	}
+	if cfg.Discoverer.LinearStates.Reviewed != "Approved" {
+		t.Errorf("Reviewed override: got %q, want %q", cfg.Discoverer.LinearStates.Reviewed, "Approved")
+	}
+}
+
+func TestLoadDiscoverer_AutoMergeDefaultsOff(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+autopilot:
+  claude_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+discoverer:
+  require_label: "agent-ready"
+`
+	cfg, err := LoadDiscoverer(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadDiscoverer: %v", err)
+	}
+	if cfg.Discoverer.AutoMerge {
+		t.Error("AutoMerge default: got true, want false (opt-in safety gate)")
+	}
+}
+
+func TestLoadDiscoverer_AutoMergeEnabled(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+autopilot:
+  claude_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+discoverer:
+  require_label: "agent-ready"
+  auto_merge: true
+`
+	cfg, err := LoadDiscoverer(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadDiscoverer: %v", err)
+	}
+	if !cfg.Discoverer.AutoMerge {
+		t.Error("AutoMerge: got false, want true")
+	}
+}
+
+func TestLoadPickupRules_Defaults(t *testing.T) {
+	// No discoverer block at all → defaults apply, no drift from the
+	// discoverer's own state_types default.
+	p := writeConfig(t, "linear:\n  api_token: x\n")
+	rules, err := LoadPickupRules(p)
+	if err != nil {
+		t.Fatalf("LoadPickupRules: %v", err)
+	}
+	if rules.RequireLabel != "" {
+		t.Errorf("RequireLabel: got %q, want empty", rules.RequireLabel)
+	}
+	if len(rules.StateTypes) != 2 || rules.StateTypes[0] != "backlog" || rules.StateTypes[1] != "unstarted" {
+		t.Errorf("StateTypes default: got %v", rules.StateTypes)
+	}
+}
+
+func TestLoadPickupRules_FromConfig(t *testing.T) {
+	p := writeConfig(t, `
+discoverer:
+  require_label: "agent-ready"
+  state_types: ["triage"]
+`)
+	rules, err := LoadPickupRules(p)
+	if err != nil {
+		t.Fatalf("LoadPickupRules: %v", err)
+	}
+	if rules.RequireLabel != "agent-ready" {
+		t.Errorf("RequireLabel: got %q", rules.RequireLabel)
+	}
+	if len(rules.StateTypes) != 1 || rules.StateTypes[0] != "triage" {
+		t.Errorf("StateTypes: got %v", rules.StateTypes)
+	}
+}
+
+func TestLoadPickupRules_MissingFile(t *testing.T) {
+	if _, err := LoadPickupRules("/no/such/config.yaml"); err == nil {
+		t.Error("expected error for missing config file")
+	}
+}
+
+func TestLoadAutopilot_VerifyMaxRetriesRoundTrip(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  verify_max_retries: 5
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if got := cfg.Autopilot.VerifyMaxRetries; got != 5 {
+		t.Errorf("VerifyMaxRetries: got %d, want 5", got)
+	}
+}
+
+func TestLoadAutopilot_VerifyMaxRetriesDefault(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if got := cfg.Autopilot.VerifyMaxRetries; got != 2 {
+		t.Errorf("VerifyMaxRetries should default to 2 when omitted; got %d", got)
+	}
+}
+
+func TestLoadAutopilot_ReviewSkillRoundTrip(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  autopilot_skill: "oh-my-claudecode:autopilot"
+  review_skill: "oh-my-claudecode:ultraqa"
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if got := cfg.Autopilot.ReviewSkill; got != "oh-my-claudecode:ultraqa" {
+		t.Errorf("ReviewSkill: got %q", got)
+	}
+	if got := cfg.Autopilot.AutopilotSkill; got != "oh-my-claudecode:autopilot" {
+		t.Errorf("AutopilotSkill: got %q (regression — should still round-trip)", got)
+	}
+}
+
+func TestLoadAutopilot_ReviewSkillDefaultEmpty(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if cfg.Autopilot.ReviewSkill != "" {
+		t.Errorf("ReviewSkill should default to empty when omitted; got %q", cfg.Autopilot.ReviewSkill)
+	}
+}
+
+func TestLoadAutopilot_RepoVerifyCmdRoundTrip(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repos:
+    - project_id: "proj-with-cmd"
+      project_name: "WithVerifyCmd"
+      repo_dir: "` + t.TempDir() + `"
+      verify_cmd: "swift build && swift test"
+    - project_id: "proj-without-cmd"
+      project_name: "NoVerifyCmd"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if got := len(cfg.Autopilot.Repos); got != 2 {
+		t.Fatalf("Repos count: got %d, want 2", got)
+	}
+	if got := cfg.Autopilot.Repos[0].VerifyCmd; got != "swift build && swift test" {
+		t.Errorf("Repos[0].VerifyCmd: got %q", got)
+	}
+	if got := cfg.Autopilot.Repos[1].VerifyCmd; got != "" {
+		t.Errorf("Repos[1].VerifyCmd: got %q, want empty (omitted in YAML)", got)
+	}
+}
+
+func TestLoadAutopilot_BotIdentityRoundTrip(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  bot_identity:
+    name: "admiral-bot"
+    email: "admiral-bot@example.com"
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if got := cfg.Autopilot.BotIdentity.Name; got != "admiral-bot" {
+		t.Errorf("BotIdentity.Name: got %q", got)
+	}
+	if got := cfg.Autopilot.BotIdentity.Email; got != "admiral-bot@example.com" {
+		t.Errorf("BotIdentity.Email: got %q", got)
+	}
+	if !cfg.Autopilot.BotIdentity.IsSet() {
+		t.Errorf("IsSet should be true when both fields are set")
+	}
+}
+
+func TestLoadAutopilot_BotIdentityDefaultEmpty(t *testing.T) {
+	bin := os.Args[0]
+	body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+	cfg, err := LoadAutopilot(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadAutopilot: %v", err)
+	}
+	if cfg.Autopilot.BotIdentity.IsSet() {
+		t.Errorf("BotIdentity should be unset when omitted in YAML; got %+v", cfg.Autopilot.BotIdentity)
+	}
+}
+
+func TestBotIdentity_IsSet(t *testing.T) {
+	cases := []struct {
+		name string
+		id   BotIdentity
+		want bool
+	}{
+		{"both set", BotIdentity{Name: "a", Email: "b@c"}, true},
+		{"only name", BotIdentity{Name: "a"}, false},
+		{"only email", BotIdentity{Email: "b@c"}, false},
+		{"both empty", BotIdentity{}, false},
+		{"whitespace-only", BotIdentity{Name: "  ", Email: "\t"}, false},
+	}
+	for _, tc := range cases {
+		if got := tc.id.IsSet(); got != tc.want {
+			t.Errorf("%s: IsSet() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

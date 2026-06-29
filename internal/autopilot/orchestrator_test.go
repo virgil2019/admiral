@@ -2,9 +2,11 @@ package autopilot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -67,13 +69,16 @@ func TestBuildPrompt_AssignNoContext(t *testing.T) {
 	if !strings.Contains(p, "(assigned, no explicit prompt") {
 		t.Errorf("missing assign placeholder:\n%s", p)
 	}
-	if !strings.Contains(p, "git push -u origin \"linear/tst-1\"") &&
-		!strings.Contains(p, "git push -u origin linear/tst-1") {
-		t.Errorf("missing branch in operating procedure:\n%s", p)
+	if !strings.Contains(p, "linear/tst-1") {
+		t.Errorf("missing branch reference in operating procedure:\n%s", p)
 	}
-	if !strings.Contains(p, "--base \"main\"") &&
-		!strings.Contains(p, "--base main") {
-		t.Errorf("missing base branch in operating procedure:\n%s", p)
+	// admiral hard gate (#161 first-run slice): the prompt MUST tell claude to
+	// not push and not open a PR — admiral owns those after the build gate.
+	if !strings.Contains(p, "Do NOT run `git push`") {
+		t.Errorf("operating procedure should forbid `git push`:\n%s", p)
+	}
+	if !strings.Contains(p, "do NOT run `gh pr create`") {
+		t.Errorf("operating procedure should forbid `gh pr create`:\n%s", p)
 	}
 }
 
@@ -256,6 +261,51 @@ type mockLinearClient struct {
 	// IssueUpdate override
 	IssueUpdateCalls []struct{ IssueID, StateID string }
 	IssueUpdateErr   error
+
+	// GetIssueBlockers override
+	IssueBlockers    []linear.IssueBlocker
+	IssueBlockersErr error
+
+	// Verify loop (C4) overrides.
+	SubIssues         []linear.SubIssue
+	SubIssuesErr      error
+	SubIssuesByParent map[string][]linear.SubIssue // per-parent override (cascade tests)
+	IssueCreateResult *linear.Issue
+	IssueCreateErr    error
+	IssueCreateInputs []linear.IssueCreateInput
+	TeamLabelID       string
+	TeamLabelIDErr    error
+	CreatedComments   []struct{ IssueID, Body string }
+	CreateCommentErr  error
+	GetIssueByID      map[string]*linear.Issue // per-id GetIssue override (sub titles)
+
+	// Cascade walk (GetParentID) override.
+	ParentByChild  map[string]string
+	GetParentIDErr error
+
+	// RemoveIssueLabel recorder (/reset)
+	RemovedLabels       []struct{ IssueID, LabelID string }
+	RemoveIssueLabelErr error
+
+	// UnassignIssue recorder (/reset)
+	UnassignedIssues []string
+	UnassignIssueErr error
+
+	// Product verify overrides.
+	TopLevelIssues    []linear.Issue
+	TopLevelIssuesErr error
+	ProjectTeamID     string
+	ProjectTeamIDErr  error
+}
+
+func (m *mockLinearClient) RemoveIssueLabel(_ context.Context, issueID, labelID string) error {
+	m.RemovedLabels = append(m.RemovedLabels, struct{ IssueID, LabelID string }{issueID, labelID})
+	return m.RemoveIssueLabelErr
+}
+
+func (m *mockLinearClient) UnassignIssue(_ context.Context, issueID string) error {
+	m.UnassignedIssues = append(m.UnassignedIssues, issueID)
+	return m.UnassignIssueErr
 }
 
 func (m *mockLinearClient) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {
@@ -275,6 +325,9 @@ func (m *mockLinearClient) GetPostedBody() string {
 func (m *mockLinearClient) GetIssue(ctx context.Context, id string) (*linear.Issue, error) {
 	if m.GetIssueErr != nil {
 		return nil, m.GetIssueErr
+	}
+	if iss, ok := m.GetIssueByID[id]; ok {
+		return iss, nil
 	}
 	if m.GetIssueResult != nil {
 		return m.GetIssueResult, nil
@@ -298,6 +351,58 @@ func (m *mockLinearClient) GetWorkflowStates(ctx context.Context, teamID string)
 func (m *mockLinearClient) IssueUpdate(ctx context.Context, issueID, stateID string) error {
 	m.IssueUpdateCalls = append(m.IssueUpdateCalls, struct{ IssueID, StateID string }{issueID, stateID})
 	return m.IssueUpdateErr
+}
+
+func (m *mockLinearClient) GetIssueBlockers(_ context.Context, _ string) ([]linear.IssueBlocker, error) {
+	return m.IssueBlockers, m.IssueBlockersErr
+}
+
+func (m *mockLinearClient) GetSubIssues(_ context.Context, parentID string) ([]linear.SubIssue, error) {
+	if m.SubIssuesErr != nil {
+		return nil, m.SubIssuesErr
+	}
+	if m.SubIssuesByParent != nil {
+		if subs, ok := m.SubIssuesByParent[parentID]; ok {
+			return subs, nil
+		}
+		return nil, nil
+	}
+	return m.SubIssues, nil
+}
+
+func (m *mockLinearClient) GetParentID(_ context.Context, childID string) (string, error) {
+	if m.GetParentIDErr != nil {
+		return "", m.GetParentIDErr
+	}
+	return m.ParentByChild[childID], nil
+}
+
+func (m *mockLinearClient) IssueCreate(_ context.Context, in linear.IssueCreateInput) (*linear.Issue, error) {
+	m.IssueCreateInputs = append(m.IssueCreateInputs, in)
+	if m.IssueCreateErr != nil {
+		return nil, m.IssueCreateErr
+	}
+	if m.IssueCreateResult != nil {
+		return m.IssueCreateResult, nil
+	}
+	return &linear.Issue{ID: "new-" + in.Title, Identifier: "GEO-NEW", Title: in.Title}, nil
+}
+
+func (m *mockLinearClient) GetTeamLabelID(_ context.Context, _, _ string) (string, error) {
+	return m.TeamLabelID, m.TeamLabelIDErr
+}
+
+func (m *mockLinearClient) CreateComment(_ context.Context, issueID, body string) error {
+	m.CreatedComments = append(m.CreatedComments, struct{ IssueID, Body string }{issueID, body})
+	return m.CreateCommentErr
+}
+
+func (m *mockLinearClient) ListProjectTopLevelIssues(_ context.Context, _ string) ([]linear.Issue, error) {
+	return m.TopLevelIssues, m.TopLevelIssuesErr
+}
+
+func (m *mockLinearClient) GetProjectTeamID(_ context.Context, _ string) (string, error) {
+	return m.ProjectTeamID, m.ProjectTeamIDErr
 }
 
 // mockStore implements storeInterface for testing.
@@ -329,6 +434,8 @@ type mockStore struct {
 	// admiral_tasks (PR-B-v2)
 	AdmiralTask             *store.AdmiralTask
 	AdmiralTaskErr          error
+	AdmiralTaskByPRURL      *store.AdmiralTask
+	AdmiralTaskByPRURLErr   error
 	LiveAdmiralTask         *store.AdmiralTask // mutated by UpdateAdmiralTask via fn
 	ClaimAdmiralTaskFresh   *bool              // override return value (nil = default true)
 	ClaimAdmiralTaskErr     error
@@ -361,6 +468,54 @@ type mockStore struct {
 	// UpdateAutopilotJob, in call order. Useful for asserting the
 	// markAlreadyMerged path updated the new session.
 	UpdatedSessionIDs []string
+
+	// Blocker-related fields
+	SetBlockedCalls     []string // issueIDs passed to SetAdmiralTaskBlocked
+	BlockedTasks        []store.BlockedTask
+	TransitionBlockedOK bool
+
+	// task_verifications (C4) overrides.
+	TaskVerification        *store.TaskVerification
+	TaskVerificationByID    map[string]*store.TaskVerification // per-parent override; preferred over TaskVerification when set
+	TaskVerificationErr     error
+	BumpedTaskVerification  *store.TaskVerification
+	BumpTaskVerificationErr error
+	BumpCalls               []string
+	SetStatusCalls          []struct{ ParentID, Status string }
+	SetStatusErr            error
+	SetSummaryCalls         []struct{ ParentID, Summary string }
+	SetSummaryErr           error
+
+	// EnqueueEventWithSource recorder (cascade hop in applyVerifyVerdict).
+	Enqueued       []enqueuedEvent
+	EnqueueFresh   bool
+	EnqueueFreshOK bool // when true, EnqueueFresh is the returned freshness; when false, defaults to true
+	EnqueueErr     error
+
+	// product_verifications
+	ProductVerification        *store.ProductVerification
+	ProductVerificationErr     error
+	BumpedProductVerification  *store.ProductVerification
+	BumpProductVerificationErr error
+	ProductBumpCalls           []string
+	ProductSetStatusCalls      []struct{ ProjectID, Status string }
+	ProductSetStatusErr        error
+
+	// /reset cascade recorders (PR-B)
+	ResetIssueRowsCalls       []string
+	ResetIssueRowsErr         error
+	DeletedTaskVerifications  []string
+	DeleteTaskVerificationErr error
+}
+
+func (m *mockStore) ResetIssueRows(issueID string) error {
+	m.ResetIssueRowsCalls = append(m.ResetIssueRowsCalls, issueID)
+	return m.ResetIssueRowsErr
+}
+
+func (m *mockStore) DeleteTaskVerification(parentIssueID string) error {
+	m.DeletedTaskVerifications = append(m.DeletedTaskVerifications, parentIssueID)
+	return m.DeleteTaskVerificationErr
 }
 
 func (m *mockStore) AnyAutopilotJobActive() (bool, string, error) {
@@ -380,8 +535,8 @@ func (m *mockStore) GetAutopilotJob(sessionID string) (*store.AutopilotJob, erro
 
 func (m *mockStore) UpdateAutopilotJob(sessionID string, fn func(*store.AutopilotJob)) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.UpdatedSessionIDs = append(m.UpdatedSessionIDs, sessionID)
-	m.mu.Unlock()
 	if m.LastUpdatedJob != nil {
 		fn(m.LastUpdatedJob)
 	}
@@ -425,6 +580,10 @@ func (m *mockStore) GetAdmiralTaskByIssue(issueID string) (*store.AdmiralTask, e
 	return m.AdmiralTask, m.AdmiralTaskErr
 }
 
+func (m *mockStore) GetAdmiralTaskByPRURL(prURL string) (*store.AdmiralTask, error) {
+	return m.AdmiralTaskByPRURL, m.AdmiralTaskByPRURLErr
+}
+
 func (m *mockStore) ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -437,12 +596,25 @@ func (m *mockStore) ClaimAdmiralTask(issueID, identifier, lastEventSessionID str
 
 func (m *mockStore) UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask)) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.UpdatedAdmiralIssues = append(m.UpdatedAdmiralIssues, issueID)
-	m.mu.Unlock()
 	if m.LiveAdmiralTask != nil {
 		fn(m.LiveAdmiralTask)
 	}
 	return m.UpdateAdmiralTaskErr
+}
+
+// LiveAdmiralSnapshot returns a copy of LiveAdmiralTask read under m.mu so
+// tests polling for an async state transition from a dispatched goroutine
+// don't race with UpdateAdmiralTask's fn() writes. Returns the zero value
+// when no live task has been configured.
+func (m *mockStore) LiveAdmiralSnapshot() store.AdmiralTask {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.LiveAdmiralTask == nil {
+		return store.AdmiralTask{}
+	}
+	return *m.LiveAdmiralTask
 }
 
 func (m *mockStore) MoveAdmiralTaskToHistoryAndClaimNew(issueID, reason, identifier, lastEventSessionID string) (int, error) {
@@ -465,6 +637,131 @@ func (m *mockStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
 
 func (m *mockStore) ListJobsByIssueAndStates(issueID string, states []string) ([]store.AutopilotJob, error) {
 	return m.ListJobsByIssueAndStatesResult, m.ListJobsByIssueAndStatesErr
+}
+
+func (m *mockStore) SetAdmiralTaskBlocked(issueID, blockerIDs string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SetBlockedCalls = append(m.SetBlockedCalls, issueID)
+	return nil
+}
+
+// SetBlockedSnapshot returns a copy of SetBlockedCalls read under m.mu, for
+// tests asserting a park that may be driven from a spawned goroutine.
+func (m *mockStore) SetBlockedSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.SetBlockedCalls))
+	copy(out, m.SetBlockedCalls)
+	return out
+}
+
+func (m *mockStore) GetBlockedAdmiralTasks() ([]store.BlockedTask, error) {
+	return m.BlockedTasks, nil
+}
+
+func (m *mockStore) TransitionBlockedToReceived(issueID string) (bool, error) {
+	return m.TransitionBlockedOK, nil
+}
+
+func (m *mockStore) InsertPendingQuestion(q store.PendingQuestion) error { return nil }
+func (m *mockStore) GetOpenPendingQuestionByIssue(issueID string) (*store.PendingQuestion, error) {
+	return nil, nil
+}
+func (m *mockStore) AnswerPendingQuestion(id, answer string) error { return nil }
+func (m *mockStore) SetAdmiralTaskAwaitingInput(issueID, pendingQuestionID string) error {
+	return nil
+}
+func (m *mockStore) TransitionAwaitingInputToExecuting(issueID string) (bool, error) {
+	return true, nil
+}
+func (m *mockStore) GetPendingQuestionByID(id string) (*store.PendingQuestion, error) {
+	return nil, nil
+}
+func (m *mockStore) CancelOpenPendingQuestionsForIssue(issueID string) error { return nil }
+
+func (m *mockStore) GetTaskVerification(parentIssueID string) (*store.TaskVerification, error) {
+	if m.TaskVerificationErr != nil {
+		return nil, m.TaskVerificationErr
+	}
+	if m.TaskVerificationByID != nil {
+		// Map mode is exclusive: an absent key means "no verification for
+		// this parent", not "fall through to the singular default" — avoids
+		// tests accidentally leaking the singular value to subs it wasn't
+		// meant for.
+		if tv, ok := m.TaskVerificationByID[parentIssueID]; ok {
+			return tv, nil
+		}
+		return nil, nil
+	}
+	return m.TaskVerification, nil
+}
+
+func (m *mockStore) BumpTaskVerificationRound(parentIssueID string) (*store.TaskVerification, error) {
+	m.mu.Lock()
+	m.BumpCalls = append(m.BumpCalls, parentIssueID)
+	m.mu.Unlock()
+	return m.BumpedTaskVerification, m.BumpTaskVerificationErr
+}
+
+func (m *mockStore) SetTaskVerificationStatus(parentIssueID, status string) error {
+	m.mu.Lock()
+	m.SetStatusCalls = append(m.SetStatusCalls, struct{ ParentID, Status string }{parentIssueID, status})
+	m.mu.Unlock()
+	return m.SetStatusErr
+}
+
+func (m *mockStore) SetTaskVerificationSummary(parentIssueID, summary string) error {
+	m.mu.Lock()
+	m.SetSummaryCalls = append(m.SetSummaryCalls, struct{ ParentID, Summary string }{parentIssueID, summary})
+	m.mu.Unlock()
+	return m.SetSummaryErr
+}
+
+// enqueuedEvent captures one EnqueueEventWithSource call by mockStore, used by
+// cascade-hop tests to assert the verify event for the next level up was filed.
+type enqueuedEvent struct {
+	Source     string
+	WebhookID  string
+	Action     string
+	SessionID  string
+	IssueID    string
+	Payload    string
+	DeliveryID string
+}
+
+func (m *mockStore) EnqueueEventWithSource(source, webhookID, action, sessionID, issueID, payloadJSON, commentID string) (bool, error) {
+	m.mu.Lock()
+	m.Enqueued = append(m.Enqueued, enqueuedEvent{
+		Source: source, WebhookID: webhookID, Action: action,
+		SessionID: sessionID, IssueID: issueID, Payload: payloadJSON, DeliveryID: commentID,
+	})
+	m.mu.Unlock()
+	if m.EnqueueErr != nil {
+		return false, m.EnqueueErr
+	}
+	if m.EnqueueFreshOK {
+		return m.EnqueueFresh, nil
+	}
+	return true, nil
+}
+
+func (m *mockStore) GetProductVerification(projectID string) (*store.ProductVerification, error) {
+	return m.ProductVerification, m.ProductVerificationErr
+}
+
+func (m *mockStore) BumpProductVerificationRound(projectID string) (*store.ProductVerification, error) {
+	m.mu.Lock()
+	m.ProductBumpCalls = append(m.ProductBumpCalls, projectID)
+	m.mu.Unlock()
+	return m.BumpedProductVerification, m.BumpProductVerificationErr
+}
+
+func (m *mockStore) SetProductVerificationStatus(projectID, status string) error {
+	m.mu.Lock()
+	m.ProductSetStatusCalls = append(m.ProductSetStatusCalls, struct{ ProjectID, Status string }{projectID, status})
+	m.mu.Unlock()
+	return m.ProductSetStatusErr
 }
 
 // fakeGhProbe is a deterministic ghProbe for tests. Configure the maps
@@ -1203,6 +1500,9 @@ func TestHandlePrompted_NoHistory(t *testing.T) {
 	if !strings.Contains(mlc.GetPostedBody(), "Available commands") {
 		t.Errorf("expected '/help' response, got: %s", mlc.GetPostedBody())
 	}
+	if mlc.PostedActivity.Type != linear.ActivityResponse {
+		t.Errorf("/help must post ActivityResponse (info), got %q", mlc.PostedActivity.Type)
+	}
 }
 
 func TestHandlePrompted_NoClaudeSessionID(t *testing.T) {
@@ -1231,6 +1531,9 @@ func TestHandlePrompted_NoClaudeSessionID(t *testing.T) {
 	// The NoClaudeSessionID path is only reached via /help (not /status which has its own handling).
 	if !strings.Contains(mlc.GetPostedBody(), "Available commands") {
 		t.Errorf("expected '/help' response, got: %s", mlc.GetPostedBody())
+	}
+	if mlc.PostedActivity.Type != linear.ActivityResponse {
+		t.Errorf("/help must post ActivityResponse (info), got %q", mlc.PostedActivity.Type)
 	}
 }
 
@@ -1288,6 +1591,7 @@ func TestHandleCreated_BareMention_Rejected(t *testing.T) {
 		IssueID:         "issue-bare",
 		IssueIdentifier: "BAR-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-bare",
 		PromptContext:   "please do something", // no leading /command
 	}
 
@@ -1296,6 +1600,9 @@ func TestHandleCreated_BareMention_Rejected(t *testing.T) {
 	// Help text must be posted.
 	if !strings.Contains(mlc.GetPostedBody(), "does not respond to bare @mentions") {
 		t.Errorf("expected bare mention help text in posted body, got: %s", mlc.GetPostedBody())
+	}
+	if mlc.PostedActivity.Type != linear.ActivityError {
+		t.Errorf("rejection must post ActivityError, got %q", mlc.PostedActivity.Type)
 	}
 	// No job claimed and no DB write — rejection is observability-only.
 	if got := ms.ClaimedSnapshot(); len(got) != 0 {
@@ -1321,6 +1628,7 @@ func TestHandleCreated_UnknownCommand_Rejected(t *testing.T) {
 		IssueID:         "issue-unknown",
 		IssueIdentifier: "UNK-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-unknown",
 		PromptContext:   "/foobar extra args",
 	}
 
@@ -1331,6 +1639,9 @@ func TestHandleCreated_UnknownCommand_Rejected(t *testing.T) {
 	}
 	if !strings.Contains(mlc.GetPostedBody(), "/foobar") {
 		t.Errorf("expected unrecognized command name in reply, got: %s", mlc.GetPostedBody())
+	}
+	if mlc.PostedActivity.Type != linear.ActivityError {
+		t.Errorf("rejection must post ActivityError, got %q", mlc.PostedActivity.Type)
 	}
 	ms.mu.Lock()
 	updates := append([]string(nil), ms.UpdatedSessionIDs...)
@@ -1361,6 +1672,7 @@ func TestHandleCreated_FixCommand_LegacyRowRejected(t *testing.T) {
 		IssueID:         "issue-fix-legacy",
 		IssueIdentifier: "FIX-LEG-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-fix-legacy",
 		PromptContext:   "/fix change v1 to v2",
 	}
 
@@ -1369,6 +1681,9 @@ func TestHandleCreated_FixCommand_LegacyRowRejected(t *testing.T) {
 	body := mlc.GetPostedBody()
 	if !strings.Contains(body, "/fix needs a prior run with both an open PR and a recoverable claude session") {
 		t.Errorf("expected legacy-row /fix reject message, got: %s", body)
+	}
+	if mlc.PostedActivity.Type != linear.ActivityError {
+		t.Errorf("rejection must post ActivityError, got %q", mlc.PostedActivity.Type)
 	}
 	// State must NOT advance — the only allowed mutation is dispatch's
 	// last_event_session_id refresh.
@@ -1505,64 +1820,253 @@ func TestHandlePrompted_UnknownCommand_PreservesState(t *testing.T) {
 }
 
 // ---- Tests for ensureWorktree ----
+//
+// remoteFixture sets up a bare origin, a local clone, and an advancer clone
+// for pushing external commits. ensureWorktree's contract: reuse the worktree
+// if on disk, else rebuild from the local branch ref so admiral's prior
+// unpushed commits are preserved; then fetch and refuse to proceed if origin
+// has commits the worktree doesn't know about.
 
-func TestEnsureWorktree_AlreadyExists(t *testing.T) {
-	tmp := t.TempDir()
-	worktreePath := filepath.Join(tmp, "existing-worktree")
-	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-		t.Fatalf("mkdir failed: %v", err)
+type remoteFixture struct {
+	originDir   string
+	localDir    string
+	advancerDir string
+	branch      string
+}
+
+func setupRemoteFixture(t *testing.T) *remoteFixture {
+	t.Helper()
+	if err := exec.Command("git", "--version").Run(); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	mustGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s in %s: %v: %s", strings.Join(args, " "), dir, err, out)
+		}
 	}
 
-	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: tmp}, logger: slog.Default()}
-	f := &flow{
-		o: o,
-		job: &store.AutopilotJob{
-			WorktreePath: worktreePath,
-			Branch:       "linear/test-branch",
-		},
-	}
+	root := t.TempDir()
+	originDir := filepath.Join(root, "origin.git")
+	localDir := filepath.Join(root, "local")
+	advancerDir := filepath.Join(root, "advancer")
+	branch := "linear/test"
 
-	err := f.ensureWorktree()
-	if err != nil {
-		t.Fatalf("ensureWorktree failed: %v", err)
+	mustGit(root, "init", "--bare", originDir)
+
+	seedDir := filepath.Join(root, "seed")
+	if err := os.MkdirAll(seedDir, 0o755); err != nil {
+		t.Fatalf("mkdir seed: %v", err)
 	}
-	if f.worktreePath != worktreePath {
-		t.Errorf("worktreePath = %q, want %q", f.worktreePath, worktreePath)
+	mustGit(seedDir, "init", "-b", "main")
+	mustGit(seedDir, "config", "user.email", "test@test.com")
+	mustGit(seedDir, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(seedDir, "README"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
 	}
-	if f.branch != "linear/test-branch" {
-		t.Errorf("branch = %q, want %q", f.branch, "linear/test-branch")
+	mustGit(seedDir, "add", "README")
+	mustGit(seedDir, "commit", "-m", "v1")
+	mustGit(seedDir, "checkout", "-b", branch)
+	mustGit(seedDir, "remote", "add", "origin", originDir)
+	mustGit(seedDir, "push", "origin", branch)
+
+	mustGit(root, "clone", originDir, localDir)
+	mustGit(localDir, "config", "user.email", "test@test.com")
+	mustGit(localDir, "config", "user.name", "test")
+	mustGit(localDir, "fetch", "origin", branch)
+	mustGit(localDir, "branch", branch, "origin/"+branch)
+
+	mustGit(root, "clone", "-b", branch, originDir, advancerDir)
+	mustGit(advancerDir, "config", "user.email", "advancer@test.com")
+	mustGit(advancerDir, "config", "user.name", "advancer")
+
+	return &remoteFixture{
+		originDir:   originDir,
+		localDir:    localDir,
+		advancerDir: advancerDir,
+		branch:      branch,
 	}
 }
 
-func TestEnsureWorktree_NeedsRebuild(t *testing.T) {
-	// Test that ensureWorktree sets the correct paths when worktree doesn't exist.
-	// The actual git operations are tested separately in integration tests.
-	tmp := t.TempDir()
-	worktreePath := filepath.Join(tmp, "nonexistent-worktree")
+// advance pushes a commit to origin from advancerDir, simulating a human or
+// another admiral session moving the branch forward.
+func (f *remoteFixture) advance(t *testing.T, content string) string {
+	t.Helper()
+	mustGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s in %s: %v: %s", strings.Join(args, " "), dir, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(f.advancerDir, "README"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	mustGit(f.advancerDir, "add", "README")
+	mustGit(f.advancerDir, "commit", "-m", "advance:"+content)
+	mustGit(f.advancerDir, "push", "origin", f.branch)
+	cmd := exec.Command("git", "rev-parse", f.branch)
+	cmd.Dir = f.originDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse %s in %s: %v: %s", f.branch, f.originDir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
 
-	o := &Orchestrator{cfg: &config.Autopilot{RepoDir: tmp}, logger: slog.Default()}
-	f := &flow{
-		o: o,
+func gitHead(t *testing.T, dir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD in %s: %v: %s", dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// resumeWorktreeAt creates a worktree at <path> checked out at <branch> in the
+// given local repo, returning the path. Used to seed the reuse path.
+func resumeWorktreeAt(t *testing.T, localDir, branch, path string) {
+	t.Helper()
+	cmd := exec.Command("git", "worktree", "add", path, branch)
+	cmd.Dir = localDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed worktree at %s: %v: %s", path, err, out)
+	}
+}
+
+// commitInWorktree adds a file and commits it inside worktreePath, returning
+// the new HEAD SHA. Used to put the worktree ahead of origin (the normal state
+// after a timed-out claude run that committed but never pushed).
+func commitInWorktree(t *testing.T, worktreePath, filename, content, msg string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(worktreePath, filename), []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", filename, err)
+	}
+	for _, args := range [][]string{
+		{"add", filename},
+		{"commit", "-m", msg},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = worktreePath
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s in %s: %v: %s", strings.Join(args, " "), worktreePath, err, out)
+		}
+	}
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = worktreePath
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD in %s: %v: %s", worktreePath, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// newEnsureWorktreeFlow builds a minimal flow suitable for driving
+// ensureWorktree against a real fixture. The orchestrator needs a non-nil
+// cfg so the bot-identity apply step can read its (empty) BotIdentity field
+// without panicking; the empty value short-circuits the apply, matching the
+// pre-#162 no-bot behavior.
+func newEnsureWorktreeFlow(repoDir, branch, worktreePath string) *flow {
+	o := &Orchestrator{logger: slog.Default(), cfg: &config.Autopilot{}}
+	return &flow{
+		o:       o,
+		repoDir: repoDir,
 		job: &store.AutopilotJob{
 			WorktreePath: worktreePath,
-			Branch:       "linear/test-branch",
+			Branch:       branch,
 		},
 	}
+}
 
-	// Worktree doesn't exist, so ensureWorktree will try to rebuild.
-	// We expect it to attempt git fetch/worktree add, which will fail
-	// in this test environment without a real remote.
-	if _, err := os.Stat(worktreePath); err == nil {
-		t.Fatalf("worktree should not exist yet")
+// Reuse, local ahead of origin (the normal timed-out → resume state).
+// Origin is unchanged; the worktree has admiral's unpushed commit. push will
+// fast-forward, so ensureWorktree must succeed.
+func TestEnsureWorktree_ReuseLocalAheadOK(t *testing.T) {
+	fx := setupRemoteFixture(t)
+	worktreePath := filepath.Join(fx.localDir, ".worktrees", "resume-test")
+	resumeWorktreeAt(t, fx.localDir, fx.branch, worktreePath)
+	localHead := commitInWorktree(t, worktreePath, "claude.txt", "wip", "claude wip")
+
+	f := newEnsureWorktreeFlow(fx.localDir, fx.branch, worktreePath)
+	if err := f.ensureWorktree(); err != nil {
+		t.Fatalf("ensureWorktree: %v", err)
 	}
+	if f.worktreePath != worktreePath {
+		t.Errorf("worktreePath: got %q want %q", f.worktreePath, worktreePath)
+	}
+	if h := gitHead(t, worktreePath); h != localHead {
+		t.Errorf("worktree HEAD: got %s want %s (local should still be ahead)", h, localHead)
+	}
+}
 
-	// This will fail on git fetch since we don't have a real remote,
-	// but it verifies the code path is correct.
+// Reuse, branch diverged: claude committed locally but someone else pushed a
+// disjoint commit to origin. ensureWorktree must refuse to proceed — auto-
+// rebase isn't safe, the user has to intervene.
+func TestEnsureWorktree_ReuseDivergedErrors(t *testing.T) {
+	fx := setupRemoteFixture(t)
+	worktreePath := filepath.Join(fx.localDir, ".worktrees", "resume-test")
+	resumeWorktreeAt(t, fx.localDir, fx.branch, worktreePath)
+	commitInWorktree(t, worktreePath, "claude.txt", "wip", "claude wip")
+	fx.advance(t, "external\n") // origin moves to a commit the worktree doesn't have
+
+	f := newEnsureWorktreeFlow(fx.localDir, fx.branch, worktreePath)
 	err := f.ensureWorktree()
 	if err == nil {
-		t.Log("ensureWorktree succeeded (unexpected in this env)")
-	} else {
-		t.Logf("ensureWorktree failed as expected in test env: %v", err)
+		t.Fatal("expected ensureWorktree to error on divergence, got nil")
+	}
+	if !errors.Is(err, errBranchDiverged) {
+		t.Errorf("error should wrap errBranchDiverged so markFailed can keep the worktree; got %q", err.Error())
+	}
+	// The user-actionable message must call out the worktree path so the
+	// "rebase inside that worktree" instruction is actionable.
+	if !strings.Contains(err.Error(), worktreePath) {
+		t.Errorf("error should include worktree path %q; got %q", worktreePath, err.Error())
+	}
+}
+
+// Reuse, local equal to origin: neither side moved since the prior run.
+// Should pass — origin is an ancestor of HEAD (equal counts as ancestor).
+func TestEnsureWorktree_ReuseEqualOK(t *testing.T) {
+	fx := setupRemoteFixture(t)
+	worktreePath := filepath.Join(fx.localDir, ".worktrees", "resume-test")
+	resumeWorktreeAt(t, fx.localDir, fx.branch, worktreePath)
+
+	f := newEnsureWorktreeFlow(fx.localDir, fx.branch, worktreePath)
+	if err := f.ensureWorktree(); err != nil {
+		t.Fatalf("ensureWorktree: %v", err)
+	}
+}
+
+// Rebuild path: the worktree directory was cleaned up but the local branch
+// ref still has admiral's prior commits in the parent repo's object store.
+// `git worktree add <path> <branch>` re-checks out those local commits;
+// ensureWorktree's divergence check should not error because origin is at the
+// original base (still an ancestor of the local tip).
+func TestEnsureWorktree_RebuildPreservesLocalCommits(t *testing.T) {
+	fx := setupRemoteFixture(t)
+	stagingPath := filepath.Join(fx.localDir, ".worktrees", "resume-test-staging")
+	resumeWorktreeAt(t, fx.localDir, fx.branch, stagingPath)
+	localHead := commitInWorktree(t, stagingPath, "claude.txt", "wip", "claude wip")
+	// Remove the staging worktree directory but keep the local branch ref it
+	// advanced — that's the state ensureWorktree's rebuild branch handles.
+	cmd := exec.Command("git", "worktree", "remove", "--force", stagingPath)
+	cmd.Dir = fx.localDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("remove staging worktree: %v: %s", err, out)
+	}
+
+	rebuildPath := filepath.Join(fx.localDir, ".worktrees", "resume-test")
+	f := newEnsureWorktreeFlow(fx.localDir, fx.branch, rebuildPath)
+	if err := f.ensureWorktree(); err != nil {
+		t.Fatalf("ensureWorktree (rebuild): %v", err)
+	}
+	if h := gitHead(t, rebuildPath); h != localHead {
+		t.Errorf("rebuilt worktree HEAD: got %s want %s (local commit must be preserved)", h, localHead)
 	}
 }
 
@@ -2145,10 +2649,148 @@ func TestClassifyGhCreateError(t *testing.T) {
 	}
 }
 
+// TestGhCreateWithRetry_RetriesTransientThenSucceeds covers the failure mode
+// from the original incident (admiral job failed with a GraphQL "unexpected
+// EOF" during `gh pr create`'s internal check-existing-PR step): the first
+// attempt should backoff + retry on transient errors, the second should
+// succeed.
+func TestGhCreateWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
+	calls := 0
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		calls++
+		if calls < 2 {
+			return `Post "https://api.github.com/graphql": unexpected EOF`, fmt.Errorf("exit status 1")
+		}
+		return "https://github.com/owner/repo/pull/42\n", nil
+	}
+	out, err := ghCreateWithRetry(context.Background(), gh, []time.Duration{0, 0, 0},
+		"pr", "create", "--base", "main", "--head", "feat/x")
+	if err != nil {
+		t.Fatalf("expected success after retry, got %v", err)
+	}
+	if !strings.Contains(out, "pull/42") {
+		t.Fatalf("unexpected out: %s", out)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls (1 transient + 1 ok), got %d", calls)
+	}
+}
+
+// TestGhCreateWithRetry_ExhaustsReturnsError ensures a persistent transient
+// failure surfaces as a real error once the backoff schedule is exhausted —
+// so a chronically-flaky network doesn't loop forever.
+func TestGhCreateWithRetry_ExhaustsReturnsError(t *testing.T) {
+	calls := 0
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		calls++
+		return `Post "https://api.github.com/graphql": unexpected EOF`, fmt.Errorf("exit status 1")
+	}
+	out, err := ghCreateWithRetry(context.Background(), gh, []time.Duration{0, 0},
+		"pr", "create", "--base", "main", "--head", "feat/x")
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 calls (1 + 2 retries), got %d", calls)
+	}
+	// Output preserved so the caller's classifyGhCreateError dispatch + error
+	// message can still see the upstream stderr.
+	if !strings.Contains(out, "unexpected EOF") {
+		t.Fatalf("expected EOF text preserved in out: %s", out)
+	}
+}
+
+// TestGhCreateWithRetry_NonTransientNoRetry covers the soft failure shapes
+// (already-exists / no-commits-between) and the fatal fall-through: none
+// should retry — they're not network blips, and retrying "already exists"
+// would just waste time before the caller's lookupPR recovery.
+func TestGhCreateWithRetry_NonTransientNoRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  string
+	}{
+		{
+			name: "already exists",
+			out:  `a pull request for branch "feat/x" into branch "main" already exists`,
+		},
+		{
+			name: "no commits between",
+			out:  "pull request create failed: GraphQL: No commits between main and feat/x (createPullRequest)",
+		},
+		{
+			name: "fatal auth",
+			out:  "error: GraphQL: Resource not accessible by integration",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			gh := func(ctx context.Context, args ...string) (string, error) {
+				calls++
+				return tc.out, fmt.Errorf("exit status 1")
+			}
+			_, err := ghCreateWithRetry(context.Background(), gh, []time.Duration{0, 0, 0},
+				"pr", "create", "--base", "main", "--head", "feat/x")
+			if err == nil {
+				t.Fatal("expected error from non-transient failure")
+			}
+			if calls != 1 {
+				t.Fatalf("non-transient must not retry, got %d calls", calls)
+			}
+		})
+	}
+}
+
+// TestGhCreateWithRetry_TransientThenAlreadyExistsStopsRetrying covers the
+// post-EOF idempotency path: attempt 1 dies with a transient error mid-create
+// (mutation may or may not have committed server-side), attempt 2 sees
+// "already exists" — the helper must hand that back to the caller without
+// further retry so ensurePR's lookupPR recovery branch can run.
+func TestGhCreateWithRetry_TransientThenAlreadyExistsStopsRetrying(t *testing.T) {
+	calls := 0
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		calls++
+		if calls == 1 {
+			return `Post "https://api.github.com/graphql": unexpected EOF`, fmt.Errorf("exit status 1")
+		}
+		return `a pull request for branch "feat/x" into branch "main" already exists`, fmt.Errorf("exit status 1")
+	}
+	out, err := ghCreateWithRetry(context.Background(), gh, []time.Duration{0, 0, 0},
+		"pr", "create", "--base", "main", "--head", "feat/x")
+	if err == nil {
+		t.Fatal("expected error to surface so the caller dispatch can run")
+	}
+	if !strings.Contains(out, "already exists") {
+		t.Fatalf("expected already-exists output preserved for caller, got: %s", out)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls (1 transient + 1 non-transient stop), got %d", calls)
+	}
+}
+
+// TestGhCreateWithRetry_RespectsContextCancellation guards against the
+// backoff sleep ignoring a cancelled context (which would defer abort by up
+// to the longest delay in the schedule).
+func TestGhCreateWithRetry_RespectsContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls := 0
+	gh := func(_ context.Context, args ...string) (string, error) {
+		calls++
+		return `Post "https://api.github.com/graphql": unexpected EOF`, fmt.Errorf("exit status 1")
+	}
+	_, err := ghCreateWithRetry(ctx, gh, []time.Duration{time.Hour}, "pr", "create")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 call before cancellation aborts the backoff, got %d", calls)
+	}
+}
+
 // ---- GEO-50 dispatch tests (PR-B-v1) ----
 
-// TestDispatch_FirstTimeAssign_DispatchesTask verifies that an assign
-// event (Action=created, no PromptContext) for an issue admiral has
+// TestDispatch_FirstTimeAssign_DispatchesTask verifies that a delegate
+// event (Action=created, no SourceCommentID) for an issue admiral has
 // never seen before claims the autopilot_jobs row.
 func TestDispatch_FirstTimeAssign_DispatchesTask(t *testing.T) {
 	mlc := &mockLinearClient{
@@ -2161,7 +2803,8 @@ func TestDispatch_FirstTimeAssign_DispatchesTask(t *testing.T) {
 		IssueID:         "issue-fresh",
 		IssueIdentifier: "FRESH-1",
 		Action:          linear.ActionCreated,
-		// PromptContext intentionally empty → assign signal
+		// SourceCommentID empty → delegate, not @mention.
+		// PromptContext also empty → user assigned without typing a prompt.
 	}
 
 	o.HandleAgentEvent(ev)
@@ -2194,6 +2837,46 @@ func TestDispatch_FirstTimeAssign_DispatchesTask(t *testing.T) {
 	}
 }
 
+// TestDispatch_FirstTimeAssignWithPrompt_DispatchesTask is the GEO-60
+// regression: a delegate event (created, no SourceCommentID) carries an
+// initial prompt in PromptContext. Pre-fix, dispatch checked text
+// emptiness and wrongly classified this as @mention, then rejected with
+// assignFirstHelp. Post-fix it must claim like any other delegate.
+// PromptContext propagation through buildPrompt is covered separately by
+// TestBuildPrompt_MentionWithContext.
+func TestDispatch_FirstTimeAssignWithPrompt_DispatchesTask(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
+	}
+	ms := &mockStore{}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-fresh-prompt",
+		IssueID:         "issue-fresh-prompt",
+		IssueIdentifier: "FRESH-PROMPT-1",
+		Action:          linear.ActionCreated,
+		// SourceCommentID empty → delegate, even though PromptContext is set.
+		PromptContext: "please refactor the module while you're at it",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ms.ClaimedSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "sess-fresh-prompt" {
+		t.Errorf("delegate-with-prompt should claim like a bare delegate; got %v", got)
+	}
+	body := mlc.GetPostedBody()
+	if strings.Contains(body, "Issue not assigned to admiral") {
+		t.Errorf("delegate-with-prompt must not post assign-first rejection; got: %s", body)
+	}
+}
+
 // TestDispatch_FirstTimeMention_RequestsAssign verifies that an @mention
 // or prompted event for an issue admiral has never seen is rejected with
 // the "assign first" reply, no claim, no DB write.
@@ -2206,7 +2889,8 @@ func TestDispatch_FirstTimeMention_RequestsAssign(t *testing.T) {
 		IssueID:         "issue-stray",
 		IssueIdentifier: "STRAY-1",
 		Action:          linear.ActionCreated,
-		PromptContext:   "@admiral please look at this", // non-empty → mention, not assign
+		SourceCommentID: "comment-stray", // non-empty → @mention, not delegate
+		PromptContext:   "@admiral please look at this",
 	}
 
 	o.HandleAgentEvent(ev)
@@ -2214,6 +2898,9 @@ func TestDispatch_FirstTimeMention_RequestsAssign(t *testing.T) {
 	body := mlc.GetPostedBody()
 	if !strings.Contains(body, "Issue not assigned to admiral") {
 		t.Errorf("expected assign-first reply, got: %s", body)
+	}
+	if mlc.PostedActivity.Type != linear.ActivityError {
+		t.Errorf("rejection must post ActivityError, got %q", mlc.PostedActivity.Type)
 	}
 	if got := ms.ClaimedSnapshot(); len(got) != 0 {
 		t.Errorf("first-time mention must not claim; got %v", got)
@@ -2244,6 +2931,9 @@ func TestDispatch_FirstTimePrompted_RequestsAssign(t *testing.T) {
 
 	if !strings.Contains(mlc.GetPostedBody(), "Issue not assigned to admiral") {
 		t.Errorf("expected assign-first reply on prompted with no prior task, got: %s", mlc.GetPostedBody())
+	}
+	if mlc.PostedActivity.Type != linear.ActivityError {
+		t.Errorf("rejection must post ActivityError, got %q", mlc.PostedActivity.Type)
 	}
 }
 
@@ -2296,6 +2986,7 @@ func TestDispatch_RerunWhileActive_Rejected(t *testing.T) {
 		IssueID:         "issue-busy",
 		IssueIdentifier: "BUSY-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-rerun-busy",
 		PromptContext:   "/rerun",
 	}
 
@@ -2307,6 +2998,12 @@ func TestDispatch_RerunWhileActive_Rejected(t *testing.T) {
 	}
 	if !strings.Contains(body, "BUSY-1") {
 		t.Errorf("expected issue identifier in reply, got: %s", body)
+	}
+	// In-flight rejection must be Thought, not ErrorActivity, so the live
+	// AgentSession isn't terminated and the running flow's progress posts
+	// keep landing.
+	if mlc.PostedActivity.Type != linear.ActivityThought {
+		t.Errorf("rejection on in-flight task must post ActivityThought, got %q", mlc.PostedActivity.Type)
 	}
 	if got := ms.SupersededAdmiralIssues; len(got) != 0 {
 		t.Errorf("rerun-while-active must not supersede admiral_tasks; got %v", got)
@@ -2334,6 +3031,7 @@ func TestDispatch_RerunOnDone_Supersedes(t *testing.T) {
 		IssueID:         "issue-done",
 		IssueIdentifier: "DONE-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-rerun-done",
 		PromptContext:   "/rerun fix the typo",
 	}
 
@@ -2352,6 +3050,52 @@ func TestDispatch_RerunOnDone_Supersedes(t *testing.T) {
 	}
 	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "sess-rerun" {
 		t.Errorf("expected fresh autopilot_jobs claim with new session id; got %v", got)
+	}
+}
+
+// TestDispatch_RerunOnDone_ParksWhenBlocked verifies /rerun respects blockers
+// like a fresh assign: a DONE task whose issue still has unresolved blockers is
+// superseded (fresh attempt claimed) and then parked BLOCKED instead of
+// spawning a run. The BlockerWatcher resumes it once the blockers clear. This
+// closes the gap where /rerun bypassed the dependency gate and shipped a
+// sub-issue before its foundation.
+func TestDispatch_RerunOnDone_ParksWhenBlocked(t *testing.T) {
+	mlc := &mockLinearClient{
+		IssueBlockers: []linear.IssueBlocker{{IssueID: "id-A", IssueIdentifier: "GEO-A"}},
+	}
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:  "issue-b",
+			State:    store.JobStateDone,
+			AttemptN: 1,
+			PRURL:    "https://github.com/x/y/pull/1",
+		},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-rerun",
+		IssueID:         "issue-b",
+		IssueIdentifier: "GEO-B",
+		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-rerun",
+		PromptContext:   "/rerun",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	// Supersede still happens before the gate (fresh attempt claimed).
+	if got := ms.SupersededAdmiralIssues; len(got) != 1 || got[0] != "issue-b" {
+		t.Errorf("expected supersession on issue-b; got %v", got)
+	}
+	// Parked BLOCKED, synchronously, before any run goroutine spawns.
+	if got := ms.SetBlockedSnapshot(); len(got) != 1 || got[0] != "issue-b" {
+		t.Errorf("expected issue-b parked BLOCKED; got %v", got)
+	}
+	// Give any (erroneously spawned) run goroutine a chance to claim, then
+	// assert none did.
+	time.Sleep(50 * time.Millisecond)
+	if got := ms.ClaimedSnapshot(); len(got) != 0 {
+		t.Errorf("blocked rerun must not spawn a run (no autopilot_jobs claim); got %v", got)
 	}
 }
 
@@ -2421,24 +3165,28 @@ func TestDispatch_FixOnDone_DispatchesResume(t *testing.T) {
 		IssueID:         "issue-fix",
 		IssueIdentifier: "FIX-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-fix-resume",
 		PromptContext:   "/fix change v1 to v2 in line 12",
 	}
 
 	o.HandleAgentEvent(ev)
 
-	// Wait for the /fix goroutine to flip state to EXECUTING.
+	// Wait for the /fix goroutine to flip state to EXECUTING. Read
+	// LiveAdmiralSnapshot under the store's mutex so the polling loop
+	// doesn't race with UpdateAdmiralTask's fn() writes.
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if live.State == store.JobStateExecuting {
+		if ms.LiveAdmiralSnapshot().State == store.JobStateExecuting {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if live.State != store.JobStateExecuting {
-		t.Errorf("expected admiral_tasks.state EXECUTING during /fix run; got %q", live.State)
+	snap := ms.LiveAdmiralSnapshot()
+	if snap.State != store.JobStateExecuting {
+		t.Errorf("expected admiral_tasks.state EXECUTING during /fix run; got %q", snap.State)
 	}
-	if live.AttemptN != 1 {
-		t.Errorf("/fix must not increment attempt_n; got %d", live.AttemptN)
+	if snap.AttemptN != 1 {
+		t.Errorf("/fix must not increment attempt_n; got %d", snap.AttemptN)
 	}
 	if got := ms.SupersededAdmiralIssues; len(got) != 0 {
 		t.Errorf("/fix must not supersede admiral_tasks; got %v", got)
@@ -2466,6 +3214,7 @@ func TestDispatch_FixOnExecuting_Rejected(t *testing.T) {
 		IssueID:         "issue-busy",
 		IssueIdentifier: "BUSY-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-fix-busy",
 		PromptContext:   "/fix something",
 	}
 
@@ -2475,9 +3224,47 @@ func TestDispatch_FixOnExecuting_Rejected(t *testing.T) {
 	if !strings.Contains(body, "currently processing") {
 		t.Errorf("expected currently-processing reply, got: %s", body)
 	}
+	if mlc.PostedActivity.Type != linear.ActivityThought {
+		t.Errorf("/fix-while-busy must post ActivityThought, got %q", mlc.PostedActivity.Type)
+	}
 	// State must remain EXECUTING — /fix did NOT take over.
 	if live.State != store.JobStateExecuting {
 		t.Errorf("/fix on EXECUTING must not change state; got %q", live.State)
+	}
+}
+
+// TestDispatch_BareCommentWhileExecuting_PostsThought is the GEO-62
+// regression: a thread-reply (or @mention) with no recognized /command
+// arriving while the task is mid-flight must post a Thought activity,
+// NOT an ErrorActivity. ErrorActivity would terminate the live
+// AgentSession in Linear and stop the running flow's progress posts
+// from landing.
+func TestDispatch_BareCommentWhileExecuting_PostsThought(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:  "issue-busy-bare",
+			State:    store.JobStateExecuting,
+			AttemptN: 1,
+		},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-busy-bare",
+		IssueID:         "issue-busy-bare",
+		IssueIdentifier: "BUSY-BARE-1",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "hey what's up", // no /command
+	}
+
+	o.HandleAgentEvent(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "does not respond to bare @mentions") {
+		t.Errorf("expected bare-mention help text, got: %s", body)
+	}
+	if mlc.PostedActivity.Type != linear.ActivityThought {
+		t.Errorf("bare-mention-while-busy must post ActivityThought (non-terminal), got %q", mlc.PostedActivity.Type)
 	}
 }
 
@@ -2502,6 +3289,7 @@ func TestDispatch_FixOnFailed_SuggestsRerun(t *testing.T) {
 		IssueID:         "issue-failed",
 		IssueIdentifier: "FAIL-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-fix-failed",
 		PromptContext:   "/fix retry",
 	}
 
@@ -2513,6 +3301,44 @@ func TestDispatch_FixOnFailed_SuggestsRerun(t *testing.T) {
 	}
 	if !strings.Contains(body, "FAILED") {
 		t.Errorf("expected current state name in reply, got: %s", body)
+	}
+}
+
+// TestDispatch_FixOnDoneMerged_SuggestsRerun verifies /fix on a task
+// whose PR has been merged (discoverer flipped DONE -> DONE_MERGED)
+// is rejected with a message pointing the user at /rerun, instead of
+// falling through to the catch-all "/fix not supported in state" branch.
+func TestDispatch_FixOnDoneMerged_SuggestsRerun(t *testing.T) {
+	mlc := &mockLinearClient{}
+	live := &store.AdmiralTask{
+		IssueID:         "issue-merged",
+		State:           store.JobStateDoneMerged,
+		AttemptN:        1,
+		PRURL:           "https://github.com/x/y/pull/3",
+		ClaudeSessionID: "claude-merged",
+	}
+	ms := &mockStore{
+		AdmiralTask:     live,
+		LiveAdmiralTask: live,
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-fix-merged",
+		IssueID:         "issue-merged",
+		IssueIdentifier: "MERGED-1",
+		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-fix-merged",
+		PromptContext:   "/fix one more tweak",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "merged") {
+		t.Errorf("expected merge-aware reject reply, got: %s", body)
+	}
+	if !strings.Contains(body, "/rerun") {
+		t.Errorf("expected suggestion to use /rerun, got: %s", body)
 	}
 }
 
@@ -2538,6 +3364,7 @@ func TestDispatch_FixWithoutDescription_Rejects(t *testing.T) {
 		IssueID:         "issue-fix-empty",
 		IssueIdentifier: "FIX-EMPTY-1",
 		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-fix-empty",
 		PromptContext:   "/fix",
 	}
 
@@ -2582,15 +3409,18 @@ func TestDispatch_FixViaPrompted_DispatchesResume(t *testing.T) {
 
 	o.HandleAgentEvent(ev)
 
+	// Read state via the locked snapshot helper so this polling loop
+	// doesn't race with UpdateAdmiralTask's fn() writes from the
+	// dispatched /fix goroutine.
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if live.State == store.JobStateExecuting {
+		if ms.LiveAdmiralSnapshot().State == store.JobStateExecuting {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if live.State != store.JobStateExecuting {
-		t.Errorf("/fix-via-thread must transition admiral_tasks to EXECUTING; got %q", live.State)
+	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateExecuting {
+		t.Errorf("/fix-via-thread must transition admiral_tasks to EXECUTING; got %q", got)
 	}
 }
 

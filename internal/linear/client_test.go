@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,6 +86,706 @@ func TestIssueUpdate(t *testing.T) {
 	}
 	if vars["id"] != "issue-123" {
 		t.Errorf("expected id 'issue-123', got %v", vars["id"])
+	}
+}
+
+func TestAssignIssue(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueUpdate": map[string]any{"success": true},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if err := c.AssignIssue(context.Background(), "issue-xyz", "user-42"); err != nil {
+		t.Fatalf("AssignIssue failed: %v", err)
+	}
+	vars := receivedBody["variables"].(map[string]any)
+	input := vars["input"].(map[string]any)
+	if input["assigneeId"] != "user-42" {
+		t.Errorf("expected assigneeId 'user-42', got %v", input["assigneeId"])
+	}
+	if vars["id"] != "issue-xyz" {
+		t.Errorf("expected id 'issue-xyz', got %v", vars["id"])
+	}
+}
+
+func TestRemoveIssueLabel(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueUpdate": map[string]any{"success": true},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if err := c.RemoveIssueLabel(context.Background(), "issue-9", "label-ready"); err != nil {
+		t.Fatalf("RemoveIssueLabel failed: %v", err)
+	}
+	vars := receivedBody["variables"].(map[string]any)
+	input := vars["input"].(map[string]any)
+	removed, ok := input["removedLabelIds"].([]any)
+	if !ok || len(removed) != 1 || removed[0] != "label-ready" {
+		t.Errorf("expected removedLabelIds [label-ready], got %v", input["removedLabelIds"])
+	}
+	if vars["id"] != "issue-9" {
+		t.Errorf("expected id 'issue-9', got %v", vars["id"])
+	}
+}
+
+func TestIssueCreate(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueCreate": map[string]any{
+					"success": true,
+					"issue": map[string]any{
+						"id":         "issue-new",
+						"identifier": "GEO-99",
+						"url":        "https://linear.app/x/issue/GEO-99",
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	iss, err := c.IssueCreate(context.Background(), IssueCreateInput{
+		TeamID:      "team-1",
+		ProjectID:   "proj-1",
+		Title:       "Follow-up: handle empty input",
+		Description: "details",
+	})
+	if err != nil {
+		t.Fatalf("IssueCreate failed: %v", err)
+	}
+	if iss.ID != "issue-new" || iss.Identifier != "GEO-99" {
+		t.Errorf("unexpected issue: %+v", iss)
+	}
+	input := receivedBody["variables"].(map[string]any)["input"].(map[string]any)
+	if input["teamId"] != "team-1" || input["projectId"] != "proj-1" {
+		t.Errorf("unexpected input: %v", input)
+	}
+	if input["title"] != "Follow-up: handle empty input" || input["description"] != "details" {
+		t.Errorf("unexpected input: %v", input)
+	}
+}
+
+func TestIssueCreateOmitsEmptyOptionalFields(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueCreate": map[string]any{
+					"success": true,
+					"issue":   map[string]any{"id": "i", "identifier": "GEO-1", "url": "u"},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.IssueCreate(context.Background(), IssueCreateInput{TeamID: "t", Title: "x"}); err != nil {
+		t.Fatalf("IssueCreate failed: %v", err)
+	}
+	input := receivedBody["variables"].(map[string]any)["input"].(map[string]any)
+	if _, ok := input["projectId"]; ok {
+		t.Errorf("projectId should be omitted when empty, got %v", input["projectId"])
+	}
+	if _, ok := input["description"]; ok {
+		t.Errorf("description should be omitted when empty, got %v", input["description"])
+	}
+}
+
+func TestIssueCreateValidatesRequiredFields(t *testing.T) {
+	c := NewClient("http://unused", "test-token")
+	if _, err := c.IssueCreate(context.Background(), IssueCreateInput{Title: "x"}); err == nil {
+		t.Error("expected error when teamId missing")
+	}
+	if _, err := c.IssueCreate(context.Background(), IssueCreateInput{TeamID: "t"}); err == nil {
+		t.Error("expected error when title missing")
+	}
+}
+
+func TestIssueCreateSuccessFalse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueCreate": map[string]any{"success": false, "issue": nil},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.IssueCreate(context.Background(), IssueCreateInput{TeamID: "t", Title: "x"}); err == nil {
+		t.Error("expected error when issueCreate returns success=false")
+	}
+}
+
+func TestGetProjectTeamID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"project": map[string]any{
+					"id": "proj-1",
+					"teams": map[string]any{
+						"nodes": []map[string]any{{"id": "team-first"}, {"id": "team-second"}},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	teamID, err := c.GetProjectTeamID(context.Background(), "proj-1")
+	if err != nil {
+		t.Fatalf("GetProjectTeamID failed: %v", err)
+	}
+	if teamID != "team-first" {
+		t.Errorf("expected first team 'team-first', got %q", teamID)
+	}
+}
+
+func TestGetProjectTeamIDNoTeams(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"project": map[string]any{"id": "proj-1", "teams": map[string]any{"nodes": []map[string]any{}}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.GetProjectTeamID(context.Background(), "proj-1"); err == nil {
+		t.Error("expected error when project has no teams")
+	}
+}
+
+func TestGetProjectTeamIDNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"project": nil}})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.GetProjectTeamID(context.Background(), "proj-x"); err == nil {
+		t.Error("expected error when project not found")
+	}
+}
+
+func TestIssueCreateThreadsLabelsAndState(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueCreate": map[string]any{
+					"success": true,
+					"issue":   map[string]any{"id": "i", "identifier": "GEO-1", "url": "u"},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.IssueCreate(context.Background(), IssueCreateInput{
+		TeamID:   "t",
+		Title:    "x",
+		LabelIDs: []string{"lbl-1", "lbl-2"},
+		StateID:  "state-backlog",
+		ParentID: "parent-1",
+	}); err != nil {
+		t.Fatalf("IssueCreate failed: %v", err)
+	}
+	input := receivedBody["variables"].(map[string]any)["input"].(map[string]any)
+	labels, ok := input["labelIds"].([]any)
+	if !ok || len(labels) != 2 || labels[0] != "lbl-1" || labels[1] != "lbl-2" {
+		t.Errorf("labelIds not threaded: %v", input["labelIds"])
+	}
+	if input["stateId"] != "state-backlog" {
+		t.Errorf("stateId not threaded: %v", input["stateId"])
+	}
+	if input["parentId"] != "parent-1" {
+		t.Errorf("parentId not threaded: %v", input["parentId"])
+	}
+}
+
+func TestIssueCreateOmitsParentWhenEmpty(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueCreate": map[string]any{
+					"success": true,
+					"issue":   map[string]any{"id": "i", "identifier": "GEO-1", "url": "u"},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.IssueCreate(context.Background(), IssueCreateInput{TeamID: "t", Title: "x"}); err != nil {
+		t.Fatalf("IssueCreate failed: %v", err)
+	}
+	input := receivedBody["variables"].(map[string]any)["input"].(map[string]any)
+	if _, ok := input["parentId"]; ok {
+		t.Errorf("parentId should be omitted when empty, got %v", input["parentId"])
+	}
+}
+
+func TestGetTeamLabelID_WorkspaceLabel(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		// Workspace-level label: team is null. Must still resolve.
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueLabels": map[string]any{
+					"nodes": []map[string]any{{"id": "lbl-ready", "name": "agent-ready", "team": nil}},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	id, err := c.GetTeamLabelID(context.Background(), "team-1", "agent-ready")
+	if err != nil {
+		t.Fatalf("GetTeamLabelID failed: %v", err)
+	}
+	if id != "lbl-ready" {
+		t.Errorf("expected lbl-ready, got %q", id)
+	}
+	vars := receivedBody["variables"].(map[string]any)
+	if vars["name"] != "agent-ready" {
+		t.Errorf("query vars wrong: %v", vars)
+	}
+}
+
+func TestGetTeamLabelID_PrefersTeamScopedOverWorkspace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// Both a workspace label and a team-scoped label share the name;
+		// the team-scoped one (matching our team) must win.
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueLabels": map[string]any{
+					"nodes": []map[string]any{
+						{"id": "lbl-workspace", "name": "agent-ready", "team": nil},
+						{"id": "lbl-team", "name": "agent-ready", "team": map[string]any{"id": "team-1"}},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	id, err := c.GetTeamLabelID(context.Background(), "team-1", "agent-ready")
+	if err != nil {
+		t.Fatalf("GetTeamLabelID failed: %v", err)
+	}
+	if id != "lbl-team" {
+		t.Errorf("expected team-scoped lbl-team to win, got %q", id)
+	}
+}
+
+func TestGetTeamLabelID_OtherTeamLabelIgnored(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// Only a label scoped to a DIFFERENT team exists — not usable here.
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issueLabels": map[string]any{
+					"nodes": []map[string]any{
+						{"id": "lbl-other", "name": "agent-ready", "team": map[string]any{"id": "team-2"}},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.GetTeamLabelID(context.Background(), "team-1", "agent-ready"); err == nil {
+		t.Error("expected error when only another team's label matches")
+	}
+}
+
+func TestGetTeamLabelIDNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"issueLabels": map[string]any{"nodes": []map[string]any{}}},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.GetTeamLabelID(context.Background(), "team-1", "nope"); err == nil {
+		t.Error("expected error when label not found")
+	}
+}
+
+func TestGetSubIssues(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issue": map[string]any{
+					"id": "parent-1",
+					"children": map[string]any{
+						"nodes": []map[string]any{
+							{"id": "c1", "identifier": "GEO-2", "state": map[string]any{"type": "completed"}},
+							{"id": "c2", "identifier": "GEO-3", "state": map[string]any{"type": "started"}},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	subs, err := c.GetSubIssues(context.Background(), "parent-1")
+	if err != nil {
+		t.Fatalf("GetSubIssues failed: %v", err)
+	}
+	if len(subs) != 2 {
+		t.Fatalf("want 2 sub-issues, got %d", len(subs))
+	}
+	if subs[0].ID != "c1" || subs[0].Identifier != "GEO-2" || subs[0].StateType != "completed" {
+		t.Errorf("sub[0] wrong: %+v", subs[0])
+	}
+	if subs[1].StateType != "started" {
+		t.Errorf("sub[1] state wrong: %+v", subs[1])
+	}
+	if receivedBody["variables"].(map[string]any)["id"] != "parent-1" {
+		t.Errorf("query var wrong: %v", receivedBody["variables"])
+	}
+}
+
+func TestGetSubIssues_NoChildren(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issue": map[string]any{"id": "parent-1", "children": map[string]any{"nodes": []map[string]any{}}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	subs, err := c.GetSubIssues(context.Background(), "parent-1")
+	if err != nil {
+		t.Fatalf("GetSubIssues failed: %v", err)
+	}
+	if len(subs) != 0 {
+		t.Errorf("want 0 sub-issues, got %d", len(subs))
+	}
+}
+
+func TestGetSubIssues_NullState(t *testing.T) {
+	// A child with no workflow state must yield StateType=="" not a panic.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issue": map[string]any{
+					"id": "parent-1",
+					"children": map[string]any{
+						"nodes": []map[string]any{{"id": "c1", "identifier": "GEO-2", "state": nil}},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	subs, err := c.GetSubIssues(context.Background(), "parent-1")
+	if err != nil {
+		t.Fatalf("GetSubIssues failed: %v", err)
+	}
+	if len(subs) != 1 || subs[0].StateType != "" {
+		t.Errorf("expected one sub with empty StateType, got %+v", subs)
+	}
+}
+
+func TestGetSubIssues_NotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"issue": nil}})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.GetSubIssues(context.Background(), "ghost"); err == nil {
+		t.Error("expected error when parent issue not found")
+	}
+}
+
+func TestGetParentID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issue": map[string]any{"id": "c1", "parent": map[string]any{"id": "parent-1"}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	id, err := c.GetParentID(context.Background(), "c1")
+	if err != nil {
+		t.Fatalf("GetParentID failed: %v", err)
+	}
+	if id != "parent-1" {
+		t.Errorf("expected parent-1, got %q", id)
+	}
+}
+
+func TestGetParentID_NoParent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"issue": map[string]any{"id": "top", "parent": nil}},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	id, err := c.GetParentID(context.Background(), "top")
+	if err != nil {
+		t.Fatalf("GetParentID failed: %v", err)
+	}
+	if id != "" {
+		t.Errorf("expected empty parent for top-level issue, got %q", id)
+	}
+}
+
+func TestCreateComment(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"commentCreate": map[string]any{"success": true, "comment": map[string]any{"id": "cmt-1"}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if err := c.CreateComment(context.Background(), "issue-1", "needs human review"); err != nil {
+		t.Fatalf("CreateComment failed: %v", err)
+	}
+	input := receivedBody["variables"].(map[string]any)["input"].(map[string]any)
+	if input["issueId"] != "issue-1" || input["body"] != "needs human review" {
+		t.Errorf("unexpected input: %v", input)
+	}
+}
+
+func TestCreateCommentValidatesArgs(t *testing.T) {
+	c := NewClient("http://unused", "test-token")
+	if err := c.CreateComment(context.Background(), "", "body"); err == nil {
+		t.Error("expected error when issueID empty")
+	}
+	if err := c.CreateComment(context.Background(), "issue-1", ""); err == nil {
+		t.Error("expected error when body empty")
+	}
+}
+
+func TestCreateCommentSuccessFalse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"commentCreate": map[string]any{"success": false}},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if err := c.CreateComment(context.Background(), "issue-1", "body"); err == nil {
+		t.Error("expected error when commentCreate returns success=false")
+	}
+}
+
+func TestGetViewer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"viewer": map[string]any{"id": "user-self", "name": "admiral-bot"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	v, err := c.GetViewer(context.Background())
+	if err != nil {
+		t.Fatalf("GetViewer failed: %v", err)
+	}
+	if v.ID != "user-self" || v.Name != "admiral-bot" {
+		t.Errorf("unexpected viewer: %+v", v)
+	}
+}
+
+func TestSearchAssignableIssues(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issues": map[string]any{
+					"nodes": []map[string]any{
+						{
+							"id":          "iss-1",
+							"identifier":  "GEO-100",
+							"title":       "Add foo",
+							"description": "do the foo",
+							"url":         "https://linear.app/x/issue/GEO-100",
+							"priority":    2,
+							"state":       map[string]any{"name": "Backlog", "type": "backlog"},
+							"assignee":    nil,
+							"team":        map[string]any{"id": "team-A"},
+							"project":     map[string]any{"id": "proj-1"},
+							"labels":      map[string]any{"nodes": []map[string]any{{"name": "agent-ready"}}},
+						},
+						{
+							"id":          "iss-2",
+							"identifier":  "GEO-101",
+							"title":       "Refactor bar",
+							"description": "",
+							"url":         "https://linear.app/x/issue/GEO-101",
+							"priority":    0,
+							"state":       map[string]any{"name": "Todo", "type": "unstarted"},
+							"assignee":    nil,
+							"team":        map[string]any{"id": "team-A"},
+							"project":     nil,
+							"labels":      map[string]any{"nodes": []map[string]any{}},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	got, err := c.SearchAssignableIssues(context.Background(), SearchFilter{
+		TeamKeys:       []string{"GEO"},
+		StateTypes:     []string{"backlog", "unstarted"},
+		RequireLabel:   "agent-ready",
+		UnassignedOnly: true,
+		Limit:          10,
+	})
+	if err != nil {
+		t.Fatalf("SearchAssignableIssues failed: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 issues, got %d", len(got))
+	}
+	if got[0].Identifier != "GEO-100" || got[0].StateName != "Backlog" || len(got[0].Labels) != 1 || got[0].Labels[0] != "agent-ready" {
+		t.Errorf("issue[0] parse mismatch: %+v", got[0])
+	}
+	if got[1].ProjectID != "" {
+		t.Errorf("expected empty project id for issue[1], got %q", got[1].ProjectID)
+	}
+
+	vars := receivedBody["variables"].(map[string]any)
+	filter := vars["filter"].(map[string]any)
+	team := filter["team"].(map[string]any)["key"].(map[string]any)["in"].([]any)
+	if len(team) != 1 || team[0] != "GEO" {
+		t.Errorf("team filter mismatch: %v", team)
+	}
+	if _, ok := filter["assignee"].(map[string]any)["null"]; !ok {
+		t.Errorf("expected assignee.null in filter, got %v", filter["assignee"])
+	}
+	labels := filter["labels"].(map[string]any)["name"].(map[string]any)["eq"]
+	if labels != "agent-ready" {
+		t.Errorf("label filter mismatch: %v", labels)
+	}
+	if vars["first"].(float64) != 10 {
+		t.Errorf("first mismatch: %v", vars["first"])
+	}
+}
+
+func TestSearchAssignableIssuesDefaultLimit(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"issues": map[string]any{"nodes": []map[string]any{}}},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.SearchAssignableIssues(context.Background(), SearchFilter{}); err != nil {
+		t.Fatal(err)
+	}
+	if receivedBody["variables"].(map[string]any)["first"].(float64) != 50 {
+		t.Errorf("default first should be 50, got %v", receivedBody["variables"].(map[string]any)["first"])
 	}
 }
 
@@ -726,5 +1428,191 @@ func TestRefresh_Success_ClearsAuthError(t *testing.T) {
 	}
 	if ms.clearCalled == 0 {
 		t.Error("ClearAuthError should be called on successful refresh")
+	}
+}
+
+// TestQueryGraphQLVariableTypes pins each query's variable declarations
+// to what Linear's schema actually accepts. The schema is asymmetric —
+// most ID-bearing fields are typed String! at the argument site
+// (issue(id:), project(id:), issueUpdate(id:)), but IDComparator
+// inside filter inputs (workflowStates filter team.id.eq) is strict
+// ID!. We learned this the hard way: PR #123 tightened everything to
+// ID! and immediately broke issue() in production. The stub-server
+// tests in this file don't run real schema validation, so this static
+// check is the only guard against the next typo of either shape.
+//
+// If a future change adds a new query: confirm against Linear's live
+// schema (https://studio.apollographql.com/public/Linear-API/) and
+// add a case here with the exact required declaration.
+func TestQueryGraphQLVariableTypes(t *testing.T) {
+	cases := []struct {
+		name        string
+		query       string
+		mustContain []string
+		mustNotHave []string
+	}{
+		// issue(id:) — schema requires String!. Tightening to ID!
+		// triggers GRAPHQL_VALIDATION_FAILED ("ID! used in position
+		// expecting type String!").
+		{"issueQuery", issueQuery,
+			[]string{"$id: String!"}, []string{"$id: ID!"}},
+		// workflowStates filter goes through IDComparator which is
+		// strict ID!. Originally declared String! → production 400.
+		{"workflowStatesQuery", workflowStatesQuery,
+			[]string{"$teamID: ID!"}, []string{"$teamID: String!"}},
+		// issue(id:) again, via a sibling query — same constraint.
+		{"issueBlockersQuery", issueBlockersQuery,
+			[]string{"$id: String!"}, []string{"$id: ID!"}},
+		// project(id:) — same String! shape as issue(id:).
+		{"projectQuery", projectQuery,
+			[]string{"$id: String!"}, []string{"$id: ID!"}},
+		// issueUpdate(id:, input:) — id is String!. $input stays
+		// IssueUpdateInput! and is not policed here.
+		{"issueUpdateMutation", issueUpdateMutation,
+			[]string{"$id: String!"}, []string{"$id: ID!"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, want := range c.mustContain {
+				if !strings.Contains(c.query, want) {
+					t.Errorf("query missing %q:\n%s", want, c.query)
+				}
+			}
+			for _, bad := range c.mustNotHave {
+				if strings.Contains(c.query, bad) {
+					t.Errorf("query has forbidden declaration %q:\n%s", bad, c.query)
+				}
+			}
+		})
+	}
+}
+
+// TestIsTransientNetErr pins the classification contract for retry
+// eligibility. Regression: a previous version returned early on any
+// error implementing net.Error (e.g. *url.Error) via ne.Timeout(),
+// which classified EOF / unexpected-EOF as non-transient and disabled
+// retries on the most common Linear failure (server-side TCP reset
+// surfaced as `Post ... : unexpected EOF`).
+func TestIsTransientNetErr(t *testing.T) {
+	// Synthetic "non-transient" net.Error stand-in: implements
+	// net.Error but Timeout() returns false. Mirrors the shape
+	// *url.Error wraps when http.Client.Do returns a non-timeout
+	// transport error.
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"plain io.EOF", io.EOF, true},
+		{"plain io.ErrUnexpectedEOF", io.ErrUnexpectedEOF, true},
+		{"context.DeadlineExceeded", context.DeadlineExceeded, true},
+		{"context.Canceled", context.Canceled, true},
+		// url.Error wrapping EOF — exactly what http.Client.Do
+		// returns on a server-side TCP reset. Must classify
+		// transient even though url.Error itself is a net.Error
+		// whose Timeout() is false.
+		{
+			"url.Error wrapping io.EOF",
+			&url.Error{Op: "Post", URL: "https://api.linear.app/graphql", Err: io.EOF},
+			true,
+		},
+		{
+			"url.Error wrapping io.ErrUnexpectedEOF",
+			&url.Error{Op: "Post", URL: "https://api.linear.app/graphql", Err: io.ErrUnexpectedEOF},
+			true,
+		},
+		// Non-network unrelated error: must NOT be classified
+		// transient — that path should fall through to a permanent
+		// failure rather than spin forever.
+		{"plain non-net error", errors.New("boom"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isTransientNetErr(c.err); got != c.want {
+				t.Errorf("isTransientNetErr(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+// blockersServer returns a test server that answers the issueBlockersQuery
+// with the given inverseRelations node set.
+func blockersServer(t *testing.T, inverse []map[string]any) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"issue": map[string]any{
+					"inverseRelations": map[string]any{"nodes": inverse},
+				},
+			},
+		})
+	}))
+}
+
+// TestGetIssueBlockers_InverseRelationsBlocks is the regression test for the
+// real Linear shape: "B blocked by A" arrives on B as an inverseRelations node
+// of type "blocks" whose source `issue` is A.
+func TestGetIssueBlockers_InverseRelationsBlocks(t *testing.T) {
+	server := blockersServer(t, []map[string]any{
+		{"type": "blocks", "issue": map[string]any{
+			"id": "id-A", "identifier": "GEO-A", "state": map[string]any{"type": "backlog"}}},
+	})
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	blockers, err := c.GetIssueBlockers(context.Background(), "id-B")
+	if err != nil {
+		t.Fatalf("GetIssueBlockers: %v", err)
+	}
+	if len(blockers) != 1 {
+		t.Fatalf("expected exactly 1 blocker (GEO-A), got %d: %+v", len(blockers), blockers)
+	}
+	if blockers[0].IssueIdentifier != "GEO-A" {
+		t.Errorf("blocker = %q, want GEO-A", blockers[0].IssueIdentifier)
+	}
+}
+
+// TestGetIssueBlockers_NonBlockingTypesIgnored: only "blocks" inverse relations
+// gate. A "related" (or duplicate/similar) inverse relation must NOT block.
+func TestGetIssueBlockers_NonBlockingTypesIgnored(t *testing.T) {
+	server := blockersServer(t, []map[string]any{
+		{"type": "related", "issue": map[string]any{
+			"id": "id-R", "identifier": "GEO-R", "state": map[string]any{"type": "backlog"}}},
+		{"type": "duplicate", "issue": map[string]any{
+			"id": "id-Dup", "identifier": "GEO-DUP", "state": map[string]any{"type": "started"}}},
+	})
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	blockers, err := c.GetIssueBlockers(context.Background(), "id-B")
+	if err != nil {
+		t.Fatalf("GetIssueBlockers: %v", err)
+	}
+	if len(blockers) != 0 {
+		t.Fatalf("expected no blockers (no 'blocks' relations), got %+v", blockers)
+	}
+}
+
+// TestGetIssueBlockers_ResolvedSkipped: a blocker already in a completed /
+// canceled state type no longer blocks.
+func TestGetIssueBlockers_ResolvedSkipped(t *testing.T) {
+	server := blockersServer(t, []map[string]any{
+		{"type": "blocks", "issue": map[string]any{
+			"id": "id-A", "identifier": "GEO-A", "state": map[string]any{"type": "completed"}}},
+		{"type": "blocks", "issue": map[string]any{
+			"id": "id-X", "identifier": "GEO-X", "state": map[string]any{"type": "canceled"}}},
+	})
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	blockers, err := c.GetIssueBlockers(context.Background(), "id-B")
+	if err != nil {
+		t.Fatalf("GetIssueBlockers: %v", err)
+	}
+	if len(blockers) != 0 {
+		t.Fatalf("expected no blockers (all resolved), got %+v", blockers)
 	}
 }

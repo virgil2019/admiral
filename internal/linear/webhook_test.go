@@ -79,7 +79,8 @@ func TestWebhook_AgentSessionCreated_Mention_Fires(t *testing.T) {
 		"agentSession":{
 			"id":"sess-1",
 			"issue":{"id":"issue-1","identifier":"TST-1","title":"hello"},
-			"creator":{"id":"user-1","name":"Test User","displayName":"test.user"}
+			"creator":{"id":"user-1","name":"Test User","displayName":"test.user"},
+			"sourceCommentId":"comment-1"
 		},
 		"promptContext":"please refactor the auth module"
 	}`)
@@ -100,6 +101,9 @@ func TestWebhook_AgentSessionCreated_Mention_Fires(t *testing.T) {
 	}
 	if got.PromptContext != "please refactor the auth module" {
 		t.Errorf("promptContext: %q", got.PromptContext)
+	}
+	if got.SourceCommentID != "comment-1" {
+		t.Errorf("sourceCommentID: %q (want %q for @mention trigger)", got.SourceCommentID, "comment-1")
 	}
 	if got.CreatorID != "user-1" {
 		t.Errorf("creator id: %q", got.CreatorID)
@@ -133,6 +137,9 @@ func TestWebhook_AgentSessionCreated_Assign_EmptyPromptContext(t *testing.T) {
 	if got.PromptContext != "" {
 		t.Errorf("expected empty promptContext on assign, got %q", got.PromptContext)
 	}
+	if got.SourceCommentID != "" {
+		t.Errorf("delegate trigger must have empty SourceCommentID, got %q", got.SourceCommentID)
+	}
 }
 
 func TestWebhook_AgentSessionPrompted_CarriesUserMessage(t *testing.T) {
@@ -158,6 +165,32 @@ func TestWebhook_AgentSessionPrompted_CarriesUserMessage(t *testing.T) {
 		t.Errorf("action: %q", got.Action)
 	}
 	if got.UserMessage != "can you also update the README?" {
+		t.Errorf("userMessage: %q", got.UserMessage)
+	}
+}
+
+func TestWebhook_AgentSessionPrompted_CarriesContentBody(t *testing.T) {
+	// Current Linear schema nests the user's prompt under
+	// agentActivity.content.body — see GEO-65 webhook capture.
+	var (
+		wg  sync.WaitGroup
+		got AgentEvent
+	)
+	wg.Add(1)
+	w := newTestWebhook(t, func(e AgentEvent) { got = e; wg.Done() })
+	body := []byte(`{
+		"type":"AgentSessionEvent",
+		"action":"prompted",
+		"agentSession":{"id":"sess-3b","issue":{"id":"issue-3b","identifier":"TST-3B","title":"x"}},
+		"agentActivity":{"content":{"type":"prompt","body":"/rerun"}}
+	}`)
+	sig := SignBody([]byte("test-secret"), body)
+	rec := post(t, w, body, sig)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: %d", rec.Code)
+	}
+	waitWithTimeout(t, &wg, time.Second)
+	if got.UserMessage != "/rerun" {
 		t.Errorf("userMessage: %q", got.UserMessage)
 	}
 }

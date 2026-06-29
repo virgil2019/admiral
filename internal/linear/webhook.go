@@ -32,10 +32,17 @@ type AgentEvent struct {
 	IssueID         string
 	IssueIdentifier string
 	IssueTitle      string
-	// PromptContext is set on action=created. For mention triggers it's the
+	// PromptContext is set on action=created. For @mention triggers it's the
 	// comment text; for raw assignment it's empty; for delegate-to-agent
-	// it's whatever the user typed in the prompt input.
+	// it's whatever the user typed in the prompt input. Use SourceCommentID
+	// (not text emptiness) to distinguish @mention from delegate.
 	PromptContext string
+	// SourceCommentID is set on action=created when the AgentSession was
+	// opened via an @mention inside an existing comment. Empty when the
+	// session was opened via delegation (assign-to-agent), regardless of
+	// whether the user typed an initial prompt. This is the protocol-level
+	// signal admiral uses to disambiguate the two trigger paths.
+	SourceCommentID string
 	// UserMessage is set on action=prompted: the user's follow-up text in
 	// the agent thread.
 	UserMessage string
@@ -88,10 +95,36 @@ type rawAgentSession struct {
 		Name        string `json:"name"`
 		DisplayName string `json:"displayName"`
 	} `json:"creator"`
+	// SourceCommentID is set when the session was opened from an @mention
+	// inside a comment. Empty on delegate triggers — this is what admiral
+	// uses to tell the two paths apart. Linear's webhook payload type
+	// `AgentSessionWebhookPayload` exposes this as a flat scalar
+	// (`sourceCommentId`), distinct from the GraphQL Query type
+	// `AgentSession` which uses a nested `sourceComment: Comment` object.
+	SourceCommentID string `json:"sourceCommentId"`
 }
 
 type rawAgentActivity struct {
-	Body string `json:"body"`
+	// Linear's current schema nests the user's prompt under
+	// agentActivity.content.body (with content.type="prompt"). The legacy
+	// top-level Body is kept for back-compat with older test fixtures.
+	Body    string `json:"body"`
+	Content *struct {
+		Type string `json:"type"`
+		Body string `json:"body"`
+	} `json:"content"`
+}
+
+// userBody returns the user's prompt text, preferring the nested content.body
+// (current Linear schema) and falling back to the legacy top-level body.
+func (a *rawAgentActivity) userBody() string {
+	if a == nil {
+		return ""
+	}
+	if a.Content != nil && a.Content.Body != "" {
+		return a.Content.Body
+	}
+	return a.Body
 }
 
 // Webhook is the HTTP receiver. Mount Handler at /webhook (matches Linear's
@@ -207,14 +240,15 @@ func (w *Webhook) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 		ev.CreatorName = session.Creator.Name
 		ev.CreatorDisplayName = session.Creator.DisplayName
 	}
+	ev.SourceCommentID = session.SourceCommentID
 	switch action {
 	case ActionCreated:
 		ev.PromptContext = firstNonEmpty(p.PromptContext, dataPromptContext(p))
 	case ActionPrompted:
 		if p.AgentActivity != nil {
-			ev.UserMessage = p.AgentActivity.Body
+			ev.UserMessage = p.AgentActivity.userBody()
 		} else if p.Data != nil && p.Data.AgentActivity != nil {
-			ev.UserMessage = p.Data.AgentActivity.Body
+			ev.UserMessage = p.Data.AgentActivity.userBody()
 		}
 	}
 

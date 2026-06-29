@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/georgehuang/admiral/internal/config"
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 	"github.com/google/uuid"
@@ -63,9 +64,43 @@ type storeInterface interface {
 	HasAnyAutopilotJobForIssue(issueID string) (bool, error)
 
 	GetAdmiralTaskByIssue(issueID string) (*store.AdmiralTask, error)
+	GetAdmiralTaskByPRURL(prURL string) (*store.AdmiralTask, error)
 	ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error)
 	UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask)) error
 	MoveAdmiralTaskToHistoryAndClaimNew(issueID, reason, identifier, lastEventSessionID string) (int, error)
+	SetAdmiralTaskBlocked(issueID, blockerIDs string) error
+	GetBlockedAdmiralTasks() ([]store.BlockedTask, error)
+	TransitionBlockedToReceived(issueID string) (bool, error)
+
+	InsertPendingQuestion(q store.PendingQuestion) error
+	GetOpenPendingQuestionByIssue(issueID string) (*store.PendingQuestion, error)
+	GetPendingQuestionByID(id string) (*store.PendingQuestion, error)
+	AnswerPendingQuestion(id, answer string) error
+	CancelOpenPendingQuestionsForIssue(issueID string) error
+	SetAdmiralTaskAwaitingInput(issueID, pendingQuestionID string) error
+	TransitionAwaitingInputToExecuting(issueID string) (bool, error)
+
+	// task_verifications: the autonomous L2 verification loop (C4).
+	GetTaskVerification(parentIssueID string) (*store.TaskVerification, error)
+	BumpTaskVerificationRound(parentIssueID string) (*store.TaskVerification, error)
+	SetTaskVerificationStatus(parentIssueID, status string) error
+	SetTaskVerificationSummary(parentIssueID, summary string) error
+
+	// EnqueueEventWithSource is the queue write the verify-cascade hop
+	// uses: when applyVerifyVerdict closes a parent, the same helper the
+	// discoverer uses for leaf merges fires a verify event for the next
+	// level up (when one exists and its siblings are all completed). See
+	// internal/cascade.
+	EnqueueEventWithSource(source, webhookID, action, sessionID, issueID, payloadJSON, commentID string) (bool, error)
+
+	// product_verifications: the autonomous product-level verification loop.
+	GetProductVerification(projectID string) (*store.ProductVerification, error)
+	BumpProductVerificationRound(projectID string) (*store.ProductVerification, error)
+	SetProductVerificationStatus(projectID, status string) error
+
+	// /reset command (PR-B): cascade-delete a task's per-issue + verify rows.
+	ResetIssueRows(issueID string) error
+	DeleteTaskVerification(parentIssueID string) error
 }
 
 // linearClientInterface abstracts the linear client methods used by the orchestrator.
@@ -74,6 +109,27 @@ type linearClientInterface interface {
 	GetIssue(ctx context.Context, id string) (*linear.Issue, error)
 	GetWorkflowStates(ctx context.Context, teamID string) ([]linear.WorkflowState, error)
 	IssueUpdate(ctx context.Context, issueID, stateID string) error
+	GetIssueBlockers(ctx context.Context, issueID string) ([]linear.IssueBlocker, error)
+
+	// Verify loop (C4): enumerate a task's sub-issues, file follow-up gaps
+	// as sub-issues, and escalate to a human via a parent-issue comment.
+	// GetParentID is the cascade walk hop: when a parent's own verify
+	// passes, we check whether ITS parent's siblings are all completed.
+	GetParentID(ctx context.Context, childID string) (string, error)
+	GetSubIssues(ctx context.Context, parentID string) ([]linear.SubIssue, error)
+	IssueCreate(ctx context.Context, in linear.IssueCreateInput) (*linear.Issue, error)
+	GetTeamLabelID(ctx context.Context, teamID, name string) (string, error)
+	CreateComment(ctx context.Context, issueID, body string) error
+
+	// /reset command (PR-B): drop the require_label from a sub-issue and
+	// clear its assignee so the discoverer can re-pick it after re-activation.
+	RemoveIssueLabel(ctx context.Context, issueID, labelID string) error
+	UnassignIssue(ctx context.Context, issueID string) error
+
+	// Product-level verify: enumerate a project's top-level "feature" issues
+	// and resolve its team for filing gap features.
+	ListProjectTopLevelIssues(ctx context.Context, projectID string) ([]linear.Issue, error)
+	GetProjectTeamID(ctx context.Context, projectID string) (string, error)
 }
 
 type Orchestrator struct {
@@ -93,6 +149,51 @@ type Orchestrator struct {
 	// workflowStatesByTeam caches workflow states per team, keyed by teamID.
 	workflowStatesByTeam map[string][]linear.WorkflowState
 	workflowStatesMu     sync.Mutex
+
+	// ciWatcher polls GitHub check runs after a PR is opened and reports
+	// results back into the Linear thread (GEO-54).
+	ciWatcher *CIWatcher
+
+	// blockerWatcher polls BLOCKED tasks and re-queues them once all their
+	// Linear blocked_by relations are resolved.
+	blockerWatcher *BlockerWatcher
+
+	// replier is the semantic reply layer for Linear AgentSession threads.
+	replier *agentSessionReplier
+
+	// prClient is the outbound GitHub PR client used by the review dispatcher.
+	prClient ghpkg.PRClient
+
+	// dbPath is the absolute path to the SQLite file. Passed as
+	// ADMIRAL_DB_PATH to the admiral-mcp-ask subprocess.
+	dbPath string
+
+	// verifyLabel / verifyStateTypes are the discoverer's pickup gates,
+	// plumbed in via SetVerifyPickupRules so follow-up sub-issues the verify
+	// loop files are auto-picked and re-shipped (single source of truth with
+	// the discoverer — no drift). Empty verifyLabel means no label is set.
+	verifyLabel      string
+	verifyStateTypes []string
+
+	// verifyRunner runs the headless verify judge. Defaults to
+	// runClaudeForVerify; tests inject a stub so the guard/apply logic is
+	// exercised without spawning a real claude process.
+	verifyRunner func(ctx context.Context, repoDir, prompt string) (string, error)
+
+	// productVerifyRunner runs the headless product-level verify judge. Same
+	// read-only signature as verifyRunner (defaults to runClaudeForVerify); a
+	// separate field lets tests stub product verify independently of L2.
+	productVerifyRunner func(ctx context.Context, repoDir, prompt string) (string, error)
+}
+
+// SetVerifyPickupRules wires the discoverer's pickup gates (require_label +
+// state_types) into the orchestrator so the verify loop's follow-up
+// sub-issues are created in a pickable state with the right label. Called
+// once from main after New. The orchestrator only holds *config.Autopilot,
+// so these cross-component values are injected rather than read from cfg.
+func (o *Orchestrator) SetVerifyPickupRules(label string, stateTypes []string) {
+	o.verifyLabel = label
+	o.verifyStateTypes = stateTypes
 }
 
 func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog.Logger) *Orchestrator {
@@ -106,11 +207,23 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		cfg:      cfg,
 		lc:       lc,
 		db:       db,
+		dbPath:   db.Path,
 		gh:       newGhCLIProbe(cfg.GhBin),
 		logger:   logger,
 		ghUser:   cfg.GhUser,
 		runSlots: make(chan struct{}, slots),
+		ciWatcher: newCIWatcher(lc, db, logger, cfg.GhBin,
+			cfg.CIWatchPollInterval, cfg.CIWatchTimeout),
+		replier:  NewAgentSessionReplier(lc),
+		prClient: ghpkg.NewClient(cfg.GhToken),
 	}
+	o.verifyRunner = func(ctx context.Context, repoDir, prompt string) (string, error) {
+		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, o.logger)
+	}
+	o.productVerifyRunner = func(ctx context.Context, repoDir, prompt string) (string, error) {
+		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, o.logger)
+	}
+	o.blockerWatcher = newBlockerWatcher(o, cfg.BlockerPollInterval)
 	// Ensure job_streams_dir exists on startup.
 	if err := os.MkdirAll(cfg.JobStreamsDir, 0o755); err != nil {
 		logger.Warn("job_streams_dir_mkdir", "dir", cfg.JobStreamsDir, "err", err)
@@ -192,24 +305,46 @@ func (o *Orchestrator) HandleAgentEvent(ev linear.AgentEvent) {
 // /rerun (start fresh) or /fix (resume current PR; coming in GEO-49).
 // admiral no longer guesses what the user meant — they say it.
 func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
+	text := ev.PromptContext
+	if text == "" && ev.Action == linear.ActionPrompted {
+		text = ev.UserMessage
+	}
+
 	o.logger.Info("dispatch",
 		"session", ev.SessionID,
 		"issue", ev.IssueIdentifier,
-		"action", ev.Action)
+		"action", ev.Action,
+		"text_preview", truncate(text, 100),
+	)
 
 	if ev.IssueID == "" {
 		o.logger.Warn("dispatch_skip_no_issue_id", "session", ev.SessionID)
 		return
 	}
 
-	// User-typed text relevant to this event. created carries it in
-	// PromptContext (mention text); prompted carries it in UserMessage
-	// (thread reply). assign-only created has empty text.
-	text := ev.PromptContext
-	if text == "" && ev.Action == linear.ActionPrompted {
-		text = ev.UserMessage
+	// Delegate vs @mention: a created event with no SourceCommentID is a
+	// delegate (assign-to-agent), regardless of whether the user typed an
+	// initial prompt. SourceCommentID set means the session was opened
+	// from an @mention inside a comment — parse it as a command on a live
+	// task, or reject as "assign first" if there's no live task yet.
+	isDelegate := ev.Action == linear.ActionCreated && ev.SourceCommentID == ""
+
+	// /reset is a parent-level command: it resets a whole task (parent + all
+	// sub-issues), and the parent issue usually has no admiral_tasks row of its
+	// own. Intercept it here, before the task==nil gate below would reject a
+	// command on a row-less parent. A genuine delegate/assign is never /reset.
+	//
+	// This fires for any @mention whose first token is /reset, including on a
+	// sub-issue (where it'll report "no sub-issues") or an AWAITING_INPUT task
+	// (where a reply literally starting with /reset is treated as the command,
+	// not the answer). Both are acceptable: /reset is always a command, and
+	// mentioning it anywhere but the parent task is a no-op-with-explanation.
+	if !isDelegate {
+		if name, remainder, ok := parseMentionCommand(text); ok && name == "reset" {
+			o.dispatchReset(ev, remainder)
+			return
+		}
 	}
-	isAssignSignal := ev.Action == linear.ActionCreated && text == ""
 
 	task, err := o.db.GetAdmiralTaskByIssue(ev.IssueID)
 	if err != nil {
@@ -219,13 +354,13 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 
 	if task == nil {
 		// First-time event for this issue.
-		if isAssignSignal {
+		if isDelegate {
 			o.dispatchFreshAssign(ev)
 			return
 		}
 		o.logger.Info("dispatch_reject_no_task",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		o.postReply(ev.SessionID, assignFirstHelp)
+		o.postRejection(ev.SessionID, assignFirstHelp)
 		return
 	}
 
@@ -238,18 +373,24 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 		})
 	}
 
-	if isAssignSignal {
+	if isDelegate {
 		o.logger.Info("dispatch_reject_repeat_assign",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		o.postReply(ev.SessionID, repeatAssignHelp)
+		o.replyRejection(ev.SessionID, task.State, repeatAssignHelp)
 		return
 	}
 
 	cmdName, remainder, ok := parseMentionCommand(text)
 	if !ok {
+		// A bare message (no /command) on an AWAITING_INPUT task is the
+		// user's reply to the pending ask_user question.
+		if task.State == store.JobStateAwaitingInput {
+			o.dispatchAwaitingReply(ev, task, text)
+			return
+		}
 		o.logger.Info("dispatch_reject_bare",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
-		o.postReply(ev.SessionID, mentionCommandHelp)
+		o.replyRejection(ev.SessionID, task.State, mentionCommandHelp)
 		return
 	}
 
@@ -258,18 +399,39 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 		o.dispatchRerun(ev, task, remainder)
 	case "fix":
 		o.dispatchFix(ev, task, remainder)
+	case "resume":
+		o.dispatchResume(ev, task)
 	case "status", "help":
 		o.handleCommand(ev, cmdName)
 	default:
 		o.logger.Info("autopilot_reject_unknown_command",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier, "command", "/"+cmdName)
-		o.postReply(ev.SessionID, unknownCommandHelp("/"+cmdName))
+		o.replyRejection(ev.SessionID, task.State, unknownCommandHelp("/"+cmdName))
 	}
 }
 
-// dispatchFreshAssign claims a fresh admiral_tasks row for the issue
-// and spawns the run goroutine. ClaimAdmiralTask is idempotent — a
-// race that loses the claim simply skips o.run, the winner runs.
+// replyRejection chooses between postRejection (ErrorActivity, terminal) and
+// postBusyAck (Thought, non-terminal) based on whether the task is still in
+// flight. Used by dispatch sites that may fire on either a live or terminal
+// task (bare @mention, unknown /command, re-toggled delegate).
+func (o *Orchestrator) replyRejection(sessionID, taskState, body string) {
+	if taskInFlight(taskState) {
+		o.postBusyAck(sessionID, body)
+		return
+	}
+	o.postRejection(sessionID, body)
+}
+
+// StartBlockerWatcher starts the background loop that re-queues BLOCKED tasks
+// once their Linear blocked_by relations are resolved. Call once from main.
+func (o *Orchestrator) StartBlockerWatcher(ctx context.Context) {
+	o.blockerWatcher.Run(ctx)
+}
+
+// dispatchFreshAssign claims a fresh admiral_tasks row for the issue,
+// checks for unresolved Linear blocked_by relations, and either parks the
+// task as BLOCKED (with an automatic re-queue via BlockerWatcher) or spawns
+// the run goroutine immediately.
 func (o *Orchestrator) dispatchFreshAssign(ev linear.AgentEvent) {
 	fresh, err := o.db.ClaimAdmiralTask(ev.IssueID, ev.IssueIdentifier, ev.SessionID)
 	if err != nil {
@@ -282,7 +444,46 @@ func (o *Orchestrator) dispatchFreshAssign(ev linear.AgentEvent) {
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
 		return
 	}
+
+	if o.parkIfBlocked(ev) {
+		return
+	}
+
 	go o.run(ev)
+}
+
+// parkIfBlocked checks for unresolved Linear blocked_by relations on ev's
+// issue. If any exist it parks the live admiral_tasks row as BLOCKED (the
+// BlockerWatcher resumes it once the blockers clear) and returns true — the
+// caller must NOT spawn a run. On a Linear API error it logs and returns false
+// (fail-open) so a transient hiccup does not permanently stall the task.
+//
+// Shared by the fresh-assign and /rerun paths so re-running an issue respects
+// the same dependency gate as first dispatch. Relies on the live row already
+// being claimed (fresh assign) or freshly superseded (/rerun) so
+// SetAdmiralTaskBlocked targets the right attempt; the BlockerWatcher resumes
+// with that row's attempt_n, preserving the rerun branch naming.
+func (o *Orchestrator) parkIfBlocked(ev linear.AgentEvent) bool {
+	bctx, bcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer bcancel()
+	blockers, err := o.lc.GetIssueBlockers(bctx, ev.IssueID)
+	if err != nil {
+		o.logger.Warn("blocker_check_failed_proceeding",
+			"issue", ev.IssueIdentifier, "err", err)
+		return false
+	}
+	if len(blockers) == 0 {
+		return false
+	}
+	o.logger.Info("dispatch_blocked",
+		"issue", ev.IssueIdentifier, "blockers", blockerIdentifiers(blockers))
+	if setErr := o.db.SetAdmiralTaskBlocked(ev.IssueID, blockerIDsJSON(blockers)); setErr != nil {
+		o.logger.Error("set_blocked_failed", "issue", ev.IssueIdentifier, "err", setErr)
+	}
+	// Use Thought (non-terminal) so the AgentSession stays alive for the
+	// watcher's follow-up "resuming now" post when blockers are resolved.
+	o.postBlockedNotice(ev.SessionID, blockedMessage(blockers))
+	return true
 }
 
 // dispatchRerun handles /rerun on an existing admiral_tasks row.
@@ -306,8 +507,24 @@ func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, task *store.AdmiralTa
 			"issue", ev.IssueIdentifier,
 			"prior_state", task.State,
 			"attempt_n", task.AttemptN)
-		o.postReply(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
+		// Task is in flight by definition of this case branch — Thought
+		// keeps the live AgentSession alive for the running flow.
+		o.postBusyAck(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
 		return
+	case store.JobStateBlocked:
+		o.logger.Info("dispatch_reject_rerun_blocked",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		// Thought keeps the session alive; watcher will auto-resume when blockers clear.
+		o.postBusyAck(ev.SessionID, "admiral is waiting for blockers to resolve. Use /status to check; will resume automatically.")
+		return
+	case store.JobStateAwaitingInput:
+		// Cancel the open pending question so the superseded row doesn't match
+		// a future reply to the new attempt.
+		if err := o.db.CancelOpenPendingQuestionsForIssue(ev.IssueID); err != nil {
+			o.logger.Warn("dispatch_rerun_cancel_pending_q_failed",
+				"err", err, "issue", ev.IssueID)
+		}
+		// Fall through to the normal supersession path below.
 	}
 
 	newAttempt, err := o.db.MoveAdmiralTaskToHistoryAndClaimNew(
@@ -316,7 +533,7 @@ func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, task *store.AdmiralTa
 	if err != nil {
 		o.logger.Error("rerun_supersede_failed",
 			"err", err, "issue", ev.IssueID)
-		o.postReply(ev.SessionID, "Internal error processing /rerun. Try again or assign the issue manually.")
+		o.postRejection(ev.SessionID, "Internal error processing /rerun. Try again or assign the issue manually.")
 		return
 	}
 	o.logger.Info("dispatch_rerun_superseded",
@@ -333,6 +550,17 @@ func (o *Orchestrator) dispatchRerun(ev linear.AgentEvent, task *store.AdmiralTa
 	} else {
 		rerunEv.PromptContext = ""
 	}
+
+	// Re-running must respect blockers just like a fresh assign: a task whose
+	// dependencies aren't done yet should park BLOCKED, not ship out of order.
+	// The just-claimed attempt-n+1 row is parked; the BlockerWatcher resumes it
+	// (with this attempt_n) once the blockers clear.
+	if o.parkIfBlocked(rerunEv) {
+		o.logger.Info("dispatch_rerun_parked_blocked",
+			"issue", ev.IssueIdentifier, "new_attempt_n", newAttempt)
+		return
+	}
+
 	go o.runWithAttempt(rerunEv, newAttempt)
 }
 
@@ -352,16 +580,37 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 		o.logger.Info("dispatch_reject_fix_currently_processing",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier,
 			"prior_state", task.State)
-		o.postReply(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
+		// Task is in flight by definition of this case branch — Thought
+		// keeps the live AgentSession alive for the running flow.
+		o.postBusyAck(ev.SessionID, rerunCurrentlyProcessingHelp(ev.IssueIdentifier))
+		return
+	case store.JobStateBlocked:
+		o.logger.Info("dispatch_reject_fix_blocked",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postBusyAck(ev.SessionID, "admiral is waiting for blockers to resolve. Will resume automatically.")
+		return
+	case store.JobStateAwaitingInput:
+		o.logger.Info("dispatch_reject_fix_awaiting_input",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postBusyAck(ev.SessionID, "admiral is waiting for your reply to a question. Reply to the question or use /rerun to start fresh.")
 		return
 	case store.JobStateFailed, store.JobStateTimedOut, store.JobStateCancelled:
 		o.logger.Info("dispatch_reject_fix_terminal_non_done",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier,
 			"prior_state", task.State)
-		o.postReply(ev.SessionID, fmt.Sprintf(
+		o.postRejection(ev.SessionID, fmt.Sprintf(
 			"/fix only works on a previous DONE run. The current attempt is %s. Use /rerun to start over.",
 			task.State,
 		))
+		return
+	case store.JobStateDoneMerged:
+		// PR was merged → branch may already be deleted on origin and the
+		// worktree cleaned up. /fix would either fail at worktree
+		// recreation or push to a dead branch. Tell the user to /rerun.
+		o.logger.Info("dispatch_reject_fix_done_merged",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postRejection(ev.SessionID,
+			"PR was already merged — /fix can't reopen merged work. Use /rerun to start fresh on a new branch.")
 		return
 	case store.JobStateDone:
 		// proceed
@@ -369,7 +618,7 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 		o.logger.Warn("dispatch_fix_unhandled_state",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier,
 			"state", task.State)
-		o.postReply(ev.SessionID, fmt.Sprintf("/fix not supported in state %q.", task.State))
+		o.postRejection(ev.SessionID, fmt.Sprintf("/fix not supported in state %q.", task.State))
 		return
 	}
 
@@ -377,13 +626,13 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 		o.logger.Info("dispatch_reject_fix_legacy_row",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier,
 			"has_pr", task.PRURL != "", "has_claude", task.ClaudeSessionID != "")
-		o.postReply(ev.SessionID,
+		o.postRejection(ev.SessionID,
 			"/fix needs a prior run with both an open PR and a recoverable claude session, but this task is missing one of those. Use /rerun to start over.")
 		return
 	}
 
 	if description == "" {
-		o.postReply(ev.SessionID,
+		o.postRejection(ev.SessionID,
 			"/fix needs a description of what to change, e.g. `/fix the typo in line 12`.")
 		return
 	}
@@ -483,6 +732,119 @@ func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 		"pr", task.PRURL, "attempt_n", task.AttemptN)
 }
 
+// dispatchResume handles /resume on an existing admiral_tasks row. Only
+// TIMED_OUT is supported — the command exists to continue a run that was
+// killed by the per-task timeout, not to retry FAILED or rerun DONE.
+//
+// Requires task.ClaudeSessionID populated (admiral writes it before launching
+// claude, so any timed-out task will have it) and the prior worktree still on
+// disk. The branch may or may not have an associated PR — /resume creates one
+// after claude finishes if the timed-out run died before it could.
+func (o *Orchestrator) dispatchResume(ev linear.AgentEvent, task *store.AdmiralTask) {
+	switch task.State {
+	case store.JobStateReceived, store.JobStateExecuting:
+		o.logger.Info("dispatch_reject_resume_currently_processing",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier,
+			"prior_state", task.State, "attempt_n", task.AttemptN)
+		o.postBusyAck(ev.SessionID, fmt.Sprintf(
+			"admiral is currently running on this issue (attempt %d). Wait for it to finish before /resume.",
+			task.AttemptN))
+		return
+	case store.JobStateTimedOut:
+		// proceed
+	default:
+		o.replyRejection(ev.SessionID, task.State, fmt.Sprintf(
+			"/resume only works on a TIMED_OUT task. Current state is %q. Use /rerun to start over or /fix <description> to patch the current PR.",
+			task.State))
+		return
+	}
+
+	if task.ClaudeSessionID == "" {
+		o.logger.Info("dispatch_reject_resume_no_session",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postRejection(ev.SessionID,
+			"/resume needs a recoverable claude session id, but this task has none. Use /rerun to start over.")
+		return
+	}
+	if task.WorktreePath == "" {
+		o.logger.Info("dispatch_reject_resume_no_worktree_path",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postRejection(ev.SessionID,
+			"/resume needs the worktree from the prior run, but this task has none. Use /rerun to start over.")
+		return
+	}
+	if _, err := os.Stat(task.WorktreePath); err != nil {
+		o.logger.Info("dispatch_reject_resume_worktree_missing",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier,
+			"worktree", task.WorktreePath, "err", err)
+		o.postRejection(ev.SessionID,
+			"/resume needs the prior worktree on disk, but it was cleaned up. Use /rerun to start over.")
+		return
+	}
+
+	o.logger.Info("dispatch_resume_starting",
+		"session", ev.SessionID, "issue", ev.IssueIdentifier,
+		"prior_pr", task.PRURL, "attempt_n", task.AttemptN)
+
+	go o.runResume(ev, task)
+}
+
+// runResume executes a /resume run: claude --resume on the prior session id
+// inside the existing worktree, then opens (or reuses) a PR. Reuses the
+// existing admiral_tasks row — attempt_n is unchanged because /resume is
+// a continuation of the same attempt, not a new one.
+func (o *Orchestrator) runResume(ev linear.AgentEvent, task *store.AdmiralTask) {
+	release := o.acquireRunSlot()
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
+	defer cancel()
+
+	if _, err := o.db.ClaimAutopilotJob(ev.SessionID, ev.IssueID, ev.IssueIdentifier); err != nil {
+		o.logger.Warn("claim_resume_audit_log_failed",
+			"err", err, "session", ev.SessionID)
+	}
+
+	if err := o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+		t.State = store.JobStateExecuting
+		t.LastEventSessionID = ev.SessionID
+	}); err != nil {
+		o.logger.Warn("resume_admiral_task_to_executing_failed",
+			"err", err, "issue", ev.IssueID)
+	}
+
+	syntheticPrior := &store.AutopilotJob{
+		AgentSessionID:  task.LastEventSessionID,
+		IssueID:         task.IssueID,
+		IssueIdentifier: task.IssueIdentifier,
+		State:           store.JobStateTimedOut,
+		WorktreePath:    task.WorktreePath,
+		Branch:          task.Branch,
+		PRURL:           task.PRURL,
+		ClaudeSessionID: task.ClaudeSessionID,
+	}
+	resumeFlow := newResumeFlow(o, ctx, ev, syntheticPrior)
+	if issue, err := o.lc.GetIssue(ctx, ev.IssueID); err == nil {
+		resumeFlow.teamID = issue.TeamID
+		if repo, err := o.db.GetRepoByProjectID(issue.ProjectID); err == nil && repo != nil {
+			resumeFlow.repoDir = repo.RepoDir
+			resumeFlow.baseBranch = repo.BaseBranch
+		}
+	}
+
+	if err := resumeFlow.executeResumeFromTimeout(); err != nil {
+		o.logger.Error("autopilot_resume_failed",
+			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
+		resumeFlow.markFailed(err)
+		return
+	}
+
+	o.logger.Info("autopilot_resume_done",
+		"issue", ev.IssueIdentifier, "session", ev.SessionID,
+		"pr", resumeFlow.prURL, "attempt_n", task.AttemptN)
+}
+
 func followupSuffix(sessionID string) string {
 	clean := sanitizeForPath(sessionID)
 	if len(clean) == 0 {
@@ -492,6 +854,168 @@ func followupSuffix(sessionID string) string {
 		clean = clean[:8]
 	}
 	return "followup-" + clean
+}
+
+// dispatchAwaitingReply handles a bare-text reply from the user when the
+// task is in AWAITING_INPUT state. It matches the reply to the open pending
+// question and re-spawns the claude session with the answer.
+func (o *Orchestrator) dispatchAwaitingReply(ev linear.AgentEvent, task *store.AdmiralTask, reply string) {
+	// Look up the exact question correlated to this task by ID (not just by
+	// issue) so stale orphaned rows from a prior rerun don't get matched.
+	if task.PendingQuestionID == "" {
+		o.logger.Warn("dispatch_awaiting_reply_no_question_id",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		o.postBusyAck(ev.SessionID, "admiral: no pending question found. Use /rerun to start a new run.")
+		return
+	}
+	pq, err := o.db.GetPendingQuestionByID(task.PendingQuestionID)
+	if err != nil {
+		o.logger.Error("dispatch_awaiting_reply_lookup_failed",
+			"err", err, "question_id", task.PendingQuestionID)
+		o.postBusyAck(ev.SessionID, "admiral: internal error looking up the pending question. Try /rerun.")
+		return
+	}
+	if pq == nil || pq.AnsweredAt != "" {
+		o.logger.Warn("dispatch_awaiting_reply_question_gone",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier,
+			"question_id", task.PendingQuestionID)
+		o.postBusyAck(ev.SessionID, "admiral: pending question not found or already answered. Use /rerun to start a new run.")
+		return
+	}
+
+	if err := o.db.AnswerPendingQuestion(pq.ID, reply); err != nil {
+		o.logger.Error("dispatch_awaiting_reply_answer_failed",
+			"err", err, "question_id", pq.ID)
+		o.postBusyAck(ev.SessionID, "admiral: internal error recording your answer. Try again.")
+		return
+	}
+
+	ok, err := o.db.TransitionAwaitingInputToExecuting(ev.IssueID)
+	if err != nil {
+		o.logger.Error("dispatch_awaiting_reply_transition_failed",
+			"err", err, "issue", ev.IssueID)
+		return
+	}
+	if !ok {
+		o.logger.Warn("dispatch_awaiting_reply_transition_lost",
+			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		return
+	}
+
+	o.logger.Info("dispatch_awaiting_resume",
+		"session", ev.SessionID,
+		"issue", ev.IssueIdentifier,
+		"question_id", pq.ID,
+		"reply_preview", truncate(reply, 80))
+
+	go o.runAwaitingResume(ev, task, pq, reply)
+}
+
+// runAwaitingResume resumes a claude session after the user replied to an
+// ask_user question. It acquires a run slot, calls claude --resume with the
+// answer injected, then opens a PR as usual.
+func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.AdmiralTask, pq *store.PendingQuestion, reply string) {
+	release := o.acquireRunSlot()
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
+	defer cancel()
+
+	if pq.WorktreePath == "" || pq.ClaudeSessionID == "" {
+		o.logger.Error("awaiting_resume_missing_fields",
+			"issue", ev.IssueIdentifier,
+			"worktree", pq.WorktreePath,
+			"claude_session", pq.ClaudeSessionID)
+		o.postBusyAck(ev.SessionID, "admiral: resume failed — missing worktree or claude session. Use /rerun.")
+		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+			t.State = store.JobStateFailed
+			t.Error = "awaiting_resume: missing worktree or claude_session_id"
+		})
+		return
+	}
+
+	// Synthetic autopilot_jobs row so runClaudeResume can access session ID.
+	job := &store.AutopilotJob{
+		AgentSessionID:  ev.SessionID,
+		ClaudeSessionID: pq.ClaudeSessionID,
+		WorktreePath:    pq.WorktreePath,
+		Branch:          task.Branch,
+	}
+	f := newResumeFlow(o, ctx, ev, job)
+	f.worktreePath = pq.WorktreePath
+	f.branch = task.Branch
+	f.claudeSessionID = pq.ClaudeSessionID
+
+	issue, err := o.lc.GetIssue(ctx, ev.IssueID)
+	if err != nil {
+		o.logger.Error("awaiting_resume_fetch_issue_failed",
+			"err", err, "issue", ev.IssueID)
+		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+			t.State = store.JobStateFailed
+			t.Error = fmt.Sprintf("fetch issue: %v", err)
+		})
+		return
+	}
+	if repo, err := o.db.GetRepoByProjectID(issue.ProjectID); err == nil && repo != nil {
+		f.repoDir = repo.RepoDir
+		f.baseBranch = repo.BaseBranch
+	}
+
+	if err := f.openStreamFile(); err != nil {
+		o.logger.Warn("awaiting_resume_stream_open_failed", "err", err)
+	}
+	defer f.closeStreamFile()
+
+	userMsg := fmt.Sprintf(
+		"The user has answered the pending question.\n\nQuestion: %s\nAnswer: %s\n\nContinue from where you left off.",
+		pq.Question, reply)
+	f.postActivity(linear.Action("claude_resume",
+		fmt.Sprintf("claude -p --resume (awaiting-input reply) in %s", f.worktreePath), ""))
+	if err := f.runClaudeResume(userMsg); err != nil {
+		o.logger.Error("awaiting_resume_claude_failed",
+			"issue", ev.IssueIdentifier, "err", err)
+		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+			t.State = store.JobStateFailed
+			t.Error = err.Error()
+		})
+		f.postActivity(linear.ErrorActivity(fmt.Sprintf("claude resume failed: %v", err)))
+		return
+	}
+
+	// claude called ask_user again — park and wait for the next reply.
+	if f.awaitPendingID != "" {
+		_ = f.parkAwaitingInput()
+		return
+	}
+
+	f.postActivity(linear.Action("ensure_pr",
+		fmt.Sprintf("gh pr (%s -> %s)", f.branch, f.baseBranch), ""))
+	prURL, err := f.ensurePR(issue)
+	isNoop := errors.Is(err, errPRNoCommits)
+	if err != nil && !isNoop {
+		o.logger.Error("awaiting_resume_pr_failed",
+			"issue", ev.IssueIdentifier, "err", err)
+		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+			t.State = store.JobStateFailed
+			t.Error = err.Error()
+		})
+		return
+	}
+	f.prURL = prURL
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+		t.State = store.JobStateDone
+		t.PRURL = prURL
+		t.ClaudeSessionID = pq.ClaudeSessionID
+		t.FinishedAt = now
+	})
+	if !isNoop && prURL != "" && o.ciWatcher != nil {
+		o.ciWatcher.WatchPR(ctx, prURL, f.repoDir, ev.SessionID, ev.IssueID)
+	}
+	o.logger.Info("awaiting_resume_done",
+		"issue", ev.IssueIdentifier, "pr", prURL)
 }
 
 func (o *Orchestrator) run(ev linear.AgentEvent) {
@@ -562,6 +1086,7 @@ type flow struct {
 	teamID          string
 	repoDir         string
 	baseBranch      string
+	verifyCmd       string // configured `verify_cmd` for this run's repo; empty = build hard gate disabled
 
 	// attemptN is the admiral_tasks attempt counter for this run.
 	// attemptN == 1 → first run on linear/<id>.
@@ -575,6 +1100,12 @@ type flow struct {
 	// Set by handleCreated for the GEO-38 fresh-follow-up path; empty for
 	// the normal first run.
 	followupSuffix string
+
+	// awaitPendingID is set by drainStreamJSON when it detects the
+	// ADMIRAL_AWAIT:<id> marker in claude's output. A non-empty value
+	// means the run called ask_user and parked itself; execute() will
+	// transition the task to AWAITING_INPUT instead of opening a PR.
+	awaitPendingID string
 }
 
 func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
@@ -653,6 +1184,7 @@ func (f *flow) execute() error {
 	}
 	f.repoDir = repo.RepoDir
 	f.baseBranch = repo.BaseBranch
+	f.verifyCmd = repo.VerifyCmd
 	worktreeName := "linear-" + sanitizeForPath(issue.Identifier)
 	f.branch = branchName(issue)
 	// /rerun: append `-rerun-<N>` to both branch and worktree so a new
@@ -770,6 +1302,75 @@ func (f *flow) execute() error {
 	if err := f.runClaude(issue); err != nil {
 		return fmt.Errorf("claude run: %w", err)
 	}
+	// ask_user was called: park task as AWAITING_INPUT and return without
+	// opening a PR. The worktree stays on disk for the resume run.
+	if f.awaitPendingID != "" {
+		return f.parkAwaitingInput()
+	}
+
+	// Build hard gate (closes the first-run slice of #161 / 漏洞 1). When the
+	// repo has verify_cmd configured, admiral runs it in the worktree AFTER
+	// claude's commit and retries fix-forward up to VerifyMaxRetries times.
+	// Only a clean exit 0 advances to ensurePR. On failure admiral does NOT
+	// open a PR — failure is surfaced on the Linear thread for a human pickup,
+	// and any branch claude may have pushed against the prompt is cleaned up.
+	// Repos without verify_cmd skip the gate entirely (preserves pre-PR
+	// behavior; prompt-level layers via autopilot_skill remain).
+	gateAttempts := 0
+	if f.verifyCmd != "" {
+		f.postActivity(linear.Action("build_gate",
+			fmt.Sprintf("verify_cmd=%s, max_retries=%d", f.verifyCmd, f.o.cfg.VerifyMaxRetries),
+			""))
+		claudeRunner := func(ctx context.Context, wt, retryPrompt string) (string, error) {
+			fullPrompt := retryPrompt
+			if f.o.cfg.AutopilotSkill != "" {
+				fullPrompt = "/" + f.o.cfg.AutopilotSkill + "\n\n" + retryPrompt
+			}
+			return runClaudeForReview(ctx, f.o.cfg.ClaudeBin, f.o.cfg.MaxRunSeconds, wt, fullPrompt, f.o.cfg.BotIdentity, f.o.logger)
+		}
+		gate := runVerifyWithRetry(f.ctx, f.worktreePath, f.verifyCmd, f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, claudeRunner)
+		gateAttempts = gate.Attempts
+		if !gate.Passed {
+			f.o.logger.Warn("first_run_build_gate_failed",
+				"issue", issue.Identifier, "branch", f.branch,
+				"attempts", gate.Attempts, "launch_err", gate.LaunchErr)
+			// Best-effort: if claude defied the prompt and pushed, remove the
+			// remote branch so no broken state sits on origin. Most calls will
+			// no-op (branch never pushed) — that's a benign Debug log, not a
+			// warn.
+			if delErr := runCmd(f.ctx, f.worktreePath, "git", "push", "origin", "--delete", f.branch); delErr != nil {
+				f.o.logger.Debug("first_run_gate_fail_no_remote_branch_to_delete",
+					"branch", f.branch, "err", delErr)
+			} else {
+				f.o.logger.Info("first_run_gate_fail_cleaned_remote_branch", "branch", f.branch)
+			}
+			body := fmt.Sprintf(
+				"admiral could not get the build to pass after %d attempt(s). No PR opened.\n\n"+
+					"Verify command: `%s`\nLast build output tail:\n```\n%s\n```",
+				gate.Attempts, f.verifyCmd, strings.TrimSpace(gate.LastBuildOutput))
+			if gate.LaunchErr != "" {
+				body += fmt.Sprintf("\n\nadmiral launch error: %s", gate.LaunchErr)
+			}
+			f.postActivity(linear.ErrorActivity(body))
+			now := time.Now().UTC().Format(time.RFC3339)
+			gateErrMsg := fmt.Sprintf("build gate failed after %d attempt(s)", gate.Attempts)
+			f.persistAdmiralTask(func(t *store.AdmiralTask) {
+				t.State = store.JobStateFailed
+				t.FinishedAt = now
+				t.Error = gateErrMsg
+			})
+			if jerr := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+				j.State = store.JobStateFailed
+				j.FinishedAt = now
+				j.Error = gateErrMsg
+			}); jerr != nil {
+				f.o.logger.Warn("update_job_state_on_gate_fail", "err", jerr)
+			}
+			return fmt.Errorf("%s", gateErrMsg)
+		}
+		f.o.logger.Info("first_run_build_gate_passed",
+			"issue", issue.Identifier, "branch", f.branch, "attempts", gate.Attempts)
+	}
 
 	f.postActivity(linear.Action("ensure_pr",
 		fmt.Sprintf("gh pr (%s -> %s)", f.branch, f.baseBranch),
@@ -797,6 +1398,13 @@ func (f *flow) execute() error {
 		t.FinishedAt = now
 	})
 
+	// Spawn CI watcher (non-blocking). Watches GitHub check runs and posts
+	// results to Linear thread. On failure, transitions admiral_tasks to
+	// FAILED with reason "ci_failed" (GEO-54).
+	if !isNoop && prURL != "" && f.o.ciWatcher != nil {
+		f.o.ciWatcher.WatchPR(f.ctx, prURL, f.repoDir, f.ev.SessionID, f.ev.IssueID)
+	}
+
 	mention := f.creatorMention()
 	var doneBody string
 	if isNoop {
@@ -807,6 +1415,11 @@ func (f *flow) execute() error {
 		doneBody = fmt.Sprintf(
 			"%sDone. PR opened: %s\n\nWorktree: `%s`\nBranch: `%s`",
 			mention, prURL, f.worktreePath, f.branch)
+	}
+	if gateAttempts > 0 {
+		// Tell reviewers whether the change landed cleanly (1 attempt) or
+		// needed retry rounds (2+).
+		doneBody += fmt.Sprintf("\n\n_(admiral build gate: passed after %d attempt(s))_", gateAttempts)
 	}
 	if err := f.postActivityWithRetry(linear.Response(doneBody)); err != nil {
 		f.o.logger.Error("final_activity_push_failed",
@@ -823,20 +1436,12 @@ func (f *flow) execute() error {
 		cancel()
 	}
 
-	// Update Linear issue status to "completed" asynchronously (non-blocking).
-	// Skip on noop: claude produced no diff, so admiral does not assert the
-	// issue is actually done — leave that judgment to the user.
-	if !isNoop && f.o.cfg.UpdateIssueStatus != nil && *f.o.cfg.UpdateIssueStatus && f.teamID != "" {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if id, err := f.o.stateIDByType(ctx, f.teamID, "completed"); err == nil && id != "" {
-				if err := f.o.lc.IssueUpdate(ctx, f.ev.IssueID, id); err != nil {
-					f.o.logger.Warn("issue_update_completed_failed", "err", err)
-				}
-			}
-		}()
-	}
+	// Linear post-PR state transitions (in_review / reviewed / completed /
+	// canceled) are now driven by admiral-discoverer based on the live
+	// GitHub PR state — autopilot only owns the "started" transition above
+	// since it needs the in-process knowledge of "claude run is starting
+	// now". The completed transition used to live here; removed in the
+	// task-lifecycle refactor.
 
 	f.cleanupWorktree(cleanupDelete)
 	return nil
@@ -884,31 +1489,180 @@ func (f *flow) executeResume() error {
 	return nil
 }
 
+// executeResumeFromTimeout continues a timed-out claude session in its
+// original worktree, then opens (or reuses) a PR. Mirrors execute()'s
+// post-claude path but skips fresh-worktree setup — the timed-out attempt
+// already created one, and dispatchResume guarantees it's still on disk.
+func (f *flow) executeResumeFromTimeout() error {
+	f.postActivity(linear.Thought("Resuming previous timed-out session...", true))
+
+	issue, err := f.o.lc.GetIssue(f.ctx, f.ev.IssueID)
+	if err != nil {
+		return fmt.Errorf("fetch issue: %w", err)
+	}
+	f.teamID = issue.TeamID
+	if f.repoDir == "" {
+		repo, err := f.o.db.GetRepoByProjectID(issue.ProjectID)
+		if err != nil || repo == nil {
+			return fmt.Errorf("repo lookup failed for project %s: %w", issue.ProjectID, err)
+		}
+		f.repoDir = repo.RepoDir
+		f.baseBranch = repo.BaseBranch
+	}
+
+	if err := f.ensureWorktree(); err != nil {
+		return fmt.Errorf("ensure worktree: %w", err)
+	}
+
+	f.postActivity(linear.Action("claude_resume",
+		fmt.Sprintf("claude -p --resume in %s", f.worktreePath),
+		""))
+	if err := f.openStreamFile(); err != nil {
+		return fmt.Errorf("open stream file: %w", err)
+	}
+	defer f.closeStreamFile()
+
+	// A non-empty prompt cues claude to continue rather than wait for input.
+	// The actual continuation context lives in the resumed session itself.
+	if err := f.runClaudeResume("Continue from where the previous run was interrupted by timeout."); err != nil {
+		return fmt.Errorf("claude resume: %w", err)
+	}
+
+	f.postActivity(linear.Action("ensure_pr",
+		fmt.Sprintf("gh pr (%s -> %s)", f.branch, f.baseBranch),
+		""))
+	prURL, err := f.ensurePR(issue)
+	isNoop := errors.Is(err, errPRNoCommits)
+	if err != nil && !isNoop {
+		return fmt.Errorf("ensure PR: %w", err)
+	}
+	f.prURL = prURL
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateDone
+		j.PRURL = prURL
+		j.FinishedAt = now
+	}); err != nil {
+		return fmt.Errorf("update job to DONE: %w", err)
+	}
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateDone
+		t.PRURL = prURL
+		t.FinishedAt = now
+	})
+
+	if !isNoop && prURL != "" && f.o.ciWatcher != nil {
+		f.o.ciWatcher.WatchPR(f.ctx, prURL, f.repoDir, f.ev.SessionID, f.ev.IssueID)
+	}
+
+	mention := f.creatorMention()
+	var doneBody string
+	if isNoop {
+		doneBody = fmt.Sprintf(
+			"%sResumed from timeout but produced no new diff.\n\nWorktree: `%s`\nBranch: `%s`",
+			mention, f.worktreePath, f.branch)
+	} else {
+		doneBody = fmt.Sprintf(
+			"%sResumed from timeout. PR: %s\n\nWorktree: `%s`\nBranch: `%s`",
+			mention, prURL, f.worktreePath, f.branch)
+	}
+	if err := f.postActivityWithRetry(linear.Response(doneBody)); err != nil {
+		f.o.logger.Error("final_activity_push_failed",
+			"session", f.ev.SessionID, "err", err)
+	}
+
+	f.cleanupWorktree(cleanupDelete)
+	return nil
+}
+
 // ensureWorktree re-enters the worktree if it still exists, or recreates it
-// on the original branch if it was cleaned up.
+// on the original branch if it was cleaned up. After the worktree is ready,
+// it fetches origin/<branch> and refuses to proceed if origin has commits
+// that are not ancestors of HEAD — i.e. someone pushed to the branch while
+// admiral's previous run was timed out. Auto-rebase isn't safe (claude's
+// unpushed work could conflict with the external commits), so this surfaces
+// the divergence as an error and lets the caller mark the task failed.
 func (f *flow) ensureWorktree() error {
 	if _, err := os.Stat(f.job.WorktreePath); err == nil {
 		f.worktreePath = f.job.WorktreePath
 		f.branch = f.job.Branch
+	} else {
+		// Worktree was cleaned up; recreate it on the original branch.
+		// Local refs/heads/<branch> still has admiral's prior commits in the
+		// parent repo's object store (worktree removal doesn't delete refs),
+		// so checking out the local branch ref preserves work in progress.
+		cmd := exec.Command("git", "fetch", "origin", f.job.Branch)
+		cmd.Dir = f.repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git fetch %s: %w (%s)", f.job.Branch, err, out)
+		}
+
+		cmd = exec.Command("git", "worktree", "add", f.job.WorktreePath, f.job.Branch)
+		cmd.Dir = f.repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git worktree add: %w (%s)", err, out)
+		}
+
+		f.worktreePath = f.job.WorktreePath
+		f.branch = f.job.Branch
+	}
+
+	if err := applyBotIdentityToWorktree(f.ctx, f.worktreePath, f.o.cfg.BotIdentity); err != nil {
+		f.o.logger.Warn("autopilot_bot_identity_apply_failed",
+			"session", f.ev.SessionID, "branch", f.branch, "err", err)
+	}
+
+	if err := f.checkBranchDiverged(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// errBranchDiverged is the sentinel wrapped into the error returned by
+// checkBranchDiverged when origin has commits not in HEAD. Used by markFailed
+// to keep the worktree on disk so the user can manually rebase and push.
+var errBranchDiverged = errors.New("branch diverged")
+
+// checkBranchDiverged fetches origin/<branch> and returns an error wrapping
+// errBranchDiverged if origin has commits that are not in the worktree's HEAD.
+// The reuse path of ensureWorktree doesn't fetch on its own, so this also
+// covers the case where the worktree was kept across a timed-out run while
+// someone pushed externally.
+//
+// Precondition: origin/<branch> must exist (i.e. admiral has pushed the branch
+// in a prior run). If it doesn't, `git fetch` fails before merge-base is
+// reached and the caller sees the wrapped fetch error.
+func (f *flow) checkBranchDiverged() error {
+	if f.branch == "" {
+		return fmt.Errorf("checkBranchDiverged: f.branch is empty")
+	}
+	cmd := exec.Command("git", "fetch", "origin", f.branch)
+	cmd.Dir = f.worktreePath
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git fetch origin %s in worktree: %w (%s)", f.branch, err, out)
+	}
+
+	// `merge-base --is-ancestor origin/<branch> HEAD` exits 0 when origin is
+	// an ancestor of HEAD (local equal or ahead — push will fast-forward) and
+	// 1 when origin has commits HEAD doesn't have (push would be rejected).
+	originRef := "origin/" + f.branch
+	cmd = exec.Command("git", "merge-base", "--is-ancestor", originRef, "HEAD")
+	cmd.Dir = f.worktreePath
+	err := cmd.Run()
+	if err == nil {
 		return nil
 	}
-
-	// Worktree was cleaned up; recreate it on the original branch.
-	cmd := exec.Command("git", "fetch", "origin", f.job.Branch)
-	cmd.Dir = f.repoDir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git fetch %s: %w (%s)", f.job.Branch, err, out)
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return fmt.Errorf(
+			"%w: %s has commits not in the resume worktree at %s (external push?); "+
+				"admiral will not auto-rebase. Inside that worktree, run "+
+				"`git pull --rebase origin %s` and resolve conflicts, then "+
+				"`git push origin %s`. admiral's task is marked failed and will not retry",
+			errBranchDiverged, originRef, f.worktreePath, f.branch, f.branch)
 	}
-
-	cmd = exec.Command("git", "worktree", "add", f.job.WorktreePath, f.job.Branch)
-	cmd.Dir = f.repoDir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git worktree add: %w (%s)", err, out)
-	}
-
-	f.worktreePath = f.job.WorktreePath
-	f.branch = f.job.Branch
-	return nil
+	return fmt.Errorf("git merge-base --is-ancestor %s HEAD: %w", originRef, err)
 }
 
 // runClaudeResume spawns `claude -p --resume` in stream-json mode inside the worktree.
@@ -920,14 +1674,26 @@ func (f *flow) runClaudeResume(userMessage string) error {
 		"--verbose",
 		"--dangerously-skip-permissions",
 	}
+	if mcpCfgPath, err := f.writeMCPConfig(); err != nil {
+		f.o.logger.Warn("mcp_config_write_failed", "err", err)
+	} else if mcpCfgPath != "" {
+		args = append(args, "--mcp-config", mcpCfgPath)
+		defer os.Remove(mcpCfgPath)
+	}
 	cctx, cancel := context.WithTimeout(f.ctx, time.Duration(f.o.cfg.MaxRunSeconds)*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, f.o.cfg.ClaudeBin, args...)
 	cmd.Dir = f.worktreePath
-	cmd.Env = append(os.Environ(),
+	cmd.Env = appendBotIdentityEnv(append(os.Environ(),
 		"CLAUDE_AUTOPILOT_ISSUE="+f.ev.IssueIdentifier,
 		"CLAUDE_AUTOPILOT_SESSION="+f.ev.SessionID,
-	)
+		"ADMIRAL_DB_PATH="+f.o.dbPath,
+		"ADMIRAL_ISSUE_ID="+f.ev.IssueID,
+		"ADMIRAL_ISSUE_IDENTIFIER="+f.ev.IssueIdentifier,
+		"ADMIRAL_LINEAR_SESSION="+f.ev.SessionID,
+		"ADMIRAL_CLAUDE_SESSION="+f.job.ClaudeSessionID,
+		"ADMIRAL_WORKTREE_PATH="+f.worktreePath,
+	), f.o.cfg.BotIdentity)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -954,6 +1720,9 @@ func (f *flow) runClaudeResume(userMessage string) error {
 	}()
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
+		if cctx.Err() != nil {
+			return fmt.Errorf("claude exit: %w: %w", err, context.DeadlineExceeded)
+		}
 		return fmt.Errorf("claude exit: %w", err)
 	}
 	return nil
@@ -1155,6 +1924,15 @@ func (f *flow) markFailed(runErr error) {
 			j.State = store.JobStateDoneThreadInconsistent
 		})
 		_ = f.addInconsistencyFooter(ctx)
+	}
+	// On branch divergence the error message instructs the user to rebase
+	// inside the worktree and push manually — keep it on disk so that
+	// instruction is actionable. The worktree will be cleaned up on the next
+	// admiral task lifecycle (e.g. /rerun) that reuses or replaces it.
+	if errors.Is(runErr, errBranchDiverged) {
+		f.o.logger.Info("mark_failed_keep_worktree_for_manual_rebase",
+			"session", f.ev.SessionID, "worktree", f.worktreePath)
+		return
 	}
 	f.cleanupWorktree(cleanupArchive)
 }
@@ -1389,6 +2167,10 @@ func (f *flow) createWorktree() error {
 		"-b", f.branch, f.worktreePath, "origin/"+base); err != nil {
 		return fmt.Errorf("git worktree add: %w", err)
 	}
+	if err := applyBotIdentityToWorktree(f.ctx, f.worktreePath, f.o.cfg.BotIdentity); err != nil {
+		f.o.logger.Warn("autopilot_bot_identity_apply_failed",
+			"session", f.ev.SessionID, "branch", f.branch, "err", err)
+	}
 	return nil
 }
 
@@ -1418,6 +2200,12 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 		// chose this binary on purpose.
 		"--dangerously-skip-permissions",
 	}
+	if mcpCfgPath, err := f.writeMCPConfig(); err != nil {
+		f.o.logger.Warn("mcp_config_write_failed", "err", err)
+	} else if mcpCfgPath != "" {
+		args = append(args, "--mcp-config", mcpCfgPath)
+		defer os.Remove(mcpCfgPath)
+	}
 	cctx, cancel := context.WithTimeout(f.ctx, time.Duration(f.o.cfg.MaxRunSeconds)*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, f.o.cfg.ClaudeBin, args...)
@@ -1426,10 +2214,17 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	}
 	cmd.WaitDelay = 5 * time.Second
 	cmd.Dir = f.worktreePath
-	cmd.Env = append(os.Environ(),
+	cmd.Env = appendBotIdentityEnv(append(os.Environ(),
 		"CLAUDE_AUTOPILOT_ISSUE="+issue.Identifier,
 		"CLAUDE_AUTOPILOT_SESSION="+f.ev.SessionID,
-	)
+		// Inherited by admiral-mcp-ask subprocess (via claude's env).
+		"ADMIRAL_DB_PATH="+f.o.dbPath,
+		"ADMIRAL_ISSUE_ID="+f.ev.IssueID,
+		"ADMIRAL_ISSUE_IDENTIFIER="+f.ev.IssueIdentifier,
+		"ADMIRAL_LINEAR_SESSION="+f.ev.SessionID,
+		"ADMIRAL_CLAUDE_SESSION="+claudeSessionID,
+		"ADMIRAL_WORKTREE_PATH="+f.worktreePath,
+	), f.o.cfg.BotIdentity)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1456,8 +2251,61 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	}()
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
+		if cctx.Err() != nil {
+			return fmt.Errorf("claude exit: %w: %w", err, context.DeadlineExceeded)
+		}
 		return fmt.Errorf("claude exit: %w", err)
 	}
+	return nil
+}
+
+// writeMCPConfig writes a temporary MCP server config JSON file for the
+// admiral-ask-mcp server and returns its path. Returns ("", nil) when
+// McpAskBin is not found on PATH — the caller omits --mcp-config gracefully.
+func (f *flow) writeMCPConfig() (string, error) {
+	bin, err := exec.LookPath(f.o.cfg.McpAskBin)
+	if err != nil {
+		// MCP ask binary not installed — skip gracefully.
+		return "", nil
+	}
+	cfg := map[string]any{
+		"mcpServers": map[string]any{
+			"admiral-ask": map[string]any{
+				"command": bin,
+				"args":    []string{},
+			},
+		},
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("marshal mcp config: %w", err)
+	}
+	tmp, err := os.CreateTemp("", "admiral-mcp-*.json")
+	if err != nil {
+		return "", fmt.Errorf("create mcp config temp file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("write mcp config: %w", err)
+	}
+	tmp.Close()
+	return tmp.Name(), nil
+}
+
+// parkAwaitingInput transitions the task to AWAITING_INPUT after claude has
+// called ask_user and exited. The worktree is kept on disk so the resume
+// path can continue file edits in the same directory.
+func (f *flow) parkAwaitingInput() error {
+	if err := f.o.db.SetAdmiralTaskAwaitingInput(f.ev.IssueID, f.awaitPendingID); err != nil {
+		return fmt.Errorf("set task awaiting_input: %w", err)
+	}
+	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateAwaitingInput
+	})
+	f.o.logger.Info("task_awaiting_input",
+		"issue", f.ev.IssueIdentifier,
+		"pending_id", f.awaitPendingID)
 	return nil
 }
 
@@ -1472,12 +2320,13 @@ type streamMsg struct {
 	DurationMs int    `json:"duration_ms,omitempty"`
 	StopReason string `json:"stop_reason,omitempty"`
 
-	// assistant message wrapper (tool_use lives here in Anthropic stream-json)
+	// assistant message wrapper (tool_use and text live here in Anthropic stream-json)
 	Message struct {
 		Content []struct {
 			Type  string          `json:"type"`
 			Name  string          `json:"name,omitempty"`
 			Input json.RawMessage `json:"input,omitempty"`
+			Text  string          `json:"text,omitempty"`
 		} `json:"content,omitempty"`
 	} `json:"message,omitempty"`
 
@@ -1613,7 +2462,7 @@ func (f *flow) drainStreamJSON(r io.Reader) {
 
 		// Emit structured logs for the 3 critical event types.
 
-		// 1. tool_use events (nested inside assistant message.content)
+		// 1. tool_use and text events (nested inside assistant message.content)
 		if msg.Type == "assistant" {
 			for _, c := range msg.Message.Content {
 				if c.Type == "tool_use" {
@@ -1622,6 +2471,13 @@ func (f *flow) drainStreamJSON(r io.Reader) {
 						"issue", f.ev.IssueIdentifier,
 						"tool", c.Name,
 						"summary", summarizeToolUse(c.Name, c.Input))
+				}
+				if c.Type == "text" && f.awaitPendingID == "" {
+					trimmed := strings.TrimSpace(c.Text)
+					if strings.HasPrefix(trimmed, "ADMIRAL_AWAIT:") {
+						f.awaitPendingID = strings.TrimSpace(
+							strings.TrimPrefix(trimmed, "ADMIRAL_AWAIT:"))
+					}
 				}
 			}
 		}
@@ -1688,6 +2544,46 @@ func classifyGhCreateError(combined string) ghCreateErrorKind {
 	return ghCreateFatal
 }
 
+// ghCreateWithRetry runs `gh pr create`, retrying ONLY on transient failures
+// (EOF / 5xx / connection reset / i/o timeout) per the given backoff. Soft
+// shapes classified by classifyGhCreateError (ghCreateNoCommits /
+// ghCreateAlreadyExists) and any other non-transient error are returned on
+// the first attempt — the caller still handles them via its existing dispatch.
+//
+// Retries are safe under all three transient-failure positions:
+//   - EOF on the internal "check existing PR" GraphQL read (no mutation yet):
+//     the retry is a fresh attempt.
+//   - EOF after the create mutation reached the server but the response was
+//     dropped: the retry sees "already exists" and ensurePR recovers the URL
+//     via lookupPR — no duplicate PR.
+//   - EOF before the mutation reached the server: the retry creates the PR
+//     for the first time.
+//
+// Intentionally near-identical to ghReadWithRetry (admin_reset.go) — kept as
+// a separate name so call-site reads carry the create-specific idempotency
+// reasoning above. Any change to one should be mirrored in the other.
+func ghCreateWithRetry(ctx context.Context, gh ghRunner, delays []time.Duration, args ...string) (string, error) {
+	var (
+		out string
+		err error
+	)
+	for attempt := 0; attempt <= len(delays); attempt++ {
+		out, err = gh(ctx, args...)
+		if err == nil {
+			return out, nil
+		}
+		if !ghpkg.IsTransientGhFailure(out, err) || attempt == len(delays) {
+			return out, err
+		}
+		select {
+		case <-ctx.Done():
+			return out, ctx.Err()
+		case <-time.After(delays[attempt]):
+		}
+	}
+	return out, err
+}
+
 // ensurePR returns the URL of an open PR with HEAD = the working branch.
 // If claude already opened one, we use that. Otherwise fall back to
 // `gh pr create`. Two benign failure modes from `gh pr create` are
@@ -1710,8 +2606,11 @@ func (f *flow) ensurePR(issue *linear.Issue) (string, error) {
 	}
 	body := fmt.Sprintf("Autopilot run for %s — %s\n\n%s",
 		issue.Identifier, issue.URL, truncate(issue.Description, 4000))
-	out, err := captureCmd(f.ctx, f.worktreePath,
-		f.o.cfg.GhBin, "pr", "create",
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		return captureCmd(ctx, f.worktreePath, f.o.cfg.GhBin, args...)
+	}
+	out, err := ghCreateWithRetry(f.ctx, gh, ghReadDelays,
+		"pr", "create",
 		"--base", f.baseBranch,
 		"--head", f.branch,
 		"--title", fmt.Sprintf("[%s] %s", issue.Identifier, issue.Title),
@@ -1742,8 +2641,15 @@ func (f *flow) ensurePR(issue *linear.Issue) (string, error) {
 }
 
 func (f *flow) lookupPR() (string, error) {
-	out, err := captureCmd(f.ctx, f.worktreePath,
-		f.o.cfg.GhBin, "pr", "list",
+	// Retry on transient gh failures (GitHub GraphQL EOF / 5xx / connection
+	// reset): a single network blip here must not fail the whole job and leave
+	// an already-created PR orphaned — which would also stall every sub-issue
+	// blocked on this one. Mirrors the reset merged-PR guard's retry.
+	gh := func(ctx context.Context, args ...string) (string, error) {
+		return captureCmd(ctx, f.worktreePath, f.o.cfg.GhBin, args...)
+	}
+	out, err := ghReadWithRetry(f.ctx, gh, ghReadDelays,
+		"pr", "list",
 		"--head", f.branch,
 		"--state", "open",
 		"--json", "url",
@@ -1842,7 +2748,9 @@ func buildPrompt(skill string, i *linear.Issue, ev linear.AgentEvent, branch, ba
 ## Operating procedure (you MUST follow this exactly)
 
 You are running inside a fresh git worktree on branch %q, forked from %q.
-Your final deliverable is a pull request. Do these steps in order:
+Your job is to edit and commit the change LOCALLY. admiral will run the
+project's build / tests (if configured) after you exit, then push + open
+the PR itself.
 
 1. Edit files as needed to address the issue above.
 2. Stage your changes: `+"`git add -A`"+`
@@ -1851,18 +2759,30 @@ Your final deliverable is a pull request. Do these steps in order:
 3. Commit with a clear conventional message referencing %s:
    `+"`git commit -m \"<type>(<scope>): <summary> (%s)\""+`
    (e.g. `+"`feat: add hello-world line to README (%s)`"+`).
-4. Push the branch: `+"`git push -u origin %s`"+`
-5. Open the PR: `+"`gh pr create --base %s --head %s --title \"[%s] %s\" --body \"<short summary plus the issue link>\"`"+`
-6. Print the PR URL on a line by itself, then exit.
+4. Exit.
 
-Do not skip any step. If you have nothing to change, still create a tiny
-no-op commit (e.g. clarify a comment) so a PR can be opened — admiral's
-flow expects a PR per session.
+Do NOT run `+"`git push`"+` and do NOT run `+"`gh pr create`"+` yourself —
+admiral owns those after its build/test hard gate. If you have nothing to
+change, still create a tiny no-op commit (e.g. clarify a comment) so admiral
+has something to ship — admiral's flow expects one commit per session.
+
+## Asking the user a question (ask_user MCP tool)
+
+If you genuinely cannot proceed without human input, call the `+"`ask_user`"+` tool
+(provided by the admiral-ask MCP server). It posts your question to the Linear
+thread and returns immediately with {"status":"pending","pending_id":"<id>"}.
+
+When ask_user returns status=pending you MUST:
+1. Stop all further work immediately.
+2. Output exactly one line: `+"`ADMIRAL_AWAIT:<pending_id>`"+` (replace
+   <pending_id> with the id value from the tool result).
+3. Exit — do NOT commit, push, or open a PR.
+
+Admiral will resume this session automatically once the user replies.
+Only use ask_user when truly blocked; never use it as a confirmation step.
 `,
 		branch, baseBranch,
-		i.Identifier, i.Identifier, i.Identifier,
-		branch,
-		baseBranch, branch, i.Identifier, i.Title)
+		i.Identifier, i.Identifier, i.Identifier)
 	return sb.String()
 }
 
@@ -1953,7 +2873,8 @@ func parseMentionCommand(text string) (name, remainder string, ok bool) {
 // mentionCommandHelp is the reply sent when a bare @mention is rejected.
 const mentionCommandHelp = `admiral does not respond to bare @mentions. Use one of:
   /rerun <optional notes>     — start over from scratch on this issue
-  /fix <description>          — patch the previous run on the existing PR with these notes`
+  /fix <description>          — patch the previous run on the existing PR with these notes
+  /resume                     — continue a TIMED_OUT run from where it stopped (same session, same worktree)`
 
 // assignFirstHelp is the reply sent when admiral receives an @mention
 // or thread-prompted event for an issue it has never seen before. The
@@ -1987,12 +2908,48 @@ func unknownCommandHelp(cmd string) string {
 	return fmt.Sprintf("admiral did not recognize %q. Currently supported: /rerun, /fix.", cmd)
 }
 
-// postReply is a thin helper used during early-exit rejection paths where no
-// flow has been created yet and therefore no worktree cleanup is needed.
-func (o *Orchestrator) postReply(sessionID, body string) {
+// postRejection posts an ErrorActivity for early-exit rejection paths where
+// no flow has been created yet. ErrorActivity (vs Response) signals to Linear
+// that the AgentSession ended in failure, so user-visible rejections show as
+// errored sessions rather than completed ones.
+//
+// MUST NOT be used while the issue's admiral_task is still in flight — Linear
+// treats ActivityError as terminal and would mark the live working session as
+// errored, killing the running flow's progress updates. Use postBusyAck for
+// rejection-class responses on in-flight tasks instead.
+func (o *Orchestrator) postRejection(sessionID, body string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.Response(body))
+	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.ErrorActivity(body))
+}
+
+// postBlockedNotice posts a non-terminal Thought activity when a task is
+// parked in BLOCKED state. Thought keeps the AgentSession alive so the
+// BlockerWatcher's "resuming now" post lands in the same thread later.
+func (o *Orchestrator) postBlockedNotice(sessionID, body string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.Thought(body, false))
+}
+
+// postBusyAck posts a non-terminal Thought activity. Use this for
+// rejection-class responses delivered while the task is in flight (bare
+// @mention, unknown command, re-toggled delegate, /rerun or /fix while busy)
+// — Thought keeps the AgentSession alive so the running flow's subsequent
+// progress posts continue to land in the same Linear thread.
+func (o *Orchestrator) postBusyAck(sessionID, body string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = o.lc.PostAgentActivity(ctx, sessionID, linear.Thought(body, false))
+}
+
+// taskInFlight reports whether the admiral_task is in a state where its
+// AgentSession must stay open (non-terminal). Used by replyRejection to
+// choose between terminal ErrorActivity and non-terminal Thought.
+func taskInFlight(state string) bool {
+	return state == store.JobStateReceived ||
+		state == store.JobStateExecuting ||
+		state == store.JobStateAwaitingInput
 }
 
 const availableCommandsHelp = `Available commands:
@@ -2008,6 +2965,13 @@ func (o *Orchestrator) handleCommand(ev linear.AgentEvent, cmd string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+
+	reply := func(ctx context.Context, sessionID, body string) error {
+		return o.lc.PostAgentActivity(ctx, sessionID, linear.Response(body))
+	}
+	if o.replier != nil {
+		reply = o.replier.Reply
+	}
 
 	switch cmd {
 	case "status":
@@ -2034,7 +2998,7 @@ func (o *Orchestrator) handleCommand(ev linear.AgentEvent, cmd string) {
 			} else {
 				body += "  - (job details unavailable)\n"
 			}
-			_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
+			_ = reply(ctx, ev.SessionID, body)
 		} else {
 			// idle state — show last job info
 			lastJob, err := o.db.GetLastAutopilotJob()
@@ -2042,7 +3006,7 @@ func (o *Orchestrator) handleCommand(ev linear.AgentEvent, cmd string) {
 				o.logger.Warn("get_last_autopilot_job_failed", "err", err)
 			}
 			if lastJob == nil {
-				_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response("admiral status: idle\n\n(no previous jobs)"))
+				_ = reply(ctx, ev.SessionID, "admiral status: idle\n\n(no previous jobs)")
 				return
 			}
 			body := "admiral status: idle\n\nLast job:\n"
@@ -2061,13 +3025,13 @@ func (o *Orchestrator) handleCommand(ev linear.AgentEvent, cmd string) {
 				}
 				body += fmt.Sprintf("  - Error: %s\n", errStr)
 			}
-			_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
+			_ = reply(ctx, ev.SessionID, body)
 		}
 	case "help":
-		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(availableCommandsHelp))
+		_ = reply(ctx, ev.SessionID, availableCommandsHelp)
 	default:
 		body := fmt.Sprintf("Unknown command: /%s\n\n%s", cmd, availableCommandsHelp)
-		_ = o.lc.PostAgentActivity(ctx, ev.SessionID, linear.Response(body))
+		_ = reply(ctx, ev.SessionID, body)
 	}
 }
 

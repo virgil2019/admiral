@@ -5,6 +5,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -31,22 +32,24 @@ func must(fsys fs.FS, err error) fs.FS {
 
 // adminServer serves the admin HTTP API (read + write).
 type adminServer struct {
-	db         *store.Store
-	lc         *linear.Client
-	logger     *slog.Logger
-	ghBin      string
-	start      time.Time
-	workers    int
-	adminToken string
+	db           *store.Store
+	lc           *linear.Client
+	logger       *slog.Logger
+	ghBin        string
+	start        time.Time
+	workers      int
+	adminToken   string
+	requireLabel string // discoverer.require_label; dropped from subs on reset-task
 }
 
 // adminRepoResponse is the JSON shape for /admin/repos.
 type adminRepoResponse struct {
-	TeamID     string `json:"team_id"`
-	TeamName   string `json:"project_name"`
-	RepoDir    string `json:"repo_dir"`
-	BaseBranch string `json:"base_branch"`
-	Enabled    bool   `json:"enabled"`
+	TeamID          string `json:"team_id"`
+	TeamName        string `json:"project_name"`
+	RepoDir         string `json:"repo_dir"`
+	BaseBranch      string `json:"base_branch"`
+	Enabled         bool   `json:"enabled"`
+	AutoPickEnabled bool   `json:"auto_pick_enabled"`
 }
 
 // adminJobResponse is the JSON shape for /admin/jobs list.
@@ -95,9 +98,10 @@ type createRepoResponse struct {
 
 // updateRepoRequest is the body for PATCH /admin/repos/<team_id>.
 type updateRepoRequest struct {
-	RepoDir    *string `json:"repo_dir,omitempty"`
-	BaseBranch *string `json:"base_branch,omitempty"`
-	Enabled    *bool   `json:"enabled,omitempty"`
+	RepoDir         *string `json:"repo_dir,omitempty"`
+	BaseBranch      *string `json:"base_branch,omitempty"`
+	Enabled         *bool   `json:"enabled,omitempty"`
+	AutoPickEnabled *bool   `json:"auto_pick_enabled,omitempty"`
 }
 
 // checkGhResponse is the body for POST /admin/repos/<team_id>/check_gh.
@@ -114,8 +118,23 @@ type testCloneResponse struct {
 	Error     string `json:"error,omitempty"`
 }
 
-func newAdminServer(db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken string) *adminServer {
-	return &adminServer{db: db, lc: lc, ghBin: ghBin, logger: logger, start: time.Now(), workers: workers, adminToken: adminToken}
+func newAdminServer(db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken, requireLabel string) *adminServer {
+	return &adminServer{db: db, lc: lc, ghBin: ghBin, logger: logger, start: time.Now(), workers: workers, adminToken: adminToken, requireLabel: requireLabel}
+}
+
+// projectFilterCookie is the name of the cookie that scopes the admin UI
+// (repos table + jobs lists) to a single Linear project. Empty value or
+// missing cookie means "all projects".
+const projectFilterCookie = "admiral_project"
+
+// projectFilter returns the project_id selected by the admin UI's project
+// switcher. Empty string means no filter.
+func projectFilter(r *http.Request) string {
+	c, err := r.Cookie(projectFilterCookie)
+	if err != nil || c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.Value)
 }
 
 // --- Read handlers ---
@@ -130,11 +149,12 @@ func (s *adminServer) listReposHandler(w http.ResponseWriter, r *http.Request) {
 	out := make([]adminRepoResponse, 0, len(repos))
 	for _, r := range repos {
 		out = append(out, adminRepoResponse{
-			TeamID:     r.ProjectID,
-			TeamName:   r.ProjectName,
-			RepoDir:    r.RepoDir,
-			BaseBranch: r.BaseBranch,
-			Enabled:    r.Enabled,
+			TeamID:          r.ProjectID,
+			TeamName:        r.ProjectName,
+			RepoDir:         r.RepoDir,
+			BaseBranch:      r.BaseBranch,
+			Enabled:         r.Enabled,
+			AutoPickEnabled: r.AutoPickEnabled,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -276,13 +296,30 @@ func (s *adminServer) createRepoHandler(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	// htmx posts the add-repo form; the JSON path is kept for direct API
+	// callers. Detect via the HX-Request header (htmx always sets it) rather
+	// than Content-Type, which can vary by browser/proxy.
+	isForm := r.Header.Get("HX-Request") == "true" ||
+		strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") ||
+		strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data")
 	var req createRepoRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
-		return
+	if isForm {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, `{"error":"parse form failed"}`, http.StatusBadRequest)
+			return
+		}
+		req.TeamID = r.Form.Get("team_id")
+		req.TeamName = r.Form.Get("team_name")
+		req.RepoDir = r.Form.Get("repo_dir")
+		req.BaseBranch = r.Form.Get("base_branch")
+	} else {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"bad json body"}`, http.StatusBadRequest)
+			return
+		}
 	}
-	if strings.TrimSpace(req.TeamID) == "" || strings.TrimSpace(req.TeamName) == "" || strings.TrimSpace(req.RepoDir) == "" {
-		http.Error(w, `{"error":"team_id, team_name, and repo_dir are required"}`, http.StatusBadRequest)
+	if strings.TrimSpace(req.TeamID) == "" || strings.TrimSpace(req.RepoDir) == "" {
+		http.Error(w, `{"error":"team_id and repo_dir are required"}`, http.StatusBadRequest)
 		return
 	}
 	baseBranch := req.BaseBranch
@@ -296,16 +333,24 @@ func (s *adminServer) createRepoHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Validate team_id exists in Linear (if lc is available)
+	// Validate team_id exists in Linear (if lc is available); reuse the
+	// returned project name when the caller didn't supply one (form path).
 	if s.lc != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
-		_, err := s.lc.GetProject(ctx, req.TeamID)
+		proj, err := s.lc.GetProject(ctx, req.TeamID)
 		if err != nil {
 			s.logger.Warn("create_repo_linear_validation_failed", "team_id", req.TeamID, "err", err)
 			http.Error(w, `{"error":"invalid team_id (project not found in Linear)"}`, http.StatusBadRequest)
 			return
 		}
+		if strings.TrimSpace(req.TeamName) == "" && proj != nil {
+			req.TeamName = proj.Name
+		}
+	}
+	if strings.TrimSpace(req.TeamName) == "" {
+		http.Error(w, `{"error":"team_name is required (Linear lookup unavailable)"}`, http.StatusBadRequest)
+		return
 	}
 
 	repo := store.Repo{
@@ -320,9 +365,132 @@ func (s *adminServer) createRepoHandler(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
+	if isForm {
+		// htmx swap target is the repos table; respond with the same fragment
+		// so the new row appears immediately.
+		s.reposTableHandler(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(createRepoResponse{TeamID: req.TeamID})
+}
+
+// listLinearProjectsHandler returns all Linear projects as JSON for the
+// add-repo form's project picker.
+func (s *adminServer) listLinearProjectsHandler(w http.ResponseWriter, r *http.Request) {
+	if s.lc == nil {
+		http.Error(w, `{"error":"linear client not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	projects, err := s.lc.ListProjects(ctx)
+	if err != nil {
+		s.logger.Warn("admin_list_linear_projects_failed", "err", err)
+		http.Error(w, `{"error":"linear list_projects failed"}`, http.StatusBadGateway)
+		return
+	}
+	type projOut struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	out := make([]projOut, 0, len(projects))
+	for _, p := range projects {
+		out = append(out, projOut{ID: p.ID, Name: p.Name})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+// selectProjectHandler writes the project filter cookie from a form POST and
+// redirects back to the page that submitted (or the dashboard).
+func (s *adminServer) selectProjectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	projectID := strings.TrimSpace(r.Form.Get("project_id"))
+	cookie := &http.Cookie{
+		Name:     projectFilterCookie,
+		Value:    projectID,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}
+	if projectID == "" {
+		// "All projects": clear the cookie.
+		cookie.MaxAge = -1
+	} else {
+		cookie.MaxAge = 30 * 24 * 60 * 60
+	}
+	http.SetCookie(w, cookie)
+	dest := r.Header.Get("Referer")
+	if dest == "" {
+		dest = "/admin/ui/"
+	}
+	// htmx follows the redirect via HX-Redirect for full-page reload, which
+	// re-runs every partial against the new cookie.
+	if r.Header.Get("HX-Request") == "true" {
+		w.Header().Set("HX-Redirect", dest)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	http.Redirect(w, r, dest, http.StatusSeeOther)
+}
+
+// projectSwitcherHandler returns the global project-switcher select element,
+// scoped to currently-configured projects (one per repo row).
+func (s *adminServer) projectSwitcherHandler(w http.ResponseWriter, r *http.Request) {
+	repos, _ := s.db.ListRepos()
+	current := projectFilter(r)
+	w.Header().Set("Content-Type", "text/html")
+	var b strings.Builder
+	b.WriteString(`<form class="project-switcher" hx-post="/admin/ui/select_project" hx-trigger="change">`)
+	b.WriteString(`<label>Project: <select name="project_id">`)
+	selAll := ""
+	if current == "" {
+		selAll = " selected"
+	}
+	fmt.Fprintf(&b, `<option value=""%s>All projects</option>`, selAll)
+	for _, repo := range repos {
+		sel := ""
+		if repo.ProjectID == current {
+			sel = " selected"
+		}
+		fmt.Fprintf(&b, `<option value="%s"%s>%s</option>`, html.EscapeString(repo.ProjectID), sel, html.EscapeString(repo.ProjectName))
+	}
+	b.WriteString(`</select></label></form>`)
+	w.Write([]byte(b.String()))
+}
+
+// linearProjectsOptionsHandler returns <option> tags for the add-repo form,
+// pulling from Linear directly. Errors render as a single disabled option so
+// the form stays usable for the rare case the user has no Linear access.
+func (s *adminServer) linearProjectsOptionsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	if s.lc == nil {
+		w.Write([]byte(`<option value="" disabled>Linear not configured</option>`))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	projects, err := s.lc.ListProjects(ctx)
+	if err != nil {
+		s.logger.Warn("admin_options_linear_failed", "err", err)
+		w.Write([]byte(`<option value="" disabled>Failed to load Linear projects</option>`))
+		return
+	}
+	var b strings.Builder
+	b.WriteString(`<option value="">— select a project —</option>`)
+	for _, p := range projects {
+		fmt.Fprintf(&b, `<option value="%s">%s</option>`, html.EscapeString(p.ID), html.EscapeString(p.Name))
+	}
+	w.Write([]byte(b.String()))
 }
 
 func (s *adminServer) updateRepoHandler(w http.ResponseWriter, r *http.Request) {
@@ -369,6 +537,9 @@ func (s *adminServer) updateRepoHandler(w http.ResponseWriter, r *http.Request) 
 	if req.Enabled != nil {
 		updated.Enabled = *req.Enabled
 	}
+	if req.AutoPickEnabled != nil {
+		updated.AutoPickEnabled = *req.AutoPickEnabled
+	}
 
 	if err := s.db.UpsertRepo(updated); err != nil {
 		s.logger.Warn("admin_update_repo_failed", "err", err)
@@ -378,12 +549,53 @@ func (s *adminServer) updateRepoHandler(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(adminRepoResponse{
-		TeamID:     updated.ProjectID,
-		TeamName:   updated.ProjectName,
-		RepoDir:    updated.RepoDir,
-		BaseBranch: updated.BaseBranch,
-		Enabled:    updated.Enabled,
+		TeamID:          updated.ProjectID,
+		TeamName:        updated.ProjectName,
+		RepoDir:         updated.RepoDir,
+		BaseBranch:      updated.BaseBranch,
+		Enabled:         updated.Enabled,
+		AutoPickEnabled: updated.AutoPickEnabled,
 	})
+}
+
+// toggleAutoPickHandler flips a repo's auto_pick_enabled flag and
+// returns the refreshed repos table fragment. Used by the htmx button
+// in repos.html so the operator gets one-click control without typing
+// JSON. POST /admin/repos/<project_id>/auto_pick.
+func (s *adminServer) toggleAutoPickHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	projectID := strings.TrimPrefix(r.URL.Path, "/admin/repos/")
+	projectID = strings.TrimSuffix(projectID, "/auto_pick")
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		http.Error(w, `{"error":"project_id required"}`, http.StatusBadRequest)
+		return
+	}
+	existing, err := s.db.GetRepoByProjectID(projectID)
+	if err != nil {
+		s.logger.Warn("admin_toggle_auto_pick_db_err", "err", err)
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	if existing == nil {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	updated := *existing
+	updated.AutoPickEnabled = !existing.AutoPickEnabled
+	if err := s.db.UpsertRepo(updated); err != nil {
+		s.logger.Warn("admin_toggle_auto_pick_failed", "err", err)
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	s.logger.Info("repo_auto_pick_toggled",
+		"project_id", projectID,
+		"auto_pick_enabled", updated.AutoPickEnabled,
+	)
+	s.reposTableHandler(w, r)
 }
 
 func (s *adminServer) deleteRepoHandler(w http.ResponseWriter, r *http.Request) {
@@ -632,7 +844,7 @@ func (s *adminServer) loadCardHandler(w http.ResponseWriter, r *http.Request) {
 
 // recentJobsHandler returns the 5 most recent jobs HTML fragment.
 func (s *adminServer) recentJobsHandler(w http.ResponseWriter, r *http.Request) {
-	jobs, _ := s.db.ListAutopilotJobs("", "", nil, 5)
+	jobs, _ := s.db.ListAutopilotJobsByProject(projectFilter(r), "", "", nil, 5)
 	w.Header().Set("Content-Type", "text/html")
 	if len(jobs) == 0 {
 		w.Write([]byte(`<p>No jobs yet.</p>`))
@@ -650,25 +862,47 @@ func (s *adminServer) recentJobsHandler(w http.ResponseWriter, r *http.Request) 
 
 // reposTableHandler returns the repos table HTML fragment.
 func (s *adminServer) reposTableHandler(w http.ResponseWriter, r *http.Request) {
-	repos, _ := s.db.ListRepos()
+	all, _ := s.db.ListRepos()
+	filter := projectFilter(r)
+	var repos []store.Repo
+	if filter == "" {
+		repos = all
+	} else {
+		for _, repo := range all {
+			if repo.ProjectID == filter {
+				repos = append(repos, repo)
+			}
+		}
+	}
 	w.Header().Set("Content-Type", "text/html")
 	if len(repos) == 0 {
 		w.Write([]byte(`<p>No repos configured.</p>`))
 		return
 	}
 	var b strings.Builder
-	b.WriteString(`<table><thead><tr><th>Project</th><th>Repo Dir</th><th>Branch</th><th>Enabled</th><th>Actions</th></tr></thead><tbody>`)
+	b.WriteString(`<table><thead><tr><th>Project</th><th>Repo Dir</th><th>Branch</th><th>Enabled</th><th>Auto-pick</th><th>Actions</th></tr></thead><tbody>`)
 	for _, r := range repos {
 		enabled := "Yes"
 		if !r.Enabled {
 			enabled = "No"
 		}
+		autoPick := "Off"
+		toggleLabel := "Enable auto-pick"
+		toggleClass := "secondary"
+		if r.AutoPickEnabled {
+			autoPick = "On"
+			toggleLabel = "Disable auto-pick"
+			toggleClass = "secondary"
+		}
 		fmt.Fprintf(&b, `<tr>
-<td>%s</td><td>%s</td><td>%s</td><td>%s</td>
+<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>
 <td>
+<button class="%s" hx-post="/admin/repos/%s/auto_pick" hx-target="#repos-table" hx-swap="innerHTML">%s</button>
 <button class="secondary" hx-post="/admin/repos/%s/check_gh" hx-swap="none">Test GH</button>
 <button class="danger" hx-delete="/admin/repos/%s" hx-confirm="Delete %s?" hx-swap="none">Delete</button>
-</td></tr>`, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, r.ProjectID, r.ProjectID, r.ProjectName)
+</td></tr>`, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, autoPick,
+			toggleClass, r.ProjectID, toggleLabel,
+			r.ProjectID, r.ProjectID, r.ProjectName)
 	}
 	b.WriteString(`</tbody></table>`)
 	w.Write([]byte(b.String()))
@@ -682,7 +916,7 @@ func (s *adminServer) jobsTableHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	status := r.Form.Get("status")
 	teamID := r.Form.Get("team_id")
-	jobs, _ := s.db.ListAutopilotJobs(status, teamID, nil, 100)
+	jobs, _ := s.db.ListAutopilotJobsByProject(projectFilter(r), status, teamID, nil, 100)
 	w.Header().Set("Content-Type", "text/html")
 	if len(jobs) == 0 {
 		w.Write([]byte(`<p>No jobs found.</p>`))
@@ -760,12 +994,12 @@ func adminAuth(token string, h http.Handler) http.Handler {
 
 // ServeAdminHTTP starts the admin HTTP server on addr.
 // If adminToken is empty the server is disabled (logged as warn) and returns nil immediately.
-func ServeAdminHTTP(addr string, db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken string) error {
+func ServeAdminHTTP(addr string, db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken, requireLabel string) error {
 	if adminToken == "" {
 		logger.Warn("admin server disabled: autopilot.admin_token not set; set ADMIRAL_ADMIN_TOKEN env or autopilot.admin_token in config to enable")
 		return nil
 	}
-	as := newAdminServer(db, lc, ghBin, logger, workers, adminToken)
+	as := newAdminServer(db, lc, ghBin, logger, workers, adminToken, requireLabel)
 	mux := newAdminMux(as, adminToken)
 	srv := &http.Server{
 		Addr:              addr,
@@ -808,19 +1042,98 @@ func (s *adminServer) serveMux() *http.ServeMux {
 	mux.HandleFunc("/admin/ui/_partial/repos_table", s.reposTableHandler)
 	mux.HandleFunc("/admin/ui/_partial/jobs_table", s.jobsTableHandler)
 	mux.HandleFunc("/admin/ui/_partial/job_detail/", s.jobDetailHandler)
+	mux.HandleFunc("/admin/ui/_partial/project_switcher", s.projectSwitcherHandler)
+	mux.HandleFunc("/admin/ui/_partial/linear_projects_options", s.linearProjectsOptionsHandler)
+	mux.HandleFunc("/admin/ui/select_project", s.selectProjectHandler)
 	// API routes
+	mux.HandleFunc("/admin/linear/projects", s.listLinearProjectsHandler)
 	mux.HandleFunc("/admin/repos", s.reposDispatchHandler)
 	mux.HandleFunc("/admin/repos/", s.reposDispatchHandler)
 	mux.HandleFunc("/admin/jobs", s.listJobsHandler)
 	mux.HandleFunc("/admin/jobs/", s.getJobHandler)
 	mux.HandleFunc("/admin/load", s.loadHandler)
 	mux.HandleFunc("/admin/health", s.healthHandler)
+	mux.HandleFunc("/admin/reset-task", s.resetTaskHandler)
+	mux.HandleFunc("/admin/product-verify", s.productVerifyHandler)
 	return mux
+}
+
+// productVerifyRequest is the JSON body for POST /admin/product-verify.
+type productVerifyRequest struct {
+	ProjectID string `json:"project_id"`
+}
+
+// productVerifyResponse is the JSON shape returned by the trigger.
+type productVerifyResponse struct {
+	ProjectID string `json:"project_id"`
+	Enqueued  bool   `json:"enqueued"`
+}
+
+// productVerifyHandler is the MVP manual trigger for product-level
+// verification: it enqueues a source="product-verify" event carrying the
+// project id, which the worker routes to HandleProductVerifyEvent. The
+// webhook id includes a nanosecond timestamp so repeated manual triggers each
+// fire (events_inbox dedups on webhook_id via INSERT-OR-IGNORE). Accepts the
+// project id via JSON body or form field. This is the pluggable trigger's
+// MVP; auto conditions (all-issues-done / sentinel-issue-done) enqueue the
+// same source later.
+func (s *adminServer) productVerifyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	var req productVerifyRequest
+	isForm := strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") ||
+		strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") ||
+		r.Header.Get("HX-Request") == "true"
+	if isForm {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, `{"error":"parse form failed"}`, http.StatusBadRequest)
+			return
+		}
+		req.ProjectID = r.Form.Get("project_id")
+	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"bad json body"}`, http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.ProjectID) == "" {
+		http.Error(w, `{"error":"project_id is required"}`, http.StatusBadRequest)
+		return
+	}
+	// Reject products with no configured repo up front — verify would fail in
+	// gather anyway, and the caller gets a clear 400 instead of a silent log.
+	repo, err := s.db.GetRepoByProjectID(req.ProjectID)
+	if err != nil {
+		s.logger.Warn("product_verify_trigger_repo_lookup_failed", "project", req.ProjectID, "err", err)
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	if repo == nil {
+		http.Error(w, `{"error":"no repo configured for that project"}`, http.StatusBadRequest)
+		return
+	}
+	webhookID := fmt.Sprintf("product-verify-%s-%d", req.ProjectID, time.Now().UnixNano())
+	enqueued, err := s.db.EnqueueEventWithSource(
+		"product-verify", webhookID, "product_verify.manual", req.ProjectID, req.ProjectID, "{}", "")
+	if err != nil {
+		s.logger.Warn("product_verify_trigger_enqueue_failed", "project", req.ProjectID, "err", err)
+		http.Error(w, `{"error":"enqueue failed"}`, http.StatusInternalServerError)
+		return
+	}
+	s.logger.Info("product_verify_triggered", "project", req.ProjectID, "enqueued", enqueued)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(productVerifyResponse{ProjectID: req.ProjectID, Enqueued: enqueued})
 }
 
 // reposDispatchHandler dispatches all /admin/repos/* requests.
 func (s *adminServer) reposDispatchHandler(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/admin/repos/")
+	// Strip "/admin/repos" first (handles bare /admin/repos), then a leading
+	// "/" if present (handles /admin/repos/<id>). The earlier single-step
+	// TrimPrefix("/admin/repos/") missed the no-trailing-slash form and
+	// routed POST /admin/repos straight into the malformed-path branch.
+	path := strings.TrimPrefix(r.URL.Path, "/admin/repos")
+	path = strings.TrimPrefix(path, "/")
 	// path is now "" (for GET/POST /admin/repos), or "<projectID>", or "<projectID>/<sub>"
 	if path == "" {
 		// /admin/repos/ — list (GET) or create (POST)
@@ -864,6 +1177,9 @@ func (s *adminServer) reposDispatchHandler(w http.ResponseWriter, r *http.Reques
 	case "/test_clone":
 		r.URL.Path = "/admin/repos/" + projectID + "/test_clone"
 		s.testCloneHandler(w, r)
+	case "/auto_pick":
+		r.URL.Path = "/admin/repos/" + projectID + "/auto_pick"
+		s.toggleAutoPickHandler(w, r)
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 	}
