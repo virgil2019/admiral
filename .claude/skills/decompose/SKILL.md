@@ -1,6 +1,6 @@
 ---
 name: decompose
-description: Decompose a task into Linear issues for the admiral autonomous loop. admiral expects a two-level issue tree — project (product) → L1 feature/task → L2 sub-issue/slice — and its verify loop only walks one hop, so two issue levels is the ceiling. Takes a parent reference — an existing Linear issue (sub-issues are created under it), the special sentinel `top-level` (with `project` accepted as a legacy alias; top-level issues are created directly under the project, no Linear parent), or a title for a new parent to create on confirmation. A recursive/full mode plans the whole feature→slice tree in one consolidated, reviewable pass (state-aware: builds features from a PRD when none exist, or batch-slices already-created features). Classifies sub-issues as agent-doable or human-only and tags agent-doable ones with `agent-task`. Top-level issues stay unlabeled — they are features, future-decomposable into ship-able slices. Deliberately does NOT apply the pickup (`agent-ready`) label — nothing is shipped until the user explicitly activates the task. Invoke when the user says "/decompose", "decompose this", "拆任务", "拆分到 Linear", "break this down into issues", "拆整个 project", "全部拆到 sub-issue", "--full" / "--recursive", or wants to turn a PRD / design doc / project description into admiral-ready Linear issues. Requires the Linear MCP.
+description: Decompose a task into Linear issues for the admiral autonomous loop. admiral expects a hierarchical issue tree of arbitrary depth — leaves (issues with no sub-issues) are the execution units that ship as PRs; every non-leaf is a verification unit that admiral judges once all its direct children complete, with verify cascading recursively up to the topmost issue under the project. Takes a parent reference — an existing Linear issue (sub-issues are created under it; sub-issues themselves can be decomposed further into deeper layers), the special sentinel `top-level` (with `project` accepted as a legacy alias; top-level issues are created directly under the project, no Linear parent), or a title for a new parent to create on confirmation. A recursive/full mode plans the whole tree in one consolidated, reviewable pass (state-aware: builds features from a PRD when none exist, or batch-slices already-created features). Classifies leaf sub-issues as agent-doable or human-only and tags agent-doable ones with `agent-task`. Non-leaf / top-level issues stay unlabeled — they are verification units, not work units. Deliberately does NOT apply the pickup (`agent-ready`) label — nothing is shipped until the user explicitly activates the task. Invoke when the user says "/decompose", "decompose this", "拆任务", "拆分到 Linear", "break this down into issues", "拆整个 project", "全部拆到 sub-issue", "--full" / "--recursive", "拆多层", "深层拆分", "再往下拆一层", "任意深度拆分", "decompose deeper", "nested decomposition", or wants to turn a PRD / design doc / project description into admiral-ready Linear issues at any tree depth. Requires the Linear MCP.
 ---
 
 # Decompose
@@ -17,29 +17,53 @@ the user asks for a parent that doesn't exist yet.
 ## The hierarchy admiral expects (read first — every mode obeys this)
 
 One meta-principle governs where pieces attach. admiral's autonomous loop is
-built around a **two-level issue tree**:
+built around an **issue tree of arbitrary depth**, where **leaves are work
+units** and **every non-leaf is a verification unit**:
 
 ```
-Project            ← the PRODUCT (product-tier acceptance enumerates its top-level issues)
- └─ Issue (L1)     ← a TASK / FEATURE: the verification unit. Never labelled, never
-     │               shipped; admiral verifies it as a whole once all its slices complete.
-     └─ Sub (L2)   ← a SLICE: the execution unit. Labelled `agent-task`; each ships as one PR.
+Project                     ← the PRODUCT (product-tier acceptance enumerates its top-level issues)
+ └─ Issue                   ← NON-LEAF: feature / milestone / sub-feature. Unlabelled, never shipped;
+     │                        admiral verifies it once all of its direct children reach completed.
+     ├─ Issue               ← NON-LEAF (deeper layer): same rules apply. Verify cascades recursively.
+     │   ├─ Sub             ← LEAF: a slice. Labelled `agent-task`; ships as one PR. Execution unit.
+     │   └─ Sub             ← LEAF: another slice.
+     └─ Sub                 ← LEAF: leaves can coexist with intermediate siblings at any layer.
 ```
 
-- **project = product**, **L1 issue = task/feature** (the parent / verification
-  unit), **L2 sub-issue = slice** (the execution unit). "feature" and "task" are
-  the same object seen from two tiers — don't let the naming confuse you.
-- **Two levels is the ceiling.** admiral's verify loop walks exactly ONE hop
-  (a merged L2 → its L1 parent → checks siblings → verifies the L1). It does
-  NOT recurse to grandparents. So an L3 issue's completion never propagates up,
-  and the verify cascade silently breaks. Never decompose an issue that is
-  itself already a sub-issue (the Step 1 guard enforces this).
-- **Executable work never lives at the root.** Only L2 slices carry labels and
-  get picked up; an L1/top-level issue with executable content stranded at the
-  root will never trigger task-verify (nothing walks up from it) and, per
-  design, carries no label so the discoverer won't ship it either. If a piece
-  is concrete enough to implement-and-ship, it belongs under a parent as an L2
-  slice, not at the root as a "feature".
+- **Leaves are work units, non-leaves are verification units.** A leaf (no
+  sub-issues) is what admiral's discoverer picks up and ships. Any non-leaf
+  is a parent — admiral never tries to ship it; it gets verified once every
+  direct child reaches a completed state, and verification cascades
+  recursively up the tree.
+- **Any depth works.** The verify loop is recursive: when a leaf merges,
+  admiral checks the parent's siblings; when the parent itself task-verifies,
+  it triggers the same check at the grandparent; and so on. The **topmost
+  non-leaf** under the project verifies itself in the same way (acceptance
+  criteria checked against its children), then stops — there's no
+  project-level verify above it. A **topmost leaf** (parentless leaf, no
+  children) simply ships and never task-verifies: no parent to cascade to,
+  no children to wait for. Each layer verifies against its own acceptance
+  criteria.
+- **`## Acceptance Criteria` section convention** (non-leaf issues): a
+  non-leaf's description is what admiral's verify judge reads as the PRD.
+  Inside it, an optional `## Acceptance Criteria` heading marks the
+  black-box "done" conditions. Present → admiral runs the LLM judge against
+  those criteria. Absent → admiral auto-passes that layer and cascades up
+  (useful for milestone-only wrappers that just organize children, no
+  layer-specific acceptance to check). Leaves don't need this heading —
+  their whole description IS the acceptance criterion, per Step 2. **Leaf
+  → non-leaf transition:** when an existing leaf gets sub-children added
+  (via re-decompose), it becomes a non-leaf and its old leaf-style
+  description (a flat acceptance criterion) no longer matches the auto-pass
+  detector. To make verify actually judge against that criterion, reformat
+  the description by adding a `## Acceptance Criteria` heading above it.
+  To keep the transitioned issue as a pure organizational wrapper, leave
+  the description as-is (auto-pass takes over).
+- **Executable work belongs in leaves.** A non-leaf with concrete,
+  code-sized scope is a sign the work should *be* a leaf, not a parent of
+  one. The discoverer only picks up leaves; if a single-PR slice sits at an
+  intermediate level, nothing under it will ship and the parent task-verify
+  will never get triggered (no children to wait for).
 
 Everything below is the mechanics of producing exactly this shape.
 
@@ -58,7 +82,7 @@ Linear writes. The valid shapes:
 | **Existing issue** — slice under it | `/decompose GEO-5`, URL, "decompose this issue" with a clear ref | `linear.get_issue(GEO-5)` to verify exists → **sub-issue mode**. PRD source = the issue's `description`. |
 | **Project root** — produce top-level features | `/decompose top-level`, `/decompose --top-level`, "拆 project / 顶层", "为 project 创建 issues"; `/decompose project` / `--project` / `--project-root` accepted as legacy aliases | No Linear parent → **top-level mode**. PRD source = conversation content provided by the user. |
 | **Title for a new parent** — issue doesn't exist yet | `/decompose "Build login feature"`, "拆: build login" with no matching ID | `linear.list_issues(query: "<title>")` to search. Zero matches → **create-then-sub-issue mode** (Step 4 will confirm + create). Multiple matches → ask user to pick. Exactly one match → treat as existing. |
-| **Whole tree at once** — features + their slices in one pass | `/decompose --full`, `/decompose --recursive`, "拆整个 project", "全部拆到 sub-issue", "把 project 一次拆到底" | **recursive mode** → see "Recursive (full) mode" section below. State-aware: builds L1 features from a PRD when none exist, then slices every feature; or, when features already exist, only slices the ones still missing sub-issues. |
+| **Whole tree at once** — features + their slices in one pass | `/decompose --full`, `/decompose --recursive`, "拆整个 project", "全部拆到 sub-issue", "把 project 一次拆到底" | **recursive mode** → see "Recursive (full) mode" section below. State-aware: builds top-level features from a PRD when none exist, then slices every feature; or, when features already exist, only slices the ones still missing sub-issues. |
 | **Nothing given** | bare `/decompose` | Infer from conversation context. If a recent Linear issue / project / title is clearly the intent, propose it back to the user and wait for confirmation. If not clear, ask explicitly. **Never guess silently.** |
 
 Identifier heuristics (the LLM applies these to disambiguate the user's input):
@@ -78,23 +102,22 @@ Rules:
 - Record the resolved **attachment mode** (one of: `sub-issue-mode`,
   `top-level-mode`, `create-then-sub-issue-mode`, `recursive-mode`) and the
   chosen `team` / `project` ids. Every later step branches on the mode.
-- **Level-3 guard (sub-issue mode).** Before slicing under an existing issue,
-  check whether that issue is **itself already a sub-issue** — `get_issue`
-  exposes the issue's parent reference; if it has a parent, the issue is an L2 slice.
-  Decomposing it would create an L3 issue, which **breaks the verify cascade**
-  (a merged L3 walks up only to its L2 parent — the L2's completion never
-  propagates to the L1, so the task never auto-verifies). STOP and tell the
-  user. Offer the right alternatives: attach the new slices under the issue's
-  **L1 parent** instead (so they become siblings, still L2), or reconsider
-  whether this work is really a separate slice. Do NOT silently create L3.
-- **Granularity sanity (top-level mode).** Top-level issues must be *features*
-  (coarse, themselves further-sliceable), not *slices* (concrete, directly
-  implement-and-ship work). If the pieces you're about to create read like
-  slices — a single PR's worth of code with a crisp acceptance criterion —
-  warn the user: "these look like executable slices, not features; attaching
-  them at the project root means they're never picked up (no label) and never
-  task-verified (nothing above them). Did you mean to slice them under a parent
-  (sub-issue mode), or run recursive mode?" Let the user redirect before any write.
+- **Granularity sanity (any sub-issue / create-then-sub-issue / recursive
+  mode).** Before decomposing an existing issue, check whether it really
+  needs further slicing. If its description already reads as a single
+  concrete, verifiable PR-sized acceptance criterion, decomposing it just
+  adds a layer of indirection — refine the description in place instead.
+  Decompose when the target is genuinely coarse (multiple independently
+  shippable pieces).
+- **Granularity sanity (top-level mode).** Top-level issues should be
+  *features* / *milestones* (coarse, themselves further-sliceable), not
+  *slices* (concrete, directly implement-and-ship work). If the pieces
+  you're about to create read like slices — a single PR's worth of code with
+  a crisp acceptance criterion — warn the user: "these look like executable
+  slices, not features; attaching them at the project root leaves them
+  unlabelled (won't be picked up) and parentless (nothing cascades). Did you
+  mean to slice them under a parent (sub-issue mode), or run recursive mode?"
+  Let the user redirect before any write.
 - **PRD content pre-check** (top-level mode, create-then-sub-issue mode, and
   recursive mode in its "no features yet" state): in these the PRD source is
   conversation content, not an existing Linear issue. If the user has not
@@ -113,6 +136,16 @@ on a single approval. It does not invent a new way to slice — it loops the
 same Steps 2–7 over each feature. Two non-negotiables carry over: the Step 2
 detail gate (every slice needs a verifiable acceptance criterion) and Step 8
 (it still NEVER applies `agent-ready`).
+
+**Scope of recursive mode.** It plans **two layers** in one pass: top-level
+features (under the project) and their direct slice children. The labels
+"L1 feature" / "L2 slice" below refer to those two layers, not a hard
+depth limit on the overall tree — admiral itself supports arbitrary depth
+(see the hierarchy section above). For deeper layouts (a feature with
+sub-features, or a milestone wrapping features), re-run `/decompose
+<sub-issue>` on individual nodes after this pass; recursive mode itself
+intentionally stops at the feature→slice boundary to keep the consolidated
+review small enough for one approval.
 
 **Separate planning from materialization.** Planning the tree is read-only and
 fully derivable from the doc; the human gate is reviewing that plan, not
@@ -141,27 +174,27 @@ global Step numbers); where it reuses a global Step it says so explicitly.
 
 - **R1 — Resolve + detect state.** Resolve the project (Step 1 rules). Enumerate
   the project's **top-level issues**, counting only issues whose `parent` is
-  empty — a returned issue with a non-empty `parent` is an L2 slice, exclude it
-  (same deterministic test as the Step 1 level-3 guard). From these, determine
-  the state in the table above. Throughout R1–R7, **"unsliced top-level issue"
-  means a top-level issue with zero sub-issues** (matching the state table);
-  features that already have any sub-issue are treated as sliced and skipped.
+  empty — a returned issue with a non-empty `parent` is a deeper-tier sub-issue,
+  exclude it. From these, determine the state in the table above. Throughout
+  R1–R7, **"unsliced top-level issue" means a top-level issue with zero
+  sub-issues** (matching the state table); features that already have any
+  sub-issue are treated as sliced and skipped.
 - **R2 — Granularity gate (before slicing anything).** A top-level issue
   existing does NOT make it a feature to slice. Classify each *unsliced*
   top-level issue:
   - **Coarse feature** — broad goal, would naturally break into several
-    independently-shippable slices, no single crisp PR-sized "done" → plan L2
+    independently-shippable slices, no single crisp PR-sized "done" → plan
     slices for it (R3).
   - **Already a slice** — single PR's worth of work with a concrete, verifiable
     acceptance criterion (often already started/done, or grouped under a Linear
-    **milestone** alongside peers). Do NOT slice it — slicing would create an L3
-    issue and break the verify cascade. Leave it and surface it as "already
-    slice-grained — not sliced".
+    **milestone** alongside peers). Do NOT slice it — it is already a leaf
+    execution unit; further slicing just adds an empty parent layer. Leave it
+    and surface as "already slice-grained — not sliced".
   If MOST top-level issues are slice-grained, the project isn't organized as
-  feature→slice at all (milestone-grouped flat slices is a different, valid
-  shape — admiral just won't task-verify them, since nothing walks up from a
-  parentless issue). Say so and stop; do not invent a feature layer or slice
-  slices. This is the recursive-mode counterpart of Step 1's granularity sanity.
+  feature→slice at all (flat top-level slices is a valid shape — admiral picks
+  them up and ships them; they simply have no parent for verify to cascade to).
+  Say so and stop; do not invent a feature layer or re-slice slices. This is
+  the recursive-mode counterpart of Step 1's granularity sanity.
 - **R3 — Plan only (no writes):**
   - No-features state: plan L1 features from the PRD, then for each feature plan
     its L2 slices (acceptance criteria + agent-task/human-only classification +
@@ -279,28 +312,31 @@ criteria the same way regardless.
 
 ## The two label layers — what this skill does and doesn't apply
 
-admiral's skill-layer pipeline uses **two orthogonal labels** on sub-issues:
+admiral's skill-layer pipeline uses **two orthogonal labels**, both applied
+**only to pieces intended to be leaves** (the actual execution units):
 
 1. **`agent-task`** (classification, applied by THIS skill in any
    slice-producing mode: sub-issue / create-then-sub-issue / recursive) —
-   marks a sub-issue as something admiral is capable of doing. Set in Step 6
-   based on the Step 3.5 classification. Stable metadata: stays on the issue
-   for its lifetime.
+   marks a piece as something admiral is capable of doing. Set in Step 6
+   based on the Step 3.5 classification, on **leaf pieces only**. A piece
+   you plan to further-decompose later is an intermediate non-leaf —
+   leave it unlabeled.
 2. **`agent-ready`** (pickup trigger, applied by `activate`, NOT here) —
-   the team's configured `discoverer.require_label`. The moment a sub-issue
+   the team's configured `discoverer.require_label`. The moment a leaf
    gets this label, admiral's discoverer can ship it on the next tick.
 
-**Decompose applies `agent-task` to agent-doable sub-issues; it NEVER
-applies `agent-ready`.** Applying the pickup trigger kicks off autonomous
-shipping, so it is a separate, explicit human action: the user reviews the
-decomposition first, then runs `activate` (Step 8). Human-only sub-issues
-carry neither label. **Top-level issues (`project` mode) carry neither
-label** — they are features, not work units.
+**Decompose applies `agent-task` to agent-doable leaves; it NEVER applies
+`agent-ready`.** Applying the pickup trigger kicks off autonomous shipping,
+so it is a separate, explicit human action: the user reviews the
+decomposition first, then runs `activate` (Step 8). Human-only leaves carry
+neither label. **Non-leaves (top-level features, intermediate parents,
+milestone wrappers) carry neither label** — they are verification units,
+not work units.
 
 Use `linear.save_issue` for every write (create when `id` is omitted, update
 when `id` is passed). It supports `parentId`, `labels`, `blockedBy`,
 `blocks`, and `state` directly — pass `labels: ["agent-task"]` only on
-agent-doable sub-issues in a slice-producing mode, and NEVER pass the pickup
+agent-doable **leaves** in a slice-producing mode, and NEVER pass the pickup
 label (`agent-ready`) at any point in this skill.
 
 ## Step 4 — Materialize parent (create-then-sub-issue mode only)
@@ -322,9 +358,18 @@ linear.save_issue(
   team:        <chosen team>,
   project:     <chosen project>,
   title:       <title from user>,
-  description: <full PRD content — the ground-truth requirement admiral's verify loop judges against>,
+  description: <full PRD content — see Acceptance Criteria convention below>,
 )
 ```
+
+**Acceptance Criteria convention.** A non-leaf's description IS the PRD
+admiral's verify judge reads. To make verify actually run for this parent
+(rather than auto-pass), include an explicit `## Acceptance Criteria`
+heading in the description with the black-box "done" conditions for the
+parent as a whole. Without that heading, the parent's verify is treated as
+"organizational wrapper" — it auto-passes and cascades up the tree. For a
+task-feature with real acceptance criteria, include the heading; for a
+pure milestone / grouping node, omit it.
 
 Record the returned identifier — this is the parent for the rest of the flow.
 Do NOT label the parent. The parent is the task definition, never a work
@@ -385,7 +430,7 @@ linear.save_issue(
   project:     <project identifier>,
   // NO parentId — issue attaches directly to the project
   title:       <feature name>,
-  description: <mini-PRD for this feature — enough that a future /decompose <this-issue> has a verifiable doc to slice>,
+  description: <mini-PRD for this feature — enough that a future /decompose <this-issue> has a verifiable doc to slice. Include an explicit `## Acceptance Criteria` section if you want admiral's verify judge to evaluate this feature's done-ness once its children all complete; omit the heading if this is a pure milestone / grouping node (verify auto-passes and cascades up).>,
   // NO labels — top-level issues carry neither agent-task nor agent-ready
   state:       <a pickable state — see note>,
 )
@@ -548,7 +593,7 @@ To activate per feature: /activate GEO-10  (then GEO-11, GEO-12 …)
 - This skill applies `agent-task` to agent-doable slices (any slice-producing mode: sub-issue / create-then-sub-issue / recursive) and NEVER applies the pickup label (`agent-ready`) — not to parents, not to sub-issues, not to top-level features. Activation is the user's explicit trigger via `/activate`.
 - Parents / top-level issues / features are never labeled (no `agent-task`, no `agent-ready`) and never picked up by the discoverer.
 - Implicit parent/feature creation happens only in the create-then-sub-issue branch and in recursive mode's "no features yet" state — both after explicit user confirmation (Step 4 / the recursive consolidated review). Otherwise this skill WRITES sub-issues / top-level issues only — it never creates parents implicitly.
-- **Two issue levels is the ceiling** (project → L1 feature/task → L2 slice). Never decompose an issue that is itself a sub-issue (Step 1 level-3 guard); never strand executable work at the project root. admiral's verify loop walks one hop only, so deeper nesting silently breaks task-verify.
+- **Tree of arbitrary depth: leaves are work, non-leaves are verification.** Any non-leaf can itself be decomposed further. Each non-leaf's description is the PRD that admiral's verify judge reads; include a `## Acceptance Criteria` heading to make verify run that layer (otherwise it auto-passes and cascades up). Never strand executable single-PR scope at a non-leaf level — the discoverer only picks up leaves.
 - Sub-issue description = acceptance criteria, not implementation details — required for both agent-task and human-only issues (judged by admiral vs by a human respectively). Top-level description = mini-PRD for the feature (must support future slicing).
 - If the user provides vague requirements, ask clarifying questions before decomposing.
 - Do not create more than ~10 issues in one pass — if a task is that large, suggest splitting into multiple decomposition passes (or, in top-level mode, multiple project decompositions). Recursive mode plans many features at once but still respects this per-feature (≤ ~10 slices each) and uses its size guard to batch a large tree into reviewable chunks.

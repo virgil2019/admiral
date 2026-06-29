@@ -1,6 +1,6 @@
 ---
 name: review-decomposition
-description: Audit an existing Linear decomposition against admiral's two-level model and the discoverer/verify invariants — the read-only "lint" counterpart to decompose. Checks for executable slices stranded at the project root, L3+ nesting (which breaks admiral's one-hop verify cascade), labels that would mis-trigger or never trigger the discoverer (agent-ready on non-agent work, agent-task on parents, sub-issues in non-pickable states), canceled sub-issues that permanently stall task-verify, weak/missing acceptance criteria, and blocking-graph problems (cycles, dangling blockers). Produces a severity-rated report with concrete issue refs and remediation pointers; NEVER writes to Linear (fixes go through decompose / activate / manual edits). Takes a parent issue (audit its sub-tree), a project (audit all top-level issues + their sub-trees), or `top-level` (product-tier features). Invoke when the user says "/review-decomposition", "审一下拆分", "检查任务拆分", "review the decomposition", "audit this project's issues", "拆得对不对", or wants to validate an admiral issue tree before/after activation. Requires the Linear MCP.
+description: Audit an existing Linear decomposition against admiral's hierarchical tree model and the discoverer/verify invariants — the read-only "lint" counterpart to decompose. Checks for executable single-PR work stranded at non-leaf levels, labels that would mis-trigger or never trigger the discoverer (agent-ready on non-agent work, agent-task on non-leaves, sub-issues in non-pickable states), canceled sub-issues that permanently stall task-verify, weak/missing acceptance criteria on leaves, missing `## Acceptance Criteria` sections on non-leaves intended for verify, and blocking-graph problems (cycles, dangling blockers). Produces a severity-rated report with concrete issue refs and remediation pointers; NEVER writes to Linear (fixes go through decompose / activate / manual edits). Takes a parent issue (audit its sub-tree), a project (audit all top-level issues + their sub-trees), or `top-level` (product-tier features). Invoke when the user says "/review-decomposition", "审一下拆分", "检查任务拆分", "review the decomposition", "audit this project's issues", "拆得对不对", "审多层拆分", "audit deep tree", "检查任意深度拆分", or wants to validate an admiral issue tree (any depth) before/after activation. Requires the Linear MCP.
 ---
 
 # review-decomposition
@@ -14,25 +14,35 @@ writing code: it is **read-only**, produces a **severity-rated report**, and
 
 ## The model being audited (what "correct" means)
 
-admiral expects a **two-level issue tree** (see the `decompose` skill for the
-full statement):
+admiral expects an **issue tree of arbitrary depth** (see the `decompose` skill
+for the full statement):
 
 ```
-Project            ← product (product-tier acceptance enumerates top-level issues)
- └─ Issue (L1)     ← task/feature: verification unit. Unlabelled, never shipped.
-     └─ Sub (L2)   ← slice: execution unit. Labelled with the pickup label; one PR each.
+Project                ← product (product-tier acceptance enumerates top-level issues)
+ └─ Issue              ← non-leaf: feature / milestone / sub-feature. Unlabelled, never shipped.
+     ├─ Issue          ← non-leaf (deeper layer): same rules.
+     │   ├─ Sub        ← leaf: slice. Labelled with the pickup label; one PR each.
+     │   └─ Sub        ← leaf.
+     └─ Sub            ← leaf. Leaves and intermediates can be siblings.
 ```
 
 The invariants this skill checks against — all verified in admiral's code:
 
-- **Pickup** (`internal/discoverer/service.go`): the discoverer ships any issue
-  matching `RequireLabel` + a `StateTypes` state + unassigned. It is
-  **hierarchy-blind** — a labelled issue is picked regardless of where it sits.
-- **Task-verify is one hop** (`internal/discoverer/state_advance.go`): a merged
-  L2 walks up to its L1 parent and, when every sibling sub-issue is in a
-  **completed** state, the parent task is verified. It does NOT recurse — so an
-  L3 issue's completion never propagates, and a parentless issue never
-  task-verifies.
+- **Pickup** (`internal/discoverer/service.go`): the discoverer ships any
+  *leaf* issue matching `RequireLabel` + a `StateTypes` state + unassigned. It
+  is hierarchy-blind for labels but skips any issue that has sub-issues —
+  non-leaves are never shipped, regardless of label.
+- **Task-verify cascades recursively** (`internal/discoverer/state_advance.go`):
+  a merged leaf walks up to its parent; when every direct sibling is in a
+  **completed** state, the parent task is verified. When the parent itself
+  task-verifies, the same check fires at the grandparent — recursion continues
+  up the tree. A non-leaf with no `## Acceptance Criteria` section in its
+  description is auto-passed at that layer (organizational pass-through) and
+  cascade continues. The **topmost non-leaf** under the project verifies
+  itself in the same way once all its children complete; cascade then stops
+  there (no project-level verify above it). A **top-level leaf** (parentless
+  leaf, no children) is a different case — it ships but never task-verifies:
+  no parent to cascade to, no children to wait for.
 - **Only `completed` counts as done** (`allSubsCompleted`): a sibling left
   `canceled` (PR closed unmerged) blocks the parent's task-verify **forever** —
   by design, a human must resolve it.
@@ -68,7 +78,7 @@ things: it reports, it does not mutate.
 
 | User intent | Examples | Resolution |
 |---|---|---|
-| **A parent issue** — audit its sub-tree | `/review-decomposition GEO-1`, a URL | `get_issue(GEO-1)`; audit it as an L1 task + its sub-issues. |
+| **A parent issue** — audit its sub-tree | `/review-decomposition GEO-1`, a URL | `get_issue(GEO-1)`; audit it as a non-leaf + its entire sub-tree (recurse to all depths). |
 | **A project** — audit the whole tree | `/review-decomposition <project>`, "审这个 project" | enumerate the project's top-level issues + each one's sub-tree. |
 | **Product tier** — top-level features only | `/review-decomposition top-level` | audit the project's top-level issues as features (lighter; skips per-slice criteria depth). |
 | **Nothing given** | bare invocation | Infer from context (recent issue / project). Propose it back and confirm. Never guess silently. |
@@ -83,12 +93,14 @@ Pull enough to evaluate every check below:
   and its sub-issues (`list_issues(parentId: …)`), each with state type, labels,
   `description`, and — via `get_issue(…, includeRelations: true)` where needed —
   `blockedBy` relations.
-- For a **project**: top-level issues (those whose `parent` is empty), then each
-  one's sub-issues. An issue returned with a non-empty `parent` is an L2; track
-  the depth so you can detect L3+.
-- Record, per issue: identifier, title, `parent` (empty?), child count, labels,
-  state + state **type**, whether `description` carries a concrete acceptance
-  criterion, and blocking edges.
+- For a **project**: top-level issues (those whose `parent` is empty), then
+  walk the sub-tree recursively. An issue returned with a non-empty `parent` is
+  a non-top-level node; record its depth + parent chain so findings can refer
+  to it precisely (e.g. `[GEO-1] > [GEO-12] > [GEO-30]`).
+- Record, per issue: identifier, title, `parent` (empty?), child count
+  (zero = leaf), labels, state + state **type**, whether `description` carries
+  a concrete acceptance criterion (leaves) or a `## Acceptance Criteria`
+  section (non-leaves), and blocking edges.
 
 Prefer a few broad `list_issues` calls over many `get_issue` calls; only
 `get_issue` individually where you need `description` or relations not in the
@@ -100,24 +112,27 @@ Severity is guidance for ranking; apply judgment. Each finding cites the
 issue(s) and the invariant it violates.
 
 ### Structure / hierarchy
-- **[HIGH] L3+ nesting** — a sub-issue that itself has sub-issues. Breaks the
-  one-hop verify cascade: the grandchild's completion never reaches the L1.
-  Remediation: flatten — move the grandchildren up to be siblings under the L1,
-  or split the work differently.
-- **[HIGH] Executable slice stranded at root** — a top-level (parentless) issue
-  that carries the pickup label and/or `agent-task` and reads like a single-PR
-  slice. It ships but never task-verifies (nothing walks up from it).
-  Remediation: attach it under an L1 task parent.
-- **[MEDIUM] Parent/feature carrying a work label** — an L1/top-level issue with
-  `agent-task` or the pickup label. Parents are verification units, not work
-  units. Remediation: remove the label from the parent.
+- **[MEDIUM] Top-level slice without a feature parent** — a top-level
+  (parentless) issue that carries the pickup label and/or `agent-task` and
+  reads like a single-PR slice. Structurally fine (admiral will ship it), but
+  it has no parent to cascade to — it does not participate in any
+  task-verification. If this is genuinely standalone, no fix is needed; if it
+  was meant to be part of a larger feature, attach it under a feature parent.
+- **[MEDIUM] Non-leaf carrying a work label** — any non-leaf (top-level or
+  intermediate) tagged with `agent-task` or the pickup label. Non-leaves are
+  verification units, not work units; the discoverer's parent-skip guard
+  prevents them from being shipped, so the label is dead weight at best, and
+  if the issue is later turned into a leaf (children removed) the label
+  becomes live and the discoverer will try to ship work the user didn't intend.
+  Remediation: remove the label from the non-leaf.
 
 ### Labels / pickup
 - **[CRITICAL] Pickup label on non-agent work** — the pickup label
-  (`require_label`) on a human-only issue (no `agent-task`) or on a parent. The
-  discoverer is hierarchy- and executor-blind: it will try to **ship** it.
-  Remediation: remove the pickup label; only `agent-task` slices should carry it.
-- **[MEDIUM] `agent-task` missing/misapplied** — an agent-doable slice without
+  (`require_label`) on a human-only leaf (no `agent-task`). The discoverer
+  skips non-leaves but is executor-blind on leaves: a labeled human-only leaf
+  will be picked up and admiral will try to **ship** it. Remediation: remove
+  the pickup label; only agent-doable leaves should carry it.
+- **[MEDIUM] `agent-task` missing/misapplied** — an agent-doable leaf without
   `agent-task` (won't be activatable via `/activate`), or `agent-task` on work
   that is clearly human-only.
 
@@ -137,6 +152,17 @@ issue(s) and the invariant it violates.
   judge has nothing to judge against → the loop can't converge (it fails
   silently, not loudly). Remediation: enrich the description before activation;
   re-run `/decompose` on the parent if many slices are thin.
+- **[MEDIUM] Non-leaf intended for verify but missing `## Acceptance Criteria` heading** —
+  a non-leaf whose description reads like real task-feature acceptance content
+  (concrete done-conditions, not pure organizational/milestone framing) but
+  carries no `## Acceptance Criteria` heading. Without the heading, admiral
+  auto-passes that layer — the criteria are present but never judged. Common
+  cause: a leaf that gained sub-children later (became a non-leaf
+  retroactively), so its old leaf-style description (a flat criterion) sits
+  at the top of the body without the convention's heading. Remediation: add
+  the `## Acceptance Criteria` heading above the existing content, or — if
+  this non-leaf is genuinely a pure organizational wrapper — leave as-is and
+  ignore the finding.
 - **[LOW] human-only issue with no clear deliverable** — same gap, judged by a
   human; still worth a concrete done-condition.
 
@@ -155,9 +181,9 @@ issue(s) and the invariant it violates.
   Flag as advisory; you can't always tell from titles alone.
 
 ### Size / granularity
-- **[MEDIUM] Oversized parent** — > ~10 sub-issues under one L1. Quality of
-  acceptance criteria and review degrades; suggest splitting into multiple
-  features.
+- **[MEDIUM] Oversized parent** — > ~10 direct sub-issues under one non-leaf.
+  Quality of acceptance criteria and review degrades; suggest splitting into
+  multiple parents or introducing an intermediate grouping layer.
 - **[LOW] Granularity smell** — a slice that's clearly multi-PR (should split)
   or trivially small (should merge with a sibling).
 
@@ -172,18 +198,18 @@ Decomposition audit: <parent/project>  (pickup label: <require_label or "judge-d
 Verdict: <N> findings — <C> critical, <H> high, <M> medium, <L> low.
 
 CRITICAL
-  - [GEO-7] pickup label on human-only issue → discoverer will try to ship it. Remove the label.
+  - [GEO-7] pickup label on human-only leaf → discoverer will try to ship it. Remove the label.
 HIGH
-  - [GEO-12 → GEO-30] L3 nesting: GEO-30 is a sub-issue of sub-issue GEO-12 → never task-verifies. Flatten under GEO-1.
-  - [GEO-9] agent-task slice, description has no verifiable acceptance criterion → verify can't converge. Enrich or re-decompose.
+  - [GEO-9] agent-task leaf, description has no verifiable acceptance criterion → verify can't converge. Enrich or re-decompose.
 MEDIUM
-  - [GEO-5] sub-issue in state "In Review" (type=started), not in pickable [backlog, unstarted] → won't be picked.
+  - [GEO-12] non-leaf carrying `agent-task` (has 3 sub-issues) → label is dead weight; if children are removed later, discoverer will pick it up unintentionally. Remove the label.
+  - [GEO-5] leaf in state "In Review" (type=started), not in pickable [backlog, unstarted] → won't be picked.
 LOW
   - [GEO-2] foundation (shared types) but nothing blocks on it — confirm intended.
 
 Remediation:
-  - Re-run /decompose GEO-12 to flatten the L3 …
   - Remove pickup label from GEO-7 (manual) …
+  - Remove `agent-task` from GEO-12 (manual) …
   - Nothing here is auto-fixed — this audit is read-only.
 ```
 
