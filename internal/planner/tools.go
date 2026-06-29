@@ -785,7 +785,7 @@ func featureFollowupSubmitTool(db *store.Store, lc LinearClient, pickup PickupRu
 				return nil, fmt.Errorf("feature_id, title, acceptance_criteria all required")
 			}
 			if lc == nil {
-				return nil, fmt.Errorf("Linear client not configured (no OAuth token in admiral DB)")
+				return nil, fmt.Errorf("linear client is not configured (no OAuth token in admiral DB)")
 			}
 			f, err := db.GetFeature(args.FeatureID)
 			if err != nil {

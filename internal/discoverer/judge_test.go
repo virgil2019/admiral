@@ -1,6 +1,7 @@
 package discoverer
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -79,7 +80,7 @@ func TestBuildJudgePromptEmptyFieldsFallback(t *testing.T) {
 
 func TestClaudeJudgeRejectsEmptyBin(t *testing.T) {
 	j := &claudeJudge{}
-	_, err := j.Judge(nil, linear.Issue{ID: "x"})
+	_, err := j.Judge(context.TODO(), linear.Issue{ID: "x"})
 	if err == nil {
 		t.Fatal("expected error on empty claude_bin")
 	}
