@@ -823,12 +823,18 @@ func TestHasAcceptanceCriteriaSection(t *testing.T) {
 
 // TestHandleVerifyEvent_AutoPassesParentWithoutAcceptanceCriteria is the
 // integration test for PR-4's core behavior: a non-leaf parent whose
-// description has no '## Acceptance Criteria' heading auto-passes the
-// verify layer — the LLM judge is never invoked, the parent is flipped to
-// completed in Linear, the verification row is closed, and the persisted
-// summary carries the auto-pass marker. Cascade is exercised by
-// TestApplyVerifyVerdict_CompleteCascadesToGrandparent on the apply path;
-// here we only check that the auto-pass branch routes through apply.
+// description has no '## Acceptance Criteria' heading AND has at least one
+// sub-issue auto-passes the verify layer — the LLM judge is never invoked,
+// the parent is flipped to completed in Linear, the verification row is
+// closed, and the persisted summary carries the auto-pass marker. Cascade
+// is exercised by TestApplyVerifyVerdict_CompleteCascadesToGrandparent on
+// the apply path; here we only check that the auto-pass branch routes
+// through apply.
+//
+// The sub-issue presence is required by the auto-pass guard: a wrapper with
+// no children would have nothing to inherit judgment from, so it falls
+// through to the LLM judge (see
+// TestHandleVerifyEvent_WrapperWithNoChildrenFallsThroughToJudge).
 func TestHandleVerifyEvent_AutoPassesParentWithoutAcceptanceCriteria(t *testing.T) {
 	parent := &linear.Issue{
 		Identifier:  "GEO-1",
@@ -836,8 +842,10 @@ func TestHandleVerifyEvent_AutoPassesParentWithoutAcceptanceCriteria(t *testing.
 		TeamID:      "team-1", ProjectID: "proj-1",
 	}
 	lc := &mockLinearClient{
-		GetIssueByID:   map[string]*linear.Issue{"p1": parent},
-		SubIssues:      nil,
+		GetIssueByID: map[string]*linear.Issue{"p1": parent},
+		SubIssues: []linear.SubIssue{
+			{ID: "sub-1", Identifier: "GEO-2", StateType: "completed"},
+		},
 		WorkflowStates: []linear.WorkflowState{{ID: "st-done", Type: "completed", Position: 0}},
 	}
 	db := &mockStore{
@@ -885,5 +893,43 @@ func TestHandleVerifyEvent_AutoPassesParentWithoutAcceptanceCriteria(t *testing.
 	}
 	if len(lc.IssueCreateInputs) != 0 {
 		t.Errorf("auto-pass must not file any gap follow-ups, got %v", lc.IssueCreateInputs)
+	}
+}
+
+// TestHandleVerifyEvent_WrapperWithNoChildrenFallsThroughToJudge guards the
+// inverse invariant: a parent that has no '## Acceptance Criteria' heading
+// but ALSO has zero sub-issues must NOT auto-pass (an empty wrapper with no
+// kids has nothing to inherit judgment from, so silently marking it done
+// would be a footgun). The runner must fire instead so the LLM judge sees
+// the empty sub list and decides based on the PRD.
+func TestHandleVerifyEvent_WrapperWithNoChildrenFallsThroughToJudge(t *testing.T) {
+	parent := &linear.Issue{
+		Identifier:  "GEO-2",
+		Description: "I am a wrapper but I have no children yet.",
+		TeamID:      "team-1", ProjectID: "proj-1",
+	}
+	lc := &mockLinearClient{
+		GetIssueByID:   map[string]*linear.Issue{"p2": parent},
+		SubIssues:      nil, // no children
+		WorkflowStates: []linear.WorkflowState{{ID: "st-done", Type: "completed", Position: 0}},
+	}
+	db := &mockStore{
+		TaskVerification:       nil,
+		BumpedTaskVerification: &store.TaskVerification{ParentIssueID: "p2", Rounds: 1, Status: store.TaskVerifyActive},
+		Repo:                   &store.Repo{RepoDir: "/repo"},
+	}
+	done := make(chan struct{})
+	runner := func(_ context.Context, _, _ string) (string, error) {
+		defer close(done)
+		return `{"complete": true, "summary": "judge ran", "gaps": []}`, nil
+	}
+	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, runner)
+
+	o.HandleVerifyEvent(context.Background(), "p2")
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("verifyRunner never ran — wrapper with no children must fall through to the LLM judge, not auto-pass")
 	}
 }
