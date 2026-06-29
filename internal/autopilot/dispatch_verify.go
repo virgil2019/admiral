@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -263,11 +264,39 @@ func (o *Orchestrator) HandleVerifyEvent(ctx context.Context, parentID string) {
 	go o.runVerify(parentID)
 }
 
+// acceptanceCriteriaHeadingRE matches a markdown H2 "## Acceptance Criteria"
+// heading line. Strict: H2 only (H1 / H3+ are NOT matched — those are
+// non-conventional and easy to write by accident), case-insensitive, leading
+// whitespace on the line tolerated, and a word boundary is required after
+// "criteria" so the heading text can be exactly that or extended ("##
+// Acceptance Criteria (must hold for v2)") but a typo like
+// "AcceptanceCriteria" does not match.
+var acceptanceCriteriaHeadingRE = regexp.MustCompile(`(?im)^[ \t]*##[ \t]+acceptance[ \t]+criteria\b`)
+
+// hasAcceptanceCriteriaSection reports whether desc carries the conventional
+// "## Acceptance Criteria" H2 heading that marks a non-leaf parent's
+// black-box done conditions. Drives the auto-pass branch in runVerify:
+// absent → admiral treats this layer as an organizational wrapper and
+// short-circuits to a passing verdict. See the decompose / review-
+// decomposition SKILL.md docs for the convention this enforces.
+func hasAcceptanceCriteriaSection(desc string) bool {
+	return acceptanceCriteriaHeadingRE.MatchString(desc)
+}
+
 // runVerify is the background goroutine for one verification round: gather
 // materials → headless judge → apply the verdict. It owns its own run slot
 // and timeout ctx (same budget as the review/autopilot claude runs). Every
 // failure logs and returns, leaving the verification 'active' for a later
 // retry.
+//
+// Auto-pass short-circuit: a non-leaf parent whose description carries no
+// '## Acceptance Criteria' heading is, by convention, an organizational
+// wrapper (no layer-specific acceptance to check; its children's
+// verifications carry the substantive judgment). We synthesize a
+// Complete=true verdict and call applyVerifyVerdict directly, skipping
+// BOTH the verify_cmd build gate AND the LLM judge — each child's PR
+// already ran the build through CI, and there's nothing for the judge to
+// evaluate without a criteria section.
 func (o *Orchestrator) runVerify(parentID string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -285,6 +314,27 @@ func (o *Orchestrator) runVerify(parentID string) {
 	mat, repoDir, teamID, projectID, verifyCmd, err := o.gatherVerifyMaterial(ctx, parentID)
 	if err != nil {
 		o.logger.Error("verify_gather_failed", "parent", parentID, "err", err)
+		return
+	}
+
+	// Auto-pass: a parent description without the conventional
+	// '## Acceptance Criteria' H2 heading is an organizational wrapper —
+	// its children's verifications are the only substantive judgment, and
+	// this layer just cascades up. Synthesize a Complete=true verdict and
+	// hand straight to applyVerifyVerdict (which flips Linear + persists
+	// the summary + walks cascade one hop). Skips the verify_cmd build
+	// gate AND the LLM judge: children already ran the build through their
+	// own PR CIs, and there's nothing to judge without acceptance criteria.
+	// Empty PRD also falls through here — there is literally nothing for
+	// the judge to evaluate, so the safe action is to auto-pass.
+	if !hasAcceptanceCriteriaSection(mat.PRD) {
+		o.logger.Info("verify_auto_pass",
+			"parent", parentID, "identifier", mat.ParentIdentifier)
+		o.applyVerifyVerdict(ctx, parentID, mat.ParentIdentifier, teamID, projectID,
+			&verifyVerdict{
+				Complete: true,
+				Summary:  "auto-pass: parent description has no '## Acceptance Criteria' section; treated as organizational wrapper",
+			})
 		return
 	}
 

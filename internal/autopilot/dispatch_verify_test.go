@@ -283,7 +283,16 @@ func TestApplyVerifyVerdict_UnpickableGatesEscalate(t *testing.T) {
 }
 
 func TestHandleVerifyEvent_HappyPathCompletes(t *testing.T) {
-	parent := &linear.Issue{Identifier: "GEO-1", Description: "Build login", TeamID: "team-1", ProjectID: "proj-1"}
+	// Description includes the convention's '## Acceptance Criteria' heading
+	// so runVerify does NOT take the auto-pass short-circuit and the runner
+	// actually fires. (Without the heading the auto-pass branch handles the
+	// verdict synchronously and never invokes the runner — see
+	// TestHandleVerifyEvent_AutoPassesParentWithoutAcceptanceCriteria.)
+	parent := &linear.Issue{
+		Identifier:  "GEO-1",
+		Description: "Build login\n\n## Acceptance Criteria\n- user can log in\n",
+		TeamID:      "team-1", ProjectID: "proj-1",
+	}
 	lc := &mockLinearClient{
 		GetIssueByID:   map[string]*linear.Issue{"p1": parent},
 		SubIssues:      nil,
@@ -772,5 +781,109 @@ func TestBuildResultMaterial_Passed(t *testing.T) {
 				t.Errorf("passed() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestHasAcceptanceCriteriaSection(t *testing.T) {
+	cases := []struct {
+		name string
+		desc string
+		want bool
+	}{
+		{"empty", "", false},
+		{"whitespace-only", "   \n\t\n", false},
+		{"h2-at-start", "## Acceptance Criteria\n- foo", true},
+		{"h2-after-body", "PRD prose here.\n\nMore text.\n\n## Acceptance Criteria\n- foo", true},
+		{"h2-leading-spaces", "  ## Acceptance Criteria\n- foo", true},
+		{"h2-leading-tab", "\t## Acceptance Criteria\n- foo", true},
+		{"h2-lowercase", "## acceptance criteria\n- foo", true},
+		{"h2-uppercase", "## ACCEPTANCE CRITERIA\n- foo", true},
+		{"h2-mixed-case", "## Acceptance CRITERIA\n- foo", true},
+		{"h2-extended-text", "## Acceptance Criteria (v2 must hold)\n- foo", true},
+		{"h2-multiple-spaces", "##   Acceptance   Criteria\n- foo", true},
+		{"h1-not-matched", "# Acceptance Criteria\n- foo", false},
+		{"h3-not-matched", "### Acceptance Criteria\n- foo", false},
+		{"h4-not-matched", "#### Acceptance Criteria\n- foo", false},
+		{"inline-prose-not-matched", "This section lists acceptance criteria for the feature.", false},
+		{"concatenated-not-matched", "## AcceptanceCriteria\n- foo", false},
+		{"missing-hash-space-not-matched", "##Acceptance Criteria\n- foo", false},
+		{"partial-word-not-matched", "## Acceptance Crit\n- foo", false},
+		// Word-boundary check: H2 line that mentions other words after the
+		// heading text should still match (extended titles are common).
+		{"with-trailing-suffix-words", "## Acceptance Criteria — what success looks like", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasAcceptanceCriteriaSection(tc.desc); got != tc.want {
+				t.Errorf("hasAcceptanceCriteriaSection(%q) = %v, want %v", tc.desc, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleVerifyEvent_AutoPassesParentWithoutAcceptanceCriteria is the
+// integration test for PR-4's core behavior: a non-leaf parent whose
+// description has no '## Acceptance Criteria' heading auto-passes the
+// verify layer — the LLM judge is never invoked, the parent is flipped to
+// completed in Linear, the verification row is closed, and the persisted
+// summary carries the auto-pass marker. Cascade is exercised by
+// TestApplyVerifyVerdict_CompleteCascadesToGrandparent on the apply path;
+// here we only check that the auto-pass branch routes through apply.
+func TestHandleVerifyEvent_AutoPassesParentWithoutAcceptanceCriteria(t *testing.T) {
+	parent := &linear.Issue{
+		Identifier:  "GEO-1",
+		Description: "Milestone wrapper for the auth subtree.\n\nNo layer-specific criteria — see children.",
+		TeamID:      "team-1", ProjectID: "proj-1",
+	}
+	lc := &mockLinearClient{
+		GetIssueByID:   map[string]*linear.Issue{"p1": parent},
+		SubIssues:      nil,
+		WorkflowStates: []linear.WorkflowState{{ID: "st-done", Type: "completed", Position: 0}},
+	}
+	db := &mockStore{
+		TaskVerification:       nil,
+		BumpedTaskVerification: &store.TaskVerification{ParentIssueID: "p1", Rounds: 1, Status: store.TaskVerifyActive},
+		Repo:                   &store.Repo{RepoDir: "/repo"},
+	}
+	runner := func(context.Context, string, string) (string, error) {
+		t.Fatal("verifyRunner must NOT fire when parent has no Acceptance Criteria heading")
+		return "", nil
+	}
+	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, runner)
+
+	o.HandleVerifyEvent(context.Background(), "p1")
+
+	// Poll for the async apply to land (auto-pass still runs through the
+	// same goroutine path so the run-slot semantics are preserved).
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		db.mu.Lock()
+		n := len(db.SetStatusCalls)
+		db.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if len(db.BumpCalls) != 1 {
+		t.Errorf("expected one round bump even on auto-pass, got %v", db.BumpCalls)
+	}
+	if len(db.SetStatusCalls) != 1 || db.SetStatusCalls[0].Status != store.TaskVerifyClosed {
+		t.Fatalf("expected verification closed after auto-pass, got %v", db.SetStatusCalls)
+	}
+	if len(lc.IssueUpdateCalls) != 1 || lc.IssueUpdateCalls[0].StateID != "st-done" {
+		t.Fatalf("expected parent flipped to completed in Linear, got %v", lc.IssueUpdateCalls)
+	}
+	if len(db.SetSummaryCalls) != 1 {
+		t.Fatalf("expected one summary write, got %v", db.SetSummaryCalls)
+	}
+	if !strings.Contains(db.SetSummaryCalls[0].Summary, "auto-pass") {
+		t.Errorf("auto-pass summary missing marker, got %q", db.SetSummaryCalls[0].Summary)
+	}
+	if len(lc.IssueCreateInputs) != 0 {
+		t.Errorf("auto-pass must not file any gap follow-ups, got %v", lc.IssueCreateInputs)
 	}
 }
