@@ -2185,6 +2185,18 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	}); err != nil {
 		f.o.logger.Warn("update_claude_session_id_failed", "session", f.ev.SessionID, "err", err)
 	}
+	// Mirror the session id to admiral_tasks *immediately* (before launch).
+	// The /resume precheck reads admiral_tasks.ClaudeSessionID; without this
+	// mirror the field is only populated on the success path (line ~1397),
+	// so a 30-min timeout leaves the field empty and /resume rejects with
+	// "no claude session id" even though autopilot_jobs has it. Discovered
+	// via GEO-276 attempt_n=1 (2026-06-30).
+	if err := f.o.db.UpdateAdmiralTask(f.ev.IssueID, func(t *store.AdmiralTask) {
+		t.ClaudeSessionID = claudeSessionID
+	}); err != nil {
+		f.o.logger.Warn("update_admiral_task_claude_session_id_failed",
+			"session", f.ev.SessionID, "issue", f.ev.IssueID, "err", err)
+	}
 	f.claudeSessionID = claudeSessionID
 
 	args := []string{
