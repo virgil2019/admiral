@@ -1,19 +1,16 @@
 package autopilot
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
+	"github.com/georgehuang/admiral/internal/claudeclient"
 	"github.com/georgehuang/admiral/internal/config"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
@@ -317,60 +314,18 @@ func ensureReviewWorktree(ctx context.Context, repoDir string, task *store.Admir
 // in the worktree and captures stdout as the text reply. Plain text output
 // mode is used (no stream-json) because progress streaming to a PR comment
 // doesn't apply.
+//
+// The actual spawn is delegated to claudeclient.Run so argv-vs-argv-size-cap
+// (E2BIG) handling lives in one place — see internal/claudeclient. The
+// review path's prompt is a single PR's worth of commentary and is rarely
+// at risk today, but routing it through the same helper means future
+// agents that produce larger prompts automatically inherit the stdin
+// fallback.
 func runClaudeForReview(ctx context.Context, claudeBin string, maxRunSeconds int, worktreePath, prompt string, botIdentity config.BotIdentity, logger *slog.Logger) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, time.Duration(maxRunSeconds)*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(cctx, claudeBin,
-		"-p", prompt,
-		"--dangerously-skip-permissions",
-	)
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
-	cmd.WaitDelay = 5 * time.Second
-	cmd.Dir = worktreePath
-	cmd.Env = appendBotIdentityEnv(os.Environ(), botIdentity)
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", fmt.Errorf("claude stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return "", fmt.Errorf("claude stderr pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("claude start: %w", err)
-	}
-
-	var sb strings.Builder
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		sc := bufio.NewScanner(stdout)
-		sc.Buffer(make([]byte, 0, 1024*1024), 4*1024*1024)
-		for sc.Scan() {
-			sb.WriteString(sc.Text())
-			sb.WriteByte('\n')
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		sc := bufio.NewScanner(stderr)
-		sc.Buffer(make([]byte, 0, 1024*1024), 4*1024*1024)
-		for sc.Scan() {
-			logger.Warn("claude_review_stderr", "line", sc.Text())
-		}
-	}()
-	wg.Wait()
-
-	if err := cmd.Wait(); err != nil {
-		if cctx.Err() != nil {
-			return "", fmt.Errorf("claude exit: %w: %w", err, context.DeadlineExceeded)
-		}
-		return "", fmt.Errorf("claude exit: %w", err)
-	}
-	return strings.TrimSpace(sb.String()), nil
+	return claudeclient.Run(ctx, claudeBin, maxRunSeconds, worktreePath,
+		appendBotIdentityEnv(os.Environ(), botIdentity), prompt,
+		[]string{"--dangerously-skip-permissions"},
+		"", logger)
 }
 
 // isCommentLikeAction reports whether action is an inline-review or

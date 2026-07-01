@@ -31,9 +31,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
+	"github.com/georgehuang/admiral/internal/claudeclient"
 	"github.com/georgehuang/admiral/internal/config"
 	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
@@ -1666,25 +1666,30 @@ func (f *flow) checkBranchDiverged() error {
 }
 
 // runClaudeResume spawns `claude -p --resume` in stream-json mode inside the worktree.
+//
+// The argv construction is delegated to claudeclient.PrepareCmd so the
+// argv-vs-argv-size-cap (E2BIG) defense lives in one place — see
+// internal/claudeclient. The stream-json drain + the MCP-config
+// lifecycle stay local because they fan out to per-event handlers and
+// own a temp file outside the helper's purview.
 func (f *flow) runClaudeResume(userMessage string) error {
-	args := []string{
-		"-p", userMessage,
+	extraArgs := []string{
 		"--resume", f.job.ClaudeSessionID,
 		"--output-format", "stream-json",
 		"--verbose",
 		"--dangerously-skip-permissions",
 	}
-	if mcpCfgPath, err := f.writeMCPConfig(); err != nil {
+	var mcpCfgPath string
+	if p, err := f.writeMCPConfig(); err != nil {
 		f.o.logger.Warn("mcp_config_write_failed", "err", err)
-	} else if mcpCfgPath != "" {
-		args = append(args, "--mcp-config", mcpCfgPath)
-		defer os.Remove(mcpCfgPath)
+	} else if p != "" {
+		extraArgs = append(extraArgs, "--mcp-config", p)
+		mcpCfgPath = p
 	}
 	cctx, cancel := context.WithTimeout(f.ctx, time.Duration(f.o.cfg.MaxRunSeconds)*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, f.o.cfg.ClaudeBin, args...)
-	cmd.Dir = f.worktreePath
-	cmd.Env = appendBotIdentityEnv(append(os.Environ(),
+
+	env := appendBotIdentityEnv(append(os.Environ(),
 		"CLAUDE_AUTOPILOT_ISSUE="+f.ev.IssueIdentifier,
 		"CLAUDE_AUTOPILOT_SESSION="+f.ev.SessionID,
 		"ADMIRAL_DB_PATH="+f.o.dbPath,
@@ -1695,15 +1700,35 @@ func (f *flow) runClaudeResume(userMessage string) error {
 		"ADMIRAL_WORKTREE_PATH="+f.worktreePath,
 	), f.o.cfg.BotIdentity)
 
+	cmd, dumpPath := claudeclient.PrepareCmd(cctx, f.o.cfg.ClaudeBin,
+		f.worktreePath, env, userMessage, extraArgs, "")
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("claude stdout pipe: %w", err)
+		// Pre-Start failures: keep dump + mcpCfg for debugging.
+		if dumpPath != "" {
+			f.o.logger.Error("claude_prompt_dump", "path", dumpPath, "err", err.Error())
+		}
+		if mcpCfgPath != "" {
+			// Intentionally leave the mcp cfg in place too.
+		}
+		return fmt.Errorf("claude stdout pipe: %w (prompt dumped to %s)", err, dumpPath)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("claude stderr pipe: %w", err)
+		if dumpPath != "" {
+			f.o.logger.Error("claude_prompt_dump", "path", dumpPath, "err", err.Error())
+		}
+		return fmt.Errorf("claude stderr pipe: %w (prompt dumped to %s)", err, dumpPath)
 	}
 	if err := cmd.Start(); err != nil {
+		if dumpPath != "" {
+			f.o.logger.Error("claude_prompt_dump", "path", dumpPath, "err", err.Error())
+			return fmt.Errorf("%w (prompt dumped to %s)", err, dumpPath)
+		}
+		if mcpCfgPath != "" {
+			os.Remove(mcpCfgPath)
+		}
 		return fmt.Errorf("claude start: %w", err)
 	}
 
@@ -1719,11 +1744,27 @@ func (f *flow) runClaudeResume(userMessage string) error {
 		}
 	}()
 	wg.Wait()
-	if err := cmd.Wait(); err != nil {
-		if cctx.Err() != nil {
-			return fmt.Errorf("claude exit: %w: %w", err, context.DeadlineExceeded)
+
+	waitErr := cmd.Wait()
+	// mcpCfg is short-lived; safe to remove unconditionally.
+	if mcpCfgPath != "" {
+		os.Remove(mcpCfgPath)
+	}
+	// dumpPath only exists when the prompt overflowed the budget. The
+	// E2BIG defence on the boundary check should make this rare; on
+	// success, remove; on failure, log + keep.
+	if dumpPath != "" {
+		if waitErr != nil {
+			f.o.logger.Error("claude_prompt_dump", "path", dumpPath, "err", waitErr.Error())
+		} else if rerr := os.Remove(dumpPath); rerr != nil && !os.IsNotExist(rerr) {
+			f.o.logger.Warn("claude_prompt_dump_remove_failed", "path", dumpPath, "err", rerr)
 		}
-		return fmt.Errorf("claude exit: %w", err)
+	}
+	if waitErr != nil {
+		if cctx.Err() != nil {
+			return fmt.Errorf("claude exit: %w: %w", waitErr, context.DeadlineExceeded)
+		}
+		return fmt.Errorf("claude exit: %w", waitErr)
 	}
 	return nil
 }
@@ -2199,8 +2240,7 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	}
 	f.claudeSessionID = claudeSessionID
 
-	args := []string{
-		"-p", prompt,
+	extraArgs := []string{
 		"--session-id", claudeSessionID,
 		"--output-format", "stream-json",
 		"--verbose",
@@ -2212,21 +2252,17 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 		// chose this binary on purpose.
 		"--dangerously-skip-permissions",
 	}
-	if mcpCfgPath, err := f.writeMCPConfig(); err != nil {
+	var mcpCfgPath string
+	if p, err := f.writeMCPConfig(); err != nil {
 		f.o.logger.Warn("mcp_config_write_failed", "err", err)
-	} else if mcpCfgPath != "" {
-		args = append(args, "--mcp-config", mcpCfgPath)
-		defer os.Remove(mcpCfgPath)
+	} else if p != "" {
+		extraArgs = append(extraArgs, "--mcp-config", p)
+		mcpCfgPath = p
 	}
 	cctx, cancel := context.WithTimeout(f.ctx, time.Duration(f.o.cfg.MaxRunSeconds)*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, f.o.cfg.ClaudeBin, args...)
-	cmd.Cancel = func() error {
-		return cmd.Process.Signal(syscall.SIGTERM)
-	}
-	cmd.WaitDelay = 5 * time.Second
-	cmd.Dir = f.worktreePath
-	cmd.Env = appendBotIdentityEnv(append(os.Environ(),
+
+	env := appendBotIdentityEnv(append(os.Environ(),
 		"CLAUDE_AUTOPILOT_ISSUE="+issue.Identifier,
 		"CLAUDE_AUTOPILOT_SESSION="+f.ev.SessionID,
 		// Inherited by admiral-mcp-ask subprocess (via claude's env).
@@ -2238,15 +2274,34 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 		"ADMIRAL_WORKTREE_PATH="+f.worktreePath,
 	), f.o.cfg.BotIdentity)
 
+	cmd, dumpPath := claudeclient.PrepareCmd(cctx, f.o.cfg.ClaudeBin,
+		f.worktreePath, env, prompt, extraArgs, "")
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		if dumpPath != "" {
+			f.o.logger.Error("claude_prompt_dump", "path", dumpPath, "err", err.Error())
+		}
 		return fmt.Errorf("claude stdout pipe: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		if dumpPath != "" {
+			f.o.logger.Error("claude_prompt_dump", "path", dumpPath, "err", err.Error())
+		}
 		return fmt.Errorf("claude stderr pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
+		if dumpPath != "" {
+			f.o.logger.Error("claude_prompt_dump", "path", dumpPath, "err", err.Error())
+			if mcpCfgPath != "" {
+				os.Remove(mcpCfgPath)
+			}
+			return fmt.Errorf("%w (prompt dumped to %s)", err, dumpPath)
+		}
+		if mcpCfgPath != "" {
+			os.Remove(mcpCfgPath)
+		}
 		return fmt.Errorf("claude start: %w", err)
 	}
 
@@ -2262,11 +2317,23 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 		}
 	}()
 	wg.Wait()
-	if err := cmd.Wait(); err != nil {
-		if cctx.Err() != nil {
-			return fmt.Errorf("claude exit: %w: %w", err, context.DeadlineExceeded)
+
+	waitErr := cmd.Wait()
+	if mcpCfgPath != "" {
+		os.Remove(mcpCfgPath)
+	}
+	if dumpPath != "" {
+		if waitErr != nil {
+			f.o.logger.Error("claude_prompt_dump", "path", dumpPath, "err", waitErr.Error())
+		} else if rerr := os.Remove(dumpPath); rerr != nil && !os.IsNotExist(rerr) {
+			f.o.logger.Warn("claude_prompt_dump_remove_failed", "path", dumpPath, "err", rerr)
 		}
-		return fmt.Errorf("claude exit: %w", err)
+	}
+	if waitErr != nil {
+		if cctx.Err() != nil {
+			return fmt.Errorf("claude exit: %w: %w", waitErr, context.DeadlineExceeded)
+		}
+		return fmt.Errorf("claude exit: %w", waitErr)
 	}
 	return nil
 }
