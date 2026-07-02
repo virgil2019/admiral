@@ -1,19 +1,15 @@
 package discoverer
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
-	"os/exec"
 	"regexp"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
+	"github.com/georgehuang/admiral/internal/claudeclient"
 	"github.com/georgehuang/admiral/internal/linear"
 )
 
@@ -31,6 +27,17 @@ type claudeJudge struct {
 	logger    *slog.Logger
 }
 
+// timeoutSeconds returns j.timeout in whole seconds for passing to
+// claudeclient.Run (which takes int seconds, not a time.Duration).
+// Returns the 30s fallback when j.timeout is unset / non-positive so a
+// caller that forgot to wire the config still gets a usable default.
+func (j *claudeJudge) timeoutSeconds() int {
+	if j.timeout <= 0 {
+		return 30
+	}
+	return int(j.timeout / time.Second)
+}
+
 func (j *claudeJudge) Judge(ctx context.Context, iss linear.Issue) (Verdict, error) {
 	if strings.TrimSpace(j.claudeBin) == "" {
 		return Verdict{}, fmt.Errorf("claude_bin not set")
@@ -38,7 +45,10 @@ func (j *claudeJudge) Judge(ctx context.Context, iss linear.Issue) (Verdict, err
 	if j.timeout <= 0 {
 		return Verdict{}, fmt.Errorf("judge timeout not set")
 	}
-	out, err := j.runClaude(ctx, buildJudgePrompt(iss))
+	out, err := claudeclient.Run(ctx, j.claudeBin, j.timeoutSeconds(),
+		"", nil, buildJudgePrompt(iss),
+		[]string{"--output-format", "text", "--dangerously-skip-permissions"},
+		"", j.logger)
 	if err != nil {
 		return Verdict{}, err
 	}
@@ -79,62 +89,6 @@ func buildJudgePrompt(iss linear.Issue) string {
 		desc = "(no description)"
 	}
 	return fmt.Sprintf(judgePromptTemplate, iss.Identifier, iss.Title, labels, desc)
-}
-
-func (j *claudeJudge) runClaude(ctx context.Context, prompt string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, j.timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(cctx, j.claudeBin,
-		"-p", prompt,
-		"--output-format", "text",
-		"--dangerously-skip-permissions",
-	)
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
-	cmd.WaitDelay = 5 * time.Second
-	cmd.Env = os.Environ()
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return "", fmt.Errorf("stderr pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("start: %w", err)
-	}
-
-	var sb strings.Builder
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		sc := bufio.NewScanner(stdout)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for sc.Scan() {
-			sb.WriteString(sc.Text())
-			sb.WriteByte('\n')
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		sc := bufio.NewScanner(stderr)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for sc.Scan() {
-			j.logger.Warn("judge_stderr", "line", sc.Text())
-		}
-	}()
-	wg.Wait()
-
-	if err := cmd.Wait(); err != nil {
-		if cctx.Err() != nil {
-			return "", fmt.Errorf("claude exit %w (timeout)", err)
-		}
-		return "", fmt.Errorf("claude exit: %w", err)
-	}
-	return strings.TrimSpace(sb.String()), nil
 }
 
 // verdictJSONRe matches the first JSON object on a line that contains

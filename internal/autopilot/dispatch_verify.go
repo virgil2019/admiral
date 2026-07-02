@@ -1,20 +1,17 @@
 package autopilot
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
 	"github.com/georgehuang/admiral/internal/cascade"
+	"github.com/georgehuang/admiral/internal/claudeclient"
 	"github.com/georgehuang/admiral/internal/config"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
@@ -710,58 +707,16 @@ func (o *Orchestrator) escalateVerifyWithReason(ctx context.Context, parentID, b
 // no worktree, no push — the agent only reads and judges) and captures stdout
 // as the verdict text. Mirrors runClaudeForReview's process handling; kept
 // separate because verify neither prepares a worktree nor pushes commits.
+//
+// The actual spawn is delegated to claudeclient.Run so argv-vs-argv-size-cap
+// (E2BIG) handling lives in one place — see internal/claudeclient. When the
+// verify prompt grows past SafeArgvBudget (concretely: 6+ sub-issue diffs in
+// one round), it streams via stdin instead of -p argv and the process gets
+// past fork(2). See the GEO-267 incident in bridge.log for the failure mode
+// this prevents.
 func runClaudeForVerify(ctx context.Context, claudeBin string, maxRunSeconds int, repoDir, prompt string, logger *slog.Logger) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, time.Duration(maxRunSeconds)*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(cctx, claudeBin,
-		"-p", prompt,
-		"--dangerously-skip-permissions",
-	)
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
-	cmd.WaitDelay = 5 * time.Second
-	cmd.Dir = repoDir
-	cmd.Env = os.Environ()
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", fmt.Errorf("claude stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return "", fmt.Errorf("claude stderr pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("claude start: %w", err)
-	}
-
-	var sb strings.Builder
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		sc := bufio.NewScanner(stdout)
-		sc.Buffer(make([]byte, 0, 1024*1024), 4*1024*1024)
-		for sc.Scan() {
-			sb.WriteString(sc.Text())
-			sb.WriteByte('\n')
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		sc := bufio.NewScanner(stderr)
-		sc.Buffer(make([]byte, 0, 1024*1024), 4*1024*1024)
-		for sc.Scan() {
-			logger.Warn("claude_verify_stderr", "line", sc.Text())
-		}
-	}()
-	wg.Wait()
-
-	if err := cmd.Wait(); err != nil {
-		if cctx.Err() != nil {
-			return "", fmt.Errorf("claude exit: %w: %w", err, context.DeadlineExceeded)
-		}
-		return "", fmt.Errorf("claude exit: %w", err)
-	}
-	return strings.TrimSpace(sb.String()), nil
+	return claudeclient.Run(ctx, claudeBin, maxRunSeconds, repoDir,
+		os.Environ(), prompt,
+		[]string{"--dangerously-skip-permissions"},
+		"", logger)
 }
