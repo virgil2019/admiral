@@ -91,6 +91,10 @@ func main() {
 		},
 		AutoMerge: cfg.Discoverer.AutoMerge,
 	}, lc, &prAdapter{c: ghClient}, db, nil, logger)
+	// Boot-time recovery for verify rows left behind by historical
+	// failures (e.g. the GEO-267 argv-overflow incident — PR #187
+	// fixed the bug, this re-enqueues the rows that were stranded).
+	svc.SetBootRescanDB(db)
 
 	logger.Info("admiral-discoverer starting",
 		"sqlite", cfg.Storage.SQLitePath,

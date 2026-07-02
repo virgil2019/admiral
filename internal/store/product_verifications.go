@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
@@ -57,6 +58,39 @@ func (s *Store) BumpProductVerificationRound(projectID string) (*ProductVerifica
 		return nil, fmt.Errorf("bump product verification: %w", err)
 	}
 	return s.GetProductVerification(projectID)
+}
+
+// ListStuckProductVerifications mirrors ListStuckTaskVerifications for
+// the product-level table. product_verifications has no `summary`
+// column — the auto-pass marker for the task side has no analog here —
+// so the stuck shape is solely `status='active' AND rounds=1`.
+//
+// Same recovery rationale as ListStuckTaskVerifications: a row bumped
+// to rounds=1 whose apply step never ran. See PR #187 / GEO-267.
+func (s *Store) ListStuckProductVerifications(ctx context.Context) ([]ProductVerification, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT project_id, rounds, status, updated_at
+		FROM product_verifications
+		WHERE status='active' AND rounds=1
+		ORDER BY updated_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list stuck product verifications: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ProductVerification
+	for rows.Next() {
+		var pv ProductVerification
+		if err := rows.Scan(&pv.ProjectID, &pv.Rounds, &pv.Status, &pv.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan stuck product verification: %w", err)
+		}
+		out = append(out, pv)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate stuck product verifications: %w", err)
+	}
+	return out, nil
 }
 
 // SetProductVerificationStatus moves a project's verification to a terminal

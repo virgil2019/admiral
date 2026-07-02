@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -103,6 +104,46 @@ func (s *Store) SetTaskVerificationSummary(parentIssueID, summary string) error 
 		return fmt.Errorf("task verification for %s not found", parentIssueID)
 	}
 	return nil
+}
+
+// ListStuckTaskVerifications returns every task_verifications row in the
+// stuck shape that the discoverer's boot-time rescan is designed to
+// recover: status='active' AND rounds=1 AND summary=''. This is the
+// signature left behind when runClaudeForVerify (or runProductVerify)
+// bumped rounds to 1 but the apply step never ran — historically because
+// the argv exceeded ARG_MAX and the kernel rejected fork(2) before
+// claude even started. See GEO-267 incident and PR #187 / #<rescan-PR>.
+//
+// `rounds=1` is the lower bound: a row stuck at rounds=2 would mean a
+// re-verify already attempted and failed, which the in-flight check in
+// the rescan helper handles separately. The empty `summary` is the
+// discriminator from a successful first round that was simply not
+// closed yet (the auto-pass branch in runVerify writes a non-empty
+// summary before flipping status).
+func (s *Store) ListStuckTaskVerifications(ctx context.Context) ([]TaskVerification, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT parent_issue_id, rounds, status, summary, updated_at
+		FROM task_verifications
+		WHERE status='active' AND rounds=1 AND summary=''
+		ORDER BY updated_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list stuck task verifications: %w", err)
+	}
+	defer rows.Close()
+
+	var out []TaskVerification
+	for rows.Next() {
+		var tv TaskVerification
+		if err := rows.Scan(&tv.ParentIssueID, &tv.Rounds, &tv.Status, &tv.Summary, &tv.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan stuck task verification: %w", err)
+		}
+		out = append(out, tv)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate stuck task verifications: %w", err)
+	}
+	return out, nil
 }
 
 // SetTaskVerificationStatus moves a parent issue's verification to a

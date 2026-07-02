@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -1718,6 +1719,28 @@ func (s *Store) EnqueueEventWithSource(source, webhookID, action, sessionID, iss
 	n, err := result.RowsAffected()
 	if err != nil {
 		return false, err
+	}
+	return n > 0, nil
+}
+
+// HasInFlightEvent reports whether an event with the given source + action +
+// sessionID currently sits in events_inbox with status='pending' or
+// 'processing'. Used by the discoverer's boot-time rescan to avoid
+// double-firing verify events for a parent whose cascade already enqueued
+// a row that the worker hasn't drained yet.
+//
+// Read-only, no locking — racing the worker's ClaimNextPendingEvent is
+// fine (the worst case is a duplicate enqueue, deduped by
+// EnqueueEventWithSource's primary-key insert).
+func (s *Store) HasInFlightEvent(ctx context.Context, source, action, sessionID string) (bool, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM events_inbox
+		WHERE source=? AND action=? AND session_id=?
+		  AND status IN ('pending','processing')
+	`, source, action, sessionID).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("has in-flight event: %w", err)
 	}
 	return n > 0, nil
 }

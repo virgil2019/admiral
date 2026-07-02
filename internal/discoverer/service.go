@@ -144,6 +144,13 @@ type Service struct {
 	judge  judger
 	logger *slog.Logger
 
+	// rescanDB is an optional concrete *store.Store used by the
+	// boot-time stuck-verifications rescan (see rescan.go). When nil
+	// (the default for tests + the standalone Service), the rescan
+	// step is skipped — Service.Run continues straight to the ticker
+	// loop. Production wires this via SetBootRescanDB.
+	rescanDB *store.Store
+
 	// workflowStatesCache memoises Linear team workflow-state lookups
 	// across ticks — they rarely change.
 	workflowStatesCache map[string][]linear.WorkflowState
@@ -165,14 +172,29 @@ func New(cfg Config, lc linearClient, pr prClient, tr taskRegistry, j judger, lo
 		}
 	}
 	return &Service{
-		cfg:                 cfg,
-		linear:              lc,
-		pr:                  pr,
-		store:               tr,
-		judge:               j,
-		logger:              logger,
+		cfg:    cfg,
+		linear: lc,
+		pr:     pr,
+		store:  tr,
+		judge:  j,
+		logger: logger,
 		workflowStatesCache: map[string][]linear.WorkflowState{},
 	}
+}
+
+// SetBootRescanDB registers a concrete *store.Store for the boot-time
+// stuck-verifications rescan (see rescan.go). When set, Service.Run
+// calls RescanStuckVerifications once before the ticker loop starts;
+// when nil (the default), the rescan step is skipped. The store is
+// only used for reads + EnqueueEventWithSource — the recover flow
+// is purely additive and never mutates task_verifications /
+// product_verifications rows.
+//
+// Production wiring: cmd/admiral-discoverer/main.go calls this right
+// after New(). Tests omit it; they exercise Service.Run with a fake
+// taskRegistry that has no rescan semantics.
+func (s *Service) SetBootRescanDB(db *store.Store) {
+	s.rescanDB = db
 }
 
 // Run blocks until ctx is cancelled. Performs an immediate scan on
@@ -190,6 +212,29 @@ func (s *Service) Run(ctx context.Context) error {
 		"judge_enabled", s.cfg.Judge.Enabled,
 		"max_pick_per_round", s.cfg.MaxPickPerRound,
 	)
+
+	// One-shot recovery for verify rows left behind by historical
+	// failures (e.g. the GEO-267 argv-overflow incident, fixed in
+	// PR #187). The rescan fires before the ticker so the worker
+	// drains the re-enqueued events on its first cycle. Skipped when
+	// SetBootRescanDB was never called — tests + the standalone
+	// Service default take this path.
+	if s.rescanDB != nil {
+		rep, err := RescanStuckVerifications(ctx, s.rescanDB, s.logger)
+		switch {
+		case err != nil:
+			s.logger.Warn("stuck_verify_rescan_failed", "err", err)
+		case rep.TaskReEnqueued+rep.TaskSkippedInFlight+rep.ProductReEnqueued+rep.ProductSkippedInFlight > 0:
+			s.logger.Info("stuck_verify_rescan_done",
+				"task_scanned", rep.TaskScanned,
+				"task_re_enqueued", rep.TaskReEnqueued,
+				"task_skipped_in_flight", rep.TaskSkippedInFlight,
+				"product_scanned", rep.ProductScanned,
+				"product_re_enqueued", rep.ProductReEnqueued,
+				"product_skipped_in_flight", rep.ProductSkippedInFlight,
+			)
+		}
+	}
 
 	t := time.NewTicker(s.cfg.PollInterval)
 	defer t.Stop()
