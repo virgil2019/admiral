@@ -3606,3 +3606,40 @@ func TestRunSlots_CapacityFromConfig(t *testing.T) {
 		})
 	}
 }
+
+// ---- Tests for isPreparePhaseError ----
+//
+// isPreparePhaseError gates whether a /resume failure routes to markTimedOut
+// (preserve state, allow retry) vs markFailed (close off /resume). The
+// matchers target the stable verb prefixes the resume helpers wrap their
+// errors with, so a failure inside ensureWorktree / openStreamFile /
+// writeMCPConfig keeps the task TIMED_OUT.
+
+func TestIsPreparePhaseError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"ensure_worktree", fmt.Errorf("ensure worktree: git fetch origin: exit status 128"), true},
+		{"ensure_worktree_wrapped",
+			fmt.Errorf("ensure worktree: %w", errors.New("fatal: couldn't find remote ref linear/x")),
+			true},
+		{"open_stream_file", fmt.Errorf("open stream file: permission denied"), true},
+		{"mcp_config", fmt.Errorf("mcp config write failed: %w", errors.New("EACCES")), true},
+		{"claude_resume", fmt.Errorf("claude resume: exit status 1"), false},
+		{"claude_exit_deadline", fmt.Errorf("claude exit: signal: killed: context deadline exceeded"), false},
+		{"push", fmt.Errorf("push: failed to push origin linear/x: 403"), false},
+		{"unrelated", errors.New("something else entirely"), false},
+		{"fetch_alone_without_ensure_worktree_wrapper",
+			errors.New("fatal: couldn't find remote ref linear/x"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isPreparePhaseError(c.err); got != c.want {
+				t.Errorf("isPreparePhaseError(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
