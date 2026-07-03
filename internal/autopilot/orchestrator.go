@@ -1630,17 +1630,33 @@ var errBranchDiverged = errors.New("branch diverged")
 // covers the case where the worktree was kept across a timed-out run while
 // someone pushed externally.
 //
-// Precondition: origin/<branch> must exist (i.e. admiral has pushed the branch
-// in a prior run). If it doesn't, `git fetch` fails before merge-base is
-// reached and the caller sees the wrapped fetch error.
+// If origin/<branch> does not exist (exit 128, stderr
+// "couldn't find remote ref" — the normal state for a timed-out claude run
+// that produced 0 commits, or for any never-pushed branch), the divergence
+// check is vacuous: there is no remote state to compare against. We skip it
+// with a warning and let the caller proceed, so resume works off the local
+// session context rather than failing at this gate. Other fetch failures
+// (network, auth, partial-clone errors) keep the original hard-error path.
 func (f *flow) checkBranchDiverged() error {
 	if f.branch == "" {
 		return fmt.Errorf("checkBranchDiverged: f.branch is empty")
 	}
 	cmd := exec.Command("git", "fetch", "origin", f.branch)
 	cmd.Dir = f.worktreePath
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git fetch origin %s in worktree: %w (%s)", f.branch, err, out)
+	fetchOut, fetchErr := cmd.CombinedOutput()
+	if fetchErr != nil {
+		// No remote ref for this branch (never pushed, or the remote branch
+		// was deleted). Nothing to diverge against, so the divergence check
+		// is vacuous — skip it and let resume continue against the local
+		// session context. Other fetch failures (network, auth, partial-clone
+		// errors) keep the original hard-error path so they remain visible.
+		if strings.Contains(string(fetchOut), "couldn't find remote ref") {
+			f.o.logger.Warn("branch_diverged_check_skipped_no_remote_ref",
+				"branch", f.branch,
+				"worktree", f.worktreePath)
+			return nil
+		}
+		return fmt.Errorf("git fetch origin %s in worktree: %w (%s)", f.branch, fetchErr, fetchOut)
 	}
 
 	// `merge-base --is-ancestor origin/<branch> HEAD` exits 0 when origin is
