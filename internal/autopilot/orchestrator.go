@@ -789,6 +789,28 @@ func (o *Orchestrator) dispatchResume(ev linear.AgentEvent, task *store.AdmiralT
 	go o.runResume(ev, task)
 }
 
+// isPreparePhaseError reports whether err originated in a /resume setup step
+// (ensureWorktree, openStreamFile, MCP config write) rather than from claude
+// itself or post-claude work like pushBranch. Prepare-phase failures are
+// recoverable by retrying /resume once the underlying blocker is resolved;
+// the caller preserves TIMED_OUT for them so the /resume gate keeps
+// accepting the task.
+//
+// Matched by error string rather than sentinel: the helpers wrap with
+// fmt.Errorf("ensure worktree: %w", ...), so the wrapped verbs are stable
+// even though the underlying errors vary (fetch failure, worktree-add
+// failure, MCP write failure). New prepare-phase helpers that should also
+// route to TIMED_OUT should follow the same "<verb>: ..." prefix pattern.
+func isPreparePhaseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "ensure worktree") ||
+		strings.Contains(msg, "open stream file") ||
+		strings.Contains(msg, "mcp config")
+}
+
 // runResume executes a /resume run: claude --resume on the prior session id
 // inside the existing worktree, then opens (or reuses) a PR. Reuses the
 // existing admiral_tasks row — attempt_n is unchanged because /resume is
@@ -836,7 +858,21 @@ func (o *Orchestrator) runResume(ev linear.AgentEvent, task *store.AdmiralTask) 
 	if err := resumeFlow.executeResumeFromTimeout(); err != nil {
 		o.logger.Error("autopilot_resume_failed",
 			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
-		resumeFlow.markFailed(err)
+		// Prepare-phase failures (ensureWorktree, openStreamFile, MCP config
+		// write) leave the run effectively unchanged: claude never launched,
+		// no work was done, the prior session id is still recoverable.
+		// Marking the task FAILED would close off /resume for good (the
+		// /resume gate requires TIMED_OUT), forcing a /rerun that drops the
+		// prior session id and creates a new branch. Preserve TIMED_OUT so
+		// the user can retry /resume once the underlying blocker (e.g. a
+		// freshly-orphaned origin ref, a stuck worktree) is resolved.
+		if isPreparePhaseError(err) {
+			o.logger.Warn("autopilot_resume_failed_in_prepare_phase_keeping_timed_out",
+				"issue", ev.IssueIdentifier, "session", ev.SessionID)
+			resumeFlow.markTimedOut(err)
+		} else {
+			resumeFlow.markFailed(err)
+		}
 		return
 	}
 
