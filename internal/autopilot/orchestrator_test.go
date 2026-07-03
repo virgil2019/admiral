@@ -2070,6 +2070,98 @@ func TestEnsureWorktree_RebuildPreservesLocalCommits(t *testing.T) {
 	}
 }
 
+// setupNoRemoteBranchFixture creates a fixture where origin has main but NOT
+// the linear/test branch — the never-pushed-branch state that timed-out
+// resume (0-commits-pushed) and first-time resume can land in.
+func setupNoRemoteBranchFixture(t *testing.T) *remoteFixture {
+	t.Helper()
+	if err := exec.Command("git", "--version").Run(); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	mustGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s in %s: %v: %s", strings.Join(args, " "), dir, err, out)
+		}
+	}
+
+	root := t.TempDir()
+	originDir := filepath.Join(root, "origin.git")
+	localDir := filepath.Join(root, "local")
+	branch := "linear/test"
+
+	mustGit(root, "init", "--bare", originDir)
+
+	seedDir := filepath.Join(root, "seed")
+	if err := os.MkdirAll(seedDir, 0o755); err != nil {
+		t.Fatalf("mkdir seed: %v", err)
+	}
+	mustGit(seedDir, "init", "-b", "main")
+	mustGit(seedDir, "config", "user.email", "test@test.com")
+	mustGit(seedDir, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(seedDir, "README"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	mustGit(seedDir, "add", "README")
+	mustGit(seedDir, "commit", "-m", "v1")
+	mustGit(seedDir, "remote", "add", "origin", originDir)
+	// Push ONLY main to origin. The branch never reaches origin — mirrors
+	// the post-timeout-0-commits state and the first-time-resume state.
+	mustGit(seedDir, "push", "origin", "main")
+
+	mustGit(root, "clone", originDir, localDir)
+	mustGit(localDir, "config", "user.email", "test@test.com")
+	mustGit(localDir, "config", "user.name", "test")
+
+	// Create the local branch ref pointing at origin/main — never pushed to
+	// origin, but a valid ref in local so `git worktree add <path> <branch>`
+	// can resolve it.
+	mustGit(localDir, "branch", branch, "origin/main")
+
+	return &remoteFixture{
+		originDir:   originDir,
+		localDir:    localDir,
+		advancerDir: "", // unused in no-remote-ref tests
+		branch:      branch,
+	}
+}
+
+// Reuse, no remote ref for the branch (HEAD == origin/main): the normal
+// timed-out-0-commits state. ensureWorktree must succeed — claude --resume
+// works off the local session context; there is no remote state to diverge
+// against. Previously this case hard-failed with "couldn't find remote ref".
+func TestEnsureWorktree_ReuseNoRemoteRefOK(t *testing.T) {
+	fx := setupNoRemoteBranchFixture(t)
+	worktreePath := filepath.Join(fx.localDir, ".worktrees", "resume-test")
+	resumeWorktreeAt(t, fx.localDir, fx.branch, worktreePath)
+
+	f := newEnsureWorktreeFlow(fx.localDir, fx.branch, worktreePath)
+	if err := f.ensureWorktree(); err != nil {
+		t.Fatalf("ensureWorktree: %v", err)
+	}
+}
+
+// Reuse, no remote ref, but the worktree has an unpushed commit: claude
+// committed locally before the timeout but never pushed. The divergence
+// check is still vacuous (nothing on origin to compare against), so
+// ensureWorktree must succeed and leave the local commit intact.
+func TestEnsureWorktree_ReuseNoRemoteRefLocalAheadOK(t *testing.T) {
+	fx := setupNoRemoteBranchFixture(t)
+	worktreePath := filepath.Join(fx.localDir, ".worktrees", "resume-test")
+	resumeWorktreeAt(t, fx.localDir, fx.branch, worktreePath)
+	localHead := commitInWorktree(t, worktreePath, "claude.txt", "wip", "claude wip")
+
+	f := newEnsureWorktreeFlow(fx.localDir, fx.branch, worktreePath)
+	if err := f.ensureWorktree(); err != nil {
+		t.Fatalf("ensureWorktree: %v", err)
+	}
+	if h := gitHead(t, worktreePath); h != localHead {
+		t.Errorf("worktree HEAD: got %s want %s (local commit must survive)", h, localHead)
+	}
+}
+
 // ---- Tests for runClaudeResume ----
 
 func TestRunClaudeResume_ArgsCorrect(t *testing.T) {
