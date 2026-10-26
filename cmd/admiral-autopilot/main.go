@@ -54,13 +54,15 @@ func main() {
 
 	// Seed repos from config if DB is empty (DB takes priority over config
 	// once repos have been stored, so we only seed on first run).
-	if err := seedRepos(db, &cfg.Autopilot, logger); err != nil {
-		logger.Warn("repos_seed_failed", "err", err)
+	if err := seedRepos(db, &cfg.Autopilot, autopilot.NewRepoGhUserValidator(cfg.Autopilot.GhBin), logger); err != nil {
+		logger.Error("repos_seed_failed", "err", err)
+		os.Exit(1)
 	}
 	// One-shot soft nudge: any repo without verify_cmd silently falls back to
 	// diff-only L2 verify, which cannot catch build/compile errors. Operators
 	// often miss this in config until something breaks.
 	warnReposMissingVerifyCmd(db, logger)
+	warnReposMissingGhUser(db, logger)
 	warnBotIdentityUnset(&cfg.Autopilot, logger)
 
 	// Build Linear client and optionally wire token refresh.
@@ -257,7 +259,9 @@ func newAuthAlerter(cfg *config.Config, db *store.Store, logger *slog.Logger) fu
 // seedRepos writes repos from config into the SQLite store only when the DB
 // repos table is empty (DB takes priority over config once repos have been
 // stored, to avoid overwriting user changes made via future admin APIs).
-func seedRepos(db *store.Store, apCfg *config.Autopilot, logger *slog.Logger) error {
+// Every seeded repo must pass validateGhUser (its gh_user is logged in and
+// can push to origin); any failure aborts the seed before a row is written.
+func seedRepos(db *store.Store, apCfg *config.Autopilot, validateGhUser func(ctx context.Context, ghUser, repoDir string) error, logger *slog.Logger) error {
 	existing, err := db.ListRepos()
 	if err != nil {
 		return fmt.Errorf("list repos: %w", err)
@@ -269,6 +273,12 @@ func seedRepos(db *store.Store, apCfg *config.Autopilot, logger *slog.Logger) er
 		return nil // nothing to seed (validation already enforces non-empty)
 	}
 
+	for _, r := range apCfg.Repos {
+		if err := validateGhUser(context.Background(), r.GhUser, r.RepoDir); err != nil {
+			return fmt.Errorf("repo %s (%s): gh_user %q: %w", r.ProjectName, r.ProjectID, r.GhUser, err)
+		}
+	}
+
 	logger.Info("repos_seeding_from_config", "count", len(apCfg.Repos))
 	for _, r := range apCfg.Repos {
 		repo := store.Repo{
@@ -278,6 +288,7 @@ func seedRepos(db *store.Store, apCfg *config.Autopilot, logger *slog.Logger) er
 			BaseBranch:  r.BaseBranch,
 			Enabled:     true,
 			VerifyCmd:   r.VerifyCmd,
+			GhUser:      r.GhUser,
 		}
 		if err := db.UpsertRepo(repo); err != nil {
 			return fmt.Errorf("upsert repo %s: %w", r.ProjectID, err)
@@ -303,6 +314,26 @@ func warnReposMissingVerifyCmd(db *store.Store, logger *slog.Logger) {
 				"project_id", r.ProjectID,
 				"project_name", r.ProjectName,
 				"hint", "L2 verify will judge from diff text only; build/compile errors will not be detected for this repo. Set autopilot.repos[].verify_cmd to enable the hard gate.")
+		}
+	}
+}
+
+// warnReposMissingGhUser emits a boot-time WARN per repo with no gh_user —
+// typically rows that predate migration0024. autopilot.repos[].gh_user in
+// config only seeds an empty repos table, so these rows must be updated via
+// the admin API.
+func warnReposMissingGhUser(db *store.Store, logger *slog.Logger) {
+	repos, err := db.ListRepos()
+	if err != nil {
+		logger.Warn("gh_user_boot_check_list_failed", "err", err)
+		return
+	}
+	for _, r := range repos {
+		if strings.TrimSpace(r.GhUser) == "" {
+			logger.Warn("gh_user_unconfigured",
+				"project_id", r.ProjectID,
+				"project_name", r.ProjectName,
+				"hint", `no gh account configured for this repo. Set it with PATCH /admin/repos/<project_id> {"gh_user":"<account from gh auth status>"}; config gh_user only applies when the repos table is empty.`)
 		}
 	}
 }
