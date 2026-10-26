@@ -375,7 +375,7 @@ Or visit `/admin/ui/login` in a browser and log in — a cookie is set.
 |--------|------|-------------|
 | GET | `/admin/health` | `{"ok": bool, "uptime_s": int, "db_ok": bool, "linear_token_valid": bool}` |
 | GET | `/admin/load` | `{"workers": int, "pending_events": int, "processing_events": int, "in_flight_jobs": int}` |
-| GET | `/admin/repos` | `[{project_id, project_name, repo_dir, base_branch, enabled}]` |
+| GET | `/admin/repos` | `[{project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, gh_user}]` |
 | GET | `/admin/jobs` | `?status=&team_id=&since=&limit=` — list jobs |
 | GET | `/admin/jobs/<session_id>` | single job detail |
 | GET | `/admin/jobs/<session_id>/stream` | `claude -p` stream-json log file |
@@ -384,10 +384,10 @@ Or visit `/admin/ui/login` in a browser and log in — a cookie is set.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/admin/repos` | add a repo `{"team_id","team_name","repo_dir","base_branch?"}` |
-| PATCH | `/admin/repos/<project_id>` | update `{"repo_dir?","base_branch?","enabled?"}` |
+| POST | `/admin/repos` | add a repo `{"team_id","team_name","repo_dir","base_branch?","gh_user"}` — `gh_user` must be logged in to gh and have push permission on origin's push URL, else 400 |
+| PATCH | `/admin/repos/<project_id>` | update `{"repo_dir?","base_branch?","enabled?","auto_pick_enabled?","gh_user?"}` — a new `gh_user` or `repo_dir` is re-validated like POST |
 | DELETE | `/admin/repos/<project_id>` | remove a repo |
-| POST | `/admin/repos/<project_id>/check_gh` | verify `gh auth status` for the repo's remote |
+| POST | `/admin/repos/<project_id>/check_gh` | re-run the `gh_user` validation; `{gh_auth_ok, current_user (the configured gh_user), gh_status_output}` |
 | POST | `/admin/repos/<project_id>/test_clone` | verify git fetch works against the remote |
 
 #### Admin web UI
