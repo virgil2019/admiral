@@ -162,7 +162,7 @@ func TestRescan_EscalatedRowSkipped(t *testing.T) {
 }
 
 // TestRescan_NonEmptySummarySkipped guards the "is this a stuck row?"
-// discriminator: summary != ” means a past round completed and wrote
+// discriminator: a non-empty summary means a past round completed and wrote
 // a digest (e.g. via the auto-pass branch in runVerify). Status is
 // still 'active' because the apply step didn't run yet, but the row
 // is NOT in the E2BIG-stuck shape — re-running verify on it would

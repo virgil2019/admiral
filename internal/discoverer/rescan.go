@@ -39,7 +39,7 @@ const (
 // recovers the historical stuck rows).
 //
 // The function walks two tables:
-//   - task_verifications   : status='active' AND rounds=1 AND summary=”
+//   - task_verifications   : status='active' AND rounds=1 AND summary is empty
 //   - product_verifications: status='active' AND rounds=1
 //
 // For each row it checks whether an in-flight verify event already
