@@ -108,7 +108,7 @@ func (s *Store) SetTaskVerificationSummary(parentIssueID, summary string) error 
 
 // ListStuckTaskVerifications returns every task_verifications row in the
 // stuck shape that the discoverer's boot-time rescan is designed to
-// recover: status='active' AND rounds=1 AND summary=''. This is the
+// recover: status='active' AND rounds=1 AND summary=”. This is the
 // signature left behind when runClaudeForVerify (or runProductVerify)
 // bumped rounds to 1 but the apply step never ran — historically because
 // the argv exceeded ARG_MAX and the kernel rejected fork(2) before

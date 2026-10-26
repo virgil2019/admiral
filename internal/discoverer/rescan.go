@@ -14,11 +14,11 @@ import (
 // SkippedInFlight counts rows where an in-flight verify event was
 // already queued (so the worker would have processed it).
 type RescanReport struct {
-	TaskScanned         int
-	TaskReEnqueued      int
-	TaskSkippedInFlight int
-	ProductScanned      int
-	ProductReEnqueued   int
+	TaskScanned            int
+	TaskReEnqueued         int
+	TaskSkippedInFlight    int
+	ProductScanned         int
+	ProductReEnqueued      int
 	ProductSkippedInFlight int
 }
 
@@ -39,7 +39,7 @@ const (
 // recovers the historical stuck rows).
 //
 // The function walks two tables:
-//   - task_verifications   : status='active' AND rounds=1 AND summary=''
+//   - task_verifications   : status='active' AND rounds=1 AND summary=”
 //   - product_verifications: status='active' AND rounds=1
 //
 // For each row it checks whether an in-flight verify event already
