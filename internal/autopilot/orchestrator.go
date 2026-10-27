@@ -306,7 +306,7 @@ func (o *Orchestrator) HandleAgentEvent(ev linear.AgentEvent) {
 // admiral no longer guesses what the user meant — they say it.
 func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	text := ev.PromptContext
-	if ev.Action == linear.ActionCreated {
+	if ev.Action == linear.ActionCreated && ev.SourceCommentID != "" {
 		text = mentionRequestText(text)
 	}
 	if text == "" && ev.Action == linear.ActionPrompted {
@@ -386,8 +386,9 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	cmdName, remainder, ok := parseMentionCommand(text)
 	if !ok {
 		// A bare message (no /command) on an AWAITING_INPUT task is the
-		// user's reply to the pending ask_user question.
-		if task.State == store.JobStateAwaitingInput {
+		// user's reply to the pending ask_user question. An empty one (e.g.
+		// a lone @handle) is not an answer.
+		if task.State == store.JobStateAwaitingInput && strings.TrimSpace(text) != "" {
 			o.dispatchAwaitingReply(ev, task, text)
 			return
 		}
@@ -3003,28 +3004,34 @@ func parseMentionCommand(text string) (name, remainder string, ok bool) {
 }
 
 // mentionRequestText extracts what the user actually wrote from an
-// ActionCreated PromptContext. Linear sends @mention sessions a context
+// @mention-created PromptContext. Linear sends such sessions a context
 // bundle (<issue>, every <comment>, <other-thread>, ...) with the
 // triggering comment in a trailing <user-request> element, prefixed by the
-// agent's @handle. Returns the last <user-request> body with a leading
-// @handle stripped; text without the tag is returned unchanged.
+// agent's @handle. Comment bodies are not XML-escaped, so only tags on a
+// line of their own count as the envelope. Returns the last <user-request>
+// body with leading @handles stripped; text without the envelope is
+// returned unchanged.
 func mentionRequestText(text string) string {
-	const openTag, closeTag = "<user-request>", "</user-request>"
-	start := strings.LastIndex(text, openTag)
+	const openTag, closeTag = "\n<user-request>", "\n</user-request>"
+	end := strings.LastIndex(text, closeTag)
+	if end < 0 {
+		return text
+	}
+	start := strings.LastIndex(text[:end], openTag)
 	if start < 0 {
 		return text
 	}
-	body := text[start+len(openTag):]
-	if end := strings.Index(body, closeTag); end >= 0 {
-		body = body[:end]
+	body := text[start+len(openTag) : end]
+	if body != "" && body[0] != '\n' {
+		return text
 	}
 	body = strings.TrimSpace(body)
-	if strings.HasPrefix(body, "@") {
-		if i := strings.IndexAny(body, " \t\r\n"); i >= 0 {
-			body = strings.TrimSpace(body[i:])
-		} else {
-			body = ""
+	for strings.HasPrefix(body, "@") {
+		i := strings.IndexAny(body, " \t\r\n")
+		if i < 0 {
+			return ""
 		}
+		body = strings.TrimSpace(body[i:])
 	}
 	return body
 }

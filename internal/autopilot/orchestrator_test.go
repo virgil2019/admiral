@@ -255,6 +255,28 @@ func TestMentionRequestText(t *testing.T) {
 			wantText: "随便聊聊",
 		},
 		{
+			name:     "inline tags typed in the request are not the envelope",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /fix parse the <user-request> and </user-request> tags\n</user-request>\n",
+			wantText: "/fix parse the <user-request> and </user-request> tags",
+			wantName: "fix", wantRem: "parse the <user-request> and </user-request> tags", wantOK: true,
+		},
+		{
+			name:     "several leading handles are stripped",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent @alice /rerun\n</user-request>",
+			wantText: "/rerun",
+			wantName: "rerun", wantOK: true,
+		},
+		{
+			name:     "handle only yields empty text",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent\n</user-request>",
+			wantText: "",
+		},
+		{
+			name:     "empty request yields empty text",
+			in:       "<issue>x</issue>\n<user-request>\n</user-request>",
+			wantText: "",
+		},
+		{
 			name:     "no tag falls back to whole text",
 			in:       "/rerun extra",
 			wantText: "/rerun extra",
@@ -472,6 +494,10 @@ func (m *mockLinearClient) GetProjectTeamID(_ context.Context, _ string) (string
 
 // mockStore implements storeInterface for testing.
 type mockStore struct {
+	// PendingQuestionLookups counts GetPendingQuestionByID calls (the first
+	// step of dispatchAwaitingReply).
+	PendingQuestionLookups int
+
 	Active     bool
 	ActiveSID  string
 	ActiveErr  error
@@ -741,6 +767,7 @@ func (m *mockStore) TransitionAwaitingInputToExecuting(issueID string) (bool, er
 	return true, nil
 }
 func (m *mockStore) GetPendingQuestionByID(id string) (*store.PendingQuestion, error) {
+	m.PendingQuestionLookups++
 	return nil, nil
 }
 func (m *mockStore) CancelOpenPendingQuestionsForIssue(issueID string) error { return nil }
@@ -3251,6 +3278,31 @@ func TestDispatch_RerunInContextBundle_Supersedes(t *testing.T) {
 	}
 	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "sess-rerun" {
 		t.Errorf("expected fresh autopilot_jobs claim with new session id; got %v", got)
+	}
+}
+
+// TestDispatch_BareHandleOnAwaitingInput_DoesNotAnswer: an @mention with
+// nothing after the handle must not be recorded as the ask_user answer.
+func TestDispatch_BareHandleOnAwaitingInput_DoesNotAnswer(t *testing.T) {
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:           "issue-await",
+			State:             store.JobStateAwaitingInput,
+			AttemptN:          1,
+			PendingQuestionID: "q-1",
+		},
+	}
+	o := newTestOrchestrator(t, ms, &mockLinearClient{}, &fakeGhProbe{})
+	o.dispatch(linear.AgentEvent{
+		SessionID:       "sess-await",
+		IssueID:         "issue-await",
+		IssueIdentifier: "AWAIT-1",
+		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-bare-handle",
+		PromptContext:   "<issue identifier=\"AWAIT-1\">\n</issue>\n<user-request>\n@claudeagent\n</user-request>\n",
+	})
+	if ms.PendingQuestionLookups != 0 {
+		t.Fatalf("bare handle must not take the ask_user reply path (pending-question lookups: %d)", ms.PendingQuestionLookups)
 	}
 }
 
