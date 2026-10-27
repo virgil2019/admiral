@@ -268,6 +268,16 @@ func TestParseUserRequest(t *testing.T) {
 			wantText: "", wantErr: errUserRequestUnparsed,
 		},
 		{
+			name:     "lone open tag pasted inside the request is ambiguous",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /fix parser breaks on\n```\n<user-request>\n```\n</user-request>\n",
+			wantText: "", wantErr: errUserRequestUnparsed,
+		},
+		{
+			name:     "complete envelope pasted in an earlier comment is fine",
+			in:       "<comment>\nlook:\n<user-request>\n/old\n</user-request>\n</comment>\n<user-request>\n@claudeagent /rerun\n</user-request>\n",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
+		},
+		{
 			name:     "tag lines with surrounding whitespace",
 			in:       "<issue>x</issue>\n<user-request> \r\n@claudeagent /rerun\r\n </user-request>\n",
 			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
@@ -3449,6 +3459,80 @@ func TestDispatch_PromptedAnswerKeepsHandle(t *testing.T) {
 	ms.mu.Unlock()
 	if answered != "@alice owns it, keep v1" {
 		t.Fatalf("answer = %q, want the whole reply (posted: %q)", answered, mlc.GetPostedBody())
+	}
+}
+
+// TestDispatch_UnparsedEnvelope_FailsClosed: an envelope admiral can't
+// locate must not be taken as a delegate (which would start a fresh run).
+func TestDispatch_UnparsedEnvelope_FailsClosed(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{} // no task row: a delegate here would dispatchFreshAssign
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.HandleAgentEvent(linear.AgentEvent{
+		SessionID:       "sess-unparsed",
+		IssueID:         "issue-new",
+		IssueIdentifier: "NEW-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "<issue identifier=\"NEW-1\">\n</issue>\n<user-request id=\"1\">\n@claudeagent /status\n</user-request>\n",
+	})
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "Issue not assigned to admiral") {
+		t.Fatalf("unparsed envelope must be handled as a mention (assign-first reply), not a delegate; posted %q, claimed %v",
+			body, ms.ClaimedSnapshot())
+	}
+}
+
+// TestDispatch_UnparsedEnvelope_OnLiveTask_ExplainsParseFailure: with a
+// live task the user gets a parse-failure hint, not a bare/empty-answer one.
+func TestDispatch_UnparsedEnvelope_OnLiveTask_ExplainsParseFailure(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		AdmiralTask:     &store.AdmiralTask{IssueID: "issue-await", State: store.JobStateAwaitingInput, AttemptN: 1, PendingQuestionID: "q-1"},
+		PendingQuestion: &store.PendingQuestion{ID: "q-1"},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.dispatch(linear.AgentEvent{
+		SessionID:       "sess-unparsed-await",
+		IssueID:         "issue-await",
+		IssueIdentifier: "AWAIT-3",
+		Action:          linear.ActionCreated,
+		SourceCommentID: "c-1",
+		PromptContext:   "<issue>x</issue>\n<user-request>@claudeagent use Postgres</user-request>\n",
+	})
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "could not read") {
+		t.Errorf("expected a parse-failure hint, got: %q", body)
+	}
+	ms.mu.Lock()
+	answered := ms.AnsweredText
+	ms.mu.Unlock()
+	if answered != "" {
+		t.Errorf("unparsed envelope must not answer the question; answered %q", answered)
+	}
+}
+
+// TestDispatch_PromptedLoneHandle_DoesNotAnswer: a lone "@claudeagent" in the
+// agent thread is an empty reply, not an answer.
+func TestDispatch_PromptedLoneHandle_DoesNotAnswer(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		AdmiralTask:     &store.AdmiralTask{IssueID: "issue-await", State: store.JobStateAwaitingInput, AttemptN: 1, PendingQuestionID: "q-1"},
+		PendingQuestion: &store.PendingQuestion{ID: "q-1"},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.dispatch(linear.AgentEvent{
+		SessionID:       "sess-lone-handle",
+		IssueID:         "issue-await",
+		IssueIdentifier: "AWAIT-4",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "@claudeagent",
+	})
+	ms.mu.Lock()
+	answered := ms.AnsweredText
+	ms.mu.Unlock()
+	if answered != "" {
+		t.Errorf("lone handle must not answer the question; answered %q", answered)
+	}
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "waiting for your answer") {
+		t.Errorf("expected a pending-question hint, got: %q", body)
 	}
 }
 

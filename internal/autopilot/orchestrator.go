@@ -309,7 +309,7 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	// A created event is an @mention when Linear set sourceCommentId, or when
 	// the bundle's <user-request> starts with an @handle: Linear omits
 	// sourceCommentId on some mention-created sessions.
-	isMention := false
+	isMention, unparsed := false, false
 	if ev.Action == linear.ActionCreated {
 		req, mentioned, err := parseUserRequest(text)
 		switch {
@@ -319,15 +319,17 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 			o.logger.Warn("user_request_unparsed",
 				"session", ev.SessionID, "issue", ev.IssueIdentifier,
 				"hint", "PromptContext has a <user-request> envelope admiral could not locate; Linear's format may have changed")
-			text = ""
+			// Fail closed: treated as a delegate this would start a run.
+			text, isMention, unparsed = "", true, true
 		}
 		isMention = isMention || ev.SourceCommentID != ""
 	}
 	if text == "" && ev.Action == linear.ActionPrompted {
-		// Strip a leading @handle only in front of a /command: a thread reply
-		// like "@alice owns it" is an answer and must stay whole.
+		// Strip a leading @handle only in front of a /command (or when nothing
+		// follows it): a thread reply like "@alice owns it" is an answer and
+		// must stay whole.
 		text = ev.UserMessage
-		if stripped := stripLeadingHandle(text); strings.HasPrefix(stripped, "/") {
+		if stripped := stripLeadingHandle(text); stripped == "" || strings.HasPrefix(stripped, "/") {
 			text = stripped
 		}
 	}
@@ -398,6 +400,11 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 		o.logger.Info("dispatch_reject_repeat_assign",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
 		o.replyRejection(ev.SessionID, task.State, repeatAssignHelp)
+		return
+	}
+
+	if unparsed {
+		o.replyRejection(ev.SessionID, task.State, userRequestUnparsedHelp)
 		return
 	}
 
@@ -3063,6 +3070,18 @@ func parseUserRequest(text string) (body string, mentioned bool, err error) {
 	if closeIdx < 0 || openIdx < 0 {
 		return "", false, errUserRequestUnparsed
 	}
+	// A lone open tag pasted inside the request would become openIdx and
+	// cut the real body short; it shows up as an earlier open tag with no
+	// close tag between it and openIdx.
+	for i := openIdx - 1; i >= 0; i-- {
+		t := strings.TrimSpace(lines[i])
+		if t == closeTag {
+			break
+		}
+		if t == openTag {
+			return "", false, errUserRequestUnparsed
+		}
+	}
 	inner := lines[openIdx+1 : closeIdx]
 	// openIdx is the nearest open tag before closeIdx, so only a close tag
 	// can sit in between: a pasted envelope makes the boundary ambiguous.
@@ -3094,6 +3113,10 @@ func stripLeadingHandle(s string) string {
 	}
 	return strings.TrimSpace(s[i:])
 }
+
+// userRequestUnparsedHelp is the reply when a comment's <user-request>
+// envelope can't be located in the PromptContext.
+const userRequestUnparsedHelp = "admiral could not read your comment (unexpected Linear payload format). Reply in this agent thread instead, e.g. /rerun or your answer to a pending question."
 
 // awaitingReplyEmptyHelp is the reply to an empty @mention (a lone @handle)
 // while an ask_user question is pending.
