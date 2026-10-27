@@ -32,10 +32,12 @@ type AgentEvent struct {
 	IssueID         string
 	IssueIdentifier string
 	IssueTitle      string
-	// PromptContext is set on action=created. For @mention triggers it's the
-	// comment text; for raw assignment it's empty; for delegate-to-agent
-	// it's whatever the user typed in the prompt input. Use SourceCommentID
-	// (not text emptiness) to distinguish @mention from delegate.
+	// PromptContext is set on action=created. For @mention triggers it's a
+	// context bundle (<issue>, <comment>s, <other-thread>s) whose trailing
+	// <user-request> element holds the triggering comment, @handle prefix
+	// included; for raw assignment it's empty; for delegate-to-agent it's
+	// whatever the user typed in the prompt input. Use SourceCommentID (not
+	// text emptiness) to distinguish @mention from delegate.
 	PromptContext string
 	// SourceCommentID is set on action=created when the AgentSession was
 	// opened via an @mention inside an existing comment. Empty when the

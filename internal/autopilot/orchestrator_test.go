@@ -216,6 +216,71 @@ func TestParseMentionCommand(t *testing.T) {
 	}
 }
 
+func TestMentionRequestText(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		wantText string
+		wantName string
+		wantRem  string
+		wantOK   bool
+	}{
+		{
+			name:     "linear context bundle with /rerun",
+			in:       "<issue identifier=\"GEO-421\">\n<title>T</title>\n</issue>\n<comment author=\"a\">\nhello\n</comment>\n<user-request>\n@claudeagent /rerun\n</user-request>\n",
+			wantText: "/rerun",
+			wantName: "rerun", wantOK: true,
+		},
+		{
+			name:     "bundle with notes",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /rerun use the v2 schema\n</user-request>",
+			wantText: "/rerun use the v2 schema",
+			wantName: "rerun", wantRem: "use the v2 schema", wantOK: true,
+		},
+		{
+			name:     "mention on its own line",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent\n/fix broken test\n</user-request>",
+			wantText: "/fix broken test",
+			wantName: "fix", wantRem: "broken test", wantOK: true,
+		},
+		{
+			name:     "last user-request wins",
+			in:       "<comment>\n<user-request>/fix old</user-request>\n</comment>\n<user-request>\n@claudeagent /rerun\n</user-request>",
+			wantText: "/rerun",
+			wantName: "rerun", wantOK: true,
+		},
+		{
+			name:     "bundle with bare chat stays bare",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent 随便聊聊\n</user-request>",
+			wantText: "随便聊聊",
+		},
+		{
+			name:     "no tag falls back to whole text",
+			in:       "/rerun extra",
+			wantText: "/rerun extra",
+			wantName: "rerun", wantRem: "extra", wantOK: true,
+		},
+		{
+			name:     "no tag, mention prefix is not stripped",
+			in:       "@claudeagent /rerun",
+			wantText: "@claudeagent /rerun",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := mentionRequestText(c.in)
+			if got != c.wantText {
+				t.Errorf("mentionRequestText = %q, want %q", got, c.wantText)
+			}
+			name, rem, ok := parseMentionCommand(got)
+			if name != c.wantName || rem != c.wantRem || ok != c.wantOK {
+				t.Errorf("parseMentionCommand(%q) = (%q, %q, %v), want (%q, %q, %v)",
+					got, name, rem, ok, c.wantName, c.wantRem, c.wantOK)
+			}
+		})
+	}
+}
+
 func TestRelativeTime(t *testing.T) {
 	now := time.Now()
 	cases := []struct {
@@ -3130,6 +3195,50 @@ func TestDispatch_RerunOnDone_Supersedes(t *testing.T) {
 	o.HandleAgentEvent(ev)
 
 	// Wait for the goroutine to run + claim.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ms.ClaimedSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ms.SupersededAdmiralIssues; len(got) != 1 || got[0] != "issue-done" {
+		t.Errorf("expected supersession on issue-done; got %v", got)
+	}
+	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "sess-rerun" {
+		t.Errorf("expected fresh autopilot_jobs claim with new session id; got %v", got)
+	}
+}
+
+// TestDispatch_RerunInContextBundle_Supersedes covers the current Linear
+// @mention payload: PromptContext is the full <issue>/<comment>/... bundle
+// and the actual comment only appears in the trailing <user-request>.
+func TestDispatch_RerunInContextBundle_Supersedes(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
+	}
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:  "issue-done",
+			State:    store.JobStateDone,
+			AttemptN: 1,
+			PRURL:    "https://github.com/x/y/pull/1",
+		},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-rerun",
+		IssueID:         "issue-done",
+		IssueIdentifier: "DONE-1",
+		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-rerun-bundle",
+		PromptContext: "<issue identifier=\"DONE-1\">\n<title>T</title>\n</issue>\n" +
+			"<comment author=\"admiral\">\nadmiral does not respond to bare @mentions.\n</comment>\n\n" +
+			"<user-request>\n@claudeagent /rerun\n</user-request>\n",
+	}
+
+	o.HandleAgentEvent(ev)
+
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		if len(ms.ClaimedSnapshot()) > 0 {

@@ -306,6 +306,9 @@ func (o *Orchestrator) HandleAgentEvent(ev linear.AgentEvent) {
 // admiral no longer guesses what the user meant — they say it.
 func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	text := ev.PromptContext
+	if ev.Action == linear.ActionCreated {
+		text = mentionRequestText(text)
+	}
 	if text == "" && ev.Action == linear.ActionPrompted {
 		text = ev.UserMessage
 	}
@@ -2997,6 +3000,33 @@ func parseMentionCommand(text string) (name, remainder string, ok bool) {
 		break // first non-empty line not starting with /, bare mention
 	}
 	return "", "", false
+}
+
+// mentionRequestText extracts what the user actually wrote from an
+// ActionCreated PromptContext. Linear sends @mention sessions a context
+// bundle (<issue>, every <comment>, <other-thread>, ...) with the
+// triggering comment in a trailing <user-request> element, prefixed by the
+// agent's @handle. Returns the last <user-request> body with a leading
+// @handle stripped; text without the tag is returned unchanged.
+func mentionRequestText(text string) string {
+	const openTag, closeTag = "<user-request>", "</user-request>"
+	start := strings.LastIndex(text, openTag)
+	if start < 0 {
+		return text
+	}
+	body := text[start+len(openTag):]
+	if end := strings.Index(body, closeTag); end >= 0 {
+		body = body[:end]
+	}
+	body = strings.TrimSpace(body)
+	if strings.HasPrefix(body, "@") {
+		if i := strings.IndexAny(body, " \t\r\n"); i >= 0 {
+			body = strings.TrimSpace(body[i:])
+		} else {
+			body = ""
+		}
+	}
+	return body
 }
 
 // mentionCommandHelp is the reply sent when a bare @mention is rejected.
