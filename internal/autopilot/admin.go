@@ -40,6 +40,7 @@ type adminServer struct {
 	workers      int
 	adminToken   string
 	requireLabel string // discoverer.require_label; dropped from subs on reset-task
+	gh           *ghAccounts
 }
 
 // adminRepoResponse is the JSON shape for /admin/repos.
@@ -50,6 +51,7 @@ type adminRepoResponse struct {
 	BaseBranch      string `json:"base_branch"`
 	Enabled         bool   `json:"enabled"`
 	AutoPickEnabled bool   `json:"auto_pick_enabled"`
+	GhUser          string `json:"gh_user"`
 }
 
 // adminJobResponse is the JSON shape for /admin/jobs list.
@@ -89,6 +91,7 @@ type createRepoRequest struct {
 	TeamName   string `json:"team_name"`
 	RepoDir    string `json:"repo_dir"`
 	BaseBranch string `json:"base_branch"`
+	GhUser     string `json:"gh_user"`
 }
 
 // createRepoResponse is the body for POST /admin/repos.
@@ -102,9 +105,12 @@ type updateRepoRequest struct {
 	BaseBranch      *string `json:"base_branch,omitempty"`
 	Enabled         *bool   `json:"enabled,omitempty"`
 	AutoPickEnabled *bool   `json:"auto_pick_enabled,omitempty"`
+	GhUser          *string `json:"gh_user,omitempty"`
 }
 
-// checkGhResponse is the body for POST /admin/repos/<team_id>/check_gh.
+// checkGhResponse is the body for POST /admin/repos/<team_id>/check_gh:
+// the result of validating the repo's configured gh_user (CurrentUser) —
+// logged in and able to push to origin. GHStatusOutput explains a failure.
 type checkGhResponse struct {
 	GHAuthOK       bool   `json:"gh_auth_ok"`
 	CurrentUser    string `json:"current_user,omitempty"`
@@ -119,7 +125,7 @@ type testCloneResponse struct {
 }
 
 func newAdminServer(db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken, requireLabel string) *adminServer {
-	return &adminServer{db: db, lc: lc, ghBin: ghBin, logger: logger, start: time.Now(), workers: workers, adminToken: adminToken, requireLabel: requireLabel}
+	return &adminServer{db: db, lc: lc, ghBin: ghBin, logger: logger, start: time.Now(), workers: workers, adminToken: adminToken, requireLabel: requireLabel, gh: newGhAccounts(ghBin)}
 }
 
 // projectFilterCookie is the name of the cookie that scopes the admin UI
@@ -155,10 +161,26 @@ func (s *adminServer) listReposHandler(w http.ResponseWriter, r *http.Request) {
 			BaseBranch:      r.BaseBranch,
 			Enabled:         r.Enabled,
 			AutoPickEnabled: r.AutoPickEnabled,
+			GhUser:          r.GhUser,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
+}
+
+// writeJSONError writes {"error": msg}. Use it instead of an http.Error JSON
+// literal when msg is dynamic and may need escaping.
+func writeJSONError(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// validateGhUser checks that ghUser is logged in to gh and can push to
+// repoDir's origin. Registration (POST / PATCH / config seed) refuses repos
+// that fail this.
+func (s *adminServer) validateGhUser(ctx context.Context, ghUser, repoDir string) error {
+	return s.gh.ValidateRepoDir(ctx, ghUser, repoDir)
 }
 
 func (s *adminServer) listJobsHandler(w http.ResponseWriter, r *http.Request) {
@@ -312,6 +334,7 @@ func (s *adminServer) createRepoHandler(w http.ResponseWriter, r *http.Request) 
 		req.TeamName = r.Form.Get("team_name")
 		req.RepoDir = r.Form.Get("repo_dir")
 		req.BaseBranch = r.Form.Get("base_branch")
+		req.GhUser = r.Form.Get("gh_user")
 	} else {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, `{"error":"bad json body"}`, http.StatusBadRequest)
@@ -352,6 +375,11 @@ func (s *adminServer) createRepoHandler(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, `{"error":"team_name is required (Linear lookup unavailable)"}`, http.StatusBadRequest)
 		return
 	}
+	ghUser := strings.TrimSpace(req.GhUser)
+	if err := s.validateGhUser(r.Context(), ghUser, req.RepoDir); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	repo := store.Repo{
 		ProjectID:   req.TeamID,
@@ -359,6 +387,7 @@ func (s *adminServer) createRepoHandler(w http.ResponseWriter, r *http.Request) 
 		RepoDir:     req.RepoDir,
 		BaseBranch:  baseBranch,
 		Enabled:     true,
+		GhUser:      ghUser,
 	}
 	if err := s.db.UpsertRepo(repo); err != nil {
 		s.logger.Warn("admin_create_repo_failed", "err", err)
@@ -540,6 +569,17 @@ func (s *adminServer) updateRepoHandler(w http.ResponseWriter, r *http.Request) 
 	if req.AutoPickEnabled != nil {
 		updated.AutoPickEnabled = *req.AutoPickEnabled
 	}
+	if req.GhUser != nil {
+		updated.GhUser = strings.TrimSpace(*req.GhUser)
+	}
+	// Re-validate when the account changes, or when the repo moves under an
+	// already-configured account (the new origin may not grant push).
+	if req.GhUser != nil || (req.RepoDir != nil && updated.GhUser != "") {
+		if err := s.validateGhUser(r.Context(), updated.GhUser, updated.RepoDir); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 
 	if err := s.db.UpsertRepo(updated); err != nil {
 		s.logger.Warn("admin_update_repo_failed", "err", err)
@@ -555,6 +595,7 @@ func (s *adminServer) updateRepoHandler(w http.ResponseWriter, r *http.Request) 
 		BaseBranch:      updated.BaseBranch,
 		Enabled:         updated.Enabled,
 		AutoPickEnabled: updated.AutoPickEnabled,
+		GhUser:          updated.GhUser,
 	})
 }
 
@@ -653,42 +694,16 @@ func (s *adminServer) checkGhAuthHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	// Detect GitHub host from repo remote origin
-	host := "github.com" // default
-	originOut, err := captureCmd(ctx, repo.RepoDir, "git", "remote", "get-url", "origin")
-	if err == nil && strings.Contains(originOut, "github.com") {
-		host = "github.com"
-	} else if err == nil {
-		// Try to extract hostname from URL
-		lines := strings.Split(strings.TrimSpace(originOut), "\n")
-		for _, line := range lines {
-			if strings.HasPrefix(line, "http") || strings.HasPrefix(line, "git@") {
-				if idx := strings.Index(line, "@"); idx != -1 {
-					hostPart := strings.TrimSuffix(strings.Split(line, "@")[1], ":")
-					hostPart = strings.TrimSuffix(hostPart, ".git")
-					if hostPart != "" {
-						host = hostPart
-					}
-				}
-			}
-		}
-	}
-
-	status, err := checkGhAuth(ctx, repo.RepoDir, s.ghBin, host)
+	out := fmt.Sprintf("gh account %q can push to this repo's origin", repo.GhUser)
+	err = s.validateGhUser(r.Context(), repo.GhUser, repo.RepoDir)
 	if err != nil {
-		s.logger.Warn("admin_check_gh_failed", "err", err)
-		http.Error(w, `{"error":"gh check failed"}`, http.StatusInternalServerError)
-		return
+		out = err.Error()
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(checkGhResponse{
-		GHAuthOK:       status.OK,
-		CurrentUser:    status.CurrentUser,
-		GHStatusOutput: status.StatusOutput,
+		GHAuthOK:       err == nil,
+		CurrentUser:    repo.GhUser,
+		GHStatusOutput: out,
 	})
 }
 
@@ -880,11 +895,15 @@ func (s *adminServer) reposTableHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var b strings.Builder
-	b.WriteString(`<table><thead><tr><th>Project</th><th>Repo Dir</th><th>Branch</th><th>Enabled</th><th>Auto-pick</th><th>Actions</th></tr></thead><tbody>`)
+	b.WriteString(`<table><thead><tr><th>Project</th><th>Repo Dir</th><th>Branch</th><th>GitHub account</th><th>Enabled</th><th>Auto-pick</th><th>Actions</th></tr></thead><tbody>`)
 	for _, r := range repos {
 		enabled := "Yes"
 		if !r.Enabled {
 			enabled = "No"
+		}
+		ghUserCell := html.EscapeString(r.GhUser)
+		if ghUserCell == "" {
+			ghUserCell = "(not set)"
 		}
 		autoPick := "Off"
 		toggleLabel := "Enable auto-pick"
@@ -895,12 +914,12 @@ func (s *adminServer) reposTableHandler(w http.ResponseWriter, r *http.Request) 
 			toggleClass = "secondary"
 		}
 		fmt.Fprintf(&b, `<tr>
-<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>
+<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>
 <td>
 <button class="%s" hx-post="/admin/repos/%s/auto_pick" hx-target="#repos-table" hx-swap="innerHTML">%s</button>
 <button class="secondary" hx-post="/admin/repos/%s/check_gh" hx-swap="none">Test GH</button>
 <button class="danger" hx-delete="/admin/repos/%s" hx-confirm="Delete %s?" hx-swap="none">Delete</button>
-</td></tr>`, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, autoPick,
+</td></tr>`, r.ProjectName, r.RepoDir, r.BaseBranch, ghUserCell, enabled, autoPick,
 			toggleClass, r.ProjectID, toggleLabel,
 			r.ProjectID, r.ProjectID, r.ProjectName)
 	}

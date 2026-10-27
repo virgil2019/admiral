@@ -513,12 +513,18 @@ func TestCreateRepoHandler_Success(t *testing.T) {
 	cmd = exec.Command("git", "config", "user.name", "test")
 	cmd.Dir = gitDir
 	cmd.Run()
+	cmd = exec.Command("git", "remote", "add", "origin", "git@virgil.github.com:virgil2019/klink.git")
+	cmd.Dir = gitDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v %s", err, out)
+	}
 
 	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "", "")
+	as.gh = &ghAccounts{bin: "gh", run: fakeGhAccountsRunner(ghUserTestAccounts)}
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 
-	body := `{"team_id":"proj-1","team_name":"My Project","repo_dir":"` + gitDir + `","base_branch":"main"}`
+	body := `{"team_id":"proj-1","team_name":"My Project","repo_dir":"` + gitDir + `","base_branch":"main","gh_user":"virgil2019"}`
 	req := httptest.NewRequest("POST", "/admin/repos/", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

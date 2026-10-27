@@ -111,10 +111,16 @@ autopilot:
       project_name: "Admiral"                              # log/UI only
       repo_dir: "/home/you/code/your-repo"
       base_branch: "main"
+      # gh account admiral uses for this repo's GitHub calls (one listed by
+      # `gh auth status`). Must be logged in and have push permission on the
+      # repo's origin, or boot fails. Only seeds an empty repos table; change
+      # it later via PATCH /admin/repos/<project_id>.
+      gh_user: "your-github-login"
     # - project_id: "11111111-1111-1111-1111-111111111111"
     #   project_name: "AnotherProject"
     #   repo_dir: "/home/you/code/another-repo"
     #   base_branch: "main"
+    #   gh_user: "your-github-login"
 
   # Defaults shown:
   # worktree_root:   ".worktrees"

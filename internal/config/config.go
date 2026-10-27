@@ -304,6 +304,11 @@ type RepoConfig struct {
 	// → L2 verify degrades to diff-only judgment and admiral logs a
 	// one-shot WARN at boot for this repo.
 	VerifyCmd string `yaml:"verify_cmd"`
+	// GhUser is the local gh account admiral uses for this repo's GitHub
+	// calls. Validated when the repo is seeded into the DB (logged in via
+	// `gh auth login`, push permission on origin); seeding fails boot when
+	// it is missing or invalid.
+	GhUser string `yaml:"gh_user"`
 }
 
 type Launch struct {

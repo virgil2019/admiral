@@ -922,3 +922,23 @@ func TestAbortAdmiralTask_NotAwaitingInput(t *testing.T) {
 		t.Errorf("expected ok=false for non-awaiting-input task")
 	}
 }
+
+func TestRepoGhUserRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	r := Repo{ProjectID: "p1", ProjectName: "klink", RepoDir: "/r", BaseBranch: "main", Enabled: true, GhUser: "virgil2019"}
+	if err := s.UpsertRepo(r); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetRepoByProjectID("p1")
+	if err != nil || got == nil || got.GhUser != "virgil2019" {
+		t.Fatalf("GetRepoByProjectID = (%+v, %v), want gh_user=virgil2019", got, err)
+	}
+	r.GhUser = "chababa9"
+	if err := s.UpsertRepo(r); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.ListRepos()
+	if err != nil || len(list) != 1 || list[0].GhUser != "chababa9" {
+		t.Fatalf("ListRepos = (%+v, %v), want one row with gh_user=chababa9", list, err)
+	}
+}

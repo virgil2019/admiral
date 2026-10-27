@@ -438,6 +438,15 @@ const migration0023 = `
 ALTER TABLE task_verifications ADD COLUMN summary TEXT NOT NULL DEFAULT '';
 `
 
+// migration0024 records which local gh account admiral acts as for each repo.
+// Only the account name is stored; the token stays in the gh keyring.
+// Registration (admin API / config seed) validates the account is logged in
+// and can push to origin. Empty (the column default) means "not configured",
+// which is what every row predating this migration gets.
+const migration0024 = `
+ALTER TABLE repos ADD COLUMN gh_user TEXT NOT NULL DEFAULT '';
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -467,6 +476,7 @@ var migrations = []migration{
 	{21, migration0021},
 	{22, migration0022},
 	{23, migration0023},
+	{24, migration0024},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -1874,12 +1884,15 @@ type Repo struct {
 	// configured → product verify instructs the judge to discover the doc
 	// itself (README / docs/ / PRD), mirroring VerifyCmd's degradation.
 	ProductDocPath string
+	// GhUser is the local gh account (as listed by `gh auth status`) admiral
+	// uses for this repo's GitHub calls. Empty = not configured.
+	GhUser string
 }
 
 // ListRepos returns all repos ordered by project_name.
 func (s *Store) ListRepos() ([]Repo, error) {
 	rows, err := s.DB.Query(`
-		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, product_doc_path
+		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, product_doc_path, gh_user
 		FROM repos ORDER BY project_name ASC
 	`)
 	if err != nil {
@@ -1890,7 +1903,7 @@ func (s *Store) ListRepos() ([]Repo, error) {
 	for rows.Next() {
 		var r Repo
 		var enabled, autoPick int
-		if err := rows.Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick, &r.VerifyCmd, &r.ProductDocPath); err != nil {
+		if err := rows.Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick, &r.VerifyCmd, &r.ProductDocPath, &r.GhUser); err != nil {
 			return nil, err
 		}
 		r.Enabled = enabled == 1
@@ -1906,9 +1919,9 @@ func (s *Store) GetRepoByProjectID(projectID string) (*Repo, error) {
 	var r Repo
 	var enabled, autoPick int
 	err := s.DB.QueryRow(`
-		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, product_doc_path
+		SELECT project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, product_doc_path, gh_user
 		FROM repos WHERE project_id=?
-	`, projectID).Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick, &r.VerifyCmd, &r.ProductDocPath)
+	`, projectID).Scan(&r.ProjectID, &r.ProjectName, &r.RepoDir, &r.BaseBranch, &enabled, &autoPick, &r.VerifyCmd, &r.ProductDocPath, &r.GhUser)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1932,8 +1945,8 @@ func (s *Store) UpsertRepo(r Repo) error {
 		autoPick = 1
 	}
 	_, err := s.DB.Exec(`
-		INSERT INTO repos(project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, product_doc_path, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO repos(project_id, project_name, repo_dir, base_branch, enabled, auto_pick_enabled, verify_cmd, product_doc_path, gh_user, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(project_id) DO UPDATE SET
 			project_name=excluded.project_name,
 			repo_dir=excluded.repo_dir,
@@ -1942,8 +1955,9 @@ func (s *Store) UpsertRepo(r Repo) error {
 			auto_pick_enabled=excluded.auto_pick_enabled,
 			verify_cmd=excluded.verify_cmd,
 			product_doc_path=excluded.product_doc_path,
+			gh_user=excluded.gh_user,
 			updated_at=excluded.updated_at
-	`, r.ProjectID, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, autoPick, r.VerifyCmd, r.ProductDocPath, now, now)
+	`, r.ProjectID, r.ProjectName, r.RepoDir, r.BaseBranch, enabled, autoPick, r.VerifyCmd, r.ProductDocPath, r.GhUser, now, now)
 	return err
 }
 
