@@ -216,90 +216,126 @@ func TestParseMentionCommand(t *testing.T) {
 	}
 }
 
-func TestMentionRequestText(t *testing.T) {
+func TestParseUserRequest(t *testing.T) {
 	cases := []struct {
-		name     string
-		in       string
-		wantText string
-		wantName string
-		wantRem  string
-		wantOK   bool
+		name          string
+		in            string
+		wantText      string
+		wantMentioned bool
+		wantOK        bool
+		wantCmd       string // parseMentionCommand name on wantText; "" = bare
+		wantRem       string
 	}{
 		{
 			name:     "linear context bundle with /rerun",
 			in:       "<issue identifier=\"GEO-421\">\n<title>T</title>\n</issue>\n<comment author=\"a\">\nhello\n</comment>\n<user-request>\n@claudeagent /rerun\n</user-request>\n",
-			wantText: "/rerun",
-			wantName: "rerun", wantOK: true,
+			wantText: "/rerun", wantMentioned: true, wantOK: true, wantCmd: "rerun",
+		},
+		{
+			name:     "double space after handle",
+			in:       "<issue>x</issue>\n\n<user-request>\n@claudeagent  /rerun\n</user-request>\n",
+			wantText: "/rerun", wantMentioned: true, wantOK: true, wantCmd: "rerun",
 		},
 		{
 			name:     "bundle with notes",
 			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /rerun use the v2 schema\n</user-request>",
-			wantText: "/rerun use the v2 schema",
-			wantName: "rerun", wantRem: "use the v2 schema", wantOK: true,
+			wantText: "/rerun use the v2 schema", wantMentioned: true, wantOK: true, wantCmd: "rerun", wantRem: "use the v2 schema",
 		},
 		{
 			name:     "mention on its own line",
 			in:       "<issue>x</issue>\n<user-request>\n@claudeagent\n/fix broken test\n</user-request>",
-			wantText: "/fix broken test",
-			wantName: "fix", wantRem: "broken test", wantOK: true,
+			wantText: "/fix broken test", wantMentioned: true, wantOK: true, wantCmd: "fix", wantRem: "broken test",
 		},
 		{
-			name:     "last user-request wins",
+			name:     "delegate prompt has no handle",
+			in:       "<issue>x</issue>\n<user-request>\nWork on [GEO-421](https://linear.app/x/issue/GEO-421/y)\n</user-request>\n",
+			wantText: "Work on [GEO-421](https://linear.app/x/issue/GEO-421/y)", wantMentioned: false, wantOK: true,
+		},
+		{
+			name:     "inline tags in an earlier comment are ignored",
 			in:       "<comment>\n<user-request>/fix old</user-request>\n</comment>\n<user-request>\n@claudeagent /rerun\n</user-request>",
-			wantText: "/rerun",
-			wantName: "rerun", wantOK: true,
+			wantText: "/rerun", wantMentioned: true, wantOK: true, wantCmd: "rerun",
+		},
+		{
+			name:     "inline tags typed in the request are kept",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /fix parse the <user-request> and </user-request> tags\n</user-request>\n",
+			wantText: "/fix parse the <user-request> and </user-request> tags", wantMentioned: true, wantOK: true,
+			wantCmd: "fix", wantRem: "parse the <user-request> and </user-request> tags",
+		},
+		{
+			name:     "envelope pasted inside the request is ambiguous",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /fix parser breaks on:\n```\n<user-request>\n/rerun\n</user-request>\n```\n</user-request>\n",
+			wantText: "", wantOK: true,
+		},
+		{
+			name:     "tag lines with surrounding whitespace",
+			in:       "<issue>x</issue>\n<user-request> \r\n@claudeagent /rerun\r\n </user-request>\n",
+			wantText: "/rerun", wantMentioned: true, wantOK: true, wantCmd: "rerun",
+		},
+		{
+			name:     "malformed envelope never yields the bundle",
+			in:       "<issue>x</issue>\n<user-request id=\"1\">\n@claudeagent use option B\n</user-request>",
+			wantText: "", wantOK: true,
+		},
+		{
+			name:     "single-line envelope never yields the bundle",
+			in:       "<issue>x</issue>\n<user-request>@claudeagent /rerun</user-request>",
+			wantText: "", wantOK: true,
+		},
+		{
+			name:     "only the leading handle is stripped",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent @alice should decide\n</user-request>",
+			wantText: "@alice should decide", wantMentioned: true, wantOK: true,
 		},
 		{
 			name:     "bundle with bare chat stays bare",
 			in:       "<issue>x</issue>\n<user-request>\n@claudeagent 随便聊聊\n</user-request>",
-			wantText: "随便聊聊",
-		},
-		{
-			name:     "inline tags typed in the request are not the envelope",
-			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /fix parse the <user-request> and </user-request> tags\n</user-request>\n",
-			wantText: "/fix parse the <user-request> and </user-request> tags",
-			wantName: "fix", wantRem: "parse the <user-request> and </user-request> tags", wantOK: true,
-		},
-		{
-			name:     "several leading handles are stripped",
-			in:       "<issue>x</issue>\n<user-request>\n@claudeagent @alice /rerun\n</user-request>",
-			wantText: "/rerun",
-			wantName: "rerun", wantOK: true,
+			wantText: "随便聊聊", wantMentioned: true, wantOK: true,
 		},
 		{
 			name:     "handle only yields empty text",
 			in:       "<issue>x</issue>\n<user-request>\n@claudeagent\n</user-request>",
-			wantText: "",
+			wantText: "", wantMentioned: true, wantOK: true,
 		},
 		{
 			name:     "empty request yields empty text",
 			in:       "<issue>x</issue>\n<user-request>\n</user-request>",
-			wantText: "",
+			wantText: "", wantOK: true,
 		},
 		{
-			name:     "no tag falls back to whole text",
+			name:     "no envelope: not ok, text unchanged",
 			in:       "/rerun extra",
-			wantText: "/rerun extra",
-			wantName: "rerun", wantRem: "extra", wantOK: true,
-		},
-		{
-			name:     "no tag, mention prefix is not stripped",
-			in:       "@claudeagent /rerun",
-			wantText: "@claudeagent /rerun",
+			wantText: "/rerun extra", wantOK: false, wantCmd: "rerun", wantRem: "extra",
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := mentionRequestText(c.in)
-			if got != c.wantText {
-				t.Errorf("mentionRequestText = %q, want %q", got, c.wantText)
+			got, mentioned, ok := parseUserRequest(c.in)
+			if got != c.wantText || mentioned != c.wantMentioned || ok != c.wantOK {
+				t.Fatalf("parseUserRequest = (%q, %v, %v), want (%q, %v, %v)",
+					got, mentioned, ok, c.wantText, c.wantMentioned, c.wantOK)
 			}
-			name, rem, ok := parseMentionCommand(got)
-			if name != c.wantName || rem != c.wantRem || ok != c.wantOK {
-				t.Errorf("parseMentionCommand(%q) = (%q, %q, %v), want (%q, %q, %v)",
-					got, name, rem, ok, c.wantName, c.wantRem, c.wantOK)
+			name, rem, cmdOK := parseMentionCommand(got)
+			if name != c.wantCmd || rem != c.wantRem || cmdOK != (c.wantCmd != "") {
+				t.Fatalf("parseMentionCommand(%q) = (%q, %q, %v), want (%q, %q)",
+					got, name, rem, cmdOK, c.wantCmd, c.wantRem)
 			}
 		})
+	}
+}
+
+func TestStripLeadingHandle(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"@claudeagent /rerun", "/rerun"},
+		{"  @claudeagent\n/rerun", "/rerun"},
+		{"/rerun", "/rerun"},
+		{"@claudeagent", ""},
+		{"hello @claudeagent", "hello @claudeagent"},
+	}
+	for _, c := range cases {
+		if got := stripLeadingHandle(c.in); got != c.want {
+			t.Errorf("stripLeadingHandle(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
 
@@ -767,7 +803,9 @@ func (m *mockStore) TransitionAwaitingInputToExecuting(issueID string) (bool, er
 	return true, nil
 }
 func (m *mockStore) GetPendingQuestionByID(id string) (*store.PendingQuestion, error) {
+	m.mu.Lock()
 	m.PendingQuestionLookups++
+	m.mu.Unlock()
 	return nil, nil
 }
 func (m *mockStore) CancelOpenPendingQuestionsForIssue(issueID string) error { return nil }
@@ -3292,7 +3330,8 @@ func TestDispatch_BareHandleOnAwaitingInput_DoesNotAnswer(t *testing.T) {
 			PendingQuestionID: "q-1",
 		},
 	}
-	o := newTestOrchestrator(t, ms, &mockLinearClient{}, &fakeGhProbe{})
+	mlc := &mockLinearClient{}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
 	o.dispatch(linear.AgentEvent{
 		SessionID:       "sess-await",
 		IssueID:         "issue-await",
@@ -3301,8 +3340,80 @@ func TestDispatch_BareHandleOnAwaitingInput_DoesNotAnswer(t *testing.T) {
 		SourceCommentID: "comment-bare-handle",
 		PromptContext:   "<issue identifier=\"AWAIT-1\">\n</issue>\n<user-request>\n@claudeagent\n</user-request>\n",
 	})
-	if ms.PendingQuestionLookups != 0 {
-		t.Fatalf("bare handle must not take the ask_user reply path (pending-question lookups: %d)", ms.PendingQuestionLookups)
+	ms.mu.Lock()
+	lookups := ms.PendingQuestionLookups
+	ms.mu.Unlock()
+	if lookups != 0 {
+		t.Fatalf("bare handle must not take the ask_user reply path (pending-question lookups: %d)", lookups)
+	}
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "waiting for your answer") {
+		t.Errorf("expected a pending-question hint, got: %q", body)
+	}
+}
+
+// TestDispatch_MentionWithoutSourceComment_Supersedes: Linear does not
+// always set sourceCommentId on @mention-created sessions (seen on klink
+// GEO-421, 2026-10-26). A <user-request> that starts with an @handle is
+// still a mention, not a repeat assign.
+func TestDispatch_MentionWithoutSourceComment_Supersedes(t *testing.T) {
+	mlc := &mockLinearClient{GetIssueErr: fmt.Errorf("synthetic short-circuit")}
+	ms := &mockStore{AdmiralTask: &store.AdmiralTask{
+		IssueID: "issue-done", State: store.JobStateDone, AttemptN: 1, PRURL: "https://github.com/x/y/pull/1",
+	}}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.HandleAgentEvent(linear.AgentEvent{
+		SessionID:       "sess-mention-nosrc",
+		IssueID:         "issue-done",
+		IssueIdentifier: "DONE-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "<issue identifier=\"DONE-1\">\n</issue>\n\n<user-request>\n@claudeagent  /rerun\n</user-request>\n",
+	})
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && len(ms.ClaimedSnapshot()) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ms.SupersededAdmiralIssues; len(got) != 1 || got[0] != "issue-done" {
+		t.Errorf("expected supersession on issue-done; got %v (posted: %q)", got, mlc.GetPostedBody())
+	}
+}
+
+// TestDispatch_DelegateBundle_StillRepeatAssign: a delegate's bundle has a
+// <user-request> without a leading handle and must stay a delegate.
+func TestDispatch_DelegateBundle_StillRepeatAssign(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{AdmiralTask: &store.AdmiralTask{IssueID: "issue-known", State: store.JobStateDone, AttemptN: 1}}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.HandleAgentEvent(linear.AgentEvent{
+		SessionID:       "sess-delegate-bundle",
+		IssueID:         "issue-known",
+		IssueIdentifier: "KNW-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "<issue identifier=\"KNW-1\">\n</issue>\n\n<user-request>\nWork on [KNW-1](https://linear.app/x/issue/KNW-1/y)\n</user-request>\n",
+	})
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "Task already exists") {
+		t.Errorf("expected repeat-assign reply, got: %s", body)
+	}
+}
+
+// TestDispatch_PromptedWithHandle_Supersedes: users type the @handle in
+// agent-thread replies too ("@claudeagent /rerun").
+func TestDispatch_PromptedWithHandle_Supersedes(t *testing.T) {
+	mlc := &mockLinearClient{GetIssueErr: fmt.Errorf("synthetic short-circuit")}
+	ms := &mockStore{AdmiralTask: &store.AdmiralTask{IssueID: "issue-thread", State: store.JobStateDone, AttemptN: 1}}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.HandleAgentEvent(linear.AgentEvent{
+		SessionID:       "sess-thread-handle",
+		IssueID:         "issue-thread",
+		IssueIdentifier: "THR-3",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "@claudeagent /rerun",
+	})
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && len(ms.SupersededAdmiralIssues) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ms.SupersededAdmiralIssues; len(got) != 1 || got[0] != "issue-thread" {
+		t.Errorf("expected supersession; got %v (posted: %q)", got, mlc.GetPostedBody())
 	}
 }
 

@@ -32,18 +32,17 @@ type AgentEvent struct {
 	IssueID         string
 	IssueIdentifier string
 	IssueTitle      string
-	// PromptContext is set on action=created. For @mention triggers it's a
-	// context bundle (<issue>, <comment>s, <other-thread>s) whose trailing
-	// <user-request> element holds the triggering comment, @handle prefix
-	// included; for raw assignment it's empty; for delegate-to-agent it's
-	// whatever the user typed in the prompt input. Use SourceCommentID (not
-	// text emptiness) to distinguish @mention from delegate.
+	// PromptContext is set on action=created. Current Linear payloads (seen
+	// 2026-10) are a context bundle for both trigger paths: <issue>, every
+	// <comment>, <other-thread>s, then a trailing <user-request> holding the
+	// triggering comment with its @handle prefix ("@claudeagent /rerun") for
+	// an @mention, or the delegation prompt ("Work on [GEO-1](…)") for a
+	// delegate. Empty for a raw assignment.
 	PromptContext string
 	// SourceCommentID is set on action=created when the AgentSession was
-	// opened via an @mention inside an existing comment. Empty when the
-	// session was opened via delegation (assign-to-agent), regardless of
-	// whether the user typed an initial prompt. This is the protocol-level
-	// signal admiral uses to disambiguate the two trigger paths.
+	// opened via an @mention inside an existing comment. Linear does not set
+	// it on every mention-created session, so it is not sufficient on its
+	// own to tell an @mention from a delegate; see autopilot's dispatch.
 	SourceCommentID string
 	// UserMessage is set on action=prompted: the user's follow-up text in
 	// the agent thread.

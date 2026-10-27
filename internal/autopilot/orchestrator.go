@@ -306,11 +306,19 @@ func (o *Orchestrator) HandleAgentEvent(ev linear.AgentEvent) {
 // admiral no longer guesses what the user meant — they say it.
 func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	text := ev.PromptContext
-	if ev.Action == linear.ActionCreated && ev.SourceCommentID != "" {
-		text = mentionRequestText(text)
+	// A created event is an @mention when Linear set sourceCommentId, or when
+	// the bundle's <user-request> starts with an @handle: Linear omits
+	// sourceCommentId on some mention-created sessions.
+	isMention := false
+	if ev.Action == linear.ActionCreated {
+		if req, mentioned, ok := parseUserRequest(text); ok {
+			text = req
+			isMention = mentioned
+		}
+		isMention = isMention || ev.SourceCommentID != ""
 	}
 	if text == "" && ev.Action == linear.ActionPrompted {
-		text = ev.UserMessage
+		text = stripLeadingHandle(ev.UserMessage)
 	}
 
 	o.logger.Info("dispatch",
@@ -325,12 +333,11 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 		return
 	}
 
-	// Delegate vs @mention: a created event with no SourceCommentID is a
-	// delegate (assign-to-agent), regardless of whether the user typed an
-	// initial prompt. SourceCommentID set means the session was opened
-	// from an @mention inside a comment — parse it as a command on a live
-	// task, or reject as "assign first" if there's no live task yet.
-	isDelegate := ev.Action == linear.ActionCreated && ev.SourceCommentID == ""
+	// Delegate vs @mention: a created event that is not a mention (see
+	// isMention above) is a delegate (assign-to-agent). A mention is parsed
+	// as a command on a live task, or rejected as "assign first" if there's
+	// no live task yet.
+	isDelegate := ev.Action == linear.ActionCreated && !isMention
 
 	// /reset is a parent-level command: it resets a whole task (parent + all
 	// sub-issues), and the parent issue usually has no admiral_tasks row of its
@@ -388,7 +395,13 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 		// A bare message (no /command) on an AWAITING_INPUT task is the
 		// user's reply to the pending ask_user question. An empty one (e.g.
 		// a lone @handle) is not an answer.
-		if task.State == store.JobStateAwaitingInput && strings.TrimSpace(text) != "" {
+		if task.State == store.JobStateAwaitingInput {
+			if strings.TrimSpace(text) == "" {
+				o.logger.Info("dispatch_awaiting_reply_empty",
+					"session", ev.SessionID, "issue", ev.IssueIdentifier)
+				o.postBusyAck(ev.SessionID, awaitingReplyEmptyHelp)
+				return
+			}
 			o.dispatchAwaitingReply(ev, task, text)
 			return
 		}
@@ -3003,38 +3016,69 @@ func parseMentionCommand(text string) (name, remainder string, ok bool) {
 	return "", "", false
 }
 
-// mentionRequestText extracts what the user actually wrote from an
-// @mention-created PromptContext. Linear sends such sessions a context
-// bundle (<issue>, every <comment>, <other-thread>, ...) with the
-// triggering comment in a trailing <user-request> element, prefixed by the
-// agent's @handle. Comment bodies are not XML-escaped, so only tags on a
-// line of their own count as the envelope. Returns the last <user-request>
-// body with leading @handles stripped; text without the envelope is
-// returned unchanged.
-func mentionRequestText(text string) string {
-	const openTag, closeTag = "\n<user-request>", "\n</user-request>"
-	end := strings.LastIndex(text, closeTag)
-	if end < 0 {
-		return text
+// parseUserRequest extracts what the user wrote from an ActionCreated
+// PromptContext. Linear sends a context bundle (<issue>, every <comment>,
+// <other-thread>, ...) whose trailing <user-request> element holds the
+// request: the triggering comment ("@claudeagent /rerun") for an @mention,
+// or the delegation prompt ("Work on [GEO-1](…)") for a delegate.
+//
+// ok is false when text has no <user-request> at all (older payloads); text
+// is then returned unchanged. Comment bodies are not XML-escaped, so only
+// tags alone on their line delimit the envelope; when the envelope is
+// present but cannot be located unambiguously, body is "" so a malformed
+// bundle is never parsed as a command or recorded as an answer. mentioned
+// reports whether the request starts with an @handle, which is stripped.
+func parseUserRequest(text string) (body string, mentioned, ok bool) {
+	const openTag, closeTag = "<user-request>", "</user-request>"
+	if !strings.Contains(text, "<user-request") {
+		return text, false, false
 	}
-	start := strings.LastIndex(text[:end], openTag)
-	if start < 0 {
-		return text
-	}
-	body := text[start+len(openTag) : end]
-	if body != "" && body[0] != '\n' {
-		return text
-	}
-	body = strings.TrimSpace(body)
-	for strings.HasPrefix(body, "@") {
-		i := strings.IndexAny(body, " \t\r\n")
-		if i < 0 {
-			return ""
+	lines := strings.Split(text, "\n")
+	closeIdx := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) == closeTag {
+			closeIdx = i
+			break
 		}
-		body = strings.TrimSpace(body[i:])
 	}
-	return body
+	openIdx := -1
+	for i := closeIdx - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) == openTag {
+			openIdx = i
+			break
+		}
+	}
+	if closeIdx < 0 || openIdx < 0 {
+		return "", false, true
+	}
+	inner := lines[openIdx+1 : closeIdx]
+	for _, l := range inner {
+		if t := strings.TrimSpace(l); t == openTag || t == closeTag {
+			return "", false, true
+		}
+	}
+	body = strings.TrimSpace(strings.Join(inner, "\n"))
+	mentioned = strings.HasPrefix(body, "@")
+	return stripLeadingHandle(body), mentioned, true
 }
+
+// stripLeadingHandle drops one leading @handle (the agent's, which Linear
+// prepends to a mention) so the text after it can be parsed as a command.
+func stripLeadingHandle(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "@") {
+		return s
+	}
+	i := strings.IndexAny(s, " \t\r\n")
+	if i < 0 {
+		return ""
+	}
+	return strings.TrimSpace(s[i:])
+}
+
+// awaitingReplyEmptyHelp is the reply to an empty @mention (a lone @handle)
+// while an ask_user question is pending.
+const awaitingReplyEmptyHelp = "admiral is waiting for your answer to the pending question. Reply with the answer text; a message starting with /rerun, /fix or /resume is treated as a command."
 
 // mentionCommandHelp is the reply sent when a bare @mention is rejected.
 const mentionCommandHelp = `admiral does not respond to bare @mentions. Use one of:
