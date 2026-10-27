@@ -172,12 +172,12 @@ func New(cfg Config, lc linearClient, pr prClient, tr taskRegistry, j judger, lo
 		}
 	}
 	return &Service{
-		cfg:    cfg,
-		linear: lc,
-		pr:     pr,
-		store:  tr,
-		judge:  j,
-		logger: logger,
+		cfg:                 cfg,
+		linear:              lc,
+		pr:                  pr,
+		store:               tr,
+		judge:               j,
+		logger:              logger,
 		workflowStatesCache: map[string][]linear.WorkflowState{},
 	}
 }

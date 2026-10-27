@@ -133,7 +133,7 @@ func TestRun_LargePromptUsesStdin(t *testing.T) {
 	claudeBin := fakeClaudeScript(t, 0, "", true) // echo stdin length
 	// Build a prompt > SafeArgvBudget (96 KiB) so the helper takes the
 	// stdin transport. Keep it cheap by repeating a short string.
-	promptLen := SafeArgvBudget + 1024             // 1 KiB over budget
+	promptLen := SafeArgvBudget + 1024 // 1 KiB over budget
 	prompt := strings.Repeat("X", promptLen)
 	dir := t.TempDir() // capture any dump the helper *might* leave
 
@@ -256,8 +256,8 @@ func TestTotalArgvBytes_Boundary(t *testing.T) {
 		wantBudget bool // true → fits under SafeArgvBudget; false → over
 	}{
 		{
-			name:      "empty-everything",
-			claudeBin: "/usr/bin/claude",
+			name:       "empty-everything",
+			claudeBin:  "/usr/bin/claude",
 			wantBudget: true,
 		},
 		{
@@ -270,15 +270,15 @@ func TestTotalArgvBytes_Boundary(t *testing.T) {
 			wantBudget: true,
 		},
 		{
-			name:      "one-byte-over-budget-prompt",
-			claudeBin: "/usr/bin/claude",
-			prompt:    strings.Repeat("p", SafeArgvBudget-17),
+			name:       "one-byte-over-budget-prompt",
+			claudeBin:  "/usr/bin/claude",
+			prompt:     strings.Repeat("p", SafeArgvBudget-17),
 			wantBudget: false,
 		},
 		{
-			name:      "empty-prompt-but-fat-extra-args-tip-over",
-			claudeBin: "/usr/bin/claude",
-			extraArgs: []string{strings.Repeat("x", SafeArgvBudget)},
+			name:       "empty-prompt-but-fat-extra-args-tip-over",
+			claudeBin:  "/usr/bin/claude",
+			extraArgs:  []string{strings.Repeat("x", SafeArgvBudget)},
 			wantBudget: false,
 		},
 	}

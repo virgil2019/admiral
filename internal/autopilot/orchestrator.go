@@ -1757,12 +1757,10 @@ func (f *flow) runClaudeResume(userMessage string) error {
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		// Pre-Start failures: keep dump + mcpCfg for debugging.
+		// Pre-Start failures: keep dump + mcpCfg for debugging (the mcp cfg
+		// is intentionally left in place too).
 		if dumpPath != "" {
 			f.o.logger.Error("claude_prompt_dump", "path", dumpPath, "err", err.Error())
-		}
-		if mcpCfgPath != "" {
-			// Intentionally leave the mcp cfg in place too.
 		}
 		return fmt.Errorf("claude stdout pipe: %w (prompt dumped to %s)", err, dumpPath)
 	}
