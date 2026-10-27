@@ -311,14 +311,25 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 	// sourceCommentId on some mention-created sessions.
 	isMention := false
 	if ev.Action == linear.ActionCreated {
-		if req, mentioned, ok := parseUserRequest(text); ok {
-			text = req
-			isMention = mentioned
+		req, mentioned, err := parseUserRequest(text)
+		switch {
+		case err == nil:
+			text, isMention = req, mentioned
+		case errors.Is(err, errUserRequestUnparsed):
+			o.logger.Warn("user_request_unparsed",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier,
+				"hint", "PromptContext has a <user-request> envelope admiral could not locate; Linear's format may have changed")
+			text = ""
 		}
 		isMention = isMention || ev.SourceCommentID != ""
 	}
 	if text == "" && ev.Action == linear.ActionPrompted {
-		text = stripLeadingHandle(ev.UserMessage)
+		// Strip a leading @handle only in front of a /command: a thread reply
+		// like "@alice owns it" is an answer and must stay whole.
+		text = ev.UserMessage
+		if stripped := stripLeadingHandle(text); strings.HasPrefix(stripped, "/") {
+			text = stripped
+		}
 	}
 
 	o.logger.Info("dispatch",
@@ -3022,16 +3033,17 @@ func parseMentionCommand(text string) (name, remainder string, ok bool) {
 // request: the triggering comment ("@claudeagent /rerun") for an @mention,
 // or the delegation prompt ("Work on [GEO-1](…)") for a delegate.
 //
-// ok is false when text has no <user-request> at all (older payloads); text
-// is then returned unchanged. Comment bodies are not XML-escaped, so only
-// tags alone on their line delimit the envelope; when the envelope is
-// present but cannot be located unambiguously, body is "" so a malformed
-// bundle is never parsed as a command or recorded as an answer. mentioned
-// reports whether the request starts with an @handle, which is stripped.
-func parseUserRequest(text string) (body string, mentioned, ok bool) {
+// errNoUserRequest is returned when text has no <user-request> at all
+// (older payloads); body is then text unchanged. Comment bodies are not
+// XML-escaped, so only tags alone on their line delimit the envelope;
+// errUserRequestUnparsed is returned, with body "", when the envelope is
+// present but cannot be located unambiguously, so a malformed bundle is
+// never parsed as a command or recorded as an answer. mentioned reports
+// whether the request starts with an @handle, which is stripped.
+func parseUserRequest(text string) (body string, mentioned bool, err error) {
 	const openTag, closeTag = "<user-request>", "</user-request>"
 	if !strings.Contains(text, "<user-request") {
-		return text, false, false
+		return text, false, errNoUserRequest
 	}
 	lines := strings.Split(text, "\n")
 	closeIdx := -1
@@ -3049,18 +3061,25 @@ func parseUserRequest(text string) (body string, mentioned, ok bool) {
 		}
 	}
 	if closeIdx < 0 || openIdx < 0 {
-		return "", false, true
+		return "", false, errUserRequestUnparsed
 	}
 	inner := lines[openIdx+1 : closeIdx]
+	// openIdx is the nearest open tag before closeIdx, so only a close tag
+	// can sit in between: a pasted envelope makes the boundary ambiguous.
 	for _, l := range inner {
-		if t := strings.TrimSpace(l); t == openTag || t == closeTag {
-			return "", false, true
+		if strings.TrimSpace(l) == closeTag {
+			return "", false, errUserRequestUnparsed
 		}
 	}
 	body = strings.TrimSpace(strings.Join(inner, "\n"))
 	mentioned = strings.HasPrefix(body, "@")
-	return stripLeadingHandle(body), mentioned, true
+	return stripLeadingHandle(body), mentioned, nil
 }
+
+var (
+	errNoUserRequest       = errors.New("no <user-request> envelope")
+	errUserRequestUnparsed = errors.New("<user-request> envelope present but not locatable")
+)
 
 // stripLeadingHandle drops one leading @handle (the agent's, which Linear
 // prepends to a mention) so the text after it can be parsed as a command.

@@ -222,98 +222,98 @@ func TestParseUserRequest(t *testing.T) {
 		in            string
 		wantText      string
 		wantMentioned bool
-		wantOK        bool
+		wantErr       error
 		wantCmd       string // parseMentionCommand name on wantText; "" = bare
 		wantRem       string
 	}{
 		{
 			name:     "linear context bundle with /rerun",
 			in:       "<issue identifier=\"GEO-421\">\n<title>T</title>\n</issue>\n<comment author=\"a\">\nhello\n</comment>\n<user-request>\n@claudeagent /rerun\n</user-request>\n",
-			wantText: "/rerun", wantMentioned: true, wantOK: true, wantCmd: "rerun",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
 		},
 		{
 			name:     "double space after handle",
 			in:       "<issue>x</issue>\n\n<user-request>\n@claudeagent  /rerun\n</user-request>\n",
-			wantText: "/rerun", wantMentioned: true, wantOK: true, wantCmd: "rerun",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
 		},
 		{
 			name:     "bundle with notes",
 			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /rerun use the v2 schema\n</user-request>",
-			wantText: "/rerun use the v2 schema", wantMentioned: true, wantOK: true, wantCmd: "rerun", wantRem: "use the v2 schema",
+			wantText: "/rerun use the v2 schema", wantMentioned: true, wantCmd: "rerun", wantRem: "use the v2 schema",
 		},
 		{
 			name:     "mention on its own line",
 			in:       "<issue>x</issue>\n<user-request>\n@claudeagent\n/fix broken test\n</user-request>",
-			wantText: "/fix broken test", wantMentioned: true, wantOK: true, wantCmd: "fix", wantRem: "broken test",
+			wantText: "/fix broken test", wantMentioned: true, wantCmd: "fix", wantRem: "broken test",
 		},
 		{
 			name:     "delegate prompt has no handle",
 			in:       "<issue>x</issue>\n<user-request>\nWork on [GEO-421](https://linear.app/x/issue/GEO-421/y)\n</user-request>\n",
-			wantText: "Work on [GEO-421](https://linear.app/x/issue/GEO-421/y)", wantMentioned: false, wantOK: true,
+			wantText: "Work on [GEO-421](https://linear.app/x/issue/GEO-421/y)", wantMentioned: false,
 		},
 		{
 			name:     "inline tags in an earlier comment are ignored",
 			in:       "<comment>\n<user-request>/fix old</user-request>\n</comment>\n<user-request>\n@claudeagent /rerun\n</user-request>",
-			wantText: "/rerun", wantMentioned: true, wantOK: true, wantCmd: "rerun",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
 		},
 		{
 			name:     "inline tags typed in the request are kept",
 			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /fix parse the <user-request> and </user-request> tags\n</user-request>\n",
-			wantText: "/fix parse the <user-request> and </user-request> tags", wantMentioned: true, wantOK: true,
+			wantText: "/fix parse the <user-request> and </user-request> tags", wantMentioned: true,
 			wantCmd: "fix", wantRem: "parse the <user-request> and </user-request> tags",
 		},
 		{
 			name:     "envelope pasted inside the request is ambiguous",
 			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /fix parser breaks on:\n```\n<user-request>\n/rerun\n</user-request>\n```\n</user-request>\n",
-			wantText: "", wantOK: true,
+			wantText: "", wantErr: errUserRequestUnparsed,
 		},
 		{
 			name:     "tag lines with surrounding whitespace",
 			in:       "<issue>x</issue>\n<user-request> \r\n@claudeagent /rerun\r\n </user-request>\n",
-			wantText: "/rerun", wantMentioned: true, wantOK: true, wantCmd: "rerun",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
 		},
 		{
 			name:     "malformed envelope never yields the bundle",
 			in:       "<issue>x</issue>\n<user-request id=\"1\">\n@claudeagent use option B\n</user-request>",
-			wantText: "", wantOK: true,
+			wantText: "", wantErr: errUserRequestUnparsed,
 		},
 		{
 			name:     "single-line envelope never yields the bundle",
 			in:       "<issue>x</issue>\n<user-request>@claudeagent /rerun</user-request>",
-			wantText: "", wantOK: true,
+			wantText: "", wantErr: errUserRequestUnparsed,
 		},
 		{
 			name:     "only the leading handle is stripped",
 			in:       "<issue>x</issue>\n<user-request>\n@claudeagent @alice should decide\n</user-request>",
-			wantText: "@alice should decide", wantMentioned: true, wantOK: true,
+			wantText: "@alice should decide", wantMentioned: true,
 		},
 		{
 			name:     "bundle with bare chat stays bare",
 			in:       "<issue>x</issue>\n<user-request>\n@claudeagent 随便聊聊\n</user-request>",
-			wantText: "随便聊聊", wantMentioned: true, wantOK: true,
+			wantText: "随便聊聊", wantMentioned: true,
 		},
 		{
 			name:     "handle only yields empty text",
 			in:       "<issue>x</issue>\n<user-request>\n@claudeagent\n</user-request>",
-			wantText: "", wantMentioned: true, wantOK: true,
+			wantText: "", wantMentioned: true,
 		},
 		{
 			name:     "empty request yields empty text",
 			in:       "<issue>x</issue>\n<user-request>\n</user-request>",
-			wantText: "", wantOK: true,
+			wantText: "",
 		},
 		{
 			name:     "no envelope: not ok, text unchanged",
 			in:       "/rerun extra",
-			wantText: "/rerun extra", wantOK: false, wantCmd: "rerun", wantRem: "extra",
+			wantText: "/rerun extra", wantErr: errNoUserRequest, wantCmd: "rerun", wantRem: "extra",
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, mentioned, ok := parseUserRequest(c.in)
-			if got != c.wantText || mentioned != c.wantMentioned || ok != c.wantOK {
+			got, mentioned, err := parseUserRequest(c.in)
+			if got != c.wantText || mentioned != c.wantMentioned || !errors.Is(err, c.wantErr) || (c.wantErr == nil && err != nil) {
 				t.Fatalf("parseUserRequest = (%q, %v, %v), want (%q, %v, %v)",
-					got, mentioned, ok, c.wantText, c.wantMentioned, c.wantOK)
+					got, mentioned, err, c.wantText, c.wantMentioned, c.wantErr)
 			}
 			name, rem, cmdOK := parseMentionCommand(got)
 			if name != c.wantCmd || rem != c.wantRem || cmdOK != (c.wantCmd != "") {
@@ -533,6 +533,10 @@ type mockStore struct {
 	// PendingQuestionLookups counts GetPendingQuestionByID calls (the first
 	// step of dispatchAwaitingReply).
 	PendingQuestionLookups int
+	// PendingQuestion, when set, is returned by GetPendingQuestionByID;
+	// AnsweredText records what AnswerPendingQuestion stored.
+	PendingQuestion *store.PendingQuestion
+	AnsweredText    string
 
 	Active     bool
 	ActiveSID  string
@@ -795,7 +799,12 @@ func (m *mockStore) InsertPendingQuestion(q store.PendingQuestion) error { retur
 func (m *mockStore) GetOpenPendingQuestionByIssue(issueID string) (*store.PendingQuestion, error) {
 	return nil, nil
 }
-func (m *mockStore) AnswerPendingQuestion(id, answer string) error { return nil }
+func (m *mockStore) AnswerPendingQuestion(id, answer string) error {
+	m.mu.Lock()
+	m.AnsweredText = answer
+	m.mu.Unlock()
+	return nil
+}
 func (m *mockStore) SetAdmiralTaskAwaitingInput(issueID, pendingQuestionID string) error {
 	return nil
 }
@@ -804,9 +813,9 @@ func (m *mockStore) TransitionAwaitingInputToExecuting(issueID string) (bool, er
 }
 func (m *mockStore) GetPendingQuestionByID(id string) (*store.PendingQuestion, error) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.PendingQuestionLookups++
-	m.mu.Unlock()
-	return nil, nil
+	return m.PendingQuestion, nil
 }
 func (m *mockStore) CancelOpenPendingQuestionsForIssue(issueID string) error { return nil }
 
@@ -3414,6 +3423,32 @@ func TestDispatch_PromptedWithHandle_Supersedes(t *testing.T) {
 	}
 	if got := ms.SupersededAdmiralIssues; len(got) != 1 || got[0] != "issue-thread" {
 		t.Errorf("expected supersession; got %v (posted: %q)", got, mlc.GetPostedBody())
+	}
+}
+
+// TestDispatch_PromptedAnswerKeepsHandle: a thread reply that starts with
+// someone else's handle is an ask_user answer and must be recorded whole.
+func TestDispatch_PromptedAnswerKeepsHandle(t *testing.T) {
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID: "issue-await", State: store.JobStateAwaitingInput, AttemptN: 1, PendingQuestionID: "q-1",
+		},
+		PendingQuestion: &store.PendingQuestion{ID: "q-1"},
+	}
+	mlc := &mockLinearClient{}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.dispatch(linear.AgentEvent{
+		SessionID:       "sess-answer",
+		IssueID:         "issue-await",
+		IssueIdentifier: "AWAIT-2",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "@alice owns it, keep v1",
+	})
+	ms.mu.Lock()
+	answered := ms.AnsweredText
+	ms.mu.Unlock()
+	if answered != "@alice owns it, keep v1" {
+		t.Fatalf("answer = %q, want the whole reply (posted: %q)", answered, mlc.GetPostedBody())
 	}
 }
 
