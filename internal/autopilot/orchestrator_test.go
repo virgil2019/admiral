@@ -190,6 +190,8 @@ func TestParseMentionCommand(t *testing.T) {
 		{`/rerun`, "rerun", "", true},
 		{`/RERUN`, "rerun", "", true},
 		{`/rerun extra notes`, "rerun", "extra notes", true},
+		{"/rerun\u00a0use v2", "rerun", "use v2", true},
+		{"/rerun\tuse v2", "rerun", "use v2", true},
 		{"/rerun\nmore content", "rerun", "", true},
 		{"/rerun note1\nnote2", "rerun", "note1", true},
 		// /fix (not yet implemented — parser still recognizes it)
@@ -212,6 +214,144 @@ func TestParseMentionCommand(t *testing.T) {
 		if name != c.wantName || rem != c.wantRem || ok != c.wantOK {
 			t.Errorf("parseMentionCommand(%q) = (%q, %q, %v), want (%q, %q, %v)",
 				c.in, name, rem, ok, c.wantName, c.wantRem, c.wantOK)
+		}
+	}
+}
+
+func TestParseUserRequest(t *testing.T) {
+	cases := []struct {
+		name          string
+		in            string
+		wantText      string
+		wantMentioned bool
+		wantErr       error
+		wantCmd       string // parseMentionCommand name on wantText; "" = bare
+		wantRem       string
+	}{
+		{
+			name:     "linear context bundle with /rerun",
+			in:       "<issue identifier=\"GEO-421\">\n<title>T</title>\n</issue>\n<comment author=\"a\">\nhello\n</comment>\n<user-request>\n@claudeagent /rerun\n</user-request>\n",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
+		},
+		{
+			name:     "double space after handle",
+			in:       "<issue>x</issue>\n\n<user-request>\n@claudeagent  /rerun\n</user-request>\n",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
+		},
+		{
+			name:     "bundle with notes",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /rerun use the v2 schema\n</user-request>",
+			wantText: "/rerun use the v2 schema", wantMentioned: true, wantCmd: "rerun", wantRem: "use the v2 schema",
+		},
+		{
+			name:     "mention on its own line",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent\n/fix broken test\n</user-request>",
+			wantText: "/fix broken test", wantMentioned: true, wantCmd: "fix", wantRem: "broken test",
+		},
+		{
+			name:     "delegate prompt has no handle",
+			in:       "<issue>x</issue>\n<user-request>\nWork on [GEO-421](https://linear.app/x/issue/GEO-421/y)\n</user-request>\n",
+			wantText: "Work on [GEO-421](https://linear.app/x/issue/GEO-421/y)", wantMentioned: false,
+		},
+		{
+			name:     "inline tags in an earlier comment are ignored",
+			in:       "<comment>\n<user-request>/fix old</user-request>\n</comment>\n<user-request>\n@claudeagent /rerun\n</user-request>",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
+		},
+		{
+			name:     "inline tags typed in the request are kept",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /fix parse the <user-request> and </user-request> tags\n</user-request>\n",
+			wantText: "/fix parse the <user-request> and </user-request> tags", wantMentioned: true,
+			wantCmd: "fix", wantRem: "parse the <user-request> and </user-request> tags",
+		},
+		{
+			name:     "envelope pasted inside the request is ambiguous",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /fix parser breaks on:\n```\n<user-request>\n/rerun\n</user-request>\n```\n</user-request>\n",
+			wantText: "", wantErr: errUserRequestUnparsed,
+		},
+		{
+			name:     "unpaired open tag in an earlier comment does not wedge the issue",
+			in:       "<comment>\nsnippet:\n<user-request>\n</comment>\n<user-request>\n@claudeagent /rerun\n</user-request>\n",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
+		},
+		{
+			name:     "non-breaking space after the handle",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent\u00a0/rerun\n</user-request>\n",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
+		},
+		{
+			name:     "complete envelope pasted in an earlier comment is fine",
+			in:       "<comment>\nlook:\n<user-request>\n/old\n</user-request>\n</comment>\n<user-request>\n@claudeagent /rerun\n</user-request>\n",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
+		},
+		{
+			name:     "tag lines with surrounding whitespace",
+			in:       "<issue>x</issue>\n<user-request> \r\n@claudeagent /rerun\r\n </user-request>\n",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
+		},
+		{
+			name:     "malformed envelope never yields the bundle",
+			in:       "<issue>x</issue>\n<user-request id=\"1\">\n@claudeagent use option B\n</user-request>",
+			wantText: "", wantErr: errUserRequestUnparsed,
+		},
+		{
+			name:     "single-line envelope never yields the bundle",
+			in:       "<issue>x</issue>\n<user-request>@claudeagent /rerun</user-request>",
+			wantText: "", wantErr: errUserRequestUnparsed,
+		},
+		{
+			name:     "only the leading handle is stripped",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent @alice should decide\n</user-request>",
+			wantText: "@alice should decide", wantMentioned: true,
+		},
+		{
+			name:     "bundle with bare chat stays bare",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent 随便聊聊\n</user-request>",
+			wantText: "随便聊聊", wantMentioned: true,
+		},
+		{
+			name:     "handle only yields empty text",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent\n</user-request>",
+			wantText: "", wantMentioned: true,
+		},
+		{
+			name:     "empty request yields empty text",
+			in:       "<issue>x</issue>\n<user-request>\n</user-request>",
+			wantText: "",
+		},
+		{
+			name:     "no envelope: not ok, text unchanged",
+			in:       "/rerun extra",
+			wantText: "/rerun extra", wantErr: errNoUserRequest, wantCmd: "rerun", wantRem: "extra",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, mentioned, err := parseUserRequest(c.in)
+			if got != c.wantText || mentioned != c.wantMentioned || !errors.Is(err, c.wantErr) || (c.wantErr == nil && err != nil) {
+				t.Fatalf("parseUserRequest = (%q, %v, %v), want (%q, %v, %v)",
+					got, mentioned, err, c.wantText, c.wantMentioned, c.wantErr)
+			}
+			name, rem, cmdOK := parseMentionCommand(got)
+			if name != c.wantCmd || rem != c.wantRem || cmdOK != (c.wantCmd != "") {
+				t.Fatalf("parseMentionCommand(%q) = (%q, %q, %v), want (%q, %q)",
+					got, name, rem, cmdOK, c.wantCmd, c.wantRem)
+			}
+		})
+	}
+}
+
+func TestStripLeadingHandle(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"@claudeagent /rerun", "/rerun"},
+		{"  @claudeagent\n/rerun", "/rerun"},
+		{"/rerun", "/rerun"},
+		{"@claudeagent", ""},
+		{"hello @claudeagent", "hello @claudeagent"},
+	}
+	for _, c := range cases {
+		if got := stripLeadingHandle(c.in); got != c.want {
+			t.Errorf("stripLeadingHandle(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }
@@ -407,6 +547,14 @@ func (m *mockLinearClient) GetProjectTeamID(_ context.Context, _ string) (string
 
 // mockStore implements storeInterface for testing.
 type mockStore struct {
+	// PendingQuestionLookups counts GetPendingQuestionByID calls (the first
+	// step of dispatchAwaitingReply).
+	PendingQuestionLookups int
+	// PendingQuestion, when set, is returned by GetPendingQuestionByID;
+	// AnsweredText records what AnswerPendingQuestion stored.
+	PendingQuestion *store.PendingQuestion
+	AnsweredText    string
+
 	Active     bool
 	ActiveSID  string
 	ActiveErr  error
@@ -668,7 +816,12 @@ func (m *mockStore) InsertPendingQuestion(q store.PendingQuestion) error { retur
 func (m *mockStore) GetOpenPendingQuestionByIssue(issueID string) (*store.PendingQuestion, error) {
 	return nil, nil
 }
-func (m *mockStore) AnswerPendingQuestion(id, answer string) error { return nil }
+func (m *mockStore) AnswerPendingQuestion(id, answer string) error {
+	m.mu.Lock()
+	m.AnsweredText = answer
+	m.mu.Unlock()
+	return nil
+}
 func (m *mockStore) SetAdmiralTaskAwaitingInput(issueID, pendingQuestionID string) error {
 	return nil
 }
@@ -676,7 +829,10 @@ func (m *mockStore) TransitionAwaitingInputToExecuting(issueID string) (bool, er
 	return true, nil
 }
 func (m *mockStore) GetPendingQuestionByID(id string) (*store.PendingQuestion, error) {
-	return nil, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.PendingQuestionLookups++
+	return m.PendingQuestion, nil
 }
 func (m *mockStore) CancelOpenPendingQuestionsForIssue(issueID string) error { return nil }
 
@@ -3142,6 +3298,248 @@ func TestDispatch_RerunOnDone_Supersedes(t *testing.T) {
 	}
 	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "sess-rerun" {
 		t.Errorf("expected fresh autopilot_jobs claim with new session id; got %v", got)
+	}
+}
+
+// TestDispatch_RerunInContextBundle_Supersedes covers the current Linear
+// @mention payload: PromptContext is the full <issue>/<comment>/... bundle
+// and the actual comment only appears in the trailing <user-request>.
+func TestDispatch_RerunInContextBundle_Supersedes(t *testing.T) {
+	mlc := &mockLinearClient{
+		GetIssueErr: fmt.Errorf("synthetic short-circuit"),
+	}
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:  "issue-done",
+			State:    store.JobStateDone,
+			AttemptN: 1,
+			PRURL:    "https://github.com/x/y/pull/1",
+		},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	ev := linear.AgentEvent{
+		SessionID:       "sess-rerun",
+		IssueID:         "issue-done",
+		IssueIdentifier: "DONE-1",
+		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-rerun-bundle",
+		PromptContext: "<issue identifier=\"DONE-1\">\n<title>T</title>\n</issue>\n" +
+			"<comment author=\"admiral\">\nadmiral does not respond to bare @mentions.\n</comment>\n\n" +
+			"<user-request>\n@claudeagent /rerun\n</user-request>\n",
+	}
+
+	o.HandleAgentEvent(ev)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ms.ClaimedSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ms.SupersededAdmiralIssues; len(got) != 1 || got[0] != "issue-done" {
+		t.Errorf("expected supersession on issue-done; got %v", got)
+	}
+	if got := ms.ClaimedSnapshot(); len(got) != 1 || got[0] != "sess-rerun" {
+		t.Errorf("expected fresh autopilot_jobs claim with new session id; got %v", got)
+	}
+}
+
+// TestDispatch_BareHandleOnAwaitingInput_DoesNotAnswer: an @mention with
+// nothing after the handle must not be recorded as the ask_user answer.
+func TestDispatch_BareHandleOnAwaitingInput_DoesNotAnswer(t *testing.T) {
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:           "issue-await",
+			State:             store.JobStateAwaitingInput,
+			AttemptN:          1,
+			PendingQuestionID: "q-1",
+		},
+	}
+	mlc := &mockLinearClient{}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.dispatch(linear.AgentEvent{
+		SessionID:       "sess-await",
+		IssueID:         "issue-await",
+		IssueIdentifier: "AWAIT-1",
+		Action:          linear.ActionCreated,
+		SourceCommentID: "comment-bare-handle",
+		PromptContext:   "<issue identifier=\"AWAIT-1\">\n</issue>\n<user-request>\n@claudeagent\n</user-request>\n",
+	})
+	ms.mu.Lock()
+	lookups := ms.PendingQuestionLookups
+	ms.mu.Unlock()
+	if lookups != 0 {
+		t.Fatalf("bare handle must not take the ask_user reply path (pending-question lookups: %d)", lookups)
+	}
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "waiting for your answer") {
+		t.Errorf("expected a pending-question hint, got: %q", body)
+	}
+}
+
+// TestDispatch_MentionWithoutSourceComment_Supersedes: Linear does not
+// always set sourceCommentId on @mention-created sessions (seen on klink
+// GEO-421, 2026-10-26). A <user-request> that starts with an @handle is
+// still a mention, not a repeat assign.
+func TestDispatch_MentionWithoutSourceComment_Supersedes(t *testing.T) {
+	mlc := &mockLinearClient{GetIssueErr: fmt.Errorf("synthetic short-circuit")}
+	ms := &mockStore{AdmiralTask: &store.AdmiralTask{
+		IssueID: "issue-done", State: store.JobStateDone, AttemptN: 1, PRURL: "https://github.com/x/y/pull/1",
+	}}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.HandleAgentEvent(linear.AgentEvent{
+		SessionID:       "sess-mention-nosrc",
+		IssueID:         "issue-done",
+		IssueIdentifier: "DONE-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "<issue identifier=\"DONE-1\">\n</issue>\n\n<user-request>\n@claudeagent  /rerun\n</user-request>\n",
+	})
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && len(ms.ClaimedSnapshot()) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ms.SupersededAdmiralIssues; len(got) != 1 || got[0] != "issue-done" {
+		t.Errorf("expected supersession on issue-done; got %v (posted: %q)", got, mlc.GetPostedBody())
+	}
+}
+
+// TestDispatch_DelegateBundle_StillRepeatAssign: a delegate's bundle has a
+// <user-request> without a leading handle and must stay a delegate.
+func TestDispatch_DelegateBundle_StillRepeatAssign(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{AdmiralTask: &store.AdmiralTask{IssueID: "issue-known", State: store.JobStateDone, AttemptN: 1}}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.HandleAgentEvent(linear.AgentEvent{
+		SessionID:       "sess-delegate-bundle",
+		IssueID:         "issue-known",
+		IssueIdentifier: "KNW-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "<issue identifier=\"KNW-1\">\n</issue>\n\n<user-request>\nWork on [KNW-1](https://linear.app/x/issue/KNW-1/y)\n</user-request>\n",
+	})
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "Task already exists") {
+		t.Errorf("expected repeat-assign reply, got: %s", body)
+	}
+}
+
+// TestDispatch_PromptedWithHandle_Supersedes: users type the @handle in
+// agent-thread replies too ("@claudeagent /rerun").
+func TestDispatch_PromptedWithHandle_Supersedes(t *testing.T) {
+	mlc := &mockLinearClient{GetIssueErr: fmt.Errorf("synthetic short-circuit")}
+	ms := &mockStore{AdmiralTask: &store.AdmiralTask{IssueID: "issue-thread", State: store.JobStateDone, AttemptN: 1}}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.HandleAgentEvent(linear.AgentEvent{
+		SessionID:       "sess-thread-handle",
+		IssueID:         "issue-thread",
+		IssueIdentifier: "THR-3",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "@claudeagent /rerun",
+	})
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && len(ms.SupersededAdmiralIssues) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ms.SupersededAdmiralIssues; len(got) != 1 || got[0] != "issue-thread" {
+		t.Errorf("expected supersession; got %v (posted: %q)", got, mlc.GetPostedBody())
+	}
+}
+
+// TestDispatch_PromptedAnswerKeepsHandle: a thread reply that starts with
+// someone else's handle is an ask_user answer and must be recorded whole.
+func TestDispatch_PromptedAnswerKeepsHandle(t *testing.T) {
+	ms := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID: "issue-await", State: store.JobStateAwaitingInput, AttemptN: 1, PendingQuestionID: "q-1",
+		},
+		PendingQuestion: &store.PendingQuestion{ID: "q-1"},
+	}
+	mlc := &mockLinearClient{}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.dispatch(linear.AgentEvent{
+		SessionID:       "sess-answer",
+		IssueID:         "issue-await",
+		IssueIdentifier: "AWAIT-2",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "@alice owns it, keep v1",
+	})
+	ms.mu.Lock()
+	answered := ms.AnsweredText
+	ms.mu.Unlock()
+	if answered != "@alice owns it, keep v1" {
+		t.Fatalf("answer = %q, want the whole reply (posted: %q)", answered, mlc.GetPostedBody())
+	}
+}
+
+// TestDispatch_UnparsedEnvelope_FailsClosed: an envelope admiral can't
+// locate must not be taken as a delegate (which would start a fresh run).
+func TestDispatch_UnparsedEnvelope_FailsClosed(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{} // no task row: a delegate here would dispatchFreshAssign
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.HandleAgentEvent(linear.AgentEvent{
+		SessionID:       "sess-unparsed",
+		IssueID:         "issue-new",
+		IssueIdentifier: "NEW-1",
+		Action:          linear.ActionCreated,
+		PromptContext:   "<issue identifier=\"NEW-1\">\n</issue>\n<user-request id=\"1\">\n@claudeagent /status\n</user-request>\n",
+	})
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "could not read") {
+		t.Fatalf("unparsed envelope must be rejected with a parse-failure hint, not dispatched as a delegate; posted %q, claimed %v",
+			body, ms.ClaimedSnapshot())
+	}
+}
+
+// TestDispatch_UnparsedEnvelope_OnLiveTask_ExplainsParseFailure: with a
+// live task the user gets a parse-failure hint, not a bare/empty-answer one.
+func TestDispatch_UnparsedEnvelope_OnLiveTask_ExplainsParseFailure(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		AdmiralTask:     &store.AdmiralTask{IssueID: "issue-await", State: store.JobStateAwaitingInput, AttemptN: 1, PendingQuestionID: "q-1"},
+		PendingQuestion: &store.PendingQuestion{ID: "q-1"},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.dispatch(linear.AgentEvent{
+		SessionID:       "sess-unparsed-await",
+		IssueID:         "issue-await",
+		IssueIdentifier: "AWAIT-3",
+		Action:          linear.ActionCreated,
+		SourceCommentID: "c-1",
+		PromptContext:   "<issue>x</issue>\n<user-request>@claudeagent use Postgres</user-request>\n",
+	})
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "could not read") {
+		t.Errorf("expected a parse-failure hint, got: %q", body)
+	}
+	ms.mu.Lock()
+	answered := ms.AnsweredText
+	ms.mu.Unlock()
+	if answered != "" {
+		t.Errorf("unparsed envelope must not answer the question; answered %q", answered)
+	}
+}
+
+// TestDispatch_PromptedLoneHandle_DoesNotAnswer: a lone "@claudeagent" in the
+// agent thread is an empty reply, not an answer.
+func TestDispatch_PromptedLoneHandle_DoesNotAnswer(t *testing.T) {
+	mlc := &mockLinearClient{}
+	ms := &mockStore{
+		AdmiralTask:     &store.AdmiralTask{IssueID: "issue-await", State: store.JobStateAwaitingInput, AttemptN: 1, PendingQuestionID: "q-1"},
+		PendingQuestion: &store.PendingQuestion{ID: "q-1"},
+	}
+	o := newTestOrchestrator(t, ms, mlc, &fakeGhProbe{})
+	o.dispatch(linear.AgentEvent{
+		SessionID:       "sess-lone-handle",
+		IssueID:         "issue-await",
+		IssueIdentifier: "AWAIT-4",
+		Action:          linear.ActionPrompted,
+		UserMessage:     "@claudeagent",
+	})
+	ms.mu.Lock()
+	answered := ms.AnsweredText
+	ms.mu.Unlock()
+	if answered != "" {
+		t.Errorf("lone handle must not answer the question; answered %q", answered)
+	}
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "waiting for your answer") {
+		t.Errorf("expected a pending-question hint, got: %q", body)
 	}
 }
 
