@@ -3026,12 +3026,11 @@ func parseMentionCommand(text string) (name, remainder string, ok bool) {
 			continue
 		}
 		if strings.HasPrefix(line, "/") {
-			parts := strings.SplitN(line, " ", 2)
-			cmd := strings.TrimSpace(parts[0])
-			name = strings.ToLower(strings.TrimPrefix(cmd, "/"))
-			if len(parts) == 2 {
-				remainder = strings.TrimSpace(parts[1])
+			cmd := line
+			if i := strings.IndexFunc(line, unicode.IsSpace); i >= 0 {
+				cmd, remainder = line[:i], strings.TrimSpace(line[i:])
 			}
+			name = strings.ToLower(strings.TrimPrefix(cmd, "/"))
 			return name, remainder, true
 		}
 		break // first non-empty line not starting with /, bare mention

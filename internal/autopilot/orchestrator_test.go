@@ -190,6 +190,8 @@ func TestParseMentionCommand(t *testing.T) {
 		{`/rerun`, "rerun", "", true},
 		{`/RERUN`, "rerun", "", true},
 		{`/rerun extra notes`, "rerun", "extra notes", true},
+		{"/rerun\u00a0use v2", "rerun", "use v2", true},
+		{"/rerun\tuse v2", "rerun", "use v2", true},
 		{"/rerun\nmore content", "rerun", "", true},
 		{"/rerun note1\nnote2", "rerun", "note1", true},
 		// /fix (not yet implemented — parser still recognizes it)
