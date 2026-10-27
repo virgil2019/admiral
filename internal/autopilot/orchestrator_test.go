@@ -268,9 +268,14 @@ func TestParseUserRequest(t *testing.T) {
 			wantText: "", wantErr: errUserRequestUnparsed,
 		},
 		{
-			name:     "lone open tag pasted inside the request is ambiguous",
-			in:       "<issue>x</issue>\n<user-request>\n@claudeagent /fix parser breaks on\n```\n<user-request>\n```\n</user-request>\n",
-			wantText: "", wantErr: errUserRequestUnparsed,
+			name:     "unpaired open tag in an earlier comment does not wedge the issue",
+			in:       "<comment>\nsnippet:\n<user-request>\n</comment>\n<user-request>\n@claudeagent /rerun\n</user-request>\n",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
+		},
+		{
+			name:     "non-breaking space after the handle",
+			in:       "<issue>x</issue>\n<user-request>\n@claudeagent\u00a0/rerun\n</user-request>\n",
+			wantText: "/rerun", wantMentioned: true, wantCmd: "rerun",
 		},
 		{
 			name:     "complete envelope pasted in an earlier comment is fine",
@@ -3475,8 +3480,8 @@ func TestDispatch_UnparsedEnvelope_FailsClosed(t *testing.T) {
 		Action:          linear.ActionCreated,
 		PromptContext:   "<issue identifier=\"NEW-1\">\n</issue>\n<user-request id=\"1\">\n@claudeagent /status\n</user-request>\n",
 	})
-	if body := mlc.GetPostedBody(); !strings.Contains(body, "Issue not assigned to admiral") {
-		t.Fatalf("unparsed envelope must be handled as a mention (assign-first reply), not a delegate; posted %q, claimed %v",
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "could not read") {
+		t.Fatalf("unparsed envelope must be rejected with a parse-failure hint, not dispatched as a delegate; posted %q, claimed %v",
 			body, ms.ClaimedSnapshot())
 	}
 }

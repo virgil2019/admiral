@@ -32,6 +32,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/georgehuang/admiral/internal/claudeclient"
 	"github.com/georgehuang/admiral/internal/config"
@@ -383,6 +384,10 @@ func (o *Orchestrator) dispatch(ev linear.AgentEvent) {
 		}
 		o.logger.Info("dispatch_reject_no_task",
 			"session", ev.SessionID, "issue", ev.IssueIdentifier)
+		if unparsed {
+			o.postRejection(ev.SessionID, userRequestUnparsedHelp)
+			return
+		}
 		o.postRejection(ev.SessionID, assignFirstHelp)
 		return
 	}
@@ -3070,18 +3075,6 @@ func parseUserRequest(text string) (body string, mentioned bool, err error) {
 	if closeIdx < 0 || openIdx < 0 {
 		return "", false, errUserRequestUnparsed
 	}
-	// A lone open tag pasted inside the request would become openIdx and
-	// cut the real body short; it shows up as an earlier open tag with no
-	// close tag between it and openIdx.
-	for i := openIdx - 1; i >= 0; i-- {
-		t := strings.TrimSpace(lines[i])
-		if t == closeTag {
-			break
-		}
-		if t == openTag {
-			return "", false, errUserRequestUnparsed
-		}
-	}
 	inner := lines[openIdx+1 : closeIdx]
 	// openIdx is the nearest open tag before closeIdx, so only a close tag
 	// can sit in between: a pasted envelope makes the boundary ambiguous.
@@ -3107,7 +3100,8 @@ func stripLeadingHandle(s string) string {
 	if !strings.HasPrefix(s, "@") {
 		return s
 	}
-	i := strings.IndexAny(s, " \t\r\n")
+	// unicode.IsSpace: rich editors put a non-breaking space after mentions.
+	i := strings.IndexFunc(s, unicode.IsSpace)
 	if i < 0 {
 		return ""
 	}
@@ -3116,7 +3110,7 @@ func stripLeadingHandle(s string) string {
 
 // userRequestUnparsedHelp is the reply when a comment's <user-request>
 // envelope can't be located in the PromptContext.
-const userRequestUnparsedHelp = "admiral could not read your comment (unexpected Linear payload format). Reply in this agent thread instead, e.g. /rerun or your answer to a pending question."
+const userRequestUnparsedHelp = "admiral could not read your request (unexpected Linear payload format), so it took no action. Reply in this agent thread instead, e.g. /rerun or your answer to a pending question; if you meant to assign the issue, unassign and assign it again."
 
 // awaitingReplyEmptyHelp is the reply to an empty @mention (a lone @handle)
 // while an ask_user question is pending.
