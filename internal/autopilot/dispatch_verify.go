@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/georgehuang/admiral/internal/cascade"
 	"github.com/georgehuang/admiral/internal/claudeclient"
 	"github.com/georgehuang/admiral/internal/config"
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
@@ -326,6 +326,11 @@ func (o *Orchestrator) runVerify(parentID string) {
 	mat, repoDir, teamID, projectID, verifyCmd, err := o.gatherVerifyMaterial(ctx, parentID)
 	if err != nil {
 		o.logger.Error("verify_gather_failed", "parent", parentID, "err", err)
+		// Gathering does not touch GitHub any more (the PR client is built
+		// lazily, per sub with a PR), so a gh-account problem cannot surface
+		// here — only Linear/store failures, which are transient and must not
+		// take the terminal escalation path. The identity refusal happens at
+		// the env gate below, which escalates for the deterministic case.
 		return
 	}
 
@@ -363,8 +368,25 @@ func (o *Orchestrator) runVerify(parentID string) {
 	// below) so a slip-up in the LLM cannot land a "complete" task with a
 	// broken build. Repos without verify_cmd skip this step — verify falls
 	// back to the original diff-only behavior (warned about at boot).
+	// The build gate, the judge and admiral's own gh calls all run as the
+	// repo's registered account. Resolved once, before the first child
+	// process starts.
+	env, err := o.ghEnvForProject(ctx, projectID)
+	if err != nil {
+		o.logger.Error("verify_resolve_identity_failed",
+			"parent", parentID, "project", projectID, "err", err)
+		// Same rule as the gather path: escalation is terminal, so only the
+		// deterministic "no gh account" case takes it. A flaky keyring read
+		// leaves the verification active rather than closing it off.
+		if isGhUserUnset(err) {
+			o.escalateVerifyWithReason(ctx, parentID, fmt.Sprintf(
+				"admiral: cannot verify — %v", err))
+		}
+		return
+	}
+
 	if verifyCmd != "" {
-		br := runRepoVerify(ctx, repoDir, verifyCmd, o.cfg.MaxRunSeconds)
+		br := runRepoVerify(ctx, repoDir, verifyCmd, o.cfg.MaxRunSeconds, env)
 		mat.BuildResult = &buildResultMaterial{
 			Command:  verifyCmd,
 			ExitCode: br.ExitCode,
@@ -387,7 +409,7 @@ func (o *Orchestrator) runVerify(parentID string) {
 		}
 	}
 
-	raw, err := o.verifyRunner(ctx, repoDir, buildVerifyPrompt(mat))
+	raw, err := o.verifyRunner(ctx, repoDir, buildVerifyPrompt(mat), env)
 	if err != nil {
 		o.logger.Error("verify_claude_failed", "parent", parentID, "err", err)
 		return
@@ -487,6 +509,25 @@ func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string
 		ParentIdentifier: parent.Identifier,
 		PRD:              parent.Description,
 	}
+
+	// The diffs come from GitHub as the repo's registered gh account, not as
+	// whichever account happens to be active on the host. Resolved lazily, on
+	// the first sub that actually has a PR: a round where no sub has one
+	// (human-shipped children, or a wrapper parent that auto-passes) must not
+	// be gated on the repo having an account at all.
+	var (
+		client      ghpkg.PRClient
+		clientErr   error
+		clientTried bool
+	)
+	prClient := func() (ghpkg.PRClient, error) {
+		if !clientTried {
+			clientTried = true
+			client, clientErr = o.prClientFor(ctx, repo)
+		}
+		return client, clientErr
+	}
+
 	for _, sub := range subs {
 		sm := verifySubMaterial{Identifier: sub.Identifier}
 		// SubIssue carries only id/identifier/state; fetch the title for a
@@ -499,7 +540,13 @@ func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string
 		}
 		if task, terr := o.db.GetAdmiralTaskByIssue(sub.ID); terr == nil && task != nil && task.PRURL != "" {
 			sm.PRURL = task.PRURL
-			if diff, derr := o.prClient.GetDiff(ctx, task.PRURL); derr == nil {
+			// Best-effort per sub: no identity (or a gh failure) costs the
+			// diff, not the whole round — the prompt just says "(diff
+			// unavailable)".
+			if c, cerr := prClient(); cerr != nil {
+				o.logger.Warn("verify_get_diff_no_identity",
+					"sub", sub.Identifier, "pr", task.PRURL, "err", cerr)
+			} else if diff, derr := c.GetDiff(ctx, task.PRURL); derr == nil {
 				sm.Diff = diff
 			} else {
 				o.logger.Warn("verify_get_diff_failed",
@@ -714,9 +761,9 @@ func (o *Orchestrator) escalateVerifyWithReason(ctx context.Context, parentID, b
 // one round), it streams via stdin instead of -p argv and the process gets
 // past fork(2). See the GEO-267 incident in bridge.log for the failure mode
 // this prevents.
-func runClaudeForVerify(ctx context.Context, claudeBin string, maxRunSeconds int, repoDir, prompt string, logger *slog.Logger) (string, error) {
+func runClaudeForVerify(ctx context.Context, claudeBin string, maxRunSeconds int, repoDir, prompt string, env []string, logger *slog.Logger) (string, error) {
 	return claudeclient.Run(ctx, claudeBin, maxRunSeconds, repoDir,
-		os.Environ(), prompt,
+		env, prompt,
 		[]string{"--dangerously-skip-permissions"},
 		"", logger)
 }

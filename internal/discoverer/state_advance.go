@@ -71,6 +71,21 @@ func (s *Service) enabledProjectSet() (map[string]struct{}, error) {
 	return out, nil
 }
 
+// ghUserForProject returns the GitHub account registered for the repo of a
+// Linear project (repos.gh_user). An empty result means the repo has no
+// account registered — the caller must then skip the GitHub call rather
+// than run it as whichever account happens to be active on the host.
+func (s *Service) ghUserForProject(projectID string) (string, error) {
+	repo, err := s.store.GetRepoByProjectID(projectID)
+	if err != nil {
+		return "", fmt.Errorf("get repo for project %s: %w", projectID, err)
+	}
+	if repo == nil {
+		return "", fmt.Errorf("no repo configured for project %s", projectID)
+	}
+	return strings.TrimSpace(repo.GhUser), nil
+}
+
 func (s *Service) advanceOne(ctx context.Context, t *store.AdmiralTask, enabled map[string]struct{}) {
 	if t.PRURL == "" {
 		return
@@ -99,7 +114,23 @@ func (s *Service) advanceOne(ctx context.Context, t *store.AdmiralTask, enabled 
 		return
 	}
 
-	status, err := s.pr.GetPRStatus(ctx, t.PRURL)
+	// The PR lookup and the merge run as the account the repo registered.
+	// With no account registered there is no identity to act as — the
+	// discoverer must not fall back to the host's active gh account.
+	ghUser, err := s.ghUserForProject(issue.ProjectID)
+	if err != nil {
+		s.logger.Warn("state_advance_resolve_identity_failed",
+			"issue", t.IssueIdentifier, "project", issue.ProjectID, "err", err)
+		return
+	}
+	if ghUser == "" {
+		s.logger.Warn("state_advance_no_gh_account",
+			"issue", t.IssueIdentifier, "project", issue.ProjectID,
+			"hint", "set the repo's gh_user (PATCH /admin/repos/<project_id> {\"gh_user\":\"<github-login>\"}) — admiral will not act as another account")
+		return
+	}
+
+	status, err := s.pr.GetPRStatus(ctx, t.PRURL, ghUser)
 	if err != nil {
 		s.logger.Warn("state_advance_pr_lookup_failed",
 			"issue", t.IssueIdentifier, "pr", t.PRURL, "err", err)
@@ -117,7 +148,7 @@ func (s *Service) advanceOne(ctx context.Context, t *store.AdmiralTask, enabled 
 	case "CLOSED":
 		s.advanceCancelled(ctx, t, issue)
 	case "OPEN":
-		s.advanceOpen(ctx, t, issue, status)
+		s.advanceOpen(ctx, t, issue, status, ghUser)
 	}
 }
 
@@ -162,14 +193,14 @@ func (s *Service) advanceCancelled(ctx context.Context, t *store.AdmiralTask, is
 		"issue", t.IssueIdentifier, "pr", t.PRURL)
 }
 
-func (s *Service) advanceOpen(ctx context.Context, t *store.AdmiralTask, issue *linear.Issue, status PRStatus) {
+func (s *Service) advanceOpen(ctx context.Context, t *store.AdmiralTask, issue *linear.Issue, status PRStatus, ghUser string) {
 	// Auto-merge gate: when enabled and the PR is approved + mergeable +
 	// CI-green, squash-merge it and short-circuit into the merged path
 	// (Linear completed + verify enqueue) this same tick instead of
 	// parking in Reviewed for a human. A merge failure falls through to
 	// the normal Reviewed push so the next tick retries.
 	if s.cfg.AutoMerge && autoMergeReady(status) {
-		if err := s.pr.MergePR(ctx, t.PRURL); err != nil {
+		if err := s.pr.MergePR(ctx, t.PRURL, ghUser); err != nil {
 			s.logger.Warn("auto_merge_failed",
 				"issue", t.IssueIdentifier, "pr", t.PRURL, "err", err)
 			// fall through to the Reviewed push below

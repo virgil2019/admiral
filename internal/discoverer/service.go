@@ -87,13 +87,15 @@ type linearClient interface {
 }
 
 // prClient is the slice of the GitHub client the discoverer uses for
-// state-advance polling.
+// state-advance polling. ghUser is the GitHub account registered for the
+// repo (repos.gh_user) — the calls authenticate as that account, never as
+// whichever one happens to be active on the host.
 type prClient interface {
-	GetPRStatus(ctx context.Context, prURL string) (PRStatus, error)
+	GetPRStatus(ctx context.Context, prURL, ghUser string) (PRStatus, error)
 	// MergePR squash-merges the PR and deletes its branch. Called only
 	// when AutoMerge is on and the gate (approved + mergeable + CI-green)
 	// is satisfied.
-	MergePR(ctx context.Context, prURL string) error
+	MergePR(ctx context.Context, prURL, ghUser string) error
 }
 
 // PRStatus is the discoverer's view of a GitHub PR. cmd/admiral-discoverer
@@ -114,12 +116,15 @@ type PRStatus struct {
 // taskRegistry is the slice of the store the discoverer needs:
 //   - GetAdmiralTaskByIssue: tertiary dedup against in-flight autopilot work
 //   - ListAutoPickEnabledProjectIDs: source of truth for scan scope
+//   - GetRepoByProjectID: the repo registered for a Linear project, and
+//     with it the gh account admiral must act as on that repo
 //   - GetDiscovererPick / UpsertDiscovererPick: own dedup record
 //   - ListAdmiralTasksByStates / UpdateAdmiralTask: drives the
 //     Linear-state advancement on DONE tasks
 type taskRegistry interface {
 	GetAdmiralTaskByIssue(issueID string) (*store.AdmiralTask, error)
 	ListAutoPickEnabledProjectIDs() ([]string, error)
+	GetRepoByProjectID(projectID string) (*store.Repo, error)
 	GetDiscovererPick(issueID string) (*store.DiscovererPick, error)
 	UpsertDiscovererPick(p store.DiscovererPick) error
 	ListAdmiralTasksByStates(states []string) ([]store.AdmiralTask, error)

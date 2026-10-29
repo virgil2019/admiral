@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -54,10 +53,16 @@ type VerifyRunResult struct {
 //
 // Empty verifyCmd is a programmer error: the caller must check + skip
 // upstream. Passing "" returns an Err result.
-func runRepoVerify(ctx context.Context, repoDir, verifyCmd string, timeoutSec int) VerifyRunResult {
+func runRepoVerify(ctx context.Context, repoDir, verifyCmd string, timeoutSec int, env []string) VerifyRunResult {
 	verifyCmd = strings.TrimSpace(verifyCmd)
 	if verifyCmd == "" {
 		return VerifyRunResult{Err: errors.New("runRepoVerify: empty verifyCmd (caller must check + skip)")}
+	}
+	// os/exec inherits the parent's environment when Env is nil, which would
+	// run verify_cmd as whichever gh account is active on the host. Refuse
+	// rather than fall back.
+	if env == nil {
+		return VerifyRunResult{Err: errors.New("runRepoVerify: nil env (caller must pass the repo's environment)")}
 	}
 
 	if timeoutSec <= 0 {
@@ -72,7 +77,12 @@ func runRepoVerify(ctx context.Context, repoDir, verifyCmd string, timeoutSec in
 
 	cmd := exec.CommandContext(cctx, "sh", "-c", verifyCmd)
 	cmd.Dir = repoDir
-	cmd.Env = os.Environ()
+	// env is the complete child environment (usually the repo's gh account).
+	// There is deliberately no inherit-the-host fallback: a caller that
+	// forgets to thread it must fail loudly (no PATH → the command does not
+	// even start) rather than silently run as whichever account the host
+	// happens to be logged in as.
+	cmd.Env = env
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 5 * time.Second
 
@@ -175,6 +185,7 @@ func runVerifyWithRetry(
 	ctx context.Context,
 	worktreePath, verifyCmd string,
 	buildTimeoutSec, maxRetries int,
+	env []string,
 	claudeRunner func(ctx context.Context, wt, prompt string) (output string, err error),
 ) VerifyRetryResult {
 	verifyCmd = strings.TrimSpace(verifyCmd)
@@ -191,7 +202,7 @@ func runVerifyWithRetry(
 	result := VerifyRetryResult{}
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		br := runRepoVerify(ctx, worktreePath, verifyCmd, buildTimeoutSec)
+		br := runRepoVerify(ctx, worktreePath, verifyCmd, buildTimeoutSec, env)
 		result.Attempts = attempt + 1
 		result.LastBuildOutput = br.Output
 

@@ -139,7 +139,12 @@ type Orchestrator struct {
 	db     storeInterface
 	gh     ghProbe
 	logger *slog.Logger
-	ghUser string // login of the configured gh user (for open-PR author comparison)
+
+	// accounts resolves a repo's registered gh account (repos.gh_user) to a
+	// token. Tokens are read from the gh keyring on every call and never
+	// cached, so admiral always acts as the account the repo registered —
+	// never as whichever account happens to be active on the host.
+	accounts *ghpkg.Accounts
 
 	// runSlots gates how many `claude -p` runs can be live concurrently
 	// across all issues (GEO-51). Acquired in runWithAttempt and runFix,
@@ -162,8 +167,10 @@ type Orchestrator struct {
 	// replier is the semantic reply layer for Linear AgentSession threads.
 	replier *agentSessionReplier
 
-	// prClient is the outbound GitHub PR client used by the review dispatcher.
-	prClient ghpkg.PRClient
+	// prClientFor builds the outbound GitHub PR client for a repo. The
+	// default authenticates as the repo's registered gh account; tests
+	// inject a fake.
+	prClientFor func(ctx context.Context, repo *store.Repo) (ghpkg.PRClient, error)
 
 	// dbPath is the absolute path to the SQLite file. Passed as
 	// ADMIRAL_DB_PATH to the admiral-mcp-ask subprocess.
@@ -178,13 +185,14 @@ type Orchestrator struct {
 
 	// verifyRunner runs the headless verify judge. Defaults to
 	// runClaudeForVerify; tests inject a stub so the guard/apply logic is
-	// exercised without spawning a real claude process.
-	verifyRunner func(ctx context.Context, repoDir, prompt string) (string, error)
+	// exercised without spawning a real claude process. env is the child
+	// environment the judge runs under — it carries the repo's gh account.
+	verifyRunner func(ctx context.Context, repoDir, prompt string, env []string) (string, error)
 
 	// productVerifyRunner runs the headless product-level verify judge. Same
 	// read-only signature as verifyRunner (defaults to runClaudeForVerify); a
 	// separate field lets tests stub product verify independently of L2.
-	productVerifyRunner func(ctx context.Context, repoDir, prompt string) (string, error)
+	productVerifyRunner func(ctx context.Context, repoDir, prompt string, env []string) (string, error)
 }
 
 // SetVerifyPickupRules wires the discoverer's pickup gates (require_label +
@@ -211,18 +219,18 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		dbPath:   db.Path,
 		gh:       newGhCLIProbe(cfg.GhBin),
 		logger:   logger,
-		ghUser:   cfg.GhUser,
+		accounts: ghpkg.NewAccounts(cfg.GhBin),
 		runSlots: make(chan struct{}, slots),
 		ciWatcher: newCIWatcher(lc, db, logger, cfg.GhBin,
 			cfg.CIWatchPollInterval, cfg.CIWatchTimeout),
-		replier:  NewAgentSessionReplier(lc),
-		prClient: ghpkg.NewClient(cfg.GhToken),
+		replier: NewAgentSessionReplier(lc),
 	}
-	o.verifyRunner = func(ctx context.Context, repoDir, prompt string) (string, error) {
-		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, o.logger)
+	o.prClientFor = o.githubClientFor
+	o.verifyRunner = func(ctx context.Context, repoDir, prompt string, env []string) (string, error) {
+		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, env, o.logger)
 	}
-	o.productVerifyRunner = func(ctx context.Context, repoDir, prompt string) (string, error) {
-		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, o.logger)
+	o.productVerifyRunner = func(ctx context.Context, repoDir, prompt string, env []string) (string, error) {
+		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, env, o.logger)
 	}
 	o.blockerWatcher = newBlockerWatcher(o, cfg.BlockerPollInterval)
 	// Ensure job_streams_dir exists on startup.
@@ -230,6 +238,55 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		logger.Warn("job_streams_dir_mkdir", "dir", cfg.JobStreamsDir, "err", err)
 	}
 	return o
+}
+
+// githubClientFor builds a GitHub client that authenticates as the repo's
+// registered gh account (repos.gh_user). The token is read from the gh
+// keyring on every call and never cached, so a re-login takes effect without
+// restarting admiral. A repo with no registered account is refused rather
+// than falling back to the host's active gh identity.
+func (o *Orchestrator) githubClientFor(ctx context.Context, repo *store.Repo) (ghpkg.PRClient, error) {
+	if repo == nil {
+		return nil, fmt.Errorf("no repo configured")
+	}
+	ghUser := strings.TrimSpace(repo.GhUser)
+	if ghUser == "" {
+		return nil, errGhUserUnset(repo.ProjectID)
+	}
+	tok, err := o.accounts.Token(ctx, ghUser)
+	if err != nil {
+		return nil, fmt.Errorf("resolve gh account %q for project %s: %w", ghUser, repo.ProjectID, err)
+	}
+	// Same binary the token was resolved with: gh_bin may point off PATH.
+	return ghpkg.NewClientWithBin(o.cfg.GhBin, tok), nil
+}
+
+// ghEnvForIssue resolves the gh account registered for the repo of the
+// issue's Linear project and returns the environment gh commands must run
+// under. Used by the flows that shell out to gh without a PR (the reset
+// flow). Fails when the repo has no account registered.
+func (o *Orchestrator) ghEnvForIssue(ctx context.Context, issueID string) ([]string, error) {
+	issue, err := o.lc.GetIssue(ctx, issueID)
+	if err != nil {
+		return nil, fmt.Errorf("get issue: %w", err)
+	}
+	return o.ghEnvForProject(ctx, issue.ProjectID)
+}
+
+// ghEnvForProject is ghEnvForIssue keyed by Linear project id.
+func (o *Orchestrator) ghEnvForProject(ctx context.Context, projectID string) ([]string, error) {
+	repo, err := o.db.GetRepoByProjectID(projectID)
+	if err != nil {
+		return nil, fmt.Errorf("get repo for project %s: %w", projectID, err)
+	}
+	if repo == nil {
+		return nil, fmt.Errorf("no repo configured for project %s", projectID)
+	}
+	ghUser := strings.TrimSpace(repo.GhUser)
+	if ghUser == "" {
+		return nil, errGhUserUnset(projectID)
+	}
+	return o.accounts.EnvFor(ctx, ghUser)
 }
 
 // acquireRunSlot blocks until a slot is available in the runSlots
@@ -740,17 +797,30 @@ func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 		ClaudeSessionID: task.ClaudeSessionID,
 	}
 	resumeFlow := newResumeFlow(o, ctx, ev, syntheticPrior)
-	if issue, err := o.lc.GetIssue(ctx, ev.IssueID); err == nil {
-		resumeFlow.teamID = issue.TeamID
-		if repo, err := o.db.GetRepoByProjectID(issue.ProjectID); err == nil && repo != nil {
-			resumeFlow.repoDir = repo.RepoDir
-			resumeFlow.baseBranch = repo.BaseBranch
-		}
+	// Identity gate: the run's gh calls (PR lookups, PR comments, CI checks,
+	// the claude subprocess) authenticate as the repo's registered account.
+	// (The branch push itself goes over the remote's SSH identity, which is
+	// configured per repo.) Resolve it before any work happens; a repo
+	// without an account is refused, never run as whichever account happens
+	// to be active on the host.
+	if err := o.prepareResume(resumeFlow, ev); err != nil {
+		o.logger.Error("fix_resolve_identity_failed",
+			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
+		resumeFlow.abortFixBeforeStart(err)
+		return
 	}
 
 	if err := resumeFlow.executeResume(); err != nil {
 		o.logger.Error("autopilot_fix_failed",
 			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
+		// A prepare-phase failure (ensureWorktree / openStreamFile / MCP
+		// config write) means claude never launched: the prior run and its
+		// session are intact, and FAILED would close off /fix (it only
+		// dispatches from DONE), forcing a /rerun with a new branch.
+		if isPreparePhaseError(err) {
+			resumeFlow.abortFixBeforeStart(err)
+			return
+		}
 		// markFailed updates admiral_tasks → FAILED (PR-B-v2 dual-write).
 		resumeFlow.markFailed(err)
 		return
@@ -887,12 +957,16 @@ func (o *Orchestrator) runResume(ev linear.AgentEvent, task *store.AdmiralTask) 
 		ClaudeSessionID: task.ClaudeSessionID,
 	}
 	resumeFlow := newResumeFlow(o, ctx, ev, syntheticPrior)
-	if issue, err := o.lc.GetIssue(ctx, ev.IssueID); err == nil {
-		resumeFlow.teamID = issue.TeamID
-		if repo, err := o.db.GetRepoByProjectID(issue.ProjectID); err == nil && repo != nil {
-			resumeFlow.repoDir = repo.RepoDir
-			resumeFlow.baseBranch = repo.BaseBranch
-		}
+	if err := o.prepareResume(resumeFlow, ev); err != nil {
+		o.logger.Error("resume_resolve_identity_failed",
+			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
+		// Nothing ran: the prior claude session is still recoverable, so keep
+		// TIMED_OUT and let the user retry /resume once the blocker is gone
+		// (a transient Linear failure, or a repo with no gh account). The
+		// message is this failure's, not the run-length timeout's — claude
+		// never started.
+		resumeFlow.markTimedOutBeforeStart(err)
+		return
 	}
 
 	if err := resumeFlow.executeResumeFromTimeout(); err != nil {
@@ -1033,9 +1107,19 @@ func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.Admir
 		})
 		return
 	}
-	if repo, err := o.db.GetRepoByProjectID(issue.ProjectID); err == nil && repo != nil {
-		f.repoDir = repo.RepoDir
-		f.baseBranch = repo.BaseBranch
+	// Identity for this repo: every gh call below (PR lookup, push, CI) runs
+	// as the account the repo registered. bindIdentity also distinguishes a
+	// project with no repo from a repo with no account, so the thread message
+	// names the right fix.
+	if err := f.bindIdentity(issue.ProjectID); err != nil {
+		o.logger.Error("awaiting_resume_resolve_identity_failed",
+			"issue", ev.IssueIdentifier, "err", err)
+		// Nothing ran and the answered question is already consumed, so
+		// FAILED would be terminal for work that never started. TIMED_OUT
+		// keeps /resume available — the same recovery /resume itself offers
+		// for its own pre-flight failures.
+		f.markTimedOutBeforeStart(err)
+		return
 	}
 
 	if err := f.openStreamFile(); err != nil {
@@ -1088,7 +1172,7 @@ func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.Admir
 		t.FinishedAt = now
 	})
 	if !isNoop && prURL != "" && o.ciWatcher != nil {
-		o.ciWatcher.WatchPR(ctx, prURL, f.repoDir, ev.SessionID, ev.IssueID)
+		o.ciWatcher.WatchPR(ctx, prURL, f.repoDir, ev.SessionID, ev.IssueID, f.ghUser)
 	}
 	o.logger.Info("awaiting_resume_done",
 		"issue", ev.IssueIdentifier, "pr", prURL)
@@ -1164,6 +1248,15 @@ type flow struct {
 	baseBranch      string
 	verifyCmd       string // configured `verify_cmd` for this run's repo; empty = build hard gate disabled
 
+	// ghUser is the gh account registered for this run's repo
+	// (repos.gh_user). Every gh call of this run authenticates as that
+	// account — never as whichever account is active on the host.
+	ghUser string
+
+	// projectID is the Linear project whose repo this run acts on. It
+	// identifies the repo row the gh account was taken from.
+	projectID string
+
 	// attemptN is the admiral_tasks attempt counter for this run.
 	// attemptN == 1 → first run on linear/<id>.
 	// attemptN  > 1 → /rerun, branch becomes linear/<id>-rerun-<N>.
@@ -1233,6 +1326,75 @@ func (f *flow) postActivityWithRetry(a linear.AgentActivity) error {
 	return lastErr
 }
 
+// ghEnv returns the environment every gh call of this run must run under:
+// the repo's registered gh account, with any ambient GH_TOKEN / GITHUB_TOKEN
+// stripped so the host's active account can never take over.
+//
+// Resolved per call — the keyring token is never cached — so a re-login
+// takes effect on the next gh call without restarting admiral.
+func (f *flow) ghEnv(ctx context.Context) ([]string, error) {
+	return f.o.accounts.EnvFor(ctx, f.ghUser)
+}
+
+// errGhUserUnset is the identity gate's failure. admiral acts on GitHub as
+// the account a repo registered; with no account registered it has no
+// identity at all, and falling back to whichever account is active on the
+// host is exactly the mis-identification this gate exists to prevent. The
+// message names the exact API call that fixes it.
+func errGhUserUnset(projectID string) error {
+	return &ghUserUnsetError{projectID: strings.TrimSpace(projectID)}
+}
+
+// ghUserUnsetError / isGhUserUnset let callers tell "this repo has no gh
+// account" (deterministic — nothing retries it into working) apart from a
+// transient lookup failure, which must stay retryable.
+type ghUserUnsetError struct{ projectID string }
+
+func (e *ghUserUnsetError) Error() string {
+	if e.projectID == "" {
+		return "admiral could not resolve which GitHub account to act as for this issue, so it will not start. The issue's Linear project must have a repo registered with an account (PATCH /admin/repos/<project_id> {\"gh_user\":\"<github-login>\"}; the account must be signed in via `gh auth login` and have push access to the repo's origin)"
+	}
+	return fmt.Sprintf("no GitHub account is configured for project %s, so admiral has no identity to act as and will not start. Set one with `PATCH /admin/repos/%s {\"gh_user\":\"<github-login>\"}` (the account must be signed in via `gh auth login` and have push access to the repo's origin), then re-run this issue",
+		e.projectID, e.projectID)
+}
+
+func isGhUserUnset(err error) bool {
+	var e *ghUserUnsetError
+	return errors.As(err, &e)
+}
+
+// bindIdentity loads the repo registered for a Linear project and records the
+// gh account admiral must act as on it (repos.gh_user). It also refreshes the
+// repo-scoped fields of the flow.
+//
+// Fails when the project has no repo registered, or when that repo has no gh
+// account — every gh call of the run (PR creation, lookups, CI checks, the
+// claude subprocess) authenticates as that account, so there is no meaningful
+// run without it.
+func (f *flow) bindIdentity(projectID string) error {
+	repo, err := f.o.db.GetRepoByProjectID(projectID)
+	if err != nil {
+		return fmt.Errorf("get repo for project %s: %w", projectID, err)
+	}
+	if repo == nil {
+		return fmt.Errorf("no repo configured for project %s", projectID)
+	}
+	if !repo.Enabled {
+		// The operator halted this repo. /fix and /resume push and comment on
+		// GitHub, so they must respect the switch that stops first runs.
+		return fmt.Errorf("the repo for project %s is disabled — re-enable it with `PATCH /admin/repos/%s {\"enabled\":true}` before retrying", projectID, projectID)
+	}
+	f.repoDir = repo.RepoDir
+	f.baseBranch = repo.BaseBranch
+	f.verifyCmd = repo.VerifyCmd
+	f.projectID = projectID
+	f.ghUser = strings.TrimSpace(repo.GhUser)
+	if f.ghUser == "" {
+		return errGhUserUnset(projectID)
+	}
+	return nil
+}
+
 func (f *flow) execute() error {
 	f.postActivity(linear.Thought("Reading issue context...", true))
 
@@ -1261,6 +1423,16 @@ func (f *flow) execute() error {
 	f.repoDir = repo.RepoDir
 	f.baseBranch = repo.BaseBranch
 	f.verifyCmd = repo.VerifyCmd
+	f.projectID = issue.ProjectID
+	// Identity gate. admiral acts on GitHub as the account the repo
+	// registered; without one it would fall back to whatever account is
+	// active on the host, which is how a run ends up pushing a branch it
+	// cannot open a PR for. Refuse before any work happens, and say in the
+	// Linear thread exactly how to fix it.
+	f.ghUser = strings.TrimSpace(repo.GhUser)
+	if f.ghUser == "" {
+		return errGhUserUnset(issue.ProjectID)
+	}
 	worktreeName := "linear-" + sanitizeForPath(issue.Identifier)
 	f.branch = branchName(issue)
 	// /rerun: append `-rerun-<N>` to both branch and worktree so a new
@@ -1289,7 +1461,13 @@ func (f *flow) execute() error {
 	// best-effort: gh failures fall through to the normal flow. Skipped on
 	// follow-up flows since the suffixed branch is intentionally fresh.
 	if f.followupSuffix == "" {
-		if url, sha, found, err := f.o.gh.FindMergedPRForBranch(f.ctx, f.repoDir, f.branch); err != nil {
+		// Best-effort like the probe itself: an identity failure only skips
+		// the check. The run still needs the account, and the first gh call
+		// that cannot do without it fails with a message naming the cause.
+		if env, envErr := f.ghEnv(f.ctx); envErr != nil {
+			f.o.logger.Warn("merged_pr_check_identity_failed",
+				"err", envErr, "branch", f.branch)
+		} else if url, sha, found, err := f.o.gh.FindMergedPRForBranch(f.ctx, f.repoDir, f.branch, env); err != nil {
 			f.o.logger.Warn("merged_pr_check_failed",
 				"err", err, "branch", f.branch)
 		} else if found {
@@ -1318,11 +1496,14 @@ func (f *flow) execute() error {
 	// someone other than admiral. If found, short-circuit so we don't
 	// create a duplicate PR. Skipped on follow-up flows (suffixed branch
 	// is intentionally unique).
-	if f.followupSuffix == "" && f.o.ghUser != "" {
-		if url, author, found, err := f.o.gh.FindOpenPRForBranch(f.ctx, f.repoDir, f.branch); err != nil {
+	if f.followupSuffix == "" {
+		if env, envErr := f.ghEnv(f.ctx); envErr != nil {
+			f.o.logger.Warn("open_pr_check_identity_failed",
+				"err", envErr, "branch", f.branch)
+		} else if url, author, found, err := f.o.gh.FindOpenPRForBranch(f.ctx, f.repoDir, f.branch, env); err != nil {
 			f.o.logger.Warn("open_pr_check_failed",
 				"err", err, "branch", f.branch)
-		} else if found && author != f.o.ghUser {
+		} else if found && author != f.ghUser {
 			return f.markOpenPRByOther(url, author)
 		}
 	}
@@ -1397,14 +1578,20 @@ func (f *flow) execute() error {
 		f.postActivity(linear.Action("build_gate",
 			fmt.Sprintf("verify_cmd=%s, max_retries=%d", f.verifyCmd, f.o.cfg.VerifyMaxRetries),
 			""))
+		// One identity for the whole gate: the build and every fix-up claude
+		// run that follows it must act as the same account.
+		gateEnv, err := f.ghEnv(f.ctx)
+		if err != nil {
+			return fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
+		}
 		claudeRunner := func(ctx context.Context, wt, retryPrompt string) (string, error) {
 			fullPrompt := retryPrompt
 			if f.o.cfg.AutopilotSkill != "" {
 				fullPrompt = "/" + f.o.cfg.AutopilotSkill + "\n\n" + retryPrompt
 			}
-			return runClaudeForReview(ctx, f.o.cfg.ClaudeBin, f.o.cfg.MaxRunSeconds, wt, fullPrompt, f.o.cfg.BotIdentity, f.o.logger)
+			return runClaudeForReview(ctx, f.o.cfg.ClaudeBin, f.o.cfg.MaxRunSeconds, wt, fullPrompt, f.o.cfg.BotIdentity, gateEnv, f.o.logger)
 		}
-		gate := runVerifyWithRetry(f.ctx, f.worktreePath, f.verifyCmd, f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, claudeRunner)
+		gate := runVerifyWithRetry(f.ctx, f.worktreePath, f.verifyCmd, f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, gateEnv, claudeRunner)
 		gateAttempts = gate.Attempts
 		if !gate.Passed {
 			f.o.logger.Warn("first_run_build_gate_failed",
@@ -1478,7 +1665,7 @@ func (f *flow) execute() error {
 	// results to Linear thread. On failure, transitions admiral_tasks to
 	// FAILED with reason "ci_failed" (GEO-54).
 	if !isNoop && prURL != "" && f.o.ciWatcher != nil {
-		f.o.ciWatcher.WatchPR(f.ctx, prURL, f.repoDir, f.ev.SessionID, f.ev.IssueID)
+		f.o.ciWatcher.WatchPR(f.ctx, prURL, f.repoDir, f.ev.SessionID, f.ev.IssueID, f.ghUser)
 	}
 
 	mention := f.creatorMention()
@@ -1523,11 +1710,33 @@ func (f *flow) execute() error {
 	return nil
 }
 
+// prepareResume resolves the issue, its repo and the gh account the resumed
+// run must act as. It runs before any work, so a resume never starts without
+// an identity — every gh call of the resume (branch push, PR comment, CI
+// checks) would otherwise authenticate as whichever account happens to be
+// active on the host.
+func (o *Orchestrator) prepareResume(f *flow, ev linear.AgentEvent) error {
+	issue, err := o.lc.GetIssue(f.ctx, ev.IssueID)
+	if err != nil {
+		return fmt.Errorf("fetch issue: %w", err)
+	}
+	f.teamID = issue.TeamID
+	return f.bindIdentity(issue.ProjectID)
+}
+
 // executeResume resumes a claude session on the original branch/PR.
 // For TIMED_OUT jobs, updates the original job row to DONE.
 // For prompted events, creates a new DONE row for the new session.
 func (f *flow) executeResume() error {
 	f.postActivity(linear.Thought("Resuming previous session...", true))
+
+	// The caller (runFix) resolves the repo and the gh account before the
+	// run starts. The resumed run comments on the PR and reads its state, so
+	// without an identity every gh call of it would fall back to the host's
+	// active account — refuse to start instead.
+	if f.ghUser == "" {
+		return errGhUserUnset(f.projectID)
+	}
 
 	if err := f.ensureWorktree(); err != nil {
 		return fmt.Errorf("ensure worktree: %w", err)
@@ -1577,13 +1786,13 @@ func (f *flow) executeResumeFromTimeout() error {
 		return fmt.Errorf("fetch issue: %w", err)
 	}
 	f.teamID = issue.TeamID
-	if f.repoDir == "" {
-		repo, err := f.o.db.GetRepoByProjectID(issue.ProjectID)
-		if err != nil || repo == nil {
-			return fmt.Errorf("repo lookup failed for project %s: %w", issue.ProjectID, err)
+	// runResume resolved the repo and the gh account this run must act as
+	// before the flow started; re-resolving would only repeat the same store
+	// lookup. Only a flow that arrives here unbound resolves it itself.
+	if f.ghUser == "" {
+		if err := f.bindIdentity(issue.ProjectID); err != nil {
+			return err
 		}
-		f.repoDir = repo.RepoDir
-		f.baseBranch = repo.BaseBranch
 	}
 
 	if err := f.ensureWorktree(); err != nil {
@@ -1629,7 +1838,7 @@ func (f *flow) executeResumeFromTimeout() error {
 	})
 
 	if !isNoop && prURL != "" && f.o.ciWatcher != nil {
-		f.o.ciWatcher.WatchPR(f.ctx, prURL, f.repoDir, f.ev.SessionID, f.ev.IssueID)
+		f.o.ciWatcher.WatchPR(f.ctx, prURL, f.repoDir, f.ev.SessionID, f.ev.IssueID, f.ghUser)
 	}
 
 	mention := f.creatorMention()
@@ -1781,7 +1990,14 @@ func (f *flow) runClaudeResume(userMessage string) error {
 	cctx, cancel := context.WithTimeout(f.ctx, time.Duration(f.o.cfg.MaxRunSeconds)*time.Second)
 	defer cancel()
 
-	env := appendBotIdentityEnv(append(os.Environ(),
+	// The claude subprocess talks to GitHub too (it may inspect or push the
+	// branch), so it inherits the repo's registered gh account — not
+	// whichever account happens to be active on the host.
+	env, err := f.ghEnv(f.ctx)
+	if err != nil {
+		return fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
+	}
+	env = appendBotIdentityEnv(append(env,
 		"CLAUDE_AUTOPILOT_ISSUE="+f.ev.IssueIdentifier,
 		"CLAUDE_AUTOPILOT_SESSION="+f.ev.SessionID,
 		"ADMIRAL_DB_PATH="+f.o.dbPath,
@@ -2069,6 +2285,28 @@ func (f *flow) markFailed(runErr error) {
 }
 
 func (f *flow) markTimedOut(runErr error) {
+	truncatedSession := f.claudeSessionID
+	if len(truncatedSession) > 8 {
+		truncatedSession = truncatedSession[:8]
+	}
+	f.markTimedOutWithMessage(runErr, fmt.Sprintf(
+		"Task timed out after %ds. State preserved — re-mention me on this issue to resume from where I left off. (claude session: %s...)",
+		f.o.cfg.MaxRunSeconds, truncatedSession))
+}
+
+// markTimedOutBeforeStart records a /resume that failed its pre-flight, i.e.
+// before claude ran. The state is TIMED_OUT so /resume stays available once
+// the blocker is fixed, but the thread message names what actually happened:
+// the run-length wording would tell the user a run timed out that never
+// launched, hiding the real fix (e.g. registering the repo's gh account).
+func (f *flow) markTimedOutBeforeStart(runErr error) {
+	f.markTimedOutWithMessage(runErr, fmt.Sprintf("admiral: cannot resume — %v", runErr))
+}
+
+// markTimedOutWithMessage persists a TIMED_OUT run and reports body on the
+// thread. Shared by the run-length timeout and the pre-flight failure above,
+// which differ only in what they tell the user.
+func (f *flow) markTimedOutWithMessage(runErr error, body string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
 		j.State = store.JobStateTimedOut
@@ -2083,16 +2321,39 @@ func (f *flow) markTimedOut(runErr error) {
 	// Use a fresh short ctx in case the parent is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	mention := f.creatorMention()
-	truncatedSession := f.claudeSessionID
-	if len(truncatedSession) > 8 {
-		truncatedSession = truncatedSession[:8]
-	}
-	body := mention + fmt.Sprintf(
-		"Task timed out after %ds. State preserved — re-mention me on this issue to resume from where I left off. (claude session: %s...)",
-		f.o.cfg.MaxRunSeconds, truncatedSession)
-	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.Response(body))
+	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.Response(f.creatorMention()+body))
 	// NO cleanupWorktree: keep worktree for resume
+}
+
+// abortFixBeforeStart reports a /fix that failed before any work started
+// (the issue, its repo, or the repo's gh account could not be resolved) and
+// returns the task to DONE.
+//
+// FAILED would be wrong here: the prior run and its claude session are still
+// valid, and /fix only dispatches from DONE — marking the task FAILED would
+// force the user to /rerun (a new branch, the work redone) merely because,
+// say, the repo's gh account had not been registered yet. DONE keeps /fix
+// retryable once the blocker is fixed.
+func (f *flow) abortFixBeforeStart(runErr error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	// The per-session audit row did fail; only the aggregate task state is
+	// rolled back.
+	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateFailed
+		j.Error = runErr.Error()
+		j.FinishedAt = now
+	})
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateDone
+		t.Error = ""
+	})
+	body := fmt.Sprintf("/fix did not start — %v\n\nThe previous run and its claude session are intact; mention me again with /fix once this is fixed.", runErr)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.ErrorActivity(f.creatorMention()+body)); err != nil {
+		f.o.logger.Error("fix_preflight_activity_failed",
+			"session", f.ev.SessionID, "err", err)
+	}
 }
 
 // cleanupMode controls whether cleanupWorktree deletes or archives the worktree.
@@ -2352,7 +2613,14 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 	cctx, cancel := context.WithTimeout(f.ctx, time.Duration(f.o.cfg.MaxRunSeconds)*time.Second)
 	defer cancel()
 
-	env := appendBotIdentityEnv(append(os.Environ(),
+	// The claude subprocess talks to GitHub too (it may inspect or push the
+	// branch), so it inherits the repo's registered gh account — not
+	// whichever account happens to be active on the host.
+	env, err := f.ghEnv(f.ctx)
+	if err != nil {
+		return fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
+	}
+	env = appendBotIdentityEnv(append(env,
 		"CLAUDE_AUTOPILOT_ISSUE="+issue.Identifier,
 		"CLAUDE_AUTOPILOT_SESSION="+f.ev.SessionID,
 		// Inherited by admiral-mcp-ask subprocess (via claude's env).
@@ -2775,8 +3043,12 @@ func (f *flow) ensurePR(issue *linear.Issue) (string, error) {
 	}
 	body := fmt.Sprintf("Autopilot run for %s — %s\n\n%s",
 		issue.Identifier, issue.URL, truncate(issue.Description, 4000))
+	env, err := f.ghEnv(f.ctx)
+	if err != nil {
+		return "", fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
+	}
 	gh := func(ctx context.Context, args ...string) (string, error) {
-		return captureCmd(ctx, f.worktreePath, f.o.cfg.GhBin, args...)
+		return captureCmdEnv(ctx, f.worktreePath, env, f.o.cfg.GhBin, args...)
 	}
 	out, err := ghCreateWithRetry(f.ctx, gh, ghReadDelays,
 		"pr", "create",
@@ -2814,8 +3086,12 @@ func (f *flow) lookupPR() (string, error) {
 	// reset): a single network blip here must not fail the whole job and leave
 	// an already-created PR orphaned — which would also stall every sub-issue
 	// blocked on this one. Mirrors the reset merged-PR guard's retry.
+	env, err := f.ghEnv(f.ctx)
+	if err != nil {
+		return "", fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
+	}
 	gh := func(ctx context.Context, args ...string) (string, error) {
-		return captureCmd(ctx, f.worktreePath, f.o.cfg.GhBin, args...)
+		return captureCmdEnv(ctx, f.worktreePath, env, f.o.cfg.GhBin, args...)
 	}
 	out, err := ghReadWithRetry(f.ctx, gh, ghReadDelays,
 		"pr", "list",
@@ -2970,6 +3246,24 @@ func captureCmd(ctx context.Context, dir, name string, args ...string) (string, 
 	return string(out), err
 }
 
+// captureCmdEnv runs a command with an explicit environment. env must be the
+// complete child environment (ghpkg.Accounts.EnvFor builds one) — anything
+// missing is invisible to the child. Use it for gh calls, which must
+// authenticate as a specific account rather than inherit the host's.
+//
+// A nil env is refused: os/exec would inherit the parent's environment, i.e.
+// run as whichever account happens to be logged in on the host.
+func captureCmdEnv(ctx context.Context, dir string, env []string, name string, args ...string) (string, error) {
+	if env == nil {
+		return "", fmt.Errorf("%s: no environment given — refusing to inherit the host's gh identity", name)
+	}
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
 func extractFirstURL(s string) string {
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimSpace(line)
@@ -2980,11 +3274,15 @@ func extractFirstURL(s string) string {
 	return ""
 }
 
+// truncate caps s at n runes without splitting a multi-byte character. Its
+// callers cut text a human then reads (issue bodies into PR bodies, gh output
+// and error strings into the Linear thread), so a byte cut would emit invalid
+// UTF-8 for any CJK or emoji input.
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+	if r := []rune(s); len(r) > n {
+		return string(r[:n]) + "..."
 	}
-	return s[:n] + "..."
+	return s
 }
 
 // relativeTime returns a human-friendly relative time string from an RFC3339
@@ -3298,7 +3596,11 @@ func (f *flow) addInconsistencyFooter(ctx context.Context) error {
 	footer := fmt.Sprintf("\n---\n\n> **Linear thread inconsistency**: admiral failed to post the final response activity to Linear thread (session: %q). The task itself completed successfully. Check admiral logs around %q for `final_activity_push_failed`.", f.ev.SessionID, timestamp)
 
 	// Get current PR body via gh pr view.
-	out, err := captureCmd(ctx, f.repoDir, f.o.cfg.GhBin, "pr", "view", extractPRNumber(f.prURL), "--json", "body", "--jq", ".body")
+	env, err := f.ghEnv(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
+	}
+	out, err := captureCmdEnv(ctx, f.repoDir, env, f.o.cfg.GhBin, "pr", "view", extractPRNumber(f.prURL), "--json", "body", "--jq", ".body")
 	if err != nil {
 		f.o.logger.Warn("pr_view_for_footer_failed", "err", err, "pr", f.prURL)
 		return err
@@ -3306,7 +3608,7 @@ func (f *flow) addInconsistencyFooter(ctx context.Context) error {
 	currentBody := strings.TrimSpace(out)
 	newBody := currentBody + footer
 
-	_, err = captureCmd(ctx, f.repoDir, f.o.cfg.GhBin, "pr", "edit", extractPRNumber(f.prURL), "--body", newBody)
+	_, err = captureCmdEnv(ctx, f.repoDir, env, f.o.cfg.GhBin, "pr", "edit", extractPRNumber(f.prURL), "--body", newBody)
 	if err != nil {
 		f.o.logger.Warn("pr_edit_footer_failed", "err", err, "pr", f.prURL)
 		return err
