@@ -108,6 +108,11 @@ func NewClientWithBin(bin, token string) *Client {
 func realRunCmd(ctx context.Context, extraEnv []string, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	if len(extraEnv) > 0 {
+		// os/exec dedups the child environment keeping the LAST occurrence of
+		// a key (its dedupEnv), so a token appended here overrides an
+		// inherited GH_TOKEN and exactly one reaches gh. Accounts.EnvFor
+		// strips the ambient ones outright; this caller relies on exec's
+		// dedup, which is why the appended value must stay last.
 		cmd.Env = append(os.Environ(), extraEnv...)
 	}
 	out, err := cmd.CombinedOutput()

@@ -326,16 +326,11 @@ func (o *Orchestrator) runVerify(parentID string) {
 	mat, repoDir, teamID, projectID, verifyCmd, err := o.gatherVerifyMaterial(ctx, parentID)
 	if err != nil {
 		o.logger.Error("verify_gather_failed", "parent", parentID, "err", err)
-		// A repo with no gh account is deterministic, so the parent is told
-		// how to fix it. Escalation is terminal for the parent
-		// (HandleVerifyEvent skips non-active rows and the boot rescan only
-		// re-enqueues rounds==1 rows), so a transient failure — Linear 5xx, a
-		// contended keyring — must NOT take it: the round is logged and the
-		// verification stays active for the next trigger (cascade or a manual
-		// re-run).
-		if isGhUserUnset(err) {
-			o.escalateVerifyWithReason(ctx, parentID, fmt.Sprintf("admiral: cannot verify — %v", err))
-		}
+		// Gathering does not touch GitHub any more (the PR client is built
+		// lazily, per sub with a PR), so a gh-account problem cannot surface
+		// here — only Linear/store failures, which are transient and must not
+		// take the terminal escalation path. The identity refusal happens at
+		// the env gate below, which escalates for the deterministic case.
 		return
 	}
 
