@@ -1,4 +1,4 @@
-package autopilot
+package github
 
 import (
 	"bytes"
@@ -19,24 +19,36 @@ const ghHost = "github.com"
 // ghValidateTimeout bounds one ValidateRepoDir call (token lookup + API).
 const ghValidateTimeout = 30 * time.Second
 
-// ghEnvRunner runs the gh binary with args. env is the complete child
+// Runner runs the gh binary with args. env is the complete child
 // environment (nil = inherit). It returns stdout on success, and stdout plus
 // stderr on failure (for error messages). Tests substitute a fake.
-type ghEnvRunner func(ctx context.Context, env []string, args ...string) (string, error)
+type Runner func(ctx context.Context, env []string, args ...string) (string, error)
 
-// ghAccounts resolves a repo's configured gh account (repos.gh_user) to a
+// Accounts resolves a repo's configured gh account (repos.gh_user) to a
 // token and validates that the account can push to the repo. Tokens are
 // read from the gh keyring on every call and never cached or persisted.
-type ghAccounts struct {
+type Accounts struct {
 	bin string
-	run ghEnvRunner
+	run Runner
 }
 
-func newGhAccounts(bin string) *ghAccounts {
-	return &ghAccounts{bin: bin}
+// NewAccounts builds an Accounts that shells out to the gh binary at bin
+// ("gh" resolves through PATH). An empty bin means "gh".
+func NewAccounts(bin string) *Accounts {
+	if bin == "" {
+		bin = "gh"
+	}
+	return &Accounts{bin: bin}
 }
 
-func (a *ghAccounts) gh(ctx context.Context, env []string, args ...string) (string, error) {
+// NewAccountsWithRunner builds an Accounts whose gh invocations go through
+// run instead of the real binary. For tests in other packages that need to
+// fake the gh CLI.
+func NewAccountsWithRunner(bin string, run Runner) *Accounts {
+	return &Accounts{bin: bin, run: run}
+}
+
+func (a *Accounts) gh(ctx context.Context, env []string, args ...string) (string, error) {
 	if a.run != nil {
 		return a.run(ctx, env, args...)
 	}
@@ -54,23 +66,42 @@ func (a *ghAccounts) gh(ctx context.Context, env []string, args ...string) (stri
 
 // Token returns the OAuth token gh holds for user in its keyring. With -u,
 // gh ignores any GH_TOKEN in the environment.
-func (a *ghAccounts) Token(ctx context.Context, user string) (string, error) {
+func (a *Accounts) Token(ctx context.Context, user string) (string, error) {
+	user = strings.TrimSpace(user)
+	if user == "" {
+		return "", ErrGhUserRequired
+	}
 	out, err := a.gh(ctx, nil, "auth", "token", "-h", ghHost, "-u", user)
 	tok := strings.TrimSpace(out)
 	if err != nil || tok == "" {
 		return "", fmt.Errorf("cannot get a token for gh account %q (not logged in? run `gh auth login -h %s` and sign in as %s): %s",
-			user, ghHost, user, truncateRunes(tok, 200))
+			user, ghHost, user, truncate(tok, 200))
 	}
 	return tok, nil
+}
+
+// EnvFor returns the environment a gh subprocess must run under to
+// authenticate as user: the host environment with every ambient token
+// variable stripped, plus GH_TOKEN pinned to that account's token.
+//
+// The token is read from the keyring on every call and never cached, so a
+// re-login (or a rotated credential) takes effect on the next call without
+// restarting admiral.
+func (a *Accounts) EnvFor(ctx context.Context, user string) ([]string, error) {
+	tok, err := a.Token(ctx, user)
+	if err != nil {
+		return nil, err
+	}
+	return append(stripGhTokenEnv(os.Environ()), "GH_TOKEN="+tok), nil
 }
 
 // ValidateRepoAccess checks that user is logged in to gh and has push
 // permission on the GitHub repo originURL points at. The returned error
 // says which of the two is missing.
-func (a *ghAccounts) ValidateRepoAccess(ctx context.Context, user, originURL string) error {
+func (a *Accounts) ValidateRepoAccess(ctx context.Context, user, originURL string) error {
 	user = strings.TrimSpace(user)
 	if user == "" {
-		return errGhUserRequired
+		return ErrGhUserRequired
 	}
 	owner, name, ok := parseGitHubRepo(originURL)
 	if !ok {
@@ -84,7 +115,7 @@ func (a *ghAccounts) ValidateRepoAccess(ctx context.Context, user, originURL str
 	out, err := a.gh(ctx, env, "api", "--hostname", ghHost, "repos/"+owner+"/"+name, "--jq", ".permissions.push")
 	if err != nil {
 		return fmt.Errorf("gh account %q cannot see %s/%s (not a collaborator, or the repo does not exist): %s",
-			user, owner, name, truncateRunes(strings.TrimSpace(out), 200))
+			user, owner, name, truncate(strings.TrimSpace(out), 200))
 	}
 	if strings.TrimSpace(out) != "true" {
 		return fmt.Errorf("gh account %q has no push permission on %s/%s", user, owner, name)
@@ -92,7 +123,10 @@ func (a *ghAccounts) ValidateRepoAccess(ctx context.Context, user, originURL str
 	return nil
 }
 
-var errGhUserRequired = fmt.Errorf("gh_user is required: the gh account admiral uses for this repo (see `gh auth status`)")
+// ErrGhUserRequired is returned when a repo has no gh account registered.
+// admiral refuses to act on a repo whose GitHub identity is unknown rather
+// than falling back to whatever account happens to be active on the host.
+var ErrGhUserRequired = fmt.Errorf("gh_user is required: the gh account admiral uses for this repo (see `gh auth status`)")
 
 // stripGhTokenEnv drops the env vars gh reads a token from, so the token
 // admiral passes (or the keyring lookup) is the only identity in play.
@@ -146,16 +180,16 @@ func repoOriginURL(ctx context.Context, repoDir string) (string, error) {
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("read origin of %s: %w (%s)", repoDir, err, truncateRunes(strings.TrimSpace(stderr.String()), 200))
+		return "", fmt.Errorf("read origin of %s: %w (%s)", repoDir, err, truncate(strings.TrimSpace(stderr.String()), 200))
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
 // ValidateRepoDir is ValidateRepoAccess against repoDir's origin remote,
 // bounded by ghValidateTimeout.
-func (a *ghAccounts) ValidateRepoDir(ctx context.Context, user, repoDir string) error {
+func (a *Accounts) ValidateRepoDir(ctx context.Context, user, repoDir string) error {
 	if strings.TrimSpace(user) == "" {
-		return errGhUserRequired
+		return ErrGhUserRequired
 	}
 	ctx, cancel := context.WithTimeout(ctx, ghValidateTimeout)
 	defer cancel()
@@ -167,16 +201,8 @@ func (a *ghAccounts) ValidateRepoDir(ctx context.Context, user, repoDir string) 
 }
 
 // NewRepoGhUserValidator returns the registration check (see
-// ghAccounts.ValidateRepoDir) for callers outside the package, i.e. the
+// Accounts.ValidateRepoDir) for callers outside the package, i.e. the
 // boot-time config seed.
 func NewRepoGhUserValidator(ghBin string) func(ctx context.Context, ghUser, repoDir string) error {
-	return newGhAccounts(ghBin).ValidateRepoDir
-}
-
-// truncateRunes caps s at n runes without splitting a multi-byte character.
-func truncateRunes(s string, n int) string {
-	if r := []rune(s); len(r) > n {
-		return string(r[:n]) + "..."
-	}
-	return s
+	return NewAccounts(ghBin).ValidateRepoDir
 }

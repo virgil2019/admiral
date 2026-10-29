@@ -580,3 +580,61 @@ func TestAdvanceSkipsWhenPRClientNil(t *testing.T) {
 		t.Errorf("expected no API calls when pr client nil, got %+v", lc.issueUpdates)
 	}
 }
+
+// TestAdvanceUsesRepoGhAccount: the PR lookup runs as the account the repo
+// registered, never as whichever account is active on the host.
+func TestAdvanceUsesRepoGhAccount(t *testing.T) {
+	prURL := newPRURL()
+	task := newGEOTaskDone(prURL)
+	ts := newFakeStore()
+	ts.tasksByState[task.IssueID] = &task
+	ts.repos = map[string]*store.Repo{
+		"proj-A": {ProjectID: "proj-A", GhUser: "virgil2019"},
+	}
+
+	lc := &fakeLinear{}
+	lc.issues = map[string]*linear.Issue{"iss-A": newGEOIssue("In Progress")}
+	seedTeamGEO(lc)
+
+	pr := &fakePR{statuses: map[string]PRStatus{
+		prURL: {State: "MERGED", MergedAt: "2026-05-25T06:00:00Z"},
+	}}
+
+	svc := newSvcWithPR(Config{AdmiralUserID: "u-1"}, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if len(pr.ghUsers) != 1 || pr.ghUsers[0] != "virgil2019" {
+		t.Fatalf("expected the PR lookup to run as virgil2019; got %v", pr.ghUsers)
+	}
+}
+
+// TestAdvanceSkipsWhenRepoHasNoGhAccount: with no account registered for
+// the repo, the discoverer has no identity to act as. It must skip the
+// GitHub call rather than run it as the host's active account.
+func TestAdvanceSkipsWhenRepoHasNoGhAccount(t *testing.T) {
+	prURL := newPRURL()
+	task := newGEOTaskDone(prURL)
+	ts := newFakeStore()
+	ts.tasksByState[task.IssueID] = &task
+	ts.repos = map[string]*store.Repo{
+		"proj-A": {ProjectID: "proj-A"},
+	}
+
+	lc := &fakeLinear{}
+	lc.issues = map[string]*linear.Issue{"iss-A": newGEOIssue("In Progress")}
+	seedTeamGEO(lc)
+
+	pr := &fakePR{statuses: map[string]PRStatus{
+		prURL: {State: "MERGED", MergedAt: "2026-05-25T06:00:00Z"},
+	}}
+
+	svc := newSvcWithPR(Config{AdmiralUserID: "u-1"}, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if len(pr.ghUsers) != 0 {
+		t.Fatalf("expected no GitHub call without a registered account; got %d call(s) as %q", len(pr.ghUsers), pr.ghUsers)
+	}
+	if len(lc.issueUpdates) != 0 {
+		t.Fatalf("expected no Linear state change without a registered account; got %+v", lc.issueUpdates)
+	}
+}

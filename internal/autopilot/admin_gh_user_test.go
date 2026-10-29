@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/store"
 )
 
@@ -43,7 +44,7 @@ func newGhUserTestServer(t *testing.T) (*adminServer, *store.Store, *http.ServeM
 	}
 
 	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "", "")
-	as.gh = &ghAccounts{bin: "gh", run: fakeGhAccountsRunner(ghUserTestAccounts)}
+	as.gh = ghpkg.NewAccountsWithRunner("gh", fakeGhAccountsRunner(ghUserTestAccounts))
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 	return as, s, mux, gitDir

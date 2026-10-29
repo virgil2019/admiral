@@ -73,7 +73,6 @@ func main() {
 	}
 
 	judgeEnabled := cfg.Discoverer.Judge.Enabled != nil && *cfg.Discoverer.Judge.Enabled
-	ghClient := ghpkg.NewClient(cfg.Autopilot.GhToken)
 	svc := discoverer.New(discoverer.Config{
 		PollInterval:    cfg.Discoverer.PollInterval,
 		StateTypes:      cfg.Discoverer.StateTypes,
@@ -90,7 +89,7 @@ func main() {
 			Reviewed: cfg.Discoverer.LinearStates.Reviewed,
 		},
 		AutoMerge: cfg.Discoverer.AutoMerge,
-	}, lc, &prAdapter{c: ghClient}, db, nil, logger)
+	}, lc, &prAdapter{accounts: ghpkg.NewAccounts(cfg.Autopilot.GhBin)}, db, nil, logger)
 	// Boot-time recovery for verify rows left behind by historical
 	// failures (e.g. the GEO-267 argv-overflow incident — PR #187
 	// fixed the bug, this re-enqueues the rows that were stranded).
@@ -125,12 +124,29 @@ func parseLevel(lvl string) slog.Level {
 // prClient interface, keeping the discoverer package free of an
 // internal/github import. When the discoverer is split off into its
 // own repo, the adapter is the only piece that has to move with it.
+//
+// Every call builds a client for the gh account the repo registered
+// (repos.gh_user): the token is read from the gh keyring per call and never
+// cached, so admiral acts as that account — never as whichever one happens
+// to be active on the host.
 type prAdapter struct {
-	c *ghpkg.Client
+	accounts *ghpkg.Accounts
 }
 
-func (a *prAdapter) GetPRStatus(ctx context.Context, prURL string) (discoverer.PRStatus, error) {
-	s, err := a.c.GetPRStatus(ctx, prURL)
+func (a *prAdapter) clientFor(ctx context.Context, ghUser string) (*ghpkg.Client, error) {
+	tok, err := a.accounts.Token(ctx, ghUser)
+	if err != nil {
+		return nil, fmt.Errorf("resolve gh account %q: %w", ghUser, err)
+	}
+	return ghpkg.NewClient(tok), nil
+}
+
+func (a *prAdapter) GetPRStatus(ctx context.Context, prURL, ghUser string) (discoverer.PRStatus, error) {
+	c, err := a.clientFor(ctx, ghUser)
+	if err != nil {
+		return discoverer.PRStatus{}, err
+	}
+	s, err := c.GetPRStatus(ctx, prURL)
 	if err != nil {
 		return discoverer.PRStatus{}, err
 	}
@@ -143,8 +159,12 @@ func (a *prAdapter) GetPRStatus(ctx context.Context, prURL string) (discoverer.P
 	}, nil
 }
 
-func (a *prAdapter) MergePR(ctx context.Context, prURL string) error {
-	return a.c.MergePR(ctx, prURL)
+func (a *prAdapter) MergePR(ctx context.Context, prURL, ghUser string) error {
+	c, err := a.clientFor(ctx, ghUser)
+	if err != nil {
+		return err
+	}
+	return c.MergePR(ctx, prURL)
 }
 
 func newLogger(c config.Logging) *slog.Logger {

@@ -467,9 +467,11 @@ func isPRNotResolvable(out string) bool {
 		strings.Contains(low, "graphql: could not resolve")
 }
 
+// truncate caps s at n runes without splitting a multi-byte character —
+// gh output can contain any UTF-8, and a byte cut would emit invalid runes.
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+	if r := []rune(s); len(r) > n {
+		return string(r[:n]) + "..."
 	}
-	return s[:n] + "..."
+	return s
 }

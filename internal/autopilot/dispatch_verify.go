@@ -478,6 +478,12 @@ func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string
 	if repo == nil {
 		return verifyMaterial{}, "", "", "", "", fmt.Errorf("no repo configured for project %s", parent.ProjectID)
 	}
+	// The diffs come from GitHub as the repo's registered gh account, not as
+	// whichever account happens to be active on the host.
+	client, err := o.prClientFor(ctx, repo)
+	if err != nil {
+		return verifyMaterial{}, "", "", "", "", fmt.Errorf("resolve gh identity for project %s: %w", parent.ProjectID, err)
+	}
 	subs, err := o.lc.GetSubIssues(ctx, parentID)
 	if err != nil {
 		return verifyMaterial{}, "", "", "", "", fmt.Errorf("get sub-issues: %w", err)
@@ -499,7 +505,7 @@ func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string
 		}
 		if task, terr := o.db.GetAdmiralTaskByIssue(sub.ID); terr == nil && task != nil && task.PRURL != "" {
 			sm.PRURL = task.PRURL
-			if diff, derr := o.prClient.GetDiff(ctx, task.PRURL); derr == nil {
+			if diff, derr := client.GetDiff(ctx, task.PRURL); derr == nil {
 				sm.Diff = diff
 			} else {
 				o.logger.Warn("verify_get_diff_failed",

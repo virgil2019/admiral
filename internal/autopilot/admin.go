@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
@@ -40,7 +41,7 @@ type adminServer struct {
 	workers      int
 	adminToken   string
 	requireLabel string // discoverer.require_label; dropped from subs on reset-task
-	gh           *ghAccounts
+	gh           *ghpkg.Accounts
 }
 
 // adminRepoResponse is the JSON shape for /admin/repos.
@@ -125,7 +126,7 @@ type testCloneResponse struct {
 }
 
 func newAdminServer(db *store.Store, lc *linear.Client, ghBin string, logger *slog.Logger, workers int, adminToken, requireLabel string) *adminServer {
-	return &adminServer{db: db, lc: lc, ghBin: ghBin, logger: logger, start: time.Now(), workers: workers, adminToken: adminToken, requireLabel: requireLabel, gh: newGhAccounts(ghBin)}
+	return &adminServer{db: db, lc: lc, ghBin: ghBin, logger: logger, start: time.Now(), workers: workers, adminToken: adminToken, requireLabel: requireLabel, gh: ghpkg.NewAccounts(ghBin)}
 }
 
 // projectFilterCookie is the name of the cookie that scopes the admin UI
@@ -181,6 +182,32 @@ func writeJSONError(w http.ResponseWriter, code int, msg string) {
 // that fail this.
 func (s *adminServer) validateGhUser(ctx context.Context, ghUser, repoDir string) error {
 	return s.gh.ValidateRepoDir(ctx, ghUser, repoDir)
+}
+
+// ghEnvForIssue resolves the gh account registered for the repo of the
+// issue's Linear project and returns the environment gh commands must run
+// under. Fails when the repo has no account registered — the admin API never
+// falls back to whichever account happens to be active on the host.
+func (s *adminServer) ghEnvForIssue(ctx context.Context, issueID string) ([]string, error) {
+	if s.lc == nil {
+		return nil, fmt.Errorf("linear client not configured")
+	}
+	issue, err := s.lc.GetIssue(ctx, issueID)
+	if err != nil {
+		return nil, fmt.Errorf("get issue: %w", err)
+	}
+	repo, err := s.db.GetRepoByProjectID(issue.ProjectID)
+	if err != nil {
+		return nil, fmt.Errorf("get repo for project %s: %w", issue.ProjectID, err)
+	}
+	if repo == nil {
+		return nil, fmt.Errorf("no repo configured for project %s", issue.ProjectID)
+	}
+	ghUser := strings.TrimSpace(repo.GhUser)
+	if ghUser == "" {
+		return nil, errGhUserUnset(issue.ProjectID)
+	}
+	return s.gh.EnvFor(ctx, ghUser)
 }
 
 func (s *adminServer) listJobsHandler(w http.ResponseWriter, r *http.Request) {

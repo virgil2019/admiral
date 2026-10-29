@@ -189,15 +189,6 @@ type Autopilot struct {
 	// GhBin is the absolute path to the `gh` CLI used for the PR fallback.
 	// Default: "gh" (PATH).
 	GhBin string `yaml:"gh_bin"`
-	// GhUser is the GitHub username of the account running admiral (used to
-	// distinguish admiral-authored PRs from human-authored ones in the
-	// open-PR short-circuit). Default: the login from `gh auth status`.
-	GhUser string `yaml:"gh_user"`
-	// GhToken is the personal access token admiral uses when posting PR
-	// comments and fetching PR state/diff. Empty inherits host gh auth,
-	// which is acceptable for local runs but not recommended in production
-	// (admiral's bot identity would be ambiguous).
-	GhToken string `yaml:"gh_token"`
 	// GhWebhookSecret is the HMAC-SHA256 signing secret configured on the
 	// GitHub webhook. Empty disables signature verification (only suitable
 	// for local dev/testing).
@@ -451,7 +442,40 @@ func parse(path string) (*Config, error) {
 	if err := yaml.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	if err := rejectRemovedAutopilotKeys(raw, path); err != nil {
+		return nil, err
+	}
 	return &c, nil
+}
+
+// removedAutopilotKeys are the autopilot-block keys that no longer exist.
+// The GitHub identity is configured per repo (autopilot.repos[].gh_user),
+// so a global account or token would either be ignored or — worse — look
+// like it still configured admiral's identity.
+var removedAutopilotKeys = map[string]string{
+	"ghuser":  "the GitHub account is configured per repo",
+	"ghtoken": "the GitHub token is read from the gh keyring of the repo's account",
+}
+
+// rejectRemovedAutopilotKeys fails when the config still carries a removed
+// autopilot key. Plain yaml.Unmarshal ignores unknown keys, so without this
+// probe a stale autopilot.gh_token would silently do nothing while the
+// operator believes it configures admiral's GitHub identity.
+func rejectRemovedAutopilotKeys(raw []byte, path string) error {
+	var doc struct {
+		Autopilot map[string]any `yaml:"autopilot"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	for key := range doc.Autopilot {
+		norm := strings.ToLower(strings.ReplaceAll(key, "_", ""))
+		if hint, removed := removedAutopilotKeys[norm]; removed {
+			return fmt.Errorf("autopilot.%s in %s has been removed: %s — configure the account per repo (autopilot.repos[].gh_user, or PATCH /admin/repos/<project_id> {\"gh_user\":\"<github-login>\"})",
+				key, path, hint)
+		}
+	}
+	return nil
 }
 
 func (c *Config) validateAutopilotAndExpand() error {

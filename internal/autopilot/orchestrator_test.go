@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -598,9 +599,11 @@ type mockStore struct {
 	LastUpdatedJob *store.AutopilotJob
 
 	// Repo to return from GetRepoByProjectID; if RepoErr is non-nil it is
-	// returned instead.
-	Repo    *store.Repo
-	RepoErr error
+	// returned instead. A repo without GhUser gets the default test account
+	// unless RepoNoGhUser is set.
+	Repo         *store.Repo
+	RepoErr      error
+	RepoNoGhUser bool
 
 	// ListJobsByIssueAndStates override
 	ListJobsByIssueAndStatesResult []store.AutopilotJob
@@ -616,6 +619,10 @@ type mockStore struct {
 	// UpdateAutopilotJob, in call order. Useful for asserting the
 	// markAlreadyMerged path updated the new session.
 	UpdatedSessionIDs []string
+
+	// StateTransitions records every admiral_tasks state the mock saw, in
+	// order.
+	StateTransitions []string
 
 	// Blocker-related fields
 	SetBlockedCalls     []string // issueIDs passed to SetAdmiralTaskBlocked
@@ -748,8 +755,19 @@ func (m *mockStore) UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask
 	m.UpdatedAdmiralIssues = append(m.UpdatedAdmiralIssues, issueID)
 	if m.LiveAdmiralTask != nil {
 		fn(m.LiveAdmiralTask)
+		m.StateTransitions = append(m.StateTransitions, m.LiveAdmiralTask.State)
 	}
 	return m.UpdateAdmiralTaskErr
+}
+
+// StateTransitionSnapshot returns the admiral_tasks states the mock observed,
+// in order. Tests assert on the sequence (e.g. "the /fix run entered
+// EXECUTING") rather than sampling the instantaneous state, which races with
+// the run goroutine.
+func (m *mockStore) StateTransitionSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.StateTransitions)
 }
 
 // LiveAdmiralSnapshot returns a copy of LiveAdmiralTask read under m.mu so
@@ -780,7 +798,17 @@ func (m *mockStore) MoveAdmiralTaskToHistoryAndClaimNew(issueID, reason, identif
 }
 
 func (m *mockStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
-	return m.Repo, m.RepoErr
+	if m.RepoErr != nil {
+		return nil, m.RepoErr
+	}
+	if m.Repo == nil || m.Repo.GhUser != "" || m.RepoNoGhUser {
+		return m.Repo, nil
+	}
+	// Copy rather than mutate: the same *store.Repo is shared across the
+	// mock's callers.
+	cp := *m.Repo
+	cp.GhUser = defaultTestGhUser
+	return &cp, nil
 }
 
 func (m *mockStore) ListJobsByIssueAndStates(issueID string, states []string) ([]store.AutopilotJob, error) {
@@ -938,10 +966,34 @@ type fakeGhProbe struct {
 	mergedCalls int32
 	stateCalls  int32
 	openPRCalls int32
+
+	// envs records the environment each gh call was made with, so tests
+	// can assert the run authenticated as the repo's registered account.
+	envMu sync.Mutex
+	envs  [][]string
 }
 
-func (f *fakeGhProbe) FindMergedPRForBranch(_ context.Context, _, branch string) (string, string, bool, error) {
+func (f *fakeGhProbe) recordEnv(env []string) {
+	f.envMu.Lock()
+	defer f.envMu.Unlock()
+	f.envs = append(f.envs, env)
+}
+
+// Environments returns the environments the gh calls were made with.
+func (f *fakeGhProbe) Environments() [][]string {
+	f.envMu.Lock()
+	defer f.envMu.Unlock()
+	return append([][]string(nil), f.envs...)
+}
+
+// TotalCalls returns how many gh calls the probe served.
+func (f *fakeGhProbe) TotalCalls() int {
+	return int(atomic.LoadInt32(&f.mergedCalls) + atomic.LoadInt32(&f.stateCalls) + atomic.LoadInt32(&f.openPRCalls))
+}
+
+func (f *fakeGhProbe) FindMergedPRForBranch(_ context.Context, _, branch string, env []string) (string, string, bool, error) {
 	atomic.AddInt32(&f.mergedCalls, 1)
+	f.recordEnv(env)
 	if f.mergedErr != nil {
 		return "", "", false, f.mergedErr
 	}
@@ -951,16 +1003,18 @@ func (f *fakeGhProbe) FindMergedPRForBranch(_ context.Context, _, branch string)
 	return "", "", false, nil
 }
 
-func (f *fakeGhProbe) PRState(_ context.Context, prURL string) (string, error) {
+func (f *fakeGhProbe) PRState(_ context.Context, prURL string, env []string) (string, error) {
 	atomic.AddInt32(&f.stateCalls, 1)
+	f.recordEnv(env)
 	if f.stateErr != nil {
 		return "", f.stateErr
 	}
 	return f.stateByURL[prURL], nil
 }
 
-func (f *fakeGhProbe) FindOpenPRForBranch(_ context.Context, _, branch string) (string, string, bool, error) {
+func (f *fakeGhProbe) FindOpenPRForBranch(_ context.Context, _, branch string, env []string) (string, string, bool, error) {
 	atomic.AddInt32(&f.openPRCalls, 1)
+	f.recordEnv(env)
 	if f.openPRErr != nil {
 		return "", "", false, f.openPRErr
 	}
@@ -1302,11 +1356,12 @@ func newTestOrchestrator(t *testing.T, ms *mockStore, mlc *mockLinearClient, gh 
 		}
 	}
 	return &Orchestrator{
-		cfg:    &config.Autopilot{MaxRunSeconds: 60},
-		db:     ms,
-		lc:     mlc,
-		gh:     gh,
-		logger: slog.Default(),
+		cfg:      &config.Autopilot{MaxRunSeconds: 60},
+		db:       ms,
+		lc:       mlc,
+		gh:       gh,
+		accounts: fakeAccounts(),
+		logger:   slog.Default(),
 	}
 }
 
@@ -2388,11 +2443,12 @@ func TestFlowExecute_ShortCircuits_WhenBranchAlreadyMerged(t *testing.T) {
 		},
 	}
 	o := &Orchestrator{
-		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
-		db:     ms,
-		lc:     mlc,
-		gh:     gh,
-		logger: slog.Default(),
+		cfg:      &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:       ms,
+		lc:       mlc,
+		gh:       gh,
+		accounts: fakeAccounts(),
+		logger:   slog.Default(),
 	}
 	ev := linear.AgentEvent{
 		SessionID:       "session-merged-check",
@@ -2460,11 +2516,12 @@ func TestFlowExecute_DoesNotShortCircuit_OnFollowupSuffix(t *testing.T) {
 		},
 	}
 	o := &Orchestrator{
-		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
-		db:     ms,
-		lc:     mlc,
-		gh:     gh,
-		logger: slog.Default(),
+		cfg:      &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:       ms,
+		lc:       mlc,
+		gh:       gh,
+		accounts: fakeAccounts(),
+		logger:   slog.Default(),
 	}
 	ev := linear.AgentEvent{
 		SessionID:       "follow-session",
@@ -2519,12 +2576,12 @@ func TestFlowExecute_ShortCircuits_WhenActiveSessionExists(t *testing.T) {
 	}
 	gh := &fakeGhProbe{}
 	o := &Orchestrator{
-		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
-		db:     ms,
-		lc:     mlc,
-		gh:     gh,
-		ghUser: "admiral",
-		logger: slog.Default(),
+		cfg:      &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:       ms,
+		lc:       mlc,
+		gh:       gh,
+		accounts: fakeAccounts(),
+		logger:   slog.Default(),
 	}
 	ev := linear.AgentEvent{
 		SessionID:       "session-new",
@@ -2595,12 +2652,12 @@ func TestFlowExecute_ShortCircuits_WhenOpenPRByAnotherAuthor(t *testing.T) {
 		},
 	}
 	o := &Orchestrator{
-		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
-		db:     ms,
-		lc:     mlc,
-		gh:     gh,
-		ghUser: "admiral", // not "georgexu"
-		logger: slog.Default(),
+		cfg:      &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:       ms,
+		lc:       mlc,
+		gh:       gh,
+		accounts: fakeAccounts(),
+		logger:   slog.Default(),
 	}
 	ev := linear.AgentEvent{
 		SessionID:       "session-human-pr",
@@ -2672,12 +2729,12 @@ func TestFlowExecute_DoesNotShortCircuit_WhenOpenPRByAdmiral(t *testing.T) {
 		},
 	}
 	o := &Orchestrator{
-		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
-		db:     ms,
-		lc:     mlc,
-		gh:     gh,
-		ghUser: "admiral",
-		logger: slog.Default(),
+		cfg:      &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:       ms,
+		lc:       mlc,
+		gh:       gh,
+		accounts: fakeAccounts(),
+		logger:   slog.Default(),
 	}
 	ev := linear.AgentEvent{
 		SessionID:       "session-admiral-pr",
@@ -2729,12 +2786,12 @@ func TestFlowExecute_DoesNotShortCircuit_WhenNoOpenPR(t *testing.T) {
 	}
 	gh := &fakeGhProbe{} // no open PRs at all
 	o := &Orchestrator{
-		cfg:    &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
-		db:     ms,
-		lc:     mlc,
-		gh:     gh,
-		ghUser: "admiral",
-		logger: slog.Default(),
+		cfg:      &config.Autopilot{MaxRunSeconds: 60, WorktreeRoot: ".worktrees"},
+		db:       ms,
+		lc:       mlc,
+		gh:       gh,
+		accounts: fakeAccounts(),
+		logger:   slog.Default(),
 	}
 	ev := linear.AgentEvent{
 		SessionID:       "session-no-pr",
@@ -3661,20 +3718,21 @@ func TestDispatch_FixOnDone_DispatchesResume(t *testing.T) {
 
 	o.HandleAgentEvent(ev)
 
-	// Wait for the /fix goroutine to flip state to EXECUTING. Read
-	// LiveAdmiralSnapshot under the store's mutex so the polling loop
-	// doesn't race with UpdateAdmiralTask's fn() writes.
+	// Wait for the /fix goroutine to flip state to EXECUTING. Assert on the
+	// recorded transition sequence rather than the instantaneous state: the
+	// run fails fast in this test (the issue fetch is short-circuited), so
+	// sampling the live state races with the goroutine.
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if ms.LiveAdmiralSnapshot().State == store.JobStateExecuting {
+		if slices.Contains(ms.StateTransitionSnapshot(), store.JobStateExecuting) {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	snap := ms.LiveAdmiralSnapshot()
-	if snap.State != store.JobStateExecuting {
-		t.Errorf("expected admiral_tasks.state EXECUTING during /fix run; got %q", snap.State)
+	if transitions := ms.StateTransitionSnapshot(); !slices.Contains(transitions, store.JobStateExecuting) {
+		t.Errorf("expected admiral_tasks to transition to EXECUTING during /fix run; got %v", transitions)
 	}
+	snap := ms.LiveAdmiralSnapshot()
 	if snap.AttemptN != 1 {
 		t.Errorf("/fix must not increment attempt_n; got %d", snap.AttemptN)
 	}
@@ -3899,18 +3957,19 @@ func TestDispatch_FixViaPrompted_DispatchesResume(t *testing.T) {
 
 	o.HandleAgentEvent(ev)
 
-	// Read state via the locked snapshot helper so this polling loop
-	// doesn't race with UpdateAdmiralTask's fn() writes from the
-	// dispatched /fix goroutine.
+	// Assert on the recorded transition sequence rather than the
+	// instantaneous state: the run fails fast in this test (the issue fetch
+	// is short-circuited), so sampling the live state races with the
+	// dispatched goroutine.
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if ms.LiveAdmiralSnapshot().State == store.JobStateExecuting {
+		if slices.Contains(ms.StateTransitionSnapshot(), store.JobStateExecuting) {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateExecuting {
-		t.Errorf("/fix-via-thread must transition admiral_tasks to EXECUTING; got %q", got)
+	if transitions := ms.StateTransitionSnapshot(); !slices.Contains(transitions, store.JobStateExecuting) {
+		t.Errorf("/fix-via-thread must transition admiral_tasks to EXECUTING; got %v", transitions)
 	}
 }
 

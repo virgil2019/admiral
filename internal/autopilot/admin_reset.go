@@ -139,8 +139,17 @@ func (s *adminServer) resetTaskHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
 
+	// The reset closes PRs and deletes branches on GitHub — it runs as the
+	// account the repo registered, not as whichever account is active on
+	// the host. Resolved once, before any gh call.
+	env, err := s.ghEnvForIssue(ctx, strings.TrimSpace(req.Parent))
+	if err != nil {
+		s.logger.Warn("admin_reset_resolve_identity_failed", "parent", req.Parent, "err", err)
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		return
+	}
 	gh := func(ctx context.Context, args ...string) (string, error) {
-		return captureCmd(ctx, "", s.ghBin, args...)
+		return captureCmdEnv(ctx, "", env, s.ghBin, args...)
 	}
 	resp, err := runResetTask(ctx, s.lc, gh, s.db, s.requireLabel, s.logger, strings.TrimSpace(req.Parent))
 	if err != nil {

@@ -12,6 +12,10 @@ import (
 // lookups). The default production implementation shells out to gh; tests
 // inject fakes via fakeGhProbe in the _test files.
 //
+// env is the complete child environment for the gh call — it pins the repo's
+// registered gh account so the probe never runs as whichever account happens
+// to be active on the host.
+//
 // "Found" semantics: callers distinguish "no such PR / branch exists but no
 // PR" (found=false, err=nil) from "couldn't reach gh / network error"
 // (err non-nil). Production shellouts coerce common gh exit codes to the
@@ -20,17 +24,17 @@ type ghProbe interface {
 	// FindMergedPRForBranch looks up the most recent merged PR whose head
 	// branch matches the given name in the repo at repoDir. Returns the PR
 	// url and the merge commit SHA when found.
-	FindMergedPRForBranch(ctx context.Context, repoDir, branch string) (url, mergeSHA string, found bool, err error)
+	FindMergedPRForBranch(ctx context.Context, repoDir, branch string, env []string) (url, mergeSHA string, found bool, err error)
 
 	// PRState returns the lifecycle state of a PR by URL: "OPEN", "MERGED",
 	// "CLOSED", or "" when the PR can't be located. Errors are returned
 	// only for unexpected failures.
-	PRState(ctx context.Context, prURL string) (state string, err error)
+	PRState(ctx context.Context, prURL string, env []string) (state string, err error)
 
 	// FindOpenPRForBranch looks up the most recent open PR whose head branch
 	// matches the given name. Returns the PR url, author login, and head
 	// ref name when found.
-	FindOpenPRForBranch(ctx context.Context, repoDir, branch string) (url, author string, found bool, err error)
+	FindOpenPRForBranch(ctx context.Context, repoDir, branch string, env []string) (url, author string, found bool, err error)
 }
 
 // ghCLIProbe is the default ghProbe — a thin shell around `gh pr list` and
@@ -52,11 +56,11 @@ func newGhCLIProbe(bin string) *ghCLIProbe {
 //
 // gh prints `[]` when no PRs match, which we treat as found=false. Anything
 // else (auth error, network error, gh not installed) bubbles up as err.
-func (g *ghCLIProbe) FindMergedPRForBranch(ctx context.Context, repoDir, branch string) (string, string, bool, error) {
+func (g *ghCLIProbe) FindMergedPRForBranch(ctx context.Context, repoDir, branch string, env []string) (string, string, bool, error) {
 	if branch == "" {
 		return "", "", false, nil
 	}
-	out, err := captureCmd(ctx, repoDir, g.bin,
+	out, err := captureCmdEnv(ctx, repoDir, env, g.bin,
 		"pr", "list",
 		"--head", branch,
 		"--state", "merged",
@@ -89,11 +93,11 @@ func (g *ghCLIProbe) FindMergedPRForBranch(ctx context.Context, repoDir, branch 
 // Treats `gh: graphql: ... could not resolve to a PullRequest` as ""
 // (unlocatable) rather than a hard error so the caller can fall back to
 // fresh-flow.
-func (g *ghCLIProbe) PRState(ctx context.Context, prURL string) (string, error) {
+func (g *ghCLIProbe) PRState(ctx context.Context, prURL string, env []string) (string, error) {
 	if strings.TrimSpace(prURL) == "" {
 		return "", nil
 	}
-	out, err := captureCmd(ctx, "", g.bin, "pr", "view", prURL, "--json", "state")
+	out, err := captureCmdEnv(ctx, "", env, g.bin, "pr", "view", prURL, "--json", "state")
 	if err != nil {
 		// gh pr view returns non-zero when the PR can't be resolved (e.g.
 		// stale URL, deleted repo). The orchestrator treats this as "we
@@ -119,11 +123,11 @@ func (g *ghCLIProbe) PRState(ctx context.Context, prURL string) (string, error) 
 //
 // gh prints `[]` when no PRs match, which we treat as found=false. Anything
 // else (auth error, network error, gh not installed) bubbles up as err.
-func (g *ghCLIProbe) FindOpenPRForBranch(ctx context.Context, repoDir, branch string) (string, string, bool, error) {
+func (g *ghCLIProbe) FindOpenPRForBranch(ctx context.Context, repoDir, branch string, env []string) (string, string, bool, error) {
 	if branch == "" {
 		return "", "", false, nil
 	}
-	out, err := captureCmd(ctx, repoDir, g.bin,
+	out, err := captureCmdEnv(ctx, repoDir, env, g.bin,
 		"pr", "list",
 		"--head", branch,
 		"--state", "open",

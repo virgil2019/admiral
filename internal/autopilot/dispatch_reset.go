@@ -91,8 +91,19 @@ func (o *Orchestrator) executeReset(ev linear.AgentEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
+	// The reset closes PRs and deletes branches on GitHub — it runs as the
+	// account the repo registered, not as whichever account is active on
+	// the host. Resolved once, before any gh call: a repo with no account
+	// registered cannot be reset at all.
+	env, err := o.ghEnvForIssue(ctx, ev.IssueID)
+	if err != nil {
+		o.logger.Warn("dispatch_reset_resolve_identity_failed",
+			"issue", ev.IssueIdentifier, "err", err)
+		o.postRejection(ev.SessionID, fmt.Sprintf("admiral: reset failed: %v", err))
+		return
+	}
 	gh := func(ctx context.Context, args ...string) (string, error) {
-		return captureCmd(ctx, "", o.cfg.GhBin, args...)
+		return captureCmdEnv(ctx, "", env, o.cfg.GhBin, args...)
 	}
 	resp, err := runResetTask(ctx, o.lc, gh, o.db, o.verifyLabel, o.logger, ev.IssueID)
 	if err != nil {
