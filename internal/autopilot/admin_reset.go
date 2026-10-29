@@ -145,7 +145,13 @@ func (s *adminServer) resetTaskHandler(w http.ResponseWriter, r *http.Request) {
 	env, err := s.ghEnvForIssue(ctx, strings.TrimSpace(req.Parent))
 	if err != nil {
 		s.logger.Warn("admin_reset_resolve_identity_failed", "parent", req.Parent, "err", err)
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		// Resolving the identity reads the issue first, so an unknown parent
+		// surfaces here now; keep it a 404 rather than degrading it to 400.
+		code := http.StatusBadRequest
+		if errors.Is(err, linear.ErrIssueNotFound) {
+			code = http.StatusNotFound
+		}
+		writeJSONError(w, code, err.Error())
 		return
 	}
 	gh := func(ctx context.Context, args ...string) (string, error) {

@@ -1334,12 +1334,25 @@ func (f *flow) ghEnv(ctx context.Context) ([]string, error) {
 // host is exactly the mis-identification this gate exists to prevent. The
 // message names the exact API call that fixes it.
 func errGhUserUnset(projectID string) error {
-	projectID = strings.TrimSpace(projectID)
-	if projectID == "" {
-		return errors.New("admiral could not resolve which GitHub account to act as for this issue, so it will not start. The issue's Linear project must have a repo registered with an account (PATCH /admin/repos/<project_id> {\"gh_user\":\"<github-login>\"}; the account must be signed in via `gh auth login` and have push access to the repo's origin)")
+	return &ghUserUnsetError{projectID: strings.TrimSpace(projectID)}
+}
+
+// ghUserUnsetError / isGhUserUnset let callers tell "this repo has no gh
+// account" (deterministic — nothing retries it into working) apart from a
+// transient lookup failure, which must stay retryable.
+type ghUserUnsetError struct{ projectID string }
+
+func (e *ghUserUnsetError) Error() string {
+	if e.projectID == "" {
+		return "admiral could not resolve which GitHub account to act as for this issue, so it will not start. The issue's Linear project must have a repo registered with an account (PATCH /admin/repos/<project_id> {\"gh_user\":\"<github-login>\"}; the account must be signed in via `gh auth login` and have push access to the repo's origin)"
 	}
-	return fmt.Errorf("no GitHub account is configured for project %s, so admiral has no identity to act as and will not start. Set one with `PATCH /admin/repos/%s {\"gh_user\":\"<github-login>\"}` (the account must be signed in via `gh auth login` and have push access to the repo's origin), then re-run this issue",
-		projectID, projectID)
+	return fmt.Sprintf("no GitHub account is configured for project %s, so admiral has no identity to act as and will not start. Set one with `PATCH /admin/repos/%s {\"gh_user\":\"<github-login>\"}` (the account must be signed in via `gh auth login` and have push access to the repo's origin), then re-run this issue",
+		e.projectID, e.projectID)
+}
+
+func isGhUserUnset(err error) bool {
+	var e *ghUserUnsetError
+	return errors.As(err, &e)
 }
 
 // bindIdentity loads the repo registered for a Linear project and records the
@@ -1551,20 +1564,18 @@ func (f *flow) execute() error {
 		f.postActivity(linear.Action("build_gate",
 			fmt.Sprintf("verify_cmd=%s, max_retries=%d", f.verifyCmd, f.o.cfg.VerifyMaxRetries),
 			""))
+		// One identity for the whole gate: the build and every fix-up claude
+		// run that follows it must act as the same account.
+		gateEnv, err := f.ghEnv(f.ctx)
+		if err != nil {
+			return fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
+		}
 		claudeRunner := func(ctx context.Context, wt, retryPrompt string) (string, error) {
 			fullPrompt := retryPrompt
 			if f.o.cfg.AutopilotSkill != "" {
 				fullPrompt = "/" + f.o.cfg.AutopilotSkill + "\n\n" + retryPrompt
 			}
-			env, err := f.ghEnv(ctx)
-			if err != nil {
-				return "", fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
-			}
-			return runClaudeForReview(ctx, f.o.cfg.ClaudeBin, f.o.cfg.MaxRunSeconds, wt, fullPrompt, f.o.cfg.BotIdentity, env, f.o.logger)
-		}
-		gateEnv, err := f.ghEnv(f.ctx)
-		if err != nil {
-			return fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
+			return runClaudeForReview(ctx, f.o.cfg.ClaudeBin, f.o.cfg.MaxRunSeconds, wt, fullPrompt, f.o.cfg.BotIdentity, gateEnv, f.o.logger)
 		}
 		gate := runVerifyWithRetry(f.ctx, f.worktreePath, f.verifyCmd, f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, gateEnv, claudeRunner)
 		gateAttempts = gate.Attempts

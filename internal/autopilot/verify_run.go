@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -72,13 +71,12 @@ func runRepoVerify(ctx context.Context, repoDir, verifyCmd string, timeoutSec in
 
 	cmd := exec.CommandContext(cctx, "sh", "-c", verifyCmd)
 	cmd.Dir = repoDir
-	// verify_cmd is operator-authored and may shell out to gh, so it runs
-	// under the same identity as the rest of the run. A nil env keeps the
-	// pre-existing inherit-everything behavior for callers with no repo.
+	// env is the complete child environment (usually the repo's gh account).
+	// There is deliberately no inherit-the-host fallback: a caller that
+	// forgets to thread it must fail loudly (no PATH → the command does not
+	// even start) rather than silently run as whichever account the host
+	// happens to be logged in as.
 	cmd.Env = env
-	if cmd.Env == nil {
-		cmd.Env = os.Environ()
-	}
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 5 * time.Second
 

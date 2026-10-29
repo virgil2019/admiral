@@ -299,3 +299,32 @@ func TestRunResume_PreflightFailureDoesNotClaimTimeout(t *testing.T) {
 		t.Errorf("expected the task to stay TIMED_OUT so /resume remains retryable; got %q", live.State)
 	}
 }
+
+// TestRunVerify_TransientGatherFailureDoesNotEscalate: escalation is terminal
+// for the parent (HandleVerifyEvent skips non-active rows and the boot rescan
+// only re-enqueues active ones), so a transient lookup failure must leave the
+// verification retryable instead of closing it off.
+func TestRunVerify_TransientGatherFailureDoesNotEscalate(t *testing.T) {
+	lc := &mockLinearClient{GetIssueByID: map[string]*linear.Issue{"p1": verifyParent()}}
+	db := &mockStore{
+		Repo:    &store.Repo{RepoDir: "/repo", ProjectID: "proj-1"},
+		RepoErr: errors.New("database is locked"),
+	}
+	ran := false
+	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, func(context.Context, string, string) (string, error) {
+		ran = true
+		return "", nil
+	})
+
+	o.runVerify("p1")
+
+	if ran {
+		t.Error("the judge must not run when the material could not be gathered")
+	}
+	if len(lc.CreatedComments) != 0 {
+		t.Errorf("a transient failure must not escalate; got: %s", lc.CreatedComments[0].Body)
+	}
+	if len(db.SetStatusCalls) != 0 {
+		t.Errorf("a transient failure must not set a terminal verify status; got %v", db.SetStatusCalls)
+	}
+}

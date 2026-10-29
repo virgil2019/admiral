@@ -118,9 +118,19 @@ gh auth status     # confirm the right account is signed in
 ```
 
 The account admiral acts as is the one registered **per repo**, not whichever
-account happens to be active on the host. Register it when you add the repo
-(`gh_user` is validated against origin's push URL — it must be signed in and
-have push permission):
+account happens to be active on the host. A new repo is added with `gh_user`
+in the same call (it is validated against origin's push URL — the account must
+be signed in and have push permission):
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -X POST http://127.0.0.1:8788/admin/repos \
+  -d '{"team_id":"<linear-team-uuid>","team_name":"Engineering",
+       "repo_dir":"/home/you/code/your-repo","base_branch":"main",
+       "gh_user":"virgil2019"}'
+```
+
+An existing row is changed in place:
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" \

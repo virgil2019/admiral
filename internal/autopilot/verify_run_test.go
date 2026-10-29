@@ -11,7 +11,7 @@ import (
 
 func TestRunRepoVerify_Success(t *testing.T) {
 	dir := t.TempDir()
-	r := runRepoVerify(context.Background(), dir, "echo hello && echo world", 30, nil)
+	r := runRepoVerify(context.Background(), dir, "echo hello && echo world", 30, os.Environ())
 	if r.Err != nil {
 		t.Fatalf("Err: %v", r.Err)
 	}
@@ -30,7 +30,7 @@ func TestRunRepoVerify_NonZeroExit(t *testing.T) {
 	dir := t.TempDir()
 	// `false` reliably exits 1. Stderr message lets us verify combined-output
 	// capture as well.
-	r := runRepoVerify(context.Background(), dir, "echo build error 1>&2 && exit 7", 30, nil)
+	r := runRepoVerify(context.Background(), dir, "echo build error 1>&2 && exit 7", 30, os.Environ())
 	if r.Err != nil {
 		t.Fatalf("Err: %v", r.Err)
 	}
@@ -48,7 +48,7 @@ func TestRunRepoVerify_Timeout(t *testing.T) {
 	// so the test stays fast.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	r := runRepoVerify(ctx, dir, "sleep 5", 10, nil)
+	r := runRepoVerify(ctx, dir, "sleep 5", 10, os.Environ())
 	if !r.TimedOut {
 		t.Fatalf("expected TimedOut=true, got %#v", r)
 	}
@@ -58,7 +58,7 @@ func TestRunRepoVerify_Timeout(t *testing.T) {
 }
 
 func TestRunRepoVerify_EmptyCmd(t *testing.T) {
-	r := runRepoVerify(context.Background(), t.TempDir(), "   ", 30, nil)
+	r := runRepoVerify(context.Background(), t.TempDir(), "   ", 30, os.Environ())
 	if r.Err == nil {
 		t.Fatal("expected Err for empty verifyCmd")
 	}
@@ -73,7 +73,7 @@ func TestRunRepoVerify_OutputCap(t *testing.T) {
 	// us assert the cap kept the END (which is the meaningful part for build
 	// errors).
 	r := runRepoVerify(context.Background(), dir,
-		"for i in $(seq 1 200); do printf 'line-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-%05d\n' $i; done; echo TAIL_MARKER", 30, nil)
+		"for i in $(seq 1 200); do printf 'line-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-%05d\n' $i; done; echo TAIL_MARKER", 30, os.Environ())
 	if r.Err != nil {
 		t.Fatalf("Err: %v", r.Err)
 	}
@@ -95,7 +95,7 @@ func TestRunRepoVerify_CommandNotFound(t *testing.T) {
 	// A non-existent command exits non-zero via sh's "command not found"
 	// path — sh itself runs fine and returns 127, so this is treated as a
 	// normal non-zero exit (ExitCode set, Err nil).
-	r := runRepoVerify(context.Background(), t.TempDir(), "definitely_not_a_real_command_42 --flag", 30, nil)
+	r := runRepoVerify(context.Background(), t.TempDir(), "definitely_not_a_real_command_42 --flag", 30, os.Environ())
 	if r.Err != nil {
 		t.Fatalf("Err: %v (expected nil — sh ran and exited)", r.Err)
 	}
@@ -127,7 +127,7 @@ func TestRunVerifyWithRetry_PassesFirstAttempt(t *testing.T) {
 		claudeCalled++
 		return "", nil
 	}
-	r := runVerifyWithRetry(context.Background(), dir, cmd, 30, 2, nil, runner)
+	r := runVerifyWithRetry(context.Background(), dir, cmd, 30, 2, os.Environ(), runner)
 	if !r.Passed {
 		t.Fatalf("expected Passed=true, got %#v", r)
 	}
@@ -155,7 +155,7 @@ func TestRunVerifyWithRetry_PassesAfterOneRetry(t *testing.T) {
 		}
 		return "fixed it", nil
 	}
-	r := runVerifyWithRetry(context.Background(), dir, cmd, 30, 2, nil, runner)
+	r := runVerifyWithRetry(context.Background(), dir, cmd, 30, 2, os.Environ(), runner)
 	if !r.Passed {
 		t.Fatalf("expected Passed=true after retry; got %#v", r)
 	}
@@ -179,7 +179,7 @@ func TestRunVerifyWithRetry_AllAttemptsFail(t *testing.T) {
 		claudeCalled++
 		return "tried but failed", nil
 	}
-	r := runVerifyWithRetry(context.Background(), dir, cmd, 30, 2, nil, runner)
+	r := runVerifyWithRetry(context.Background(), dir, cmd, 30, 2, os.Environ(), runner)
 	if r.Passed {
 		t.Fatalf("expected Passed=false; got %#v", r)
 	}
@@ -202,7 +202,7 @@ func TestRunVerifyWithRetry_MaxRetriesZero(t *testing.T) {
 		claudeCalled++
 		return "", nil
 	}
-	r := runVerifyWithRetry(context.Background(), dir, cmd, 30, 0, nil, runner)
+	r := runVerifyWithRetry(context.Background(), dir, cmd, 30, 0, os.Environ(), runner)
 	if r.Passed {
 		t.Fatal("expected Passed=false with maxRetries=0")
 	}
@@ -220,7 +220,7 @@ func TestRunVerifyWithRetry_ClaudeRunnerError(t *testing.T) {
 	runner := func(ctx context.Context, wt, prompt string) (string, error) {
 		return "", errors.New("claude binary missing")
 	}
-	r := runVerifyWithRetry(context.Background(), dir, cmd, 30, 2, nil, runner)
+	r := runVerifyWithRetry(context.Background(), dir, cmd, 30, 2, os.Environ(), runner)
 	if r.Passed {
 		t.Fatal("expected Passed=false when claudeRunner errors")
 	}
@@ -238,7 +238,7 @@ func TestRunVerifyWithRetry_ClaudeRunnerError(t *testing.T) {
 
 func TestRunVerifyWithRetry_EmptyVerifyCmd(t *testing.T) {
 	runner := func(ctx context.Context, wt, prompt string) (string, error) { return "", nil }
-	r := runVerifyWithRetry(context.Background(), t.TempDir(), "  ", 30, 2, nil, runner)
+	r := runVerifyWithRetry(context.Background(), t.TempDir(), "  ", 30, 2, os.Environ(), runner)
 	if r.Passed {
 		t.Error("expected Passed=false on empty verifyCmd")
 	}
@@ -248,7 +248,7 @@ func TestRunVerifyWithRetry_EmptyVerifyCmd(t *testing.T) {
 }
 
 func TestRunVerifyWithRetry_NilClaudeRunner(t *testing.T) {
-	r := runVerifyWithRetry(context.Background(), t.TempDir(), "exit 0", 30, 2, nil, nil)
+	r := runVerifyWithRetry(context.Background(), t.TempDir(), "exit 0", 30, 2, os.Environ(), nil)
 	if r.Passed {
 		t.Error("expected Passed=false on nil claudeRunner")
 	}

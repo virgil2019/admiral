@@ -325,11 +325,14 @@ func (o *Orchestrator) runVerify(parentID string) {
 	mat, repoDir, teamID, projectID, verifyCmd, err := o.gatherVerifyMaterial(ctx, parentID)
 	if err != nil {
 		o.logger.Error("verify_gather_failed", "parent", parentID, "err", err)
-		// This is the only user-visible exit of the verify path: without a
-		// notice here the parent just stalls with no Linear-side explanation
-		// (the common cause is a repo with no gh account, which gather
-		// already resolves through).
-		o.escalateVerifyWithReason(ctx, parentID, fmt.Sprintf("admiral: cannot verify — %v", err))
+		// A repo with no gh account is deterministic — nothing retries it into
+		// working — so the parent is told how to fix it. Every other failure
+		// (Linear 5xx, a transient store error) is left alone: escalation is
+		// terminal (HandleVerifyEvent skips non-active rows and the boot
+		// rescan only re-enqueues active ones), and the next round retries.
+		if isGhUserUnset(err) {
+			o.escalateVerifyWithReason(ctx, parentID, fmt.Sprintf("admiral: cannot verify — %v", err))
+		}
 		return
 	}
 
