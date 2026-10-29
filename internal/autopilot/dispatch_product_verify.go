@@ -163,6 +163,15 @@ func (o *Orchestrator) runProductVerify(projectID string) {
 	if err != nil {
 		o.logger.Error("product_verify_resolve_identity_failed",
 			"project", projectID, "err", err)
+		// Product verification has no retry after its first round, so a repo
+		// with no gh account would stall it invisibly. Escalate that
+		// deterministic case; transient failures stay logged only.
+		if isGhUserUnset(err) {
+			if serr := o.db.SetProductVerificationStatus(projectID, store.TaskVerifyEscalated); serr != nil {
+				o.logger.Error("product_verify_escalate_set_status_failed",
+					"project", projectID, "err", serr)
+			}
+		}
 		return
 	}
 

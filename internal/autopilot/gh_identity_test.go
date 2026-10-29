@@ -359,3 +359,38 @@ func TestRunFix_RefusesDisabledRepo(t *testing.T) {
 		t.Errorf("expected the task to stay DONE; got %q", live.State)
 	}
 }
+
+// TestRunProductVerify_EscalatesWhenRepoHasNoGhAccount: product verify has no
+// retry after its first round, so the deterministic no-account case must not
+// leave it "active" and invisible.
+func TestRunProductVerify_EscalatesWhenRepoHasNoGhAccount(t *testing.T) {
+	db := &mockStore{
+		Repo:         &store.Repo{RepoDir: "/repo", ProjectID: "proj-1"},
+		RepoNoGhUser: true,
+		ProductVerification: &store.ProductVerification{
+			ProjectID: "proj-1", Rounds: 1, Status: store.TaskVerifyActive,
+		},
+	}
+	lc := &mockLinearClient{ProjectTeamID: "team-1"}
+	ran := false
+	o := newProductVerifyOrchestrator(db, lc, 3, func(context.Context, string, string) (string, error) {
+		ran = true
+		return "", nil
+	})
+	o.productVerifyRunner = func(context.Context, string, string, []string) (string, error) {
+		ran = true
+		return "", nil
+	}
+
+	o.runProductVerify("proj-1")
+
+	if ran {
+		t.Error("the judge must not run without a gh identity")
+	}
+	if len(db.ProductSetStatusCalls) == 0 {
+		t.Fatal("expected the deterministic no-account case to escalate")
+	}
+	if got := db.ProductSetStatusCalls[len(db.ProductSetStatusCalls)-1].Status; got != store.TaskVerifyEscalated {
+		t.Errorf("status = %q, want %q", got, store.TaskVerifyEscalated)
+	}
+}

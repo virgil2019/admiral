@@ -325,11 +325,13 @@ func (o *Orchestrator) runVerify(parentID string) {
 	mat, repoDir, teamID, projectID, verifyCmd, err := o.gatherVerifyMaterial(ctx, parentID)
 	if err != nil {
 		o.logger.Error("verify_gather_failed", "parent", parentID, "err", err)
-		// A repo with no gh account is deterministic — nothing retries it into
-		// working — so the parent is told how to fix it. Every other failure
-		// (Linear 5xx, a transient store error) is left alone: escalation is
-		// terminal (HandleVerifyEvent skips non-active rows and the boot
-		// rescan only re-enqueues active ones), and the next round retries.
+		// A repo with no gh account is deterministic, so the parent is told
+		// how to fix it. Escalation is terminal for the parent
+		// (HandleVerifyEvent skips non-active rows and the boot rescan only
+		// re-enqueues rounds==1 rows), so a transient failure — Linear 5xx, a
+		// contended keyring — must NOT take it: the round is logged and the
+		// verification stays active for the next trigger (cascade or a manual
+		// re-run).
 		if isGhUserUnset(err) {
 			o.escalateVerifyWithReason(ctx, parentID, fmt.Sprintf("admiral: cannot verify — %v", err))
 		}
@@ -379,7 +381,7 @@ func (o *Orchestrator) runVerify(parentID string) {
 			"parent", parentID, "project", projectID, "err", err)
 		// Same rule as the gather path: escalation is terminal, so only the
 		// deterministic "no gh account" case takes it. A flaky keyring read
-		// keeps the verification active and retries.
+		// leaves the verification active rather than closing it off.
 		if isGhUserUnset(err) {
 			o.escalateVerifyWithReason(ctx, parentID, fmt.Sprintf(
 				"admiral: cannot verify — %v", err))

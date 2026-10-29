@@ -1104,11 +1104,11 @@ func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.Admir
 	if err := f.bindIdentity(issue.ProjectID); err != nil {
 		o.logger.Error("awaiting_resume_resolve_identity_failed",
 			"issue", ev.IssueIdentifier, "err", err)
-		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
-			t.State = store.JobStateFailed
-			t.Error = err.Error()
-		})
-		f.postActivity(linear.ErrorActivity(fmt.Sprintf("admiral: cannot resume — %v", err)))
+		// Nothing ran and the answered question is already consumed, so
+		// FAILED would be terminal for work that never started. TIMED_OUT
+		// keeps /resume available — the same recovery /resume itself offers
+		// for its own pre-flight failures.
+		f.markTimedOutBeforeStart(err)
 		return
 	}
 
@@ -1451,11 +1451,13 @@ func (f *flow) execute() error {
 	// best-effort: gh failures fall through to the normal flow. Skipped on
 	// follow-up flows since the suffixed branch is intentionally fresh.
 	if f.followupSuffix == "" {
-		env, err := f.ghEnv(f.ctx)
-		if err != nil {
-			return fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
-		}
-		if url, sha, found, err := f.o.gh.FindMergedPRForBranch(f.ctx, f.repoDir, f.branch, env); err != nil {
+		// Best-effort like the probe itself: an identity failure only skips
+		// the check. The run still needs the account, and the first gh call
+		// that cannot do without it fails with a message naming the cause.
+		if env, envErr := f.ghEnv(f.ctx); envErr != nil {
+			f.o.logger.Warn("merged_pr_check_identity_failed",
+				"err", envErr, "branch", f.branch)
+		} else if url, sha, found, err := f.o.gh.FindMergedPRForBranch(f.ctx, f.repoDir, f.branch, env); err != nil {
 			f.o.logger.Warn("merged_pr_check_failed",
 				"err", err, "branch", f.branch)
 		} else if found {
@@ -1485,11 +1487,10 @@ func (f *flow) execute() error {
 	// create a duplicate PR. Skipped on follow-up flows (suffixed branch
 	// is intentionally unique).
 	if f.followupSuffix == "" {
-		env, err := f.ghEnv(f.ctx)
-		if err != nil {
-			return fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
-		}
-		if url, author, found, err := f.o.gh.FindOpenPRForBranch(f.ctx, f.repoDir, f.branch, env); err != nil {
+		if env, envErr := f.ghEnv(f.ctx); envErr != nil {
+			f.o.logger.Warn("open_pr_check_identity_failed",
+				"err", envErr, "branch", f.branch)
+		} else if url, author, found, err := f.o.gh.FindOpenPRForBranch(f.ctx, f.repoDir, f.branch, env); err != nil {
 			f.o.logger.Warn("open_pr_check_failed",
 				"err", err, "branch", f.branch)
 		} else if found && author != f.ghUser {
