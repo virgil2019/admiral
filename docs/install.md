@@ -114,8 +114,22 @@ Auth the GitHub account that owns the target repo:
 
 ```bash
 gh auth login
-gh auth status     # confirm the right account is active
+gh auth status     # confirm the right account is signed in
 ```
+
+The account admiral acts as is the one registered **per repo**, not whichever
+account happens to be active on the host. Register it when you add the repo
+(`gh_user` is validated against origin's push URL — it must be signed in and
+have push permission):
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -X PATCH http://127.0.0.1:8788/admin/repos/<project_id> \
+  -d '{"gh_user":"virgil2019"}'
+```
+
+A repo with no `gh_user` is refused: admiral has no identity to act as and
+will not fall back to another account.
 
 Optionally, `~/.claude/gh-accounts.yml` for multi-account routing:
 
@@ -127,8 +141,9 @@ accounts:
     gh_user: yourcompany
 ```
 
-(harness-pack's `finish-task` uses this; admiral itself relies on
-`gh auth status` matching the repo's remote at runtime.)
+(harness-pack's `finish-task` uses this; admiral reads each repo's
+`gh_user` from its own registry and takes the token from the gh keyring of
+that account.)
 
 ## Step 5 — Build and install admiral
 
@@ -279,8 +294,9 @@ with the PR URL.
   `sudo -u admiral -i`, run `claude` once interactively in the target
   repo directory and accept the trust dialog. After that it persists.
 - **`gh` errors inside admiral but works for you interactively**:
-  admiral's runtime user has no auth.
-  `sudo -u admiral gh auth status` and re-login as needed.
+  admiral's runtime user has no auth for the repo's registered account.
+  `sudo -u admiral gh auth status` and re-login as the account registered
+  for that repo (`gh_user`, see Step 4).
 - **Worktree paths exist from a prior failed run**: admiral cleans up
   on the next run for the same issue (`git worktree remove --force` +
   `git branch -D`). Manual cleanup if needed:
