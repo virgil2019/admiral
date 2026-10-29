@@ -239,12 +239,16 @@ func TestRunVerify_JudgeRunsAsRepoAccount(t *testing.T) {
 // the parent is told how to fix it.
 func TestRunVerify_RefusesWhenRepoHasNoGhAccount(t *testing.T) {
 	lc := &mockLinearClient{GetIssueByID: map[string]*linear.Issue{"p1": verifyParent()}}
-	db := &mockStore{Repo: &store.Repo{RepoDir: "/repo"}, RepoNoGhUser: true}
+	db := &mockStore{Repo: &store.Repo{RepoDir: "/repo", ProjectID: "proj-1"}, RepoNoGhUser: true}
 	ran := false
 	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, func(context.Context, string, string) (string, error) {
 		ran = true
 		return "", nil
 	})
+	// Production shape: the identity is resolved while gathering the material
+	// (the PR diffs come from GitHub), so the refusal happens there — before
+	// any child process, and long before the judge.
+	o.prClientFor = o.githubClientFor
 
 	o.runVerify("p1")
 

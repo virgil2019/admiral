@@ -956,15 +956,12 @@ type fakeGhProbe struct {
 	mergedByBranch map[string]struct {
 		URL, SHA string
 	}
-	stateByURL     map[string]string
 	openPRByBranch map[string]struct {
 		URL, Author string
 	}
 	mergedErr   error
-	stateErr    error
 	openPRErr   error
 	mergedCalls int32
-	stateCalls  int32
 	openPRCalls int32
 
 	// envs records the environment each gh call was made with, so tests
@@ -988,7 +985,7 @@ func (f *fakeGhProbe) Environments() [][]string {
 
 // TotalCalls returns how many gh calls the probe served.
 func (f *fakeGhProbe) TotalCalls() int {
-	return int(atomic.LoadInt32(&f.mergedCalls) + atomic.LoadInt32(&f.stateCalls) + atomic.LoadInt32(&f.openPRCalls))
+	return int(atomic.LoadInt32(&f.mergedCalls) + atomic.LoadInt32(&f.openPRCalls))
 }
 
 func (f *fakeGhProbe) FindMergedPRForBranch(_ context.Context, _, branch string, env []string) (string, string, bool, error) {
@@ -1001,15 +998,6 @@ func (f *fakeGhProbe) FindMergedPRForBranch(_ context.Context, _, branch string,
 		return v.URL, v.SHA, true, nil
 	}
 	return "", "", false, nil
-}
-
-func (f *fakeGhProbe) PRState(_ context.Context, prURL string, env []string) (string, error) {
-	atomic.AddInt32(&f.stateCalls, 1)
-	f.recordEnv(env)
-	if f.stateErr != nil {
-		return "", f.stateErr
-	}
-	return f.stateByURL[prURL], nil
 }
 
 func (f *fakeGhProbe) FindOpenPRForBranch(_ context.Context, _, branch string, env []string) (string, string, bool, error) {

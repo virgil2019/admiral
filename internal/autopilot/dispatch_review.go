@@ -199,7 +199,7 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 			}
 			return runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, wt, fullPrompt, o.cfg.BotIdentity, env, o.logger)
 		}
-		gate := runVerifyWithRetry(ctx, worktreePath, verifyCmd, o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries, claudeRunner)
+		gate := runVerifyWithRetry(ctx, worktreePath, verifyCmd, o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries, env, claudeRunner)
 		gateAttempts = gate.Attempts
 		if !gate.Passed {
 			o.logger.Warn("review_run_build_gate_failed",

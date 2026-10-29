@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/georgehuang/admiral/internal/config"
@@ -52,6 +53,13 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.Close()
+
+	// The discoverer advances a task's Linear state by polling its PR, and
+	// every one of those calls runs as the account the repo registered. A
+	// repo with no gh_user is skipped at runtime, so without this boot-time
+	// warning an upgraded deployment (migration0024 backfills '') would look
+	// like the state machine silently froze.
+	warnReposMissingGhUser(db, logger)
 
 	lc := linear.NewClient(cfg.Linear.APIBase, cfg.Linear.APIToken)
 	tr, refreshAvailable := linear.NewTokenRefresher(
@@ -182,4 +190,24 @@ func newLogger(c config.Logging) *slog.Logger {
 		}
 	}
 	return slog.New(slog.NewTextHandler(w, opts))
+}
+
+// warnReposMissingGhUser emits a boot-time WARN per repo with no gh_user —
+// typically rows that predate migration0024. A repo without an account cannot
+// have its PR polled, so its tasks never advance (no MERGED → Completed, no
+// CLOSED → Canceled, no verify enqueue, no auto-merge).
+func warnReposMissingGhUser(db *store.Store, logger *slog.Logger) {
+	repos, err := db.ListRepos()
+	if err != nil {
+		logger.Warn("gh_user_boot_check_list_failed", "err", err)
+		return
+	}
+	for _, r := range repos {
+		if strings.TrimSpace(r.GhUser) == "" {
+			logger.Warn("gh_user_unconfigured",
+				"project_id", r.ProjectID,
+				"project_name", r.ProjectName,
+				"hint", `no gh account configured for this repo: its PR state advancement is skipped. Set it with PATCH /admin/repos/<project_id> {"gh_user":"<account from gh auth status>"}.`)
+		}
+	}
 }

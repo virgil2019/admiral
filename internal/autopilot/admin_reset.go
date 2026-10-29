@@ -145,7 +145,7 @@ func (s *adminServer) resetTaskHandler(w http.ResponseWriter, r *http.Request) {
 	env, err := s.ghEnvForIssue(ctx, strings.TrimSpace(req.Parent))
 	if err != nil {
 		s.logger.Warn("admin_reset_resolve_identity_failed", "parent", req.Parent, "err", err)
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	gh := func(ctx context.Context, args ...string) (string, error) {

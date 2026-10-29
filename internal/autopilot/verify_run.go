@@ -54,7 +54,7 @@ type VerifyRunResult struct {
 //
 // Empty verifyCmd is a programmer error: the caller must check + skip
 // upstream. Passing "" returns an Err result.
-func runRepoVerify(ctx context.Context, repoDir, verifyCmd string, timeoutSec int) VerifyRunResult {
+func runRepoVerify(ctx context.Context, repoDir, verifyCmd string, timeoutSec int, env []string) VerifyRunResult {
 	verifyCmd = strings.TrimSpace(verifyCmd)
 	if verifyCmd == "" {
 		return VerifyRunResult{Err: errors.New("runRepoVerify: empty verifyCmd (caller must check + skip)")}
@@ -72,7 +72,13 @@ func runRepoVerify(ctx context.Context, repoDir, verifyCmd string, timeoutSec in
 
 	cmd := exec.CommandContext(cctx, "sh", "-c", verifyCmd)
 	cmd.Dir = repoDir
-	cmd.Env = os.Environ()
+	// verify_cmd is operator-authored and may shell out to gh, so it runs
+	// under the same identity as the rest of the run. A nil env keeps the
+	// pre-existing inherit-everything behavior for callers with no repo.
+	cmd.Env = env
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 5 * time.Second
 
@@ -175,6 +181,7 @@ func runVerifyWithRetry(
 	ctx context.Context,
 	worktreePath, verifyCmd string,
 	buildTimeoutSec, maxRetries int,
+	env []string,
 	claudeRunner func(ctx context.Context, wt, prompt string) (output string, err error),
 ) VerifyRetryResult {
 	verifyCmd = strings.TrimSpace(verifyCmd)
@@ -191,7 +198,7 @@ func runVerifyWithRetry(
 	result := VerifyRetryResult{}
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		br := runRepoVerify(ctx, worktreePath, verifyCmd, buildTimeoutSec)
+		br := runRepoVerify(ctx, worktreePath, verifyCmd, buildTimeoutSec, env)
 		result.Attempts = attempt + 1
 		result.LastBuildOutput = br.Output
 

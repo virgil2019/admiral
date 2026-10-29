@@ -1099,16 +1099,11 @@ func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.Admir
 		})
 		return
 	}
-	if repo, err := o.db.GetRepoByProjectID(issue.ProjectID); err == nil && repo != nil {
-		f.repoDir = repo.RepoDir
-		f.baseBranch = repo.BaseBranch
-		f.projectID = issue.ProjectID
-		f.ghUser = strings.TrimSpace(repo.GhUser)
-	}
-	if f.ghUser == "" {
-		// No identity for this repo: every gh call below would fall back to
-		// the host's active account, so refuse before touching the PR.
-		err := errGhUserUnset(issue.ProjectID)
+	// Identity for this repo: every gh call below (PR lookup, push, CI) runs
+	// as the account the repo registered. bindIdentity also distinguishes a
+	// project with no repo from a repo with no account, so the thread message
+	// names the right fix.
+	if err := f.bindIdentity(issue.ProjectID); err != nil {
 		o.logger.Error("awaiting_resume_resolve_identity_failed",
 			"issue", ev.IssueIdentifier, "err", err)
 		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
@@ -1567,7 +1562,11 @@ func (f *flow) execute() error {
 			}
 			return runClaudeForReview(ctx, f.o.cfg.ClaudeBin, f.o.cfg.MaxRunSeconds, wt, fullPrompt, f.o.cfg.BotIdentity, env, f.o.logger)
 		}
-		gate := runVerifyWithRetry(f.ctx, f.worktreePath, f.verifyCmd, f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, claudeRunner)
+		gateEnv, err := f.ghEnv(f.ctx)
+		if err != nil {
+			return fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
+		}
+		gate := runVerifyWithRetry(f.ctx, f.worktreePath, f.verifyCmd, f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, gateEnv, claudeRunner)
 		gateAttempts = gate.Attempts
 		if !gate.Passed {
 			f.o.logger.Warn("first_run_build_gate_failed",

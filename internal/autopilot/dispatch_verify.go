@@ -325,6 +325,11 @@ func (o *Orchestrator) runVerify(parentID string) {
 	mat, repoDir, teamID, projectID, verifyCmd, err := o.gatherVerifyMaterial(ctx, parentID)
 	if err != nil {
 		o.logger.Error("verify_gather_failed", "parent", parentID, "err", err)
+		// This is the only user-visible exit of the verify path: without a
+		// notice here the parent just stalls with no Linear-side explanation
+		// (the common cause is a repo with no gh account, which gather
+		// already resolves through).
+		o.escalateVerifyWithReason(ctx, parentID, fmt.Sprintf("admiral: cannot verify — %v", err))
 		return
 	}
 
@@ -362,8 +367,20 @@ func (o *Orchestrator) runVerify(parentID string) {
 	// below) so a slip-up in the LLM cannot land a "complete" task with a
 	// broken build. Repos without verify_cmd skip this step — verify falls
 	// back to the original diff-only behavior (warned about at boot).
+	// The build gate, the judge and admiral's own gh calls all run as the
+	// repo's registered account. Resolved once, before the first child
+	// process starts.
+	env, err := o.ghEnvForProject(ctx, projectID)
+	if err != nil {
+		o.logger.Error("verify_resolve_identity_failed",
+			"parent", parentID, "project", projectID, "err", err)
+		o.escalateVerifyWithReason(ctx, parentID, fmt.Sprintf(
+			"admiral: cannot verify — %v", err))
+		return
+	}
+
 	if verifyCmd != "" {
-		br := runRepoVerify(ctx, repoDir, verifyCmd, o.cfg.MaxRunSeconds)
+		br := runRepoVerify(ctx, repoDir, verifyCmd, o.cfg.MaxRunSeconds, env)
 		mat.BuildResult = &buildResultMaterial{
 			Command:  verifyCmd,
 			ExitCode: br.ExitCode,
@@ -384,18 +401,6 @@ func (o *Orchestrator) runVerify(parentID string) {
 			o.logger.Info("verify_build_run",
 				"parent", parentID, "exit_code", br.ExitCode, "output_bytes", len(br.Output))
 		}
-	}
-
-	// The judge reads the repo and may call gh itself, so it runs as the
-	// account the repo registered. A repo with no account has no identity to
-	// verify as — refuse rather than judge under the host's account.
-	env, err := o.ghEnvForProject(ctx, projectID)
-	if err != nil {
-		o.logger.Error("verify_resolve_identity_failed",
-			"parent", parentID, "project", projectID, "err", err)
-		o.escalateVerifyWithReason(ctx, parentID, fmt.Sprintf(
-			"admiral: cannot verify — %v", err))
-		return
 	}
 
 	raw, err := o.verifyRunner(ctx, repoDir, buildVerifyPrompt(mat), env)
