@@ -225,9 +225,7 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 			cfg.CIWatchPollInterval, cfg.CIWatchTimeout),
 		replier: NewAgentSessionReplier(lc),
 	}
-	o.prClientFor = func(ctx context.Context, repo *store.Repo) (ghpkg.PRClient, error) {
-		return o.githubClientFor(ctx, repo)
-	}
+	o.prClientFor = o.githubClientFor
 	o.verifyRunner = func(ctx context.Context, repoDir, prompt string, env []string) (string, error) {
 		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, env, o.logger)
 	}
@@ -1370,6 +1368,11 @@ func (f *flow) bindIdentity(projectID string) error {
 	}
 	if repo == nil {
 		return fmt.Errorf("no repo configured for project %s", projectID)
+	}
+	if !repo.Enabled {
+		// The operator halted this repo. /fix and /resume push and comment on
+		// GitHub, so they must respect the switch that stops first runs.
+		return fmt.Errorf("the repo for project %s is disabled — re-enable it with `PATCH /admin/repos/%s {\"enabled\":true}` before retrying", projectID, projectID)
 	}
 	f.repoDir = repo.RepoDir
 	f.baseBranch = repo.BaseBranch
@@ -3236,7 +3239,13 @@ func captureCmd(ctx context.Context, dir, name string, args ...string) (string, 
 // complete child environment (ghpkg.Accounts.EnvFor builds one) — anything
 // missing is invisible to the child. Use it for gh calls, which must
 // authenticate as a specific account rather than inherit the host's.
+//
+// A nil env is refused: os/exec would inherit the parent's environment, i.e.
+// run as whichever account happens to be logged in on the host.
 func captureCmdEnv(ctx context.Context, dir string, env []string, name string, args ...string) (string, error) {
+	if env == nil {
+		return "", fmt.Errorf("%s: no environment given — refusing to inherit the host's gh identity", name)
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	cmd.Env = env

@@ -377,8 +377,13 @@ func (o *Orchestrator) runVerify(parentID string) {
 	if err != nil {
 		o.logger.Error("verify_resolve_identity_failed",
 			"parent", parentID, "project", projectID, "err", err)
-		o.escalateVerifyWithReason(ctx, parentID, fmt.Sprintf(
-			"admiral: cannot verify — %v", err))
+		// Same rule as the gather path: escalation is terminal, so only the
+		// deterministic "no gh account" case takes it. A flaky keyring read
+		// keeps the verification active and retries.
+		if isGhUserUnset(err) {
+			o.escalateVerifyWithReason(ctx, parentID, fmt.Sprintf(
+				"admiral: cannot verify — %v", err))
+		}
 		return
 	}
 

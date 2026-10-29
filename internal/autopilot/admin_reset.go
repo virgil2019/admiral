@@ -147,9 +147,14 @@ func (s *adminServer) resetTaskHandler(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn("admin_reset_resolve_identity_failed", "parent", req.Parent, "err", err)
 		// Resolving the identity reads the issue first, so an unknown parent
 		// surfaces here now; keep it a 404 rather than degrading it to 400.
-		code := http.StatusBadRequest
-		if errors.Is(err, linear.ErrIssueNotFound) {
+		// Only the deterministic cases are client errors — a store or Linear
+		// failure is not the caller's fault.
+		code := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, linear.ErrIssueNotFound):
 			code = http.StatusNotFound
+		case isGhUserUnset(err), errors.Is(err, ghpkg.ErrGhUserRequired):
+			code = http.StatusBadRequest
 		}
 		writeJSONError(w, code, err.Error())
 		return

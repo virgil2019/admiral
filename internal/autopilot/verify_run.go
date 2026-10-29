@@ -58,6 +58,12 @@ func runRepoVerify(ctx context.Context, repoDir, verifyCmd string, timeoutSec in
 	if verifyCmd == "" {
 		return VerifyRunResult{Err: errors.New("runRepoVerify: empty verifyCmd (caller must check + skip)")}
 	}
+	// os/exec inherits the parent's environment when Env is nil, which would
+	// run verify_cmd as whichever gh account is active on the host. Refuse
+	// rather than fall back.
+	if env == nil {
+		return VerifyRunResult{Err: errors.New("runRepoVerify: nil env (caller must pass the repo's environment)")}
+	}
 
 	if timeoutSec <= 0 {
 		// Fallback when the caller passes a bad timeout. 10 min is enough for

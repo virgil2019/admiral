@@ -99,6 +99,13 @@ func (o *Orchestrator) executeReset(ev linear.AgentEvent) {
 	if err != nil {
 		o.logger.Warn("dispatch_reset_resolve_identity_failed",
 			"issue", ev.IssueIdentifier, "err", err)
+		// The identity lookup reads the issue first, so a deleted issue
+		// surfaces here — keep telling the user the issue is gone rather
+		// than that the reset errored.
+		if errors.Is(err, linear.ErrIssueNotFound) {
+			o.postRejection(ev.SessionID, fmt.Sprintf("admiral: issue %s not found.", ev.IssueIdentifier))
+			return
+		}
 		o.postRejection(ev.SessionID, fmt.Sprintf("admiral: reset failed: %v", err))
 		return
 	}

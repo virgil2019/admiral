@@ -328,3 +328,34 @@ func TestRunVerify_TransientGatherFailureDoesNotEscalate(t *testing.T) {
 		t.Errorf("a transient failure must not set a terminal verify status; got %v", db.SetStatusCalls)
 	}
 }
+
+// TestRunFix_RefusesDisabledRepo: /fix pushes and comments on GitHub, so it
+// must respect the same `enabled` switch that stops first runs.
+func TestRunFix_RefusesDisabledRepo(t *testing.T) {
+	o, ms, mlc, gh := newIdentityOrchestrator(t, t.TempDir(), "proj-disabled", "virgil2019")
+	ms.Repo.Enabled = false
+	live := &store.AdmiralTask{
+		IssueID: "issue-identity", State: store.JobStateDone, AttemptN: 1,
+		PRURL: "https://github.com/x/y/pull/42", Branch: "linear/abc-9",
+		ClaudeSessionID: "claude-session",
+	}
+	ms.AdmiralTask = live
+	ms.LiveAdmiralTask = live
+	ms.LastUpdatedJob = &store.AutopilotJob{}
+
+	ev := linear.AgentEvent{
+		SessionID: "session-fix-disabled", IssueID: "issue-identity",
+		IssueIdentifier: "ABC-9", Action: linear.ActionCreated,
+	}
+	o.runFix(ev, live)
+
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "disabled") {
+		t.Errorf("expected the thread to say the repo is disabled; got: %s", body)
+	}
+	if n := gh.TotalCalls(); n != 0 {
+		t.Errorf("a disabled repo must not be touched; got %d gh call(s)", n)
+	}
+	if live.State != store.JobStateDone {
+		t.Errorf("expected the task to stay DONE; got %q", live.State)
+	}
+}
