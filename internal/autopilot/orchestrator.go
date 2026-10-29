@@ -185,13 +185,14 @@ type Orchestrator struct {
 
 	// verifyRunner runs the headless verify judge. Defaults to
 	// runClaudeForVerify; tests inject a stub so the guard/apply logic is
-	// exercised without spawning a real claude process.
-	verifyRunner func(ctx context.Context, repoDir, prompt string) (string, error)
+	// exercised without spawning a real claude process. env is the child
+	// environment the judge runs under — it carries the repo's gh account.
+	verifyRunner func(ctx context.Context, repoDir, prompt string, env []string) (string, error)
 
 	// productVerifyRunner runs the headless product-level verify judge. Same
 	// read-only signature as verifyRunner (defaults to runClaudeForVerify); a
 	// separate field lets tests stub product verify independently of L2.
-	productVerifyRunner func(ctx context.Context, repoDir, prompt string) (string, error)
+	productVerifyRunner func(ctx context.Context, repoDir, prompt string, env []string) (string, error)
 }
 
 // SetVerifyPickupRules wires the discoverer's pickup gates (require_label +
@@ -227,11 +228,11 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 	o.prClientFor = func(ctx context.Context, repo *store.Repo) (ghpkg.PRClient, error) {
 		return o.githubClientFor(ctx, repo)
 	}
-	o.verifyRunner = func(ctx context.Context, repoDir, prompt string) (string, error) {
-		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, o.logger)
+	o.verifyRunner = func(ctx context.Context, repoDir, prompt string, env []string) (string, error) {
+		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, env, o.logger)
 	}
-	o.productVerifyRunner = func(ctx context.Context, repoDir, prompt string) (string, error) {
-		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, o.logger)
+	o.productVerifyRunner = func(ctx context.Context, repoDir, prompt string, env []string) (string, error) {
+		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, env, o.logger)
 	}
 	o.blockerWatcher = newBlockerWatcher(o, cfg.BlockerPollInterval)
 	// Ensure job_streams_dir exists on startup.
@@ -258,7 +259,8 @@ func (o *Orchestrator) githubClientFor(ctx context.Context, repo *store.Repo) (g
 	if err != nil {
 		return nil, fmt.Errorf("resolve gh account %q for project %s: %w", ghUser, repo.ProjectID, err)
 	}
-	return ghpkg.NewClient(tok), nil
+	// Same binary the token was resolved with: gh_bin may point off PATH.
+	return ghpkg.NewClientWithBin(o.cfg.GhBin, tok), nil
 }
 
 // ghEnvForIssue resolves the gh account registered for the repo of the
@@ -804,7 +806,7 @@ func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 	if err := o.prepareResume(resumeFlow, ev); err != nil {
 		o.logger.Error("fix_resolve_identity_failed",
 			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
-		resumeFlow.markFailed(err)
+		resumeFlow.abortFixBeforeStart(err)
 		return
 	}
 
@@ -952,9 +954,10 @@ func (o *Orchestrator) runResume(ev linear.AgentEvent, task *store.AdmiralTask) 
 			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
 		// Nothing ran: the prior claude session is still recoverable, so keep
 		// TIMED_OUT and let the user retry /resume once the blocker is gone
-		// (a transient Linear failure, or a repo with no gh account).
-		resumeFlow.markTimedOut(err)
-		resumeFlow.postActivity(linear.ErrorActivity(fmt.Sprintf("admiral: cannot resume — %v", err)))
+		// (a transient Linear failure, or a repo with no gh account). The
+		// message is this failure's, not the run-length timeout's — claude
+		// never started.
+		resumeFlow.markTimedOutBeforeStart(err)
 		return
 	}
 
@@ -1558,7 +1561,11 @@ func (f *flow) execute() error {
 			if f.o.cfg.AutopilotSkill != "" {
 				fullPrompt = "/" + f.o.cfg.AutopilotSkill + "\n\n" + retryPrompt
 			}
-			return runClaudeForReview(ctx, f.o.cfg.ClaudeBin, f.o.cfg.MaxRunSeconds, wt, fullPrompt, f.o.cfg.BotIdentity, f.o.logger)
+			env, err := f.ghEnv(ctx)
+			if err != nil {
+				return "", fmt.Errorf("resolve gh account %q: %w", f.ghUser, err)
+			}
+			return runClaudeForReview(ctx, f.o.cfg.ClaudeBin, f.o.cfg.MaxRunSeconds, wt, fullPrompt, f.o.cfg.BotIdentity, env, f.o.logger)
 		}
 		gate := runVerifyWithRetry(f.ctx, f.worktreePath, f.verifyCmd, f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, claudeRunner)
 		gateAttempts = gate.Attempts
@@ -1755,11 +1762,13 @@ func (f *flow) executeResumeFromTimeout() error {
 		return fmt.Errorf("fetch issue: %w", err)
 	}
 	f.teamID = issue.TeamID
-	// Resolve the repo (and the gh account admiral must act as) even when
-	// repoDir is already set: the identity is what every gh call of this
-	// run authenticates as, and it comes from the repo row, not the flow.
-	if err := f.bindIdentity(issue.ProjectID); err != nil {
-		return err
+	// runResume resolved the repo and the gh account this run must act as
+	// before the flow started; re-resolving would only repeat the same store
+	// lookup. Only a flow that arrives here unbound resolves it itself.
+	if f.ghUser == "" {
+		if err := f.bindIdentity(issue.ProjectID); err != nil {
+			return err
+		}
 	}
 
 	if err := f.ensureWorktree(); err != nil {
@@ -2252,6 +2261,28 @@ func (f *flow) markFailed(runErr error) {
 }
 
 func (f *flow) markTimedOut(runErr error) {
+	truncatedSession := f.claudeSessionID
+	if len(truncatedSession) > 8 {
+		truncatedSession = truncatedSession[:8]
+	}
+	f.markTimedOutWithMessage(runErr, fmt.Sprintf(
+		"Task timed out after %ds. State preserved — re-mention me on this issue to resume from where I left off. (claude session: %s...)",
+		f.o.cfg.MaxRunSeconds, truncatedSession))
+}
+
+// markTimedOutBeforeStart records a /resume that failed its pre-flight, i.e.
+// before claude ran. The state is TIMED_OUT so /resume stays available once
+// the blocker is fixed, but the thread message names what actually happened:
+// the run-length wording would tell the user a run timed out that never
+// launched, hiding the real fix (e.g. registering the repo's gh account).
+func (f *flow) markTimedOutBeforeStart(runErr error) {
+	f.markTimedOutWithMessage(runErr, fmt.Sprintf("admiral: cannot resume — %v", runErr))
+}
+
+// markTimedOutWithMessage persists a TIMED_OUT run and reports body on the
+// thread. Shared by the run-length timeout and the pre-flight failure above,
+// which differ only in what they tell the user.
+func (f *flow) markTimedOutWithMessage(runErr error, body string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
 		j.State = store.JobStateTimedOut
@@ -2266,16 +2297,39 @@ func (f *flow) markTimedOut(runErr error) {
 	// Use a fresh short ctx in case the parent is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	mention := f.creatorMention()
-	truncatedSession := f.claudeSessionID
-	if len(truncatedSession) > 8 {
-		truncatedSession = truncatedSession[:8]
-	}
-	body := mention + fmt.Sprintf(
-		"Task timed out after %ds. State preserved — re-mention me on this issue to resume from where I left off. (claude session: %s...)",
-		f.o.cfg.MaxRunSeconds, truncatedSession)
-	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.Response(body))
+	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.Response(f.creatorMention()+body))
 	// NO cleanupWorktree: keep worktree for resume
+}
+
+// abortFixBeforeStart reports a /fix that failed before any work started
+// (the issue, its repo, or the repo's gh account could not be resolved) and
+// returns the task to DONE.
+//
+// FAILED would be wrong here: the prior run and its claude session are still
+// valid, and /fix only dispatches from DONE — marking the task FAILED would
+// force the user to /rerun (a new branch, the work redone) merely because,
+// say, the repo's gh account had not been registered yet. DONE keeps /fix
+// retryable once the blocker is fixed.
+func (f *flow) abortFixBeforeStart(runErr error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	// The per-session audit row did fail; only the aggregate task state is
+	// rolled back.
+	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateFailed
+		j.Error = runErr.Error()
+		j.FinishedAt = now
+	})
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateDone
+		t.Error = ""
+	})
+	body := fmt.Sprintf("/fix did not start — %v\n\nThe previous run and its claude session are intact; mention me again with /fix once this is fixed.", runErr)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.ErrorActivity(f.creatorMention()+body)); err != nil {
+		f.o.logger.Error("fix_preflight_activity_failed",
+			"session", f.ev.SessionID, "err", err)
+	}
 }
 
 // cleanupMode controls whether cleanupWorktree deletes or archives the worktree.
@@ -3190,14 +3244,11 @@ func extractFirstURL(s string) string {
 	return ""
 }
 
-// truncate caps s at n runes without splitting a multi-byte character —
-// the text it cuts is user-visible (issue bodies into PR bodies, gh output
-// into Linear threads), and a byte cut would emit invalid UTF-8.
 func truncate(s string, n int) string {
-	if r := []rune(s); len(r) > n {
-		return string(r[:n]) + "..."
+	if len(s) <= n {
+		return s
 	}
-	return s
+	return s[:n] + "..."
 }
 
 // relativeTime returns a human-friendly relative time string from an RFC3339

@@ -131,10 +131,8 @@ func (w *CIWatcher) handleResult(ctx context.Context, runs []checkRun, prURL, se
 		firstFail := failed[0]
 		// Truncate failure output to 1k chars as per spec
 		failOutput := firstFail.Conclusion
-		// Rune cap, not byte cap: the conclusion lands in a Linear message,
-		// and a byte cut would split a multi-byte character.
-		if r := []rune(failOutput); len(r) > 1000 {
-			failOutput = string(r[:1000]) + "..."
+		if len(failOutput) > 1000 {
+			failOutput = failOutput[:1000] + "..."
 		}
 		msg := fmt.Sprintf("❌ CI failed: %s - %s. Logs: %s", firstFail.Name, failOutput, firstFail.URL)
 		w.postResult(ctx, sessionID, linear.Response(msg))

@@ -23,9 +23,13 @@ func newVerifyOrchestrator(db *mockStore, lc *mockLinearClient, pr *mockPRClient
 		prClientFor: func(_ context.Context, _ *store.Repo) (ghpkg.PRClient, error) {
 			return pr, nil
 		},
-		logger:       slog.Default(),
-		cfg:          &config.Autopilot{VerifyMaxRounds: maxRounds, MaxRunSeconds: 60},
-		verifyRunner: runner,
+		logger: slog.Default(),
+		cfg:    &config.Autopilot{VerifyMaxRounds: maxRounds, MaxRunSeconds: 60},
+		// The production runner carries the repo's gh account env; these
+		// tests exercise the guard/apply logic, which does not read it.
+		verifyRunner: func(ctx context.Context, repoDir, prompt string, _ []string) (string, error) {
+			return runner(ctx, repoDir, prompt)
+		},
 	}
 }
 

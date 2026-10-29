@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -387,7 +386,19 @@ func (o *Orchestrator) runVerify(parentID string) {
 		}
 	}
 
-	raw, err := o.verifyRunner(ctx, repoDir, buildVerifyPrompt(mat))
+	// The judge reads the repo and may call gh itself, so it runs as the
+	// account the repo registered. A repo with no account has no identity to
+	// verify as — refuse rather than judge under the host's account.
+	env, err := o.ghEnvForProject(ctx, projectID)
+	if err != nil {
+		o.logger.Error("verify_resolve_identity_failed",
+			"parent", parentID, "project", projectID, "err", err)
+		o.escalateVerifyWithReason(ctx, parentID, fmt.Sprintf(
+			"admiral: cannot verify — %v", err))
+		return
+	}
+
+	raw, err := o.verifyRunner(ctx, repoDir, buildVerifyPrompt(mat), env)
 	if err != nil {
 		o.logger.Error("verify_claude_failed", "parent", parentID, "err", err)
 		return
@@ -720,9 +731,9 @@ func (o *Orchestrator) escalateVerifyWithReason(ctx context.Context, parentID, b
 // one round), it streams via stdin instead of -p argv and the process gets
 // past fork(2). See the GEO-267 incident in bridge.log for the failure mode
 // this prevents.
-func runClaudeForVerify(ctx context.Context, claudeBin string, maxRunSeconds int, repoDir, prompt string, logger *slog.Logger) (string, error) {
+func runClaudeForVerify(ctx context.Context, claudeBin string, maxRunSeconds int, repoDir, prompt string, env []string, logger *slog.Logger) (string, error) {
 	return claudeclient.Run(ctx, claudeBin, maxRunSeconds, repoDir,
-		os.Environ(), prompt,
+		env, prompt,
 		[]string{"--dangerously-skip-permissions"},
 		"", logger)
 }

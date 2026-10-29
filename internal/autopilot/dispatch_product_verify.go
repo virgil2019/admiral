@@ -157,7 +157,16 @@ func (o *Orchestrator) runProductVerify(projectID string) {
 		return
 	}
 
-	raw, err := o.productVerifyRunner(ctx, repoDir, buildProductVerifyPrompt(mat))
+	// Same identity rule as L2 verify: the judge runs as the account the
+	// repo registered, never the host's active one.
+	env, err := o.ghEnvForProject(ctx, projectID)
+	if err != nil {
+		o.logger.Error("product_verify_resolve_identity_failed",
+			"project", projectID, "err", err)
+		return
+	}
+
+	raw, err := o.productVerifyRunner(ctx, repoDir, buildProductVerifyPrompt(mat), env)
 	if err != nil {
 		o.logger.Error("product_verify_claude_failed", "project", projectID, "err", err)
 		return

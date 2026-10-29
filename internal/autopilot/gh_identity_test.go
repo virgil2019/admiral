@@ -2,6 +2,7 @@ package autopilot
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -126,8 +127,9 @@ func TestFlowExecute_GhCallsUseRepoAccount(t *testing.T) {
 }
 
 // TestRunFix_RefusesWhenRepoHasNoGhAccount: the /fix path resolves the
-// identity before it starts; a repo without an account is refused, and the
-// task ends FAILED with the error.
+// identity before it starts; a repo without an account is refused. The task
+// goes back to DONE (not FAILED) so /fix stays retryable once the account is
+// registered — the prior run and its claude session are still valid.
 func TestRunFix_RefusesWhenRepoHasNoGhAccount(t *testing.T) {
 	repoDir := t.TempDir()
 	o, ms, mlc, _ := newIdentityOrchestrator(t, repoDir, "proj-nogh", "")
@@ -141,6 +143,8 @@ func TestRunFix_RefusesWhenRepoHasNoGhAccount(t *testing.T) {
 	}
 	ms.AdmiralTask = live
 	ms.LiveAdmiralTask = live
+	auditJob := &store.AutopilotJob{}
+	ms.LastUpdatedJob = auditJob
 
 	ev := linear.AgentEvent{
 		SessionID:       "session-fix-nogh",
@@ -153,11 +157,16 @@ func TestRunFix_RefusesWhenRepoHasNoGhAccount(t *testing.T) {
 	if body := mlc.GetPostedBody(); !strings.Contains(body, "PATCH /admin/repos/proj-nogh") {
 		t.Errorf("expected the PATCH hint in the Linear thread; got: %s", body)
 	}
-	if live.State != store.JobStateFailed {
-		t.Errorf("expected the task to be FAILED; got %q", live.State)
+	if live.State != store.JobStateDone {
+		t.Errorf("expected the task to stay DONE so /fix remains retryable; got %q", live.State)
 	}
-	if !strings.Contains(live.Error, "gh_user") {
-		t.Errorf("expected the error to name the missing setting; got: %q", live.Error)
+	if live.ClaudeSessionID != "claude-session" || live.PRURL == "" {
+		t.Errorf("the prior run must be left intact; got session %q pr %q",
+			live.ClaudeSessionID, live.PRURL)
+	}
+	// The per-session audit row still records the failure.
+	if auditJob.State != store.JobStateFailed {
+		t.Errorf("expected the audit job to be FAILED; got %q", auditJob.State)
 	}
 }
 
@@ -184,4 +193,105 @@ func hasAmbientToken(env []string) bool {
 		}
 	}
 	return false
+}
+
+// verifyParent is a parent issue with an Acceptance Criteria heading, so
+// runVerify takes the LLM-judge path instead of the auto-pass shortcut.
+func verifyParent() *linear.Issue {
+	return &linear.Issue{
+		Identifier:  "GEO-1",
+		Description: "Build login\n\n## Acceptance Criteria\n- user can log in\n",
+		TeamID:      "team-1", ProjectID: "proj-1",
+	}
+}
+
+// TestRunVerify_JudgeRunsAsRepoAccount: the verify judge is a claude process
+// that reads the repo (and may call gh), so it runs under the repo's
+// registered account — never the host's active one.
+func TestRunVerify_JudgeRunsAsRepoAccount(t *testing.T) {
+	lc := &mockLinearClient{GetIssueByID: map[string]*linear.Issue{"p1": verifyParent()}}
+	db := &mockStore{Repo: &store.Repo{RepoDir: "/repo"}}
+	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, func(context.Context, string, string) (string, error) {
+		return "", errors.New("unused")
+	})
+	var got []string
+	o.verifyRunner = func(_ context.Context, _, _ string, env []string) (string, error) {
+		got = env
+		// Stop the flow here: the identity is what this test asserts on.
+		return "", errors.New("stop after capturing env")
+	}
+
+	o.runVerify("p1")
+
+	if got == nil {
+		t.Fatal("verify judge never ran")
+	}
+	if !containsEnv(got, "GH_TOKEN=tok-"+defaultTestGhUser) {
+		t.Errorf("judge must run as the repo's account; env: %v", got)
+	}
+	if hasAmbientToken(got) {
+		t.Errorf("judge must not carry an ambient token; env: %v", got)
+	}
+}
+
+// TestRunVerify_RefusesWhenRepoHasNoGhAccount: with no account registered
+// there is no identity to judge as, so the judge is not spawned at all and
+// the parent is told how to fix it.
+func TestRunVerify_RefusesWhenRepoHasNoGhAccount(t *testing.T) {
+	lc := &mockLinearClient{GetIssueByID: map[string]*linear.Issue{"p1": verifyParent()}}
+	db := &mockStore{Repo: &store.Repo{RepoDir: "/repo"}, RepoNoGhUser: true}
+	ran := false
+	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, func(context.Context, string, string) (string, error) {
+		ran = true
+		return "", nil
+	})
+
+	o.runVerify("p1")
+
+	if ran {
+		t.Error("the judge must not run without a gh identity")
+	}
+	if len(lc.CreatedComments) == 0 {
+		t.Fatal("expected an escalation comment naming the missing account")
+	}
+	if body := lc.CreatedComments[0].Body; !strings.Contains(body, "PATCH /admin/repos/proj-1") {
+		t.Errorf("escalation must name the API call that fixes it; got: %s", body)
+	}
+}
+
+// TestRunResume_PreflightFailureDoesNotClaimTimeout: a /resume refused before
+// claude started must not tell the thread the run timed out after
+// MaxRunSeconds — that message describes a run that never launched and hides
+// the real fix. State stays TIMED_OUT so /resume remains retryable.
+func TestRunResume_PreflightFailureDoesNotClaimTimeout(t *testing.T) {
+	o, ms, mlc, _ := newIdentityOrchestrator(t, t.TempDir(), "proj-nogh", "")
+	live := &store.AdmiralTask{
+		IssueID:         "issue-identity",
+		State:           store.JobStateTimedOut,
+		AttemptN:        1,
+		Branch:          "linear/abc-9",
+		ClaudeSessionID: "claude-session",
+	}
+	ms.AdmiralTask = live
+	ms.LiveAdmiralTask = live
+	ms.LastUpdatedJob = &store.AutopilotJob{}
+
+	ev := linear.AgentEvent{
+		SessionID:       "session-resume-nogh",
+		IssueID:         "issue-identity",
+		IssueIdentifier: "ABC-9",
+		Action:          linear.ActionCreated,
+	}
+	o.runResume(ev, live)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "PATCH /admin/repos/proj-nogh") {
+		t.Errorf("expected the PATCH hint in the thread; got: %s", body)
+	}
+	if strings.Contains(body, "timed out after") {
+		t.Errorf("claude never ran, so the thread must not claim a run-length timeout; got: %s", body)
+	}
+	if live.State != store.JobStateTimedOut {
+		t.Errorf("expected the task to stay TIMED_OUT so /resume remains retryable; got %q", live.State)
+	}
 }

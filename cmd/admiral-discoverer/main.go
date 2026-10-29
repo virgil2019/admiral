@@ -89,7 +89,7 @@ func main() {
 			Reviewed: cfg.Discoverer.LinearStates.Reviewed,
 		},
 		AutoMerge: cfg.Discoverer.AutoMerge,
-	}, lc, &prAdapter{accounts: ghpkg.NewAccounts(cfg.Autopilot.GhBin)}, db, nil, logger)
+	}, lc, &prAdapter{accounts: ghpkg.NewAccounts(cfg.Autopilot.GhBin), ghBin: cfg.Autopilot.GhBin}, db, nil, logger)
 	// Boot-time recovery for verify rows left behind by historical
 	// failures (e.g. the GEO-267 argv-overflow incident — PR #187
 	// fixed the bug, this re-enqueues the rows that were stranded).
@@ -131,6 +131,8 @@ func parseLevel(lvl string) slog.Level {
 // to be active on the host.
 type prAdapter struct {
 	accounts *ghpkg.Accounts
+	// ghBin is the gh binary the client shells out to (autopilot.gh_bin).
+	ghBin string
 }
 
 func (a *prAdapter) clientFor(ctx context.Context, ghUser string) (*ghpkg.Client, error) {
@@ -138,7 +140,7 @@ func (a *prAdapter) clientFor(ctx context.Context, ghUser string) (*ghpkg.Client
 	if err != nil {
 		return nil, fmt.Errorf("resolve gh account %q: %w", ghUser, err)
 	}
-	return ghpkg.NewClient(tok), nil
+	return ghpkg.NewClientWithBin(a.ghBin, tok), nil
 }
 
 func (a *prAdapter) GetPRStatus(ctx context.Context, prURL, ghUser string) (discoverer.PRStatus, error) {

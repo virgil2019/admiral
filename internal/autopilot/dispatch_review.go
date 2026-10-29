@@ -104,7 +104,9 @@ func (o *Orchestrator) HandleReviewEvent(ctx context.Context, row *store.EventIn
 // Events_inbox lifecycle: the events_inbox row is marked done by the worker
 // immediately after HandleReviewEvent returns — same as the Linear dispatch
 // model where events_inbox tracks delivery only, not task completion. Failures
-// inside runReview are surfaced via the PR comment (best-effort) and logs.
+// inside runReview are surfaced on the PR as a comment reply (best-effort),
+// and — when the run cannot even resolve the repo or its gh account, so there
+// is no PR client to reply with — on the Linear thread instead.
 func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -139,6 +141,17 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 	}
 	replier := NewGitHubReplier(client, task.PRURL)
 
+	// The claude subprocess below reads and pushes GitHub state too, so it
+	// runs under the same account as the PR client — not the host's.
+	env, err := o.accounts.EnvFor(ctx, strings.TrimSpace(repo.GhUser))
+	if err != nil {
+		o.logger.Error("review_run_resolve_identity_env_failed",
+			"issue", task.IssueIdentifier, "err", err)
+		o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
+			"admiral: cannot address review — %v", err)))
+		return
+	}
+
 	// Fetch the PR diff inside the goroutine so the worker's drain loop is
 	// not blocked by the network call.
 	diff, err := client.GetDiff(ctx, task.PRURL)
@@ -163,7 +176,7 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 
 	prompt := buildReviewPrompt(o.cfg.ReviewSkill, task.PRURL, task.Branch, baseBranch, reviewBody, diff)
 
-	output, err := runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, worktreePath, prompt, o.cfg.BotIdentity, o.logger)
+	output, err := runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, worktreePath, prompt, o.cfg.BotIdentity, env, o.logger)
 	if err != nil {
 		o.logger.Error("review_run_claude_failed", "pr", task.PRURL, "err", err)
 		_ = replier.Fail(ctx, fmt.Sprintf("admiral: review run failed: %v", err))
@@ -184,7 +197,7 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 			if o.cfg.ReviewSkill != "" {
 				fullPrompt = "/" + o.cfg.ReviewSkill + "\n\n" + retryPrompt
 			}
-			return runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, wt, fullPrompt, o.cfg.BotIdentity, o.logger)
+			return runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, wt, fullPrompt, o.cfg.BotIdentity, env, o.logger)
 		}
 		gate := runVerifyWithRetry(ctx, worktreePath, verifyCmd, o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries, claudeRunner)
 		gateAttempts = gate.Attempts
@@ -336,9 +349,9 @@ func ensureReviewWorktree(ctx context.Context, repoDir string, task *store.Admir
 // at risk today, but routing it through the same helper means future
 // agents that produce larger prompts automatically inherit the stdin
 // fallback.
-func runClaudeForReview(ctx context.Context, claudeBin string, maxRunSeconds int, worktreePath, prompt string, botIdentity config.BotIdentity, logger *slog.Logger) (string, error) {
+func runClaudeForReview(ctx context.Context, claudeBin string, maxRunSeconds int, worktreePath, prompt string, botIdentity config.BotIdentity, env []string, logger *slog.Logger) (string, error) {
 	return claudeclient.Run(ctx, claudeBin, maxRunSeconds, worktreePath,
-		appendBotIdentityEnv(os.Environ(), botIdentity), prompt,
+		appendBotIdentityEnv(env, botIdentity), prompt,
 		[]string{"--dangerously-skip-permissions"},
 		"", logger)
 }

@@ -85,8 +85,17 @@ type Client struct {
 // explicit and independent of host gh auth state — see admiral's
 // gh-accounts multi-account discipline for why.
 func NewClient(token string) *Client {
+	return NewClientWithBin("", token)
+}
+
+// NewClientWithBin is NewClient for a deployment whose gh is not the one on
+// PATH (autopilot.gh_bin). An empty bin means "gh".
+func NewClientWithBin(bin, token string) *Client {
+	if bin == "" {
+		bin = "gh"
+	}
 	return &Client{
-		bin:    "gh",
+		bin:    bin,
 		token:  token,
 		runCmd: realRunCmd,
 	}
@@ -467,8 +476,9 @@ func isPRNotResolvable(out string) bool {
 		strings.Contains(low, "graphql: could not resolve")
 }
 
-// truncate caps s at n runes without splitting a multi-byte character —
-// gh output can contain any UTF-8, and a byte cut would emit invalid runes.
+// truncate caps s at n runes without splitting a multi-byte character. Every
+// caller feeds it gh's output, which is arbitrary UTF-8, straight into an
+// error message a human reads — a byte cut there can emit invalid UTF-8.
 func truncate(s string, n int) string {
 	if r := []rune(s); len(r) > n {
 		return string(r[:n]) + "..."
