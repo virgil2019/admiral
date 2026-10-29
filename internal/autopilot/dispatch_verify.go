@@ -12,6 +12,7 @@ import (
 	"github.com/georgehuang/admiral/internal/cascade"
 	"github.com/georgehuang/admiral/internal/claudeclient"
 	"github.com/georgehuang/admiral/internal/config"
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
@@ -504,12 +505,6 @@ func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string
 	if repo == nil {
 		return verifyMaterial{}, "", "", "", "", fmt.Errorf("no repo configured for project %s", parent.ProjectID)
 	}
-	// The diffs come from GitHub as the repo's registered gh account, not as
-	// whichever account happens to be active on the host.
-	client, err := o.prClientFor(ctx, repo)
-	if err != nil {
-		return verifyMaterial{}, "", "", "", "", fmt.Errorf("resolve gh identity for project %s: %w", parent.ProjectID, err)
-	}
 	subs, err := o.lc.GetSubIssues(ctx, parentID)
 	if err != nil {
 		return verifyMaterial{}, "", "", "", "", fmt.Errorf("get sub-issues: %w", err)
@@ -519,6 +514,25 @@ func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string
 		ParentIdentifier: parent.Identifier,
 		PRD:              parent.Description,
 	}
+
+	// The diffs come from GitHub as the repo's registered gh account, not as
+	// whichever account happens to be active on the host. Resolved lazily, on
+	// the first sub that actually has a PR: a round where no sub has one
+	// (human-shipped children, or a wrapper parent that auto-passes) must not
+	// be gated on the repo having an account at all.
+	var (
+		client      ghpkg.PRClient
+		clientErr   error
+		clientTried bool
+	)
+	prClient := func() (ghpkg.PRClient, error) {
+		if !clientTried {
+			clientTried = true
+			client, clientErr = o.prClientFor(ctx, repo)
+		}
+		return client, clientErr
+	}
+
 	for _, sub := range subs {
 		sm := verifySubMaterial{Identifier: sub.Identifier}
 		// SubIssue carries only id/identifier/state; fetch the title for a
@@ -531,7 +545,13 @@ func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string
 		}
 		if task, terr := o.db.GetAdmiralTaskByIssue(sub.ID); terr == nil && task != nil && task.PRURL != "" {
 			sm.PRURL = task.PRURL
-			if diff, derr := client.GetDiff(ctx, task.PRURL); derr == nil {
+			// Best-effort per sub: no identity (or a gh failure) costs the
+			// diff, not the whole round — the prompt just says "(diff
+			// unavailable)".
+			if c, cerr := prClient(); cerr != nil {
+				o.logger.Warn("verify_get_diff_no_identity",
+					"sub", sub.Identifier, "pr", task.PRURL, "err", cerr)
+			} else if diff, derr := c.GetDiff(ctx, task.PRURL); derr == nil {
 				sm.Diff = diff
 			} else {
 				o.logger.Warn("verify_get_diff_failed",

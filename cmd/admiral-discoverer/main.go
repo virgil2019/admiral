@@ -207,7 +207,7 @@ func warnReposMissingGhUser(db *store.Store, logger *slog.Logger) {
 			logger.Warn("gh_user_unconfigured",
 				"project_id", r.ProjectID,
 				"project_name", r.ProjectName,
-				"hint", `no gh account configured for this repo: its PR state advancement is skipped. Set it with PATCH /admin/repos/<project_id> {"gh_user":"<account from gh auth status>"}.`)
+				"hint", `no gh account configured for this repo: its PR state advancement is skipped. Set it with PATCH /admin/repos/<project_id> {"gh_user":"<account from gh auth status>"}; config gh_user only applies when the repos table is empty.`)
 		}
 	}
 }

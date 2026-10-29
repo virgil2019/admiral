@@ -797,10 +797,12 @@ func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 		ClaudeSessionID: task.ClaudeSessionID,
 	}
 	resumeFlow := newResumeFlow(o, ctx, ev, syntheticPrior)
-	// Identity gate: the resumed run pushes the branch and comments on the
-	// PR as the repo's registered gh account. Resolve it before any work
-	// happens; a repo without an account is refused, never run as whichever
-	// account happens to be active on the host.
+	// Identity gate: the run's gh calls (PR lookups, PR comments, CI checks,
+	// the claude subprocess) authenticate as the repo's registered account.
+	// (The branch push itself goes over the remote's SSH identity, which is
+	// configured per repo.) Resolve it before any work happens; a repo
+	// without an account is refused, never run as whichever account happens
+	// to be active on the host.
 	if err := o.prepareResume(resumeFlow, ev); err != nil {
 		o.logger.Error("fix_resolve_identity_failed",
 			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
@@ -811,6 +813,14 @@ func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 	if err := resumeFlow.executeResume(); err != nil {
 		o.logger.Error("autopilot_fix_failed",
 			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
+		// A prepare-phase failure (ensureWorktree / openStreamFile / MCP
+		// config write) means claude never launched: the prior run and its
+		// session are intact, and FAILED would close off /fix (it only
+		// dispatches from DONE), forcing a /rerun with a new branch.
+		if isPreparePhaseError(err) {
+			resumeFlow.abortFixBeforeStart(err)
+			return
+		}
 		// markFailed updates admiral_tasks → FAILED (PR-B-v2 dual-write).
 		resumeFlow.markFailed(err)
 		return
@@ -1721,9 +1731,9 @@ func (f *flow) executeResume() error {
 	f.postActivity(linear.Thought("Resuming previous session...", true))
 
 	// The caller (runFix) resolves the repo and the gh account before the
-	// run starts. The resumed run pushes the branch and comments on the PR,
-	// so without an identity every gh call of it would fall back to the
-	// host's active account — refuse to start instead.
+	// run starts. The resumed run comments on the PR and reads its state, so
+	// without an identity every gh call of it would fall back to the host's
+	// active account — refuse to start instead.
 	if f.ghUser == "" {
 		return errGhUserUnset(f.projectID)
 	}
@@ -3264,11 +3274,15 @@ func extractFirstURL(s string) string {
 	return ""
 }
 
+// truncate caps s at n runes without splitting a multi-byte character. Its
+// callers cut text a human then reads (issue bodies into PR bodies, gh output
+// and error strings into the Linear thread), so a byte cut would emit invalid
+// UTF-8 for any CJK or emoji input.
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+	if r := []rune(s); len(r) > n {
+		return string(r[:n]) + "..."
 	}
-	return s[:n] + "..."
+	return s
 }
 
 // relativeTime returns a human-friendly relative time string from an RFC3339

@@ -394,3 +394,64 @@ func TestRunProductVerify_EscalatesWhenRepoHasNoGhAccount(t *testing.T) {
 		t.Errorf("status = %q, want %q", got, store.TaskVerifyEscalated)
 	}
 }
+
+// TestGatherVerifyMaterial_NoIdentityStillGathers: the identity is only needed
+// for the sub-issue diffs, so a round where no sub has a PR must still gather
+// (and can auto-pass) on a repo with no gh account — gating it there would
+// escalate wrappers that need no GitHub at all.
+func TestGatherVerifyMaterial_NoIdentityStillGathers(t *testing.T) {
+	parent := verifyParent()
+	parent.Description = "wrapper" // no Acceptance Criteria → auto-pass path
+	lc := &mockLinearClient{
+		GetIssueByID: map[string]*linear.Issue{"p1": parent},
+		SubIssues:    []linear.SubIssue{{ID: "p2", Identifier: "GEO-2"}},
+	}
+	db := &mockStore{Repo: &store.Repo{RepoDir: "/repo", ProjectID: "proj-1"}, RepoNoGhUser: true}
+	o := newVerifyOrchestrator(db, lc, &mockPRClient{}, 3, func(context.Context, string, string) (string, error) {
+		return "", errors.New("unused")
+	})
+	o.prClientFor = o.githubClientFor
+
+	_, _, _, _, _, err := o.gatherVerifyMaterial(context.Background(), "p1")
+	if err != nil {
+		t.Fatalf("gather must not require a gh identity when no sub has a PR: %v", err)
+	}
+}
+
+// TestTruncate_IsRuneSafe pins the red line: user-visible text must never be
+// cut mid-codepoint.
+func TestTruncate_IsRuneSafe(t *testing.T) {
+	if got := truncate("✓✓✓", 2); got != "✓✓..." {
+		t.Errorf("truncate = %q, want rune-safe cut", got)
+	}
+}
+
+// TestRunFix_PreparePhaseFailureKeepsFixRetryable: a failure in ensureWorktree
+// means claude never ran, so /fix must stay available (DONE) instead of
+// closing itself off with FAILED — the same rule /resume follows.
+func TestRunFix_PreparePhaseFailureKeepsFixRetryable(t *testing.T) {
+	// The temp dir is not a git repo, so ensureWorktree fails inside the flow.
+	o, ms, mlc, _ := newIdentityOrchestrator(t, t.TempDir(), "proj-x", "virgil2019")
+	live := &store.AdmiralTask{
+		IssueID: "issue-identity", State: store.JobStateDone, AttemptN: 1,
+		PRURL: "https://github.com/x/y/pull/42", Branch: "linear/abc-9",
+		ClaudeSessionID: "claude-session",
+	}
+	ms.AdmiralTask = live
+	ms.LiveAdmiralTask = live
+	ms.LastUpdatedJob = &store.AutopilotJob{}
+
+	ev := linear.AgentEvent{
+		SessionID: "session-fix-prepare", IssueID: "issue-identity",
+		IssueIdentifier: "ABC-9", Action: linear.ActionCreated,
+	}
+	o.runFix(ev, live)
+
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "/fix did not start") || !strings.Contains(body, "ensure worktree") {
+		t.Errorf("expected a pre-flight failure report; got: %s", body)
+	}
+	if live.State != store.JobStateDone {
+		t.Errorf("expected the task to stay DONE so /fix remains retryable; got %q", live.State)
+	}
+}
