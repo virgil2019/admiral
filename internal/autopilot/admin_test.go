@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/store"
 )
 
@@ -520,7 +521,7 @@ func TestCreateRepoHandler_Success(t *testing.T) {
 	}
 
 	as := newAdminServer(s, nil, "gh", slog.Default(), 3, "", "")
-	as.gh = &ghAccounts{bin: "gh", run: fakeGhAccountsRunner(ghUserTestAccounts)}
+	as.gh = ghpkg.NewAccountsWithRunner("gh", fakeGhAccountsRunner(ghUserTestAccounts))
 	mux := http.NewServeMux()
 	as.registerRoutesForTest(mux)
 

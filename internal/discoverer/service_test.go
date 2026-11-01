@@ -121,6 +121,8 @@ type fakeStore struct {
 	tracked         map[string]*store.AdmiralTask
 	picks           map[string]*store.DiscovererPick
 	projectIDs      []string
+	repos           map[string]*store.Repo
+	repoErr         error
 	tasksByState    map[string]*store.AdmiralTask
 	taskErr         error
 	pickGetErr      error
@@ -131,6 +133,10 @@ type fakeStore struct {
 	enqueueFresh    bool
 	enqueueErr      error
 }
+
+// defaultTestGhUser is the gh account the fake store reports for a project
+// that has no explicit repo row.
+const defaultTestGhUser = "test-gh-user"
 
 type enqueueCall struct {
 	Source, WebhookID, Action, SessionID, IssueID, Payload, CommentID string
@@ -158,6 +164,19 @@ func (s *fakeStore) ListAutoPickEnabledProjectIDs() ([]string, error) {
 		return nil, s.projErr
 	}
 	return s.projectIDs, nil
+}
+
+// GetRepoByProjectID returns the repo registered for a project. The
+// discoverer reads the repo's gh_user from it — that is the account every
+// GitHub call of the project runs as.
+func (s *fakeStore) GetRepoByProjectID(projectID string) (*store.Repo, error) {
+	if s.repoErr != nil {
+		return nil, s.repoErr
+	}
+	if s.repos == nil {
+		return &store.Repo{ProjectID: projectID, GhUser: defaultTestGhUser}, nil
+	}
+	return s.repos[projectID], nil
 }
 
 func (s *fakeStore) GetDiscovererPick(id string) (*store.DiscovererPick, error) {
@@ -233,20 +252,25 @@ type fakePR struct {
 	// mergeErr, when set, makes MergePR fail — used to test the
 	// fall-through-to-Reviewed path on a merge failure.
 	mergeErr error
+	// ghUsers records the gh account each call was made as, so tests can
+	// assert the discoverer acts as the repo's registered account.
+	ghUsers []string
 }
 
-func (p *fakePR) GetPRStatus(_ context.Context, prURL string) (PRStatus, error) {
+func (p *fakePR) GetPRStatus(_ context.Context, prURL, ghUser string) (PRStatus, error) {
 	if p.err != nil {
 		return PRStatus{}, p.err
 	}
+	p.ghUsers = append(p.ghUsers, ghUser)
 	return p.statuses[prURL], nil
 }
 
-func (p *fakePR) MergePR(_ context.Context, prURL string) error {
+func (p *fakePR) MergePR(_ context.Context, prURL, ghUser string) error {
 	if p.mergeErr != nil {
 		return p.mergeErr
 	}
 	p.merged = append(p.merged, prURL)
+	p.ghUsers = append(p.ghUsers, ghUser)
 	return nil
 }
 

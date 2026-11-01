@@ -86,23 +86,28 @@ func (o *Orchestrator) HandleReviewEvent(ctx context.Context, row *store.EventIn
 		return
 	}
 
-	replier := NewGitHubReplier(o.prClient, prURL)
-	go o.runReview(task, reviewBody, replier)
+	go o.runReview(task, reviewBody)
 }
 
 // runReview is the background goroutine for a GitHub review event. Steps:
-//  1. Resolve the repo directory via the Linear issue.
+//  1. Resolve the repo (and its registered gh account) via the Linear issue.
 //  2. Fetch the PR diff for context (non-fatal if unavailable).
 //  3. Ensure the worktree exists (rebuild from remote if cleaned up).
 //  4. Run `claude -p` with a review prompt.
 //  5. Push the branch to origin.
 //  6. Post the claude output as a PR comment.
 //
+// The PR client authenticates as the account the repo registered
+// (repos.gh_user): the reply has to land on the PR as that account, not as
+// whichever one happens to be active on the host.
+//
 // Events_inbox lifecycle: the events_inbox row is marked done by the worker
 // immediately after HandleReviewEvent returns — same as the Linear dispatch
 // model where events_inbox tracks delivery only, not task completion. Failures
-// inside runReview are surfaced via the PR comment (best-effort) and logs.
-func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, replier Replier) {
+// inside runReview are surfaced on the PR as a comment reply (best-effort),
+// and — when the run cannot even resolve the repo or its gh account, so there
+// is no PR client to reply with — on the Linear thread instead.
+func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 	defer func() {
 		if r := recover(); r != nil {
 			o.logger.Error("review_run_panic", "pr", task.PRURL, "panic", r)
@@ -116,20 +121,43 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 
-	// Fetch the PR diff inside the goroutine so the worker's drain loop is
-	// not blocked by the network call.
-	diff, err := o.prClient.GetDiff(ctx, task.PRURL)
-	if err != nil {
-		o.logger.Warn("review_run_get_diff_failed", "pr", task.PRURL, "err", err)
-		// Non-fatal: proceed without diff context.
-	}
-
-	repoDir, baseBranch, verifyCmd, err := o.resolveRepoForReview(ctx, task)
+	repo, err := o.resolveRepoForReview(ctx, task)
 	if err != nil {
 		o.logger.Error("review_run_resolve_repo_failed",
 			"issue", task.IssueIdentifier, "err", err)
-		_ = replier.Fail(ctx, "admiral: cannot address review — could not resolve repo for this issue.")
+		o.postReviewLinearNotice(task, linear.Response(
+			"admiral: cannot address review — could not resolve repo for this issue."))
 		return
+	}
+	repoDir, baseBranch, verifyCmd := repo.RepoDir, repo.BaseBranch, repo.VerifyCmd
+
+	client, err := o.prClientFor(ctx, repo)
+	if err != nil {
+		o.logger.Error("review_run_resolve_identity_failed",
+			"issue", task.IssueIdentifier, "err", err)
+		o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
+			"admiral: cannot address review — %v", err)))
+		return
+	}
+	replier := NewGitHubReplier(client, task.PRURL)
+
+	// The claude subprocess below reads and pushes GitHub state too, so it
+	// runs under the same account as the PR client — not the host's.
+	env, err := o.accounts.EnvFor(ctx, strings.TrimSpace(repo.GhUser))
+	if err != nil {
+		o.logger.Error("review_run_resolve_identity_env_failed",
+			"issue", task.IssueIdentifier, "err", err)
+		o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
+			"admiral: cannot address review — %v", err)))
+		return
+	}
+
+	// Fetch the PR diff inside the goroutine so the worker's drain loop is
+	// not blocked by the network call.
+	diff, err := client.GetDiff(ctx, task.PRURL)
+	if err != nil {
+		o.logger.Warn("review_run_get_diff_failed", "pr", task.PRURL, "err", err)
+		// Non-fatal: proceed without diff context.
 	}
 
 	worktreePath, err := ensureReviewWorktree(ctx, repoDir, task)
@@ -148,7 +176,7 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 
 	prompt := buildReviewPrompt(o.cfg.ReviewSkill, task.PRURL, task.Branch, baseBranch, reviewBody, diff)
 
-	output, err := runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, worktreePath, prompt, o.cfg.BotIdentity, o.logger)
+	output, err := runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, worktreePath, prompt, o.cfg.BotIdentity, env, o.logger)
 	if err != nil {
 		o.logger.Error("review_run_claude_failed", "pr", task.PRURL, "err", err)
 		_ = replier.Fail(ctx, fmt.Sprintf("admiral: review run failed: %v", err))
@@ -169,9 +197,9 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 			if o.cfg.ReviewSkill != "" {
 				fullPrompt = "/" + o.cfg.ReviewSkill + "\n\n" + retryPrompt
 			}
-			return runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, wt, fullPrompt, o.cfg.BotIdentity, o.logger)
+			return runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, wt, fullPrompt, o.cfg.BotIdentity, env, o.logger)
 		}
-		gate := runVerifyWithRetry(ctx, worktreePath, verifyCmd, o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries, claudeRunner)
+		gate := runVerifyWithRetry(ctx, worktreePath, verifyCmd, o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries, env, claudeRunner)
 		gateAttempts = gate.Attempts
 		if !gate.Passed {
 			o.logger.Warn("review_run_build_gate_failed",
@@ -243,21 +271,21 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string, rep
 }
 
 // resolveRepoForReview fetches the Linear issue for the task and returns the
-// configured repo directory, base branch, and verify command (empty when no
-// build hard gate is configured for the repo).
-func (o *Orchestrator) resolveRepoForReview(ctx context.Context, task *store.AdmiralTask) (repoDir, baseBranch, verifyCmd string, err error) {
+// repo registered for its project. The repo carries the gh account admiral
+// must act as (repos.gh_user) — the caller turns it into a PR client.
+func (o *Orchestrator) resolveRepoForReview(ctx context.Context, task *store.AdmiralTask) (*store.Repo, error) {
 	issue, err := o.lc.GetIssue(ctx, task.IssueID)
 	if err != nil {
-		return "", "", "", fmt.Errorf("get issue: %w", err)
+		return nil, fmt.Errorf("get issue: %w", err)
 	}
 	repo, err := o.db.GetRepoByProjectID(issue.ProjectID)
 	if err != nil {
-		return "", "", "", fmt.Errorf("get repo for project %s: %w", issue.ProjectID, err)
+		return nil, fmt.Errorf("get repo for project %s: %w", issue.ProjectID, err)
 	}
 	if repo == nil {
-		return "", "", "", fmt.Errorf("no repo configured for project %s", issue.ProjectID)
+		return nil, fmt.Errorf("no repo configured for project %s", issue.ProjectID)
 	}
-	return repo.RepoDir, repo.BaseBranch, repo.VerifyCmd, nil
+	return repo, nil
 }
 
 // ensureReviewWorktree returns a ready worktree path for task.Branch synced
@@ -321,9 +349,9 @@ func ensureReviewWorktree(ctx context.Context, repoDir string, task *store.Admir
 // at risk today, but routing it through the same helper means future
 // agents that produce larger prompts automatically inherit the stdin
 // fallback.
-func runClaudeForReview(ctx context.Context, claudeBin string, maxRunSeconds int, worktreePath, prompt string, botIdentity config.BotIdentity, logger *slog.Logger) (string, error) {
+func runClaudeForReview(ctx context.Context, claudeBin string, maxRunSeconds int, worktreePath, prompt string, botIdentity config.BotIdentity, env []string, logger *slog.Logger) (string, error) {
 	return claudeclient.Run(ctx, claudeBin, maxRunSeconds, worktreePath,
-		appendBotIdentityEnv(os.Environ(), botIdentity), prompt,
+		appendBotIdentityEnv(env, botIdentity), prompt,
 		[]string{"--dangerously-skip-permissions"},
 		"", logger)
 }

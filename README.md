@@ -330,6 +330,7 @@ autopilot:
       project_name: "MyProject"
       repo_dir: "/path/to/my-repo"
       base_branch: "main"
+      gh_user: "your-github-login"  # account admiral acts as on this repo
   # bot_token and allowed_tg_user_ids enable Telegram alerts when OAuth breaks:
   # bot_token: "123456:ABC-..."
   # allowed_tg_user_ids: [111222333]
@@ -354,8 +355,9 @@ In Linear, on a toy issue, either:
 - `@mention` admiral in a comment
 
 The agent thread should show: 💭 thought → ⚡ action(s) → ✅ response with
-PR URL. The PR opens on `repo_dir`'s GitHub remote (admiral expects
-`gh auth login` to have been run for the right account).
+PR URL. The PR opens on `repo_dir`'s GitHub remote, authored by the account
+registered for that repo (`repos[].gh_user`) — admiral expects
+`gh auth login` to have been run for that account.
 
 ### Admin API (read + write)
 

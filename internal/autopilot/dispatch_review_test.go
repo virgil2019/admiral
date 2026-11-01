@@ -50,7 +50,10 @@ func newReviewOrchestrator(db *mockStore, lc *mockLinearClient, pr *mockPRClient
 	return &Orchestrator{
 		db:       db,
 		lc:       lc,
-		prClient: pr,
+		accounts: fakeAccounts(),
+		prClientFor: func(_ context.Context, _ *store.Repo) (ghpkg.PRClient, error) {
+			return pr, nil
+		},
 		logger:   slog.Default(),
 		runSlots: make(chan struct{}, 3),
 		cfg: &config.Autopilot{

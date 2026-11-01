@@ -17,11 +17,16 @@ import (
 // productVerifyRunner the test supplies.
 func newProductVerifyOrchestrator(db *mockStore, lc *mockLinearClient, maxRounds int, runner func(ctx context.Context, repoDir, prompt string) (string, error)) *Orchestrator {
 	return &Orchestrator{
-		db:                  db,
-		lc:                  lc,
-		logger:              slog.Default(),
-		cfg:                 &config.Autopilot{VerifyMaxRounds: maxRounds, MaxRunSeconds: 60},
-		productVerifyRunner: runner,
+		db:       db,
+		lc:       lc,
+		accounts: fakeAccounts(),
+		logger:   slog.Default(),
+		cfg:      &config.Autopilot{VerifyMaxRounds: maxRounds, MaxRunSeconds: 60},
+		// The production runner carries the repo's gh account env; these
+		// tests exercise the guard/apply logic, which does not read it.
+		productVerifyRunner: func(ctx context.Context, repoDir, prompt string, _ []string) (string, error) {
+			return runner(ctx, repoDir, prompt)
+		},
 	}
 }
 

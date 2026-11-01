@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/georgehuang/admiral/internal/config"
@@ -53,6 +54,13 @@ func main() {
 	}
 	defer db.Close()
 
+	// The discoverer advances a task's Linear state by polling its PR, and
+	// every one of those calls runs as the account the repo registered. A
+	// repo with no gh_user is skipped at runtime, so without this boot-time
+	// warning an upgraded deployment (migration0024 backfills '') would look
+	// like the state machine silently froze.
+	warnReposMissingGhUser(db, logger)
+
 	lc := linear.NewClient(cfg.Linear.APIBase, cfg.Linear.APIToken)
 	tr, refreshAvailable := linear.NewTokenRefresher(
 		cfg.Linear.ClientID, cfg.Linear.ClientSecret, db, logger, "")
@@ -73,7 +81,6 @@ func main() {
 	}
 
 	judgeEnabled := cfg.Discoverer.Judge.Enabled != nil && *cfg.Discoverer.Judge.Enabled
-	ghClient := ghpkg.NewClient(cfg.Autopilot.GhToken)
 	svc := discoverer.New(discoverer.Config{
 		PollInterval:    cfg.Discoverer.PollInterval,
 		StateTypes:      cfg.Discoverer.StateTypes,
@@ -90,7 +97,7 @@ func main() {
 			Reviewed: cfg.Discoverer.LinearStates.Reviewed,
 		},
 		AutoMerge: cfg.Discoverer.AutoMerge,
-	}, lc, &prAdapter{c: ghClient}, db, nil, logger)
+	}, lc, &prAdapter{accounts: ghpkg.NewAccounts(cfg.Autopilot.GhBin), ghBin: cfg.Autopilot.GhBin}, db, nil, logger)
 	// Boot-time recovery for verify rows left behind by historical
 	// failures (e.g. the GEO-267 argv-overflow incident — PR #187
 	// fixed the bug, this re-enqueues the rows that were stranded).
@@ -125,12 +132,31 @@ func parseLevel(lvl string) slog.Level {
 // prClient interface, keeping the discoverer package free of an
 // internal/github import. When the discoverer is split off into its
 // own repo, the adapter is the only piece that has to move with it.
+//
+// Every call builds a client for the gh account the repo registered
+// (repos.gh_user): the token is read from the gh keyring per call and never
+// cached, so admiral acts as that account — never as whichever one happens
+// to be active on the host.
 type prAdapter struct {
-	c *ghpkg.Client
+	accounts *ghpkg.Accounts
+	// ghBin is the gh binary the client shells out to (autopilot.gh_bin).
+	ghBin string
 }
 
-func (a *prAdapter) GetPRStatus(ctx context.Context, prURL string) (discoverer.PRStatus, error) {
-	s, err := a.c.GetPRStatus(ctx, prURL)
+func (a *prAdapter) clientFor(ctx context.Context, ghUser string) (*ghpkg.Client, error) {
+	tok, err := a.accounts.Token(ctx, ghUser)
+	if err != nil {
+		return nil, fmt.Errorf("resolve gh account %q: %w", ghUser, err)
+	}
+	return ghpkg.NewClientWithBin(a.ghBin, tok), nil
+}
+
+func (a *prAdapter) GetPRStatus(ctx context.Context, prURL, ghUser string) (discoverer.PRStatus, error) {
+	c, err := a.clientFor(ctx, ghUser)
+	if err != nil {
+		return discoverer.PRStatus{}, err
+	}
+	s, err := c.GetPRStatus(ctx, prURL)
 	if err != nil {
 		return discoverer.PRStatus{}, err
 	}
@@ -143,8 +169,12 @@ func (a *prAdapter) GetPRStatus(ctx context.Context, prURL string) (discoverer.P
 	}, nil
 }
 
-func (a *prAdapter) MergePR(ctx context.Context, prURL string) error {
-	return a.c.MergePR(ctx, prURL)
+func (a *prAdapter) MergePR(ctx context.Context, prURL, ghUser string) error {
+	c, err := a.clientFor(ctx, ghUser)
+	if err != nil {
+		return err
+	}
+	return c.MergePR(ctx, prURL)
 }
 
 func newLogger(c config.Logging) *slog.Logger {
@@ -160,4 +190,24 @@ func newLogger(c config.Logging) *slog.Logger {
 		}
 	}
 	return slog.New(slog.NewTextHandler(w, opts))
+}
+
+// warnReposMissingGhUser emits a boot-time WARN per repo with no gh_user —
+// typically rows that predate migration0024. A repo without an account cannot
+// have its PR polled, so its tasks never advance (no MERGED → Completed, no
+// CLOSED → Canceled, no verify enqueue, no auto-merge).
+func warnReposMissingGhUser(db *store.Store, logger *slog.Logger) {
+	repos, err := db.ListRepos()
+	if err != nil {
+		logger.Warn("gh_user_boot_check_list_failed", "err", err)
+		return
+	}
+	for _, r := range repos {
+		if strings.TrimSpace(r.GhUser) == "" {
+			logger.Warn("gh_user_unconfigured",
+				"project_id", r.ProjectID,
+				"project_name", r.ProjectName,
+				"hint", `no gh account configured for this repo: its PR state advancement is skipped. Set it with PATCH /admin/repos/<project_id> {"gh_user":"<account from gh auth status>"}; config gh_user only applies when the repos table is empty.`)
+		}
+	}
 }

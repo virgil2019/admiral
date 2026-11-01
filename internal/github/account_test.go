@@ -1,4 +1,4 @@
-package autopilot
+package github
 
 import (
 	"context"
@@ -22,7 +22,7 @@ type fakeGhAccount struct {
 // `gh api repos/<owner>/<name> --jq .permissions.push` for the given
 // accounts. The token for user X is "tok-X"; api calls authenticate by the
 // GH_TOKEN in env, so a call without the right token fails like gh would.
-func fakeGhAccountsRunner(accounts map[string]fakeGhAccount) ghEnvRunner {
+func fakeGhAccountsRunner(accounts map[string]fakeGhAccount) Runner {
 	return func(_ context.Context, env []string, args ...string) (string, error) {
 		joined := strings.Join(args, " ")
 		switch {
@@ -90,12 +90,12 @@ func TestParseGitHubRepo(t *testing.T) {
 	}
 }
 
-func TestGhAccounts_ValidateRepoAccess(t *testing.T) {
+func TestAccounts_ValidateRepoAccess(t *testing.T) {
 	accounts := map[string]fakeGhAccount{
 		"virgil2019": {loggedIn: true, repos: map[string]bool{"virgil2019/klink": true, "other/readonly": false}},
 		"chababa9":   {loggedIn: true, repos: map[string]bool{}},
 	}
-	a := &ghAccounts{bin: "gh", run: fakeGhAccountsRunner(accounts)}
+	a := NewAccountsWithRunner("gh", fakeGhAccountsRunner(accounts))
 	const origin = "git@virgil.github.com:virgil2019/klink.git"
 
 	cases := []struct {
@@ -127,10 +127,10 @@ func TestGhAccounts_ValidateRepoAccess(t *testing.T) {
 	}
 }
 
-func TestGhAccounts_Token(t *testing.T) {
-	a := &ghAccounts{bin: "gh", run: fakeGhAccountsRunner(map[string]fakeGhAccount{
+func TestAccounts_Token(t *testing.T) {
+	a := NewAccountsWithRunner("gh", fakeGhAccountsRunner(map[string]fakeGhAccount{
 		"virgil2019": {loggedIn: true},
-	})}
+	}))
 	tok, err := a.Token(context.Background(), "virgil2019")
 	if err != nil || tok != "tok-virgil2019" {
 		t.Fatalf("Token = (%q, %v), want (tok-virgil2019, nil)", tok, err)
@@ -140,9 +140,37 @@ func TestGhAccounts_Token(t *testing.T) {
 	}
 }
 
-// TestGhAccounts_RealRunnerIgnoresStderr runs a fake gh script that warns on
+// TestAccounts_EnvForPinsIdentity: the env admiral hands to gh must pin
+// GH_TOKEN to the requested account and drop every ambient token variable,
+// so the host's active gh account can never take over.
+func TestAccounts_EnvForPinsIdentity(t *testing.T) {
+	t.Setenv("GH_TOKEN", "ambient-token")
+	t.Setenv("GITHUB_TOKEN", "ambient-token-2")
+	a := NewAccountsWithRunner("gh", fakeGhAccountsRunner(map[string]fakeGhAccount{
+		"virgil2019": {loggedIn: true},
+	}))
+	env, err := a.EnvFor(context.Background(), "virgil2019")
+	if err != nil {
+		t.Fatalf("EnvFor: %v", err)
+	}
+	var tokens []string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GH_TOKEN=") || strings.HasPrefix(kv, "GITHUB_TOKEN=") {
+			tokens = append(tokens, kv)
+		}
+	}
+	want := []string{"GH_TOKEN=tok-virgil2019"}
+	if !slices.Equal(tokens, want) {
+		t.Fatalf("token vars = %v, want %v", tokens, want)
+	}
+	if _, err := a.EnvFor(context.Background(), ""); err == nil {
+		t.Fatal("expected error for empty user")
+	}
+}
+
+// TestAccounts_RealRunnerIgnoresStderr runs a fake gh script that warns on
 // stderr while succeeding: only stdout may reach the token / --jq value.
-func TestGhAccounts_RealRunnerIgnoresStderr(t *testing.T) {
+func TestAccounts_RealRunnerIgnoresStderr(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "gh")
 	body := `#!/bin/sh
 echo "warning: something deprecated" >&2
@@ -154,7 +182,7 @@ esac
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	a := newGhAccounts(script)
+	a := NewAccounts(script)
 	if tok, err := a.Token(context.Background(), "u"); err != nil || tok != "tok-real" {
 		t.Fatalf("Token = (%q, %v), want tok-real", tok, err)
 	}
@@ -163,12 +191,12 @@ esac
 	}
 }
 
-func TestTruncateRunes(t *testing.T) {
-	if got := truncateRunes("✓✓✓", 2); got != "✓✓..." {
-		t.Fatalf("truncateRunes = %q", got)
+func TestTruncate(t *testing.T) {
+	if got := truncate("✓✓✓", 2); got != "✓✓..." {
+		t.Fatalf("truncate = %q", got)
 	}
-	if got := truncateRunes("ab", 5); got != "ab" {
-		t.Fatalf("truncateRunes = %q", got)
+	if got := truncate("ab", 5); got != "ab" {
+		t.Fatalf("truncate = %q", got)
 	}
 }
 

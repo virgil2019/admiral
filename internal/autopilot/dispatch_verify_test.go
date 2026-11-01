@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/georgehuang/admiral/internal/config"
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
@@ -16,12 +17,19 @@ import (
 // stubbed clients, a no-op run slot, and a verifyRunner the test supplies.
 func newVerifyOrchestrator(db *mockStore, lc *mockLinearClient, pr *mockPRClient, maxRounds int, runner func(ctx context.Context, repoDir, prompt string) (string, error)) *Orchestrator {
 	return &Orchestrator{
-		db:           db,
-		lc:           lc,
-		prClient:     pr,
-		logger:       slog.Default(),
-		cfg:          &config.Autopilot{VerifyMaxRounds: maxRounds, MaxRunSeconds: 60},
-		verifyRunner: runner,
+		db:       db,
+		lc:       lc,
+		accounts: fakeAccounts(),
+		prClientFor: func(_ context.Context, _ *store.Repo) (ghpkg.PRClient, error) {
+			return pr, nil
+		},
+		logger: slog.Default(),
+		cfg:    &config.Autopilot{VerifyMaxRounds: maxRounds, MaxRunSeconds: 60},
+		// The production runner carries the repo's gh account env; these
+		// tests exercise the guard/apply logic, which does not read it.
+		verifyRunner: func(ctx context.Context, repoDir, prompt string, _ []string) (string, error) {
+			return runner(ctx, repoDir, prompt)
+		},
 	}
 }
 

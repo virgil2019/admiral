@@ -54,7 +54,7 @@ func main() {
 
 	// Seed repos from config if DB is empty (DB takes priority over config
 	// once repos have been stored, so we only seed on first run).
-	if err := seedRepos(db, &cfg.Autopilot, autopilot.NewRepoGhUserValidator(cfg.Autopilot.GhBin), logger); err != nil {
+	if err := seedRepos(db, &cfg.Autopilot, ghpkg.NewRepoGhUserValidator(cfg.Autopilot.GhBin), logger); err != nil {
 		logger.Error("repos_seed_failed", "err", err)
 		os.Exit(1)
 	}

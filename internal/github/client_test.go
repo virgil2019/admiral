@@ -34,6 +34,25 @@ func newTestClient(token string, fr *fakeRunner) *Client {
 	}
 }
 
+// TestNewClientWithBin pins the configured gh binary: a deployment whose gh
+// is not on PATH (autopilot.gh_bin) must not silently fall back to PATH.
+func TestNewClientWithBin(t *testing.T) {
+	fr := &fakeRunner{stdout: `{"state":"OPEN"}`}
+	c := NewClientWithBin("/opt/gh/bin/gh", "tok")
+	c.runCmd = fr.run
+
+	if _, err := c.GetPRState(context.Background(), "https://github.com/x/y/pull/1"); err != nil {
+		t.Fatalf("GetPRState: %v", err)
+	}
+	if fr.gotName != "/opt/gh/bin/gh" {
+		t.Errorf("gh binary: got %q, want the configured one", fr.gotName)
+	}
+
+	if got := NewClientWithBin("", "tok").bin; got != "gh" {
+		t.Errorf("empty bin must default to gh; got %q", got)
+	}
+}
+
 func TestPostComment_Composition(t *testing.T) {
 	fr := &fakeRunner{stdout: "https://github.com/x/y/pull/1#issuecomment-42\n"}
 	c := newTestClient("tok-abc", fr)

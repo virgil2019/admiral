@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 	"log/slog"
@@ -21,6 +22,9 @@ type CIWatcher struct {
 	pollInter time.Duration
 	timeout   time.Duration
 	ghBin     string
+	// accounts resolves the repo's registered gh account to a token for
+	// each poll, so the check-run lookup runs as that account.
+	accounts *ghpkg.Accounts
 }
 
 // checkRun represents a single GitHub check run.
@@ -40,18 +44,20 @@ func newCIWatcher(lc linearClientInterface, db storeInterface, logger *slog.Logg
 		pollInter: pollInter,
 		timeout:   timeout,
 		ghBin:     ghBin,
+		accounts:  ghpkg.NewAccounts(ghBin),
 	}
 }
 
 // WatchPR polls GitHub check runs for the given PR URL and posts results to Linear.
 // It spawns a goroutine and returns immediately — the caller does not block.
 // repoDir is the directory where the git repo is located (used for gh commands).
+// ghUser is the repo's registered gh account; the poll authenticates as it.
 // On CI failure, the admiral_tasks row is transitioned to FAILED with reason "ci_failed".
-func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issueID string) {
-	go w.watch(ctx, prURL, repoDir, sessionID, issueID)
+func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issueID, ghUser string) {
+	go w.watch(ctx, prURL, repoDir, sessionID, issueID, ghUser)
 }
 
-func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueID string) {
+func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueID, ghUser string) {
 	prNumber, err := extractPRNumberFromURL(prURL)
 	if err != nil {
 		w.logger.Warn("ci_watch_parse_failed", "pr_url", prURL, "err", err)
@@ -69,7 +75,7 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 			w.logger.Info("ci_watch_cancelled", "pr_url", prURL)
 			return
 		case <-ticker.C:
-			runs, err := w.fetchCheckRuns(ctx, repoDir, prNumber)
+			runs, err := w.fetchCheckRuns(ctx, repoDir, prNumber, ghUser)
 			if err != nil {
 				w.logger.Warn("ci_fetch_runs_failed", "pr_url", prURL, "err", err)
 				continue
@@ -90,12 +96,18 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 	}
 }
 
-func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber int) ([]checkRun, error) {
+func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber int, ghUser string) ([]checkRun, error) {
 	dir := repoDir
 	if dir == "" {
 		dir = "."
 	}
-	out, err := captureCmd(ctx, dir, w.ghBin,
+	// The check-run lookup runs as the repo's registered gh account, so a
+	// private repo's checks are visible to admiral at all.
+	env, err := w.accounts.EnvFor(ctx, ghUser)
+	if err != nil {
+		return nil, fmt.Errorf("resolve gh account %q: %w", ghUser, err)
+	}
+	out, err := captureCmdEnv(ctx, dir, env, w.ghBin,
 		"pr", "checks", fmt.Sprintf("%d", prNumber),
 		"--json", "name,status,conclusion,url",
 	)

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -685,5 +686,47 @@ func TestBotIdentity_IsSet(t *testing.T) {
 		if got := tc.id.IsSet(); got != tc.want {
 			t.Errorf("%s: IsSet() = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestLoad_RejectsRemovedAutopilotGhKeys: the GitHub identity is configured
+// per repo, so a global autopilot.gh_user / autopilot.gh_token is gone.
+// Plain yaml.Unmarshal ignores unknown keys, so without an explicit probe a
+// stale autopilot.gh_token would silently do nothing while the operator
+// believes it configures admiral's GitHub identity.
+func TestLoad_RejectsRemovedAutopilotGhKeys(t *testing.T) {
+	bin := os.Args[0]
+	cases := []struct {
+		name string
+		key  string
+		want string
+	}{
+		{"gh_user", "gh_user", "autopilot.gh_user"},
+		{"gh_token", "gh_token", "autopilot.gh_token"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  ` + tc.key + `: "some-value"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+			_, err := LoadAutopilot(writeConfig(t, body))
+			if err == nil {
+				t.Fatalf("expected autopilot.%s to be rejected", tc.key)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error must name the removed key %q; got: %v", tc.want, err)
+			}
+			if !strings.Contains(err.Error(), "gh_user") {
+				t.Errorf("error must point at the per-repo setting; got: %v", err)
+			}
+		})
 	}
 }
