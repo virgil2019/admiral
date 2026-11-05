@@ -3,6 +3,7 @@ package autopilot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/georgehuang/admiral/internal/claudeclient"
 	"github.com/georgehuang/admiral/internal/config"
+	ghpkg "github.com/georgehuang/admiral/internal/github"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
 )
@@ -92,10 +94,10 @@ func (o *Orchestrator) HandleReviewEvent(ctx context.Context, row *store.EventIn
 // runReview is the background goroutine for a GitHub review event. Steps:
 //  1. Resolve the repo (and its registered gh account) via the Linear issue.
 //  2. Fetch the PR diff for context (non-fatal if unavailable).
-//  3. Ensure the worktree exists (rebuild from remote if cleaned up).
-//  4. Run `claude -p` with a review prompt.
-//  5. Push the branch to origin.
-//  6. Post the claude output as a PR comment.
+//  3. Run one fix round on the PR branch (claude + build gate + push) via
+//     runPRFix — the same tail a CI-failure fix round uses.
+//  4. Post the claude output as a PR comment and a notice to the Linear
+//     thread.
 //
 // The PR client authenticates as the account the repo registered
 // (repos.gh_user): the reply has to land on the PR as that account, not as
@@ -121,66 +123,202 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 
-	repo, err := o.resolveRepoForReview(ctx, task)
+	deps, stage, err := o.resolvePRFixDeps(ctx, task)
 	if err != nil {
-		o.logger.Error("review_run_resolve_repo_failed",
-			"issue", task.IssueIdentifier, "err", err)
-		o.postReviewLinearNotice(task, linear.Response(
-			"admiral: cannot address review — could not resolve repo for this issue."))
-		return
-	}
-	repoDir, baseBranch, verifyCmd := repo.RepoDir, repo.BaseBranch, repo.VerifyCmd
-
-	client, err := o.prClientFor(ctx, repo)
-	if err != nil {
-		o.logger.Error("review_run_resolve_identity_failed",
-			"issue", task.IssueIdentifier, "err", err)
-		o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
-			"admiral: cannot address review — %v", err)))
-		return
-	}
-	replier := NewGitHubReplier(client, task.PRURL)
-
-	// The claude subprocess below reads and pushes GitHub state too, so it
-	// runs under the same account as the PR client — not the host's.
-	env, err := o.accounts.EnvFor(ctx, strings.TrimSpace(repo.GhUser))
-	if err != nil {
-		o.logger.Error("review_run_resolve_identity_env_failed",
-			"issue", task.IssueIdentifier, "err", err)
-		o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
-			"admiral: cannot address review — %v", err)))
+		o.logger.Error("review_run_prepare_failed",
+			"stage", stage, "issue", task.IssueIdentifier, "err", err)
+		switch stage {
+		case prFixStageRepo:
+			o.postReviewLinearNotice(task, linear.Response(
+				"admiral: cannot address review — could not resolve repo for this issue."))
+		case prFixStageIdentity:
+			o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
+				"admiral: cannot address review — %v", err)))
+		case prFixStageWorktree:
+			_ = deps.replier.Fail(ctx, fmt.Sprintf(
+				"admiral: cannot address review — failed to prepare worktree for branch %s: %v",
+				task.Branch, err))
+		}
 		return
 	}
 
 	// Fetch the PR diff inside the goroutine so the worker's drain loop is
 	// not blocked by the network call.
-	diff, err := client.GetDiff(ctx, task.PRURL)
+	diff, err := deps.client.GetDiff(ctx, task.PRURL)
 	if err != nil {
 		o.logger.Warn("review_run_get_diff_failed", "pr", task.PRURL, "err", err)
 		// Non-fatal: proceed without diff context.
 	}
 
-	worktreePath, err := ensureReviewWorktree(ctx, repoDir, task)
+	prompt := buildReviewPrompt(o.cfg.ReviewSkill, task.PRURL, task.Branch, deps.baseBranch, reviewBody, diff)
+
+	out, err := o.runPRFix(ctx, task, deps, prompt)
 	if err != nil {
-		o.logger.Error("review_run_worktree_failed",
-			"pr", task.PRURL, "branch", task.Branch, "err", err)
-		_ = replier.Fail(ctx, fmt.Sprintf(
-			"admiral: cannot address review — failed to prepare worktree for branch %s: %v",
-			task.Branch, err))
+		var gateFail *gateFailureError
+		if errors.As(err, &gateFail) {
+			_ = deps.replier.Fail(ctx, gateFail.message())
+			// Mirror the PR-side notice on the Linear thread so the issue
+			// creator is aware without having to watch the PR tab.
+			o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
+				"admiral build gate failed for PR %s after %d attempt(s). Manual review needed.",
+				task.PRURL, gateFail.Attempts)))
+			return
+		}
+		o.logger.Error("review_run_claude_failed", "pr", task.PRURL, "err", err)
+		_ = deps.replier.Fail(ctx, fmt.Sprintf("admiral: review run failed: %v", err))
 		return
+	}
+
+	output := out.Output
+	if !out.Pushed {
+		output += "\n\n(note: push to origin failed — `" + task.Branch +
+			"` on origin has commits admiral didn't see. " +
+			"Local commits were discarded; trigger the review again to retry.)"
+	}
+	if output == "" {
+		output = "addressed"
+	}
+	if out.GateAttempts > 0 {
+		// Surface the attempt count so reviewers can tell at a glance whether
+		// the fix landed cleanly (1 attempt) or needed retries (2+).
+		output += fmt.Sprintf("\n\n_(admiral build gate: passed after %d attempt(s))_", out.GateAttempts)
+	}
+	_ = deps.replier.Reply(ctx, output)
+
+	// Best-effort: notify the Linear thread that the review has been addressed
+	// so the issue creator knows to come re-review. Failures are logged at
+	// warn level — the PR comment above is the authoritative signal.
+	o.postReviewHandledNotice(task)
+}
+
+// Stages resolvePRFixDeps can fail at. The caller phrases the human-facing
+// message per stage: repo/identity failures have no PR client to reply with
+// (Linear thread only); a worktree failure can still fail the PR comment.
+const (
+	prFixStageRepo     = "repo"
+	prFixStageIdentity = "identity"
+	prFixStageWorktree = "worktree"
+)
+
+// prFixDeps is everything one fix round on a task's PR needs, resolved once:
+// the repo (and its registered gh account), a PR client that authenticates
+// as that account, the child env for claude/gh subprocesses, and a synced
+// worktree on the task's branch.
+type prFixDeps struct {
+	repo       *store.Repo
+	client     ghpkg.PRClient
+	replier    Replier
+	env        []string
+	repoDir    string
+	baseBranch string
+	verifyCmd  string
+	worktree   string
+}
+
+// resolvePRFixDeps resolves the repo via the task's Linear issue, builds the
+// PR client + subprocess env for its registered gh account, and prepares the
+// worktree (rebuilt from origin when missing, always synced to the fresh tip).
+//
+// Returns the deps and the stage the resolution reached; on error, deps is
+// non-nil once the client exists (worktree stage) so the caller can still
+// reply on the PR.
+func (o *Orchestrator) resolvePRFixDeps(ctx context.Context, task *store.AdmiralTask) (*prFixDeps, string, error) {
+	repo, err := o.resolveRepoForReview(ctx, task)
+	if err != nil {
+		return nil, prFixStageRepo, err
+	}
+
+	client, err := o.prClientFor(ctx, repo)
+	if err != nil {
+		return nil, prFixStageIdentity, err
+	}
+	deps := &prFixDeps{
+		repo:       repo,
+		client:     client,
+		replier:    NewGitHubReplier(client, task.PRURL),
+		repoDir:    repo.RepoDir,
+		baseBranch: repo.BaseBranch,
+		verifyCmd:  repo.VerifyCmd,
+	}
+
+	// The claude subprocess below reads and pushes GitHub state too, so it
+	// runs under the same account as the PR client — not the host's.
+	env, err := o.accounts.EnvFor(ctx, strings.TrimSpace(repo.GhUser))
+	if err != nil {
+		return deps, prFixStageIdentity, err
+	}
+	deps.env = env
+
+	worktreePath, err := ensureReviewWorktree(ctx, repo.RepoDir, task)
+	if err != nil {
+		o.logger.Error("pr_fix_worktree_failed",
+			"pr", task.PRURL, "branch", task.Branch, "err", err)
+		return deps, prFixStageWorktree, err
 	}
 	if err := applyBotIdentityToWorktree(ctx, worktreePath, o.cfg.BotIdentity); err != nil {
-		o.logger.Warn("review_run_bot_identity_apply_failed",
+		o.logger.Warn("pr_fix_bot_identity_apply_failed",
 			"pr", task.PRURL, "branch", task.Branch, "err", err)
 	}
+	deps.worktree = worktreePath
+	return deps, "", nil
+}
 
-	prompt := buildReviewPrompt(o.cfg.ReviewSkill, task.PRURL, task.Branch, baseBranch, reviewBody, diff)
+// gateFailureError reports a build gate that never passed, with the fields
+// the human-facing message needs. The change has NOT been pushed.
+type gateFailureError struct {
+	Attempts    int
+	VerifyCmd   string
+	BuildOutput string
+	LaunchErr   string
+}
 
-	output, err := runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, worktreePath, prompt, o.cfg.BotIdentity, env, o.logger)
+func (e *gateFailureError) Error() string {
+	msg := fmt.Sprintf("build gate failed after %d attempt(s) (verify cmd: %s)", e.Attempts, e.VerifyCmd)
+	if e.LaunchErr != "" {
+		msg += "; launch error: " + e.LaunchErr
+	}
+	return msg
+}
+
+// message renders the PR-comment form of the failure, matching the format
+// the review path has always posted.
+func (e *gateFailureError) message() string {
+	msg := fmt.Sprintf(
+		"admiral could not get the build to pass after %d attempt(s). The change has NOT been pushed.\n\n"+
+			"Verify command: `%s`\nLast build output tail:\n```\n%s\n```",
+		e.Attempts, e.VerifyCmd, e.BuildOutput)
+	if e.LaunchErr != "" {
+		msg += fmt.Sprintf("\n\nadmiral launch error: %s", e.LaunchErr)
+	}
+	return msg
+}
+
+// prFixOutcome reports what one fix round produced.
+type prFixOutcome struct {
+	// Output is claude's reply, refreshed from the gate's retry when the
+	// gate had to run (its summary reflects the FINAL passing commit).
+	Output string
+	// Pushed is false when the push to origin failed; the branch's local
+	// commits were discarded so the next round starts from origin.
+	Pushed bool
+	// GateAttempts is how many build-gate claude runs happened (0 when the
+	// repo has no verify_cmd).
+	GateAttempts int
+}
+
+// runPRFix runs one claude fix round on a task's PR branch: claude with the
+// given prompt in deps.worktree, the build hard gate when the repo has
+// verify_cmd (retries claude up to VerifyMaxRetries with a fix-forward
+// prompt; only a clean exit 0 gets pushed), then the push with divergence
+// cleanup. Shared by the review-feedback path and the CI-failure path.
+//
+// A gate that never passes returns a *gateFailureError. A claude launch or
+// run failure returns the raw error. Push failure is NOT an error — the
+// outcome reports Pushed=false and the caller phrases the note.
+func (o *Orchestrator) runPRFix(ctx context.Context, task *store.AdmiralTask, deps *prFixDeps, prompt string) (prFixOutcome, error) {
+	output, err := runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, deps.worktree, prompt, o.cfg.BotIdentity, deps.env, o.logger)
 	if err != nil {
-		o.logger.Error("review_run_claude_failed", "pr", task.PRURL, "err", err)
-		_ = replier.Fail(ctx, fmt.Sprintf("admiral: review run failed: %v", err))
-		return
+		return prFixOutcome{}, err
 	}
 
 	// Build hard gate (closes the review-dispatch slice of #161 / 漏洞 2 hard
@@ -191,83 +329,61 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 	// entirely (preserves pre-PR behavior; prompt-level layers from #163/#165
 	// remain).
 	gateAttempts := 0
-	if verifyCmd != "" {
+	if deps.verifyCmd != "" {
 		claudeRunner := func(ctx context.Context, wt, retryPrompt string) (string, error) {
 			fullPrompt := retryPrompt
 			if o.cfg.ReviewSkill != "" {
 				fullPrompt = "/" + o.cfg.ReviewSkill + "\n\n" + retryPrompt
 			}
-			return runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, wt, fullPrompt, o.cfg.BotIdentity, env, o.logger)
+			return runClaudeForReview(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, wt, fullPrompt, o.cfg.BotIdentity, deps.env, o.logger)
 		}
-		gate := runVerifyWithRetry(ctx, worktreePath, verifyCmd, o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries, env, claudeRunner)
+		gate := runVerifyWithRetry(ctx, deps.worktree, deps.verifyCmd, o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries, deps.env, claudeRunner)
 		gateAttempts = gate.Attempts
 		if !gate.Passed {
-			o.logger.Warn("review_run_build_gate_failed",
+			o.logger.Warn("pr_fix_build_gate_failed",
 				"pr", task.PRURL, "branch", task.Branch,
 				"attempts", gate.Attempts,
 				"launch_err", gate.LaunchErr)
-			failMsg := fmt.Sprintf(
-				"admiral could not get the build to pass after %d attempt(s). The change has NOT been pushed.\n\n"+
-					"Verify command: `%s`\nLast build output tail:\n```\n%s\n```",
-				gate.Attempts, verifyCmd, strings.TrimSpace(gate.LastBuildOutput))
-			if gate.LaunchErr != "" {
-				failMsg += fmt.Sprintf("\n\nadmiral launch error: %s", gate.LaunchErr)
+			return prFixOutcome{GateAttempts: gate.Attempts}, &gateFailureError{
+				Attempts:    gate.Attempts,
+				VerifyCmd:   deps.verifyCmd,
+				BuildOutput: strings.TrimSpace(gate.LastBuildOutput),
+				LaunchErr:   gate.LaunchErr,
 			}
-			_ = replier.Fail(ctx, failMsg)
-			// Mirror the PR-side notice on the Linear thread so the issue
-			// creator is aware without having to watch the PR tab.
-			o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
-				"admiral build gate failed for PR %s after %d attempt(s). Manual review needed.",
-				task.PRURL, gate.Attempts)))
-			return
 		}
+		o.logger.Info("pr_fix_build_gate_passed",
+			"pr", task.PRURL, "branch", task.Branch, "attempts", gate.Attempts)
 		// Retry produced a fresher summary that reflects the FINAL passing
 		// commit; surface it to the reviewer.
 		if gate.LastClaudeReply != "" {
 			output = gate.LastClaudeReply
 		}
-		o.logger.Info("review_run_build_gate_passed",
-			"pr", task.PRURL, "branch", task.Branch, "attempts", gate.Attempts)
 	}
 
-	if pushErr := runCmd(ctx, worktreePath, "git", "push", "origin", task.Branch); pushErr != nil {
-		o.logger.Error("review_run_push_failed",
+	pushed := true
+	if pushErr := runCmd(ctx, deps.worktree, "git", "push", "origin", task.Branch); pushErr != nil {
+		pushed = false
+		o.logger.Error("pr_fix_push_failed",
 			"pr", task.PRURL, "branch", task.Branch, "err", pushErr)
-		// Discard claude's local-only commits so the next review run starts
-		// from origin instead of compounding the divergence. ensureReviewWorktree
-		// already fetched at the start of this run; fetch once more in case the
-		// remote moved between then and now.
-		if fetchErr := runCmd(ctx, worktreePath, "git", "fetch", "origin", task.Branch); fetchErr != nil {
-			o.logger.Warn("review_run_push_cleanup_fetch_failed",
+		// Discard claude's local-only commits so the next fix round starts
+		// from origin instead of compounding the divergence.
+		// ensureReviewWorktree already fetched at the start of this run;
+		// fetch once more in case the remote moved between then and now.
+		if fetchErr := runCmd(ctx, deps.worktree, "git", "fetch", "origin", task.Branch); fetchErr != nil {
+			o.logger.Warn("pr_fix_push_cleanup_fetch_failed",
 				"pr", task.PRURL, "branch", task.Branch, "err", fetchErr)
 		}
-		if resetErr := runCmd(ctx, worktreePath, "git", "reset", "--hard", "origin/"+task.Branch); resetErr != nil {
-			o.logger.Warn("review_run_push_cleanup_reset_failed",
+		if resetErr := runCmd(ctx, deps.worktree, "git", "reset", "--hard", "origin/"+task.Branch); resetErr != nil {
+			o.logger.Warn("pr_fix_push_cleanup_reset_failed",
 				"pr", task.PRURL, "branch", task.Branch, "err", resetErr)
 		}
-		if cleanErr := runCmd(ctx, worktreePath, "git", "clean", "-fd"); cleanErr != nil {
-			o.logger.Warn("review_run_push_cleanup_clean_failed",
+		if cleanErr := runCmd(ctx, deps.worktree, "git", "clean", "-fd"); cleanErr != nil {
+			o.logger.Warn("pr_fix_push_cleanup_clean_failed",
 				"pr", task.PRURL, "branch", task.Branch, "err", cleanErr)
 		}
-		output += "\n\n(note: push to origin failed — `" + task.Branch +
-			"` on origin has commits admiral didn't see. " +
-			"Local commits were discarded; trigger the review again to retry.)"
 	}
 
-	if output == "" {
-		output = "addressed"
-	}
-	if gateAttempts > 0 {
-		// Surface the attempt count so reviewers can tell at a glance whether
-		// the fix landed cleanly (1 attempt) or needed retries (2+).
-		output += fmt.Sprintf("\n\n_(admiral build gate: passed after %d attempt(s))_", gateAttempts)
-	}
-	_ = replier.Reply(ctx, output)
-
-	// Best-effort: notify the Linear thread that the review has been addressed
-	// so the issue creator knows to come re-review. Failures are logged at
-	// warn level — the PR comment above is the authoritative signal.
-	o.postReviewHandledNotice(task)
+	return prFixOutcome{Output: output, Pushed: pushed, GateAttempts: gateAttempts}, nil
 }
 
 // resolveRepoForReview fetches the Linear issue for the task and returns the
