@@ -64,10 +64,8 @@ func buildCIFixPrompt(skill, prURL, branch, baseBranch, failure string) string {
 	}
 	fmt.Fprintf(&b, "CI failed on PR %s (branch: %s, base: %s).\n\n", prURL, branch, baseBranch)
 	fmt.Fprintf(&b, "Failing checks:\n%s\n\n", failure)
-	b.WriteString("Investigate the failure logs (you are authenticated as the repo's registered account — use `gh pr checks` and `gh run view --log-failed`), fix the underlying problem, and run the project's build / test command " +
-		"(e.g. `swift build`, `go build ./...`, `cargo build`, `npm test` — whichever this repo uses; " +
-		"check the repo's README or common build files if unsure) and ensure it passes locally. ")
-	b.WriteString("Do not commit broken code. ")
+	b.WriteString("Investigate the failure logs (you are authenticated as the repo's registered account — use `gh pr checks` and `gh run view --log-failed`), fix the underlying problem, and ")
+	b.WriteString(fixBuildInstructions)
 	fmt.Fprintf(&b, "Stage and commit your changes to branch %q. Do NOT open a new PR.\n", branch)
 	b.WriteString("Summarize what you changed in 1–3 sentences.")
 	return b.String()

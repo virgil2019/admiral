@@ -679,7 +679,7 @@ func TestEscalateCI_RespectsTerminalTask(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	w := newCIWatcher(&mockLinearClient{}, db, logger, "gh", time.Second, time.Minute, 2)
 
-	w.escalateCI(context.Background(), "escalation message", "sess-1", db.AdmiralTask.IssueID)
+	w.escalateCI(context.Background(), "escalation message", "sess-1", db.AdmiralTask.IssueID, "https://github.com/acme/repo/pull/7")
 
 	if state, errMsg := taskStateSnapshot(db); state != store.JobStateDoneMerged || errMsg != "" {
 		t.Errorf("terminal row clobbered: task = %q/%q, want DONE_MERGED untouched", state, errMsg)
@@ -788,4 +788,52 @@ func TestLockPRFix_SerializesSameBranch(t *testing.T) {
 		t.Fatal("different branch should lock independently")
 	}
 	u2()
+}
+
+// TestEscalateCI_RespectsSupersededRow: the write-side twin of the loop's
+// stale guard — a /rerun can reuse the row (new attempt, different PR,
+// non-terminal) WHILE a fix round or escalation is in flight; the mutation
+// must re-validate PRURL at write time, not just at loop start.
+func TestEscalateCI_RespectsSupersededRow(t *testing.T) {
+	db := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID: "issue-1", State: store.JobStateExecuting,
+			PRURL: "https://github.com/acme/repo/pull/9", // reused by /rerun
+		},
+	}
+	db.LiveAdmiralTask = db.AdmiralTask
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w := newCIWatcher(&mockLinearClient{}, db, logger, "gh", time.Second, time.Minute, 2)
+
+	w.escalateCI(context.Background(), "escalation message", "sess-1", db.AdmiralTask.IssueID,
+		"https://github.com/acme/repo/pull/7") // this watch's PR
+
+	if state, errMsg := taskStateSnapshot(db); state != store.JobStateExecuting || errMsg != "" {
+		t.Errorf("superseded row clobbered: %q/%q, want EXECUTING untouched", state, errMsg)
+	}
+}
+
+// TestWatchPR_DuplicateSuppressed: a PR can get a second watcher (ensurePR
+// reuses the PR across /rerun attempts); with the fix loop a duplicate
+// means double claude spend — the second WatchPR for a PR with an active
+// watcher is a no-op.
+func TestWatchPR_DuplicateSuppressed(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, fixCalls := ciWatchFixFixture(ghBin, 2)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "attempted 2 automatic fix round(s) without success")
+	if *fixCalls != 2 {
+		t.Errorf("fixRound called %d times, want exactly 2 (ONE watcher's two rounds — duplicate suppressed)", *fixCalls)
+	}
 }

@@ -157,6 +157,12 @@ type Orchestrator struct {
 	// would interleave `git reset --hard` / `git clean -fd` with the other
 	// round's in-flight claude edits, or trip git's index.lock. Keyed by
 	// branch (one branch = one worktree = one PR).
+	//
+	// Entries are never deleted — the map grows by one small mutex per
+	// branch ever fix-rounded, i.e. per issue per rerun attempt. That is
+	// bounded by the issue tracker's lifetime output (~thousands of tiny
+	// entries over months), not by traffic; revisit only if that ever
+	// stops holding.
 	prFixLocksMu sync.Mutex
 	prFixLocks   map[string]*sync.Mutex
 

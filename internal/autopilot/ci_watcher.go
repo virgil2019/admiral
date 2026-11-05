@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	ghpkg "github.com/georgehuang/admiral/internal/github"
@@ -37,6 +38,13 @@ type CIWatcher struct {
 	// and its child process — forever; exec only kills the child on ctx
 	// cancellation.
 	fetchTimeout time.Duration
+
+	// activePRs dedups concurrent watchers on the same PR: multiple runs
+	// can land on one PR (ensurePR reuses it across /rerun attempts), and
+	// with the fix loop a duplicate watcher means double claude spend and
+	// double escalation messages, not just a duplicate report.
+	activeMu sync.Mutex
+	activePR map[string]struct{}
 	// accounts resolves the repo's registered gh account to a token for
 	// each poll, so the check-run lookup runs as that account.
 	accounts *ghpkg.Accounts
@@ -85,8 +93,14 @@ func newCIWatcher(lc linearClientInterface, db storeInterface, logger *slog.Logg
 // watcher detaches from it (WithoutCancel) and terminates on its own deadline
 // (w.timeout) instead.
 func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issueID, ghUser string) {
+	if !w.claimPR(prURL) {
+		w.logger.Info("ci_watch_duplicate_suppressed",
+			"pr_url", prURL, "issue", issueID)
+		return
+	}
 	ctx = context.WithoutCancel(ctx)
 	go func() {
+		defer w.releasePR(prURL)
 		// The goroutine runs claude, git, and Linear posts via fixRound; a
 		// panic here would take down the whole daemon (Go kills the process
 		// on any unrecovered panic). Same guard as runReview.
@@ -97,6 +111,27 @@ func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issu
 		}()
 		w.watch(ctx, prURL, repoDir, sessionID, issueID, ghUser)
 	}()
+}
+
+// claimPR registers prURL as actively watched; false = a watcher for this
+// PR is already running, the caller must not spawn a second one.
+func (w *CIWatcher) claimPR(prURL string) bool {
+	w.activeMu.Lock()
+	defer w.activeMu.Unlock()
+	if w.activePR == nil {
+		w.activePR = make(map[string]struct{})
+	}
+	if _, dup := w.activePR[prURL]; dup {
+		return false
+	}
+	w.activePR[prURL] = struct{}{}
+	return true
+}
+
+func (w *CIWatcher) releasePR(prURL string) {
+	w.activeMu.Lock()
+	defer w.activeMu.Unlock()
+	delete(w.activePR, prURL)
 }
 
 func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueID, ghUser string) {
@@ -175,13 +210,13 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 		if w.fixRound == nil {
 			w.escalateCI(ctx, fmt.Sprintf(
 				"❌ CI failed on PR %s:\n%s\n\nNo automatic fix is configured (ci_fix_max_rounds is 0). Manual intervention needed — use `/rerun` on the issue.",
-				prURL, failure), sessionID, issueID)
+				prURL, failure), sessionID, issueID, prURL)
 			return
 		}
 		if round >= w.maxFixRounds {
 			w.escalateCI(ctx, fmt.Sprintf(
 				"❌ CI failed on PR %s:\n%s\n\nadmiral attempted %d automatic fix round(s) without success. Manual intervention needed — use `/rerun` on the issue.",
-				prURL, failure, round), sessionID, issueID)
+				prURL, failure, round), sessionID, issueID, prURL)
 			return
 		}
 
@@ -193,7 +228,7 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 			w.logger.Warn("ci_fix_round_failed", "pr_url", prURL, "round", round+1, "err", err)
 			w.escalateCI(ctx, fmt.Sprintf(
 				"❌ CI failed on PR %s:\n%s\n\nFix round %d failed: %v. Manual intervention needed — use `/rerun` on the issue.",
-				prURL, failure, round+1, err), sessionID, issueID)
+				prURL, failure, round+1, err), sessionID, issueID, prURL)
 			return
 		}
 
@@ -201,7 +236,9 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 		// the re-poll: a poll landing too early resolves the previous
 		// head's completed failing checks and burns a round on stale data.
 		// This narrows the race; it cannot eliminate it — the cap and the
-		// per-round escalation bound the damage if it loses.
+		// per-round escalation bound the damage if it loses. (As in
+		// pollUntilFinal, the Done branch is by-construction dead here —
+		// the ctx is detached — and kept for future cancelable callers.)
 		select {
 		case <-ctx.Done():
 			return
@@ -221,6 +258,9 @@ func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber
 
 	for {
 		select {
+		// By construction this ctx is never cancelled (WatchPR detaches it
+		// with WithoutCancel); the branch stays so a future cancelable
+		// caller remains correct instead of polling into shutdown.
 		case <-ctx.Done():
 			w.logger.Info("ci_watch_cancelled", "pr_url", prURL)
 			return nil, false
@@ -257,15 +297,18 @@ func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber
 // the admiral_tasks row FAILED with reason ci_failed — the human-recovery
 // path (use /rerun on the issue; /fix requires a DONE run) starts from
 // there.
-func (w *CIWatcher) escalateCI(ctx context.Context, msg, sessionID, issueID string) {
+func (w *CIWatcher) escalateCI(ctx context.Context, msg, sessionID, issueID, prURL string) {
 	w.postResult(ctx, sessionID, linear.Response(msg))
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	err := w.db.UpdateAdmiralTask(issueID, func(t *store.AdmiralTask) {
-		// The row may have gone terminal while a fix round was running
-		// (e.g. the PR got merged mid-round); never clobber a terminal
-		// state — it is the audit trail the discoverer advances on.
-		if isTerminalTaskState(t.State) {
+		// Re-validate at WRITE time: a fix round can run for hours, and a
+		// /rerun reuses the row mid-round (new attempt, different PR,
+		// non-terminal state). The loop-start check alone is TOCTOU — the
+		// mutation must not clobber a row that no longer points at this
+		// watch's PR, nor a row that went terminal (merged mid-round) —
+		// that row is the audit trail the discoverer advances on.
+		if t.PRURL != prURL || isTerminalTaskState(t.State) {
 			return
 		}
 		t.State = store.JobStateFailed
