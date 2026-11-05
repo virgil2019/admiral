@@ -2,13 +2,17 @@ package autopilot
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/georgehuang/admiral/internal/store"
 )
 
 func TestAllFinal(t *testing.T) {
@@ -306,7 +310,7 @@ func TestParseInt(t *testing.T) {
 }
 
 func TestNewCIWatcher(t *testing.T) {
-	w := newCIWatcher(nil, nil, nil, "gh", 30*time.Second, 15*time.Minute)
+	w := newCIWatcher(nil, nil, nil, "gh", 30*time.Second, 15*time.Minute, 2)
 	if w == nil {
 		t.Fatal("newCIWatcher returned nil")
 	}
@@ -339,7 +343,7 @@ func TestWatchPR_PollsAfterCallerCancels(t *testing.T) {
 	lc := &mockLinearClient{}
 	db := &mockStore{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	w := newCIWatcher(lc, db, logger, ghBin, 10*time.Millisecond, 5*time.Second)
+	w := newCIWatcher(lc, db, logger, ghBin, 10*time.Millisecond, 5*time.Second, 2)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // the run is over before watching even starts — exactly the production shape
@@ -361,4 +365,228 @@ func TestWatchPR_PollsAfterCallerCancels(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// ciWatchFakeGh writes a fake gh binary whose check-run JSON depends on how
+// many times `gh pr checks` has been invoked: the first calls (before
+// fixRounds) return the given failure JSON, later calls return all-success.
+// `gh auth token` calls (made by Accounts.EnvFor with the same binary) are
+// answered separately and not counted. Returns the binary path and a
+// function reading back the checks-invocation count.
+func ciWatchFakeGh(t *testing.T, firstRuns int) (string, func() int) {
+	t.Helper()
+	dir := t.TempDir()
+	ghBin := filepath.Join(dir, "fake-gh")
+	cnt := filepath.Join(dir, "calls")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		fmt.Sprintf("n=$(cat %s 2>/dev/null || echo 0); n=$((n+1)); echo $n > %s\n", cnt, cnt) +
+		fmt.Sprintf("if [ $n -le %d ]; then\n", firstRuns) +
+		`  echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n" +
+		"else\n" +
+		`  echo '[{"name":"test","status":"completed","conclusion":"success"}]'` + "\n" +
+		"fi\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	count := func() int {
+		b, err := os.ReadFile(cnt)
+		if err != nil {
+			return 0
+		}
+		n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+		return n
+	}
+	return ghBin, count
+}
+
+// ciWatchTaskFailure polls the mock's posted body until it contains want
+// (or times out), returning the last body seen.
+func ciWatchTaskFailure(t *testing.T, lc *mockLinearClient, want string) string {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		lc.PostedBodyMu.Lock()
+		posted := lc.PostedBody
+		lc.PostedBodyMu.Unlock()
+		if strings.Contains(posted, want) {
+			return posted
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no Linear post containing %q within deadline; last: %q", want, posted)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func ciWatchFixFixture(ghBin string, maxFixRounds int) (*CIWatcher, *mockLinearClient, *mockStore, *int) {
+	lc := &mockLinearClient{}
+	db := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID:         "issue-1",
+			IssueIdentifier: "TEST-1",
+			State:           store.JobStateDone,
+			Branch:          "linear/TEST-1",
+			PRURL:           "https://github.com/acme/repo/pull/7",
+			WorktreePath:    "/tmp/wt",
+		},
+	}
+	db.LiveAdmiralTask = db.AdmiralTask
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w := newCIWatcher(lc, db, logger, ghBin, 10*time.Millisecond, 5*time.Second, maxFixRounds)
+	fixCalls := 0
+	w.fixRound = func(_ context.Context, _ *store.AdmiralTask, _ string) error {
+		fixCalls++
+		return nil
+	}
+	return w, lc, db, &fixCalls
+}
+
+// TestWatchPR_CIFailureTriggersFixThenGreen: a failing first poll runs one
+// fix round, the fix push makes CI re-run green, and the Linear thread gets
+// the success notice with the fix-round count. The task row must NOT be
+// marked FAILED anywhere on this path.
+func TestWatchPR_CIFailureTriggersFixThenGreen(t *testing.T) {
+	ghBin, ghCalls := ciWatchFakeGh(t, 1)
+	w, lc, db, fixCalls := ciWatchFixFixture(ghBin, 2)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	body := ciWatchTaskFailure(t, lc, "✅ All CI checks passed")
+	if !strings.Contains(body, "1 automatic fix round") {
+		t.Errorf("success notice missing fix-round count: %q", body)
+	}
+	if *fixCalls != 1 {
+		t.Errorf("fixRound called %d times, want 1", *fixCalls)
+	}
+	if ghCalls() < 2 {
+		t.Errorf("gh polled %d times, want >= 2 (re-poll after fix)", ghCalls())
+	}
+	db.LiveAdmiralTask = db.AdmiralTask // LiveAdmiralTask points at the same struct; re-assert below
+	if state, _ := taskStateSnapshot(db); state != store.JobStateDone {
+		t.Errorf("task state = %q, want DONE (fix succeeded, no FAILED marker)", state)
+	}
+}
+
+// TestWatchPR_CIFixCapEscalates: when CI keeps failing, the watcher runs
+// exactly maxFixRounds fix rounds, then escalates to the human (Linear
+// notice with a /fix pointer) and marks the task FAILED ci_failed. This is
+// the anti-infinite-loop contract.
+func TestWatchPR_CIFixCapEscalates(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, fixCalls := ciWatchFixFixture(ghBin, 2)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "could not fix it after 2 fix round(s)")
+	body := ciWatchTaskFailure(t, lc, "comment `/fix` on the issue")
+	if !strings.Contains(body, "could not fix it after 2 fix round(s)") {
+		t.Errorf("escalation notice lost the round count: %q", body)
+	}
+	if *fixCalls != 2 {
+		t.Errorf("fixRound called %d times, want exactly 2 (cap enforced)", *fixCalls)
+	}
+	if state, errMsg := taskStateSnapshot(db); state != store.JobStateFailed || errMsg != "ci_failed" {
+		t.Errorf("task = %q/%q, want FAILED/ci_failed", state, errMsg)
+	}
+}
+
+// TestWatchPR_ReportOnlyWhenNoFixRound: with fixRound nil the watcher keeps
+// GEO-54 behavior — one failure notice, immediate FAILED ci_failed, no fix
+// attempts.
+func TestWatchPR_ReportOnlyWhenNoFixRound(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	lc := &mockLinearClient{}
+	db := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID: "issue-1", State: store.JobStateDone,
+			PRURL: "https://github.com/acme/repo/pull/7",
+		},
+	}
+	db.LiveAdmiralTask = db.AdmiralTask
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w := newCIWatcher(lc, db, logger, ghBin, 10*time.Millisecond, 5*time.Second, 2)
+	// w.fixRound deliberately left nil — the report-only mode.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "could not fix it after 0 fix round(s)")
+	if state, errMsg := taskStateSnapshot(db); state != store.JobStateFailed || errMsg != "ci_failed" {
+		t.Errorf("task = %q/%q, want FAILED/ci_failed", state, errMsg)
+	}
+}
+
+// TestWatchPR_TerminalTaskNotFixed: a PR whose task already reached a
+// terminal state (merged, cancelled, FAILED) gets a report but never a fix
+// round and no row mutation.
+func TestWatchPR_TerminalTaskNotFixed(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, fixCalls := ciWatchFixFixture(ghBin, 2)
+	db.AdmiralTask.State = store.JobStateDoneMerged
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "not attempting a fix")
+	if *fixCalls != 0 {
+		t.Errorf("fixRound called %d times, want 0 (terminal task)", *fixCalls)
+	}
+	if db.AdmiralTask.State != store.JobStateDoneMerged {
+		t.Errorf("terminal task state mutated to %q", db.AdmiralTask.State)
+	}
+}
+
+// TestBuildCIFixPrompt: the prompt names the PR, branch, failing checks and
+// forbids opening a new PR; the skill prefix follows the review convention.
+func TestBuildCIFixPrompt(t *testing.T) {
+	p := buildCIFixPrompt("", "https://github.com/acme/repo/pull/7", "linear/TEST-1", "main",
+		"- test (failure)\n\nLogs: https://ci.example.com/run/1")
+	for _, want := range []string{
+		"https://github.com/acme/repo/pull/7",
+		"linear/TEST-1",
+		"test (failure)",
+		"Do NOT open a new PR",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("prompt missing %q:\n%s", want, p)
+		}
+	}
+	if strings.HasPrefix(p, "/") {
+		t.Errorf("empty skill must not produce a skill prefix: %q", p[:20])
+	}
+	withSkill := buildCIFixPrompt("some-skill", "u", "b", "main", "f")
+	if !strings.HasPrefix(withSkill, "/some-skill\n\n") {
+		t.Errorf("skill prefix missing: %q", withSkill[:30])
+	}
+}
+
+// taskStateSnapshot reads the task row under the mock's lock — the watcher
+// goroutine mutates the same struct via UpdateAdmiralTask, so a direct read
+// from the test goroutine races.
+func taskStateSnapshot(db *mockStore) (state, errMsg string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.AdmiralTask.State, db.AdmiralTask.Error
 }

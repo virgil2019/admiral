@@ -222,10 +222,13 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		accounts: ghpkg.NewAccounts(cfg.GhBin),
 		runSlots: make(chan struct{}, slots),
 		ciWatcher: newCIWatcher(lc, db, logger, cfg.GhBin,
-			cfg.CIWatchPollInterval, cfg.CIWatchTimeout),
+			cfg.CIWatchPollInterval, cfg.CIWatchTimeout, cfg.CIFixMaxRounds),
 		replier: NewAgentSessionReplier(lc),
 	}
 	o.prClientFor = o.githubClientFor
+	// The CI watcher's automatic fix rounds reuse the review path's fix
+	// machinery (claude + build gate + push on the PR's branch).
+	o.ciWatcher.fixRound = o.runCIFixRound
 	o.verifyRunner = func(ctx context.Context, repoDir, prompt string, env []string) (string, error) {
 		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, env, o.logger)
 	}
