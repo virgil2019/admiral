@@ -212,6 +212,13 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		// caller constructs Autopilot{} directly we still want a sane cap.
 		slots = 3
 	}
+	// Callers built from a config load always have CIFixMaxRounds non-nil
+	// (defaults applied); a directly-constructed Autopilot{} falls back to
+	// the same default here.
+	ciFixMaxRounds := 2
+	if cfg.CIFixMaxRounds != nil {
+		ciFixMaxRounds = *cfg.CIFixMaxRounds
+	}
 	o := &Orchestrator{
 		cfg:      cfg,
 		lc:       lc,
@@ -222,7 +229,7 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		accounts: ghpkg.NewAccounts(cfg.GhBin),
 		runSlots: make(chan struct{}, slots),
 		ciWatcher: newCIWatcher(lc, db, logger, cfg.GhBin,
-			cfg.CIWatchPollInterval, cfg.CIWatchTimeout, cfg.CIFixMaxRounds),
+			cfg.CIWatchPollInterval, cfg.CIWatchTimeout, ciFixMaxRounds),
 		replier: NewAgentSessionReplier(lc),
 	}
 	o.prClientFor = o.githubClientFor

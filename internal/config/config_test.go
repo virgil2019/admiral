@@ -730,3 +730,50 @@ storage:
 		})
 	}
 }
+
+// TestLoadAutopilot_CIFixMaxRounds: nil (unset) defaults to 2; an explicit 0
+// means report-only and must survive the load untouched — a plain int would
+// be indistinguishable from unset and silently upgraded to 2, re-enabling
+// auto-fix after an operator deliberately turned it off.
+func TestLoadAutopilot_CIFixMaxRounds(t *testing.T) {
+	// extra is spliced into the autopilot block (before storage:), not
+	// appended at the end — trailing keys would nest under storage.
+	run := func(t *testing.T, extra string) *int {
+		bin := os.Args[0]
+		body := `
+linear:
+  api_token: "lin_api_test"
+  webhook_secret: "wh_secret"
+autopilot:
+  repos:
+    - project_id: "proj-test"
+      project_name: "TestProject"
+      repo_dir: "` + t.TempDir() + `"
+  claude_bin: "` + bin + `"
+  gh_bin: "` + bin + `"
+` + extra + `storage:
+  sqlite_path: "` + t.TempDir() + `/autopilot.db"
+`
+		cfg, err := LoadAutopilot(writeConfig(t, body))
+		if err != nil {
+			t.Fatalf("LoadAutopilot: %v", err)
+		}
+		return cfg.Autopilot.CIFixMaxRounds
+	}
+
+	t.Run("unset defaults to 2", func(t *testing.T) {
+		if got := run(t, ""); got == nil || *got != 2 {
+			t.Errorf("CIFixMaxRounds = %v, want 2", got)
+		}
+	})
+	t.Run("explicit 0 stays 0", func(t *testing.T) {
+		if got := run(t, "  ci_fix_max_rounds: 0\n"); got == nil || *got != 0 {
+			t.Errorf("CIFixMaxRounds = %v, want 0 (report only)", got)
+		}
+	})
+	t.Run("negative clamps to 0", func(t *testing.T) {
+		if got := run(t, "  ci_fix_max_rounds: -3\n"); got == nil || *got != 0 {
+			t.Errorf("CIFixMaxRounds = %v, want clamped 0", got)
+		}
+	})
+}

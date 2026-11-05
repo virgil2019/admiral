@@ -92,6 +92,15 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 	for round := 0; ; round++ {
 		runs, ok := w.pollUntilFinal(ctx, repoDir, prNumber, ghUser, prURL)
 		if !ok {
+			// After announcing fix rounds, silence would leave the thread
+			// dangling on "attempting an automatic fix". Round 0 timeouts
+			// stay silent — the pre-existing GEO-54 behavior (a PR with no
+			// checks, or checks that never conclude, is common).
+			if round > 0 {
+				w.postResult(ctx, sessionID, linear.Response(fmt.Sprintf(
+					"⏳ CI did not reach a conclusion within %s after the fix push. No verdict — check the PR: %s",
+					w.timeout, prURL)))
+			}
 			return
 		}
 
@@ -141,6 +150,17 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 				prURL, sessionID, issueID, round+1)
 			return
 		}
+
+		// Give GitHub a moment to register the new head's check runs before
+		// the re-poll: a poll landing too early resolves the previous
+		// head's completed failing checks and burns a round on stale data.
+		// This narrows the race; it cannot eliminate it — the cap and the
+		// per-round escalation bound the damage if it loses.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(w.pollInter):
+		}
 	}
 }
 
@@ -162,6 +182,14 @@ func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber
 			runs, err := w.fetchCheckRuns(ctx, repoDir, prNumber, ghUser)
 			if err != nil {
 				w.logger.Warn("ci_fetch_runs_failed", "pr_url", prURL, "err", err)
+				// The deadline check must also cover this path: the watcher
+				// is detached from the run ctx (no cancel will arrive), so
+				// a persistent fetch failure — expired token, removed gh
+				// binary, network partition — would otherwise poll forever.
+				if time.Now().After(deadline) {
+					w.logger.Info("ci_watch_timeout", "pr_url", prURL, "timeout", w.timeout)
+					return nil, false
+				}
 				continue
 			}
 
@@ -189,6 +217,12 @@ func (w *CIWatcher) escalateCI(ctx context.Context, failure, prURL, sessionID, i
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	err := w.db.UpdateAdmiralTask(issueID, func(t *store.AdmiralTask) {
+		// The row may have gone terminal while a fix round was running
+		// (e.g. the PR got merged mid-round); never clobber a terminal
+		// state — it is the audit trail the discoverer advances on.
+		if isTerminalTaskState(t.State) {
+			return
+		}
 		t.State = store.JobStateFailed
 		t.Error = "ci_failed"
 		t.FinishedAt = now

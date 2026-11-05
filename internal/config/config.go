@@ -249,8 +249,9 @@ type Autopilot struct {
 	// and re-watches CI. When the rounds are exhausted (or this is 0), the
 	// watcher falls back to GEO-54 behavior: report the failure to Linear
 	// and mark the task FAILED as ci_failed.
-	// Default: 2.
-	CIFixMaxRounds int `yaml:"ci_fix_max_rounds"`
+	// Pointer so an explicit `0` in yaml is distinguishable from unset:
+	// unset (nil) defaults to 2; explicit 0 means report only.
+	CIFixMaxRounds *int `yaml:"ci_fix_max_rounds"`
 	// BlockerPollInterval is how often the blocker watcher re-checks tasks that
 	// were blocked on unresolved Linear dependencies. Default: 10m.
 	BlockerPollInterval time.Duration `yaml:"blocker_poll_interval"`
@@ -595,14 +596,16 @@ func (c *Config) validateAutopilotAndExpand() error {
 	if c.Autopilot.CIWatchTimeout <= 0 {
 		c.Autopilot.CIWatchTimeout = 15 * time.Minute
 	}
-	// CIFixMaxRounds defaults to 2 on the zero value; an explicit 0 from
-	// yaml must stay 0 — it means "report only". Negatives mean the same,
-	// so they are clamped to 0.
-	if c.Autopilot.CIFixMaxRounds == 0 {
-		c.Autopilot.CIFixMaxRounds = 2
+	// CIFixMaxRounds: nil (unset) defaults to 2; an explicit 0 stays 0 —
+	// it means "report only". Negatives mean the same, so they are
+	// clamped to 0.
+	if c.Autopilot.CIFixMaxRounds == nil {
+		two := 2
+		c.Autopilot.CIFixMaxRounds = &two
 	}
-	if c.Autopilot.CIFixMaxRounds < 0 {
-		c.Autopilot.CIFixMaxRounds = 0
+	if *c.Autopilot.CIFixMaxRounds < 0 {
+		zero := 0
+		c.Autopilot.CIFixMaxRounds = &zero
 	}
 	if c.Autopilot.BlockerPollInterval <= 0 {
 		c.Autopilot.BlockerPollInterval = 10 * time.Minute

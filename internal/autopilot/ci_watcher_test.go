@@ -590,3 +590,92 @@ func taskStateSnapshot(db *mockStore) (state, errMsg string) {
 	defer db.mu.Unlock()
 	return db.AdmiralTask.State, db.AdmiralTask.Error
 }
+
+// TestPollUntilFinal_StopsOnPersistentFetchErrors: the watcher is detached
+// from the run ctx (no cancel will arrive), so a persistent fetch failure
+// — expired token, removed gh binary — must still end the poll via the
+// per-round deadline, not loop forever.
+func TestPollUntilFinal_StopsOnPersistentFetchErrors(t *testing.T) {
+	dir := t.TempDir()
+	ghBin := filepath.Join(dir, "fake-gh")
+	if err := os.WriteFile(ghBin, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w := newCIWatcher(&mockLinearClient{}, &mockStore{}, logger, ghBin, 10*time.Millisecond, 150*time.Millisecond, 2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	runs, ok := w.pollUntilFinal(ctx, dir, 7, defaultTestGhUser, "https://github.com/acme/repo/pull/7")
+	if ok {
+		t.Fatalf("pollUntilFinal reported success with a permanently failing gh: %v", runs)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("pollUntilFinal took %v to give up, want ~deadline (150ms); the deadline check is not covering the fetch-error path", elapsed)
+	}
+}
+
+// TestWatchPR_TimeoutAfterFixPostsNotice: when the re-run CI after a fix
+// push never concludes, the watcher must not leave the thread dangling on
+// "attempting an automatic fix" — it posts a no-verdict notice. Round 0
+// timeouts (no fix announced) stay silent, preserving GEO-54 behavior for
+// checkless PRs.
+func TestWatchPR_TimeoutAfterFixPostsNotice(t *testing.T) {
+	dir := t.TempDir()
+	ghBin := filepath.Join(dir, "fake-gh")
+	cnt := filepath.Join(dir, "calls")
+	// First checks call: completed+failure (triggers round 1). Later calls:
+	// still in_progress, forever — the re-run never concludes.
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		fmt.Sprintf("n=$(cat %s 2>/dev/null || echo 0); n=$((n+1)); echo $n > %s\n", cnt, cnt) +
+		"if [ $n -le 1 ]; then\n" +
+		`  echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n" +
+		"else\n" +
+		`  echo '[{"name":"test","status":"in_progress","conclusion":""}]'` + "\n" +
+		"fi\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	lc := &mockLinearClient{}
+	db := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID: "issue-1", State: store.JobStateDone,
+			PRURL: "https://github.com/acme/repo/pull/7",
+		},
+	}
+	db.LiveAdmiralTask = db.AdmiralTask
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Per-round deadline 150ms; the post-fix settle (one pollInter) is 10ms.
+	w := newCIWatcher(lc, db, logger, ghBin, 10*time.Millisecond, 150*time.Millisecond, 2)
+	w.fixRound = func(_ context.Context, _ *store.AdmiralTask, _ string) error { return nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, dir, "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "did not reach a conclusion")
+	if state, errMsg := taskStateSnapshot(db); state != store.JobStateDone || errMsg != "" {
+		t.Errorf("timeout is not a failure: task = %q/%q, want untouched DONE", state, errMsg)
+	}
+}
+
+// TestEscalateCI_RespectsTerminalTask: the row can go terminal while a fix
+// round is running (PR merged mid-round); escalateCI must not clobber it.
+func TestEscalateCI_RespectsTerminalTask(t *testing.T) {
+	db := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID: "issue-1", State: store.JobStateDoneMerged,
+		},
+	}
+	db.LiveAdmiralTask = db.AdmiralTask
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w := newCIWatcher(&mockLinearClient{}, db, logger, "gh", time.Second, time.Minute, 2)
+
+	w.escalateCI(context.Background(), "- test (failure)", "https://github.com/acme/repo/pull/7", "sess-1", db.AdmiralTask.IssueID, 1)
+
+	if state, errMsg := taskStateSnapshot(db); state != store.JobStateDoneMerged || errMsg != "" {
+		t.Errorf("terminal row clobbered: task = %q/%q, want DONE_MERGED untouched", state, errMsg)
+	}
+}

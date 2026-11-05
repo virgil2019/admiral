@@ -119,8 +119,7 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), prFixBudget(o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries))
 	defer cancel()
 
 	deps, stage, err := o.resolvePRFixDeps(ctx, task)
@@ -200,16 +199,28 @@ const (
 	prFixStageWorktree = "worktree"
 )
 
+// prFixBudget returns the wall-clock budget for one PR fix round: the
+// initial claude run plus every build-gate retry the verify gate allows,
+// each individually budgeted maxRunSeconds (+ slack). A single
+// MaxRunSeconds+120 budget would be mostly consumed by the initial run and
+// the outer ctx would kill the gate mid-build — the gate's retries would
+// be unreachable in practice (worst on CI fix rounds, whose verify_cmd is
+// precisely the thing that is failing).
+func prFixBudget(maxRunSeconds, verifyMaxRetries int) time.Duration {
+	retries := verifyMaxRetries
+	if retries < 0 {
+		retries = 0
+	}
+	return time.Duration(maxRunSeconds+120) * time.Duration(2+2*retries)
+}
+
 // prFixDeps is everything one fix round on a task's PR needs, resolved once:
-// the repo (and its registered gh account), a PR client that authenticates
-// as that account, the child env for claude/gh subprocesses, and a synced
-// worktree on the task's branch.
+// a PR client that authenticates as the repo's registered account, the child
+// env for claude/gh subprocesses, and a synced worktree on the task's branch.
 type prFixDeps struct {
-	repo       *store.Repo
 	client     ghpkg.PRClient
 	replier    Replier
 	env        []string
-	repoDir    string
 	baseBranch string
 	verifyCmd  string
 	worktree   string
@@ -233,10 +244,8 @@ func (o *Orchestrator) resolvePRFixDeps(ctx context.Context, task *store.Admiral
 		return nil, prFixStageIdentity, err
 	}
 	deps := &prFixDeps{
-		repo:       repo,
 		client:     client,
 		replier:    NewGitHubReplier(client, task.PRURL),
-		repoDir:    repo.RepoDir,
 		baseBranch: repo.BaseBranch,
 		verifyCmd:  repo.VerifyCmd,
 	}
