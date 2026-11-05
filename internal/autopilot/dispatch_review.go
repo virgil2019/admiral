@@ -117,10 +117,14 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 		}
 	}()
 
-	release := o.acquireRunSlot()
-	defer release()
+	// Branch lock BEFORE the run slot: a caller blocked on another round's
+	// lock must not hold claude capacity while it waits (run slots exist to
+	// bound live claude processes, and lock waiting runs none). All three
+	// callers use the same order, so no lock-order inversion.
 	unlockPRFix := o.lockPRFix(task.Branch)
 	defer unlockPRFix()
+	release := o.acquireRunSlot()
+	defer release()
 
 	ctx, cancel := context.WithTimeout(context.Background(), prFixBudget(o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries))
 	defer cancel()

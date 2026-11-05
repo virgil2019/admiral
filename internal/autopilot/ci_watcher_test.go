@@ -923,3 +923,97 @@ func TestWatchPR_TransientLookupRetried(t *testing.T) {
 		t.Errorf("task = %q/%q after transient lookup failure, want FAILED/ci_failed", state, errMsg)
 	}
 }
+
+// TestWatchPR_AwaitingInputNotFixed: a parked ask_user run owns the row and
+// the worktree — the watcher must not reset the worktree with an automatic
+// round, and must not flip the row FAILED (the user's pending answer would
+// bounce).
+func TestWatchPR_AwaitingInputNotFixed(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, fixCalls := ciWatchFixFixture(ghBin, 2)
+	db.AdmiralTask.State = store.JobStateAwaitingInput
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "a fix run is already in progress")
+	if *fixCalls != 0 {
+		t.Errorf("fixRound called %d times, want 0 (AWAITING_INPUT)", *fixCalls)
+	}
+	if state, errMsg := taskStateSnapshot(db); state != store.JobStateAwaitingInput || errMsg != "" {
+		t.Errorf("parked row clobbered: %q/%q, want AWAITING_INPUT untouched", state, errMsg)
+	}
+}
+
+// TestWatchPR_StaleHeadReObservedBeforeSpending: the first failure
+// observation after a fix push can still be the OLD head's completed
+// failing checks — it must be re-observed once (uncounted) before a fix
+// round is spent, so the round count reflects the new head's CI.
+func TestWatchPR_StaleHeadReObservedBeforeSpending(t *testing.T) {
+	dir := t.TempDir()
+	ghBin := filepath.Join(dir, "fake-gh")
+	cnt := filepath.Join(dir, "calls")
+	// checks call 1: failure (triggers fix round 1). call 2: stale failure
+	// from the old head. call 3+: the fix landed — green.
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		fmt.Sprintf("n=$(cat %s 2>/dev/null || echo 0); n=$((n+1)); echo $n > %s\n", cnt, cnt) +
+		"if [ $n -le 1 ]; then\n" +
+		`  echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n" +
+		"elif [ $n -eq 2 ]; then\n" +
+		`  echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n" +
+		"else\n" +
+		`  echo '[{"name":"test","status":"completed","conclusion":"success"}]'` + "\n" +
+		"fi\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, fixCalls := ciWatchFixFixture(ghBin, 2)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, dir, "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	body := ciWatchTaskFailure(t, lc, "✅ All CI checks passed")
+	if !strings.Contains(body, "green after 1 automatic fix round") {
+		t.Errorf("stale observation consumed a round: %q", body)
+	}
+	if *fixCalls != 1 {
+		t.Errorf("fixRound called %d times, want 1 (stale head not acted on)", *fixCalls)
+	}
+}
+
+// TestWatchPR_SuppressedSessionGetsPointer: when this attempt's watcher is
+// suppressed (another one is already on the PR), its session thread is told
+// where the CI results land instead of staying silent.
+func TestWatchPR_SuppressedSessionGetsPointer(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, _ := ciWatchFixFixture(ghBin, 2)
+	oldWait := ciClaimWait
+	ciClaimWait = 300 * time.Millisecond
+	t.Cleanup(func() { ciClaimWait = oldWait })
+
+	// A long-lived watcher holds the claim for this PR.
+	if !w.claimPRWait(db.AdmiralTask.PRURL, 0) {
+		t.Fatal("initial claim failed")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-NEW", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "already being watched")
+}

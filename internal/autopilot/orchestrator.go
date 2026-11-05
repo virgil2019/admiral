@@ -781,13 +781,14 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 // runWithAttempt's lifecycle but reuses the existing admiral_tasks row
 // rather than claiming a new one (attempt_n unchanged).
 func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
-	release := o.acquireRunSlot()
-	defer release()
 	// /fix works the same task worktree the CI watcher's automatic fix
 	// rounds (and review rounds) use — serialize on the branch so a manual
-	// fix cannot interleave with an in-flight automatic round.
+	// fix cannot interleave with an in-flight automatic round. Branch lock
+	// BEFORE the run slot (see runReview for the ordering note).
 	unlockPRFix := o.lockPRFix(task.Branch)
 	defer unlockPRFix()
+	release := o.acquireRunSlot()
+	defer release()
 
 	ctx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)

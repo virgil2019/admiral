@@ -96,6 +96,13 @@ func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issu
 	if !w.claimPRWait(prURL, ciClaimWait) {
 		w.logger.Info("ci_watch_duplicate_suppressed",
 			"pr_url", prURL, "issue", issueID)
+		// CI continues to be reported on the earlier session's thread; tell
+		// THIS attempt's thread where to look instead of leaving it silent.
+		noteCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w.postResult(noteCtx, sessionID, linear.Response(fmt.Sprintf(
+			"(CI for PR %s is already being watched — results are posted to the earlier session thread.)",
+			prURL)))
 		return
 	}
 	ctx = context.WithoutCancel(ctx)
@@ -162,7 +169,16 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 	// Each iteration gets a fresh polling deadline: a fix round can run far
 	// longer than ci_watch_timeout, and the re-run CI after its push needs
 	// the full window again.
-	for round := 0; ; round++ {
+	// justPushed spans the first observation after a fix round: that poll
+	// can still resolve the PREVIOUS head's completed failing checks
+	// (GitHub registers the new head's checks asynchronously), and acting
+	// on them burns a fix round on already-fixed code. The first failure
+	// observation after a push is therefore re-observed once, uncounted,
+	// before any round is spent.
+	justPushed := false
+	// round counts FIX ROUNDS spent, not loop iterations — the
+	// justPushed re-observation pass re-enters the loop without spending.
+	for round := 0; ; {
 		runs, ok := w.pollUntilFinal(ctx, repoDir, prNumber, ghUser, prURL)
 		if !ok {
 			// After announcing fix rounds, silence would leave the thread
@@ -186,6 +202,13 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 			}
 			w.postResult(ctx, sessionID, linear.Response(msg))
 			return
+		}
+
+		if justPushed {
+			// First observation after the fix push: could be the old head's
+			// stale failure. Re-observe once before spending anything.
+			justPushed = false
+			continue
 		}
 
 		failure := describeFailedChecks(failed)
@@ -230,10 +253,14 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 				prURL, task.State, failure)))
 			return
 		}
-		// An in-flight run (/fix, /rerun execution) owns the task row and
-		// the worktree right now — never race it with an automatic round;
-		// its own lifecycle reports the outcome.
-		if task.State == store.JobStateExecuting || task.State == store.JobStateReceived {
+		// An in-flight or parked run (/fix, /rerun execution, a pending
+		// ask_user answer) owns the task row and the worktree right now —
+		// never race it with an automatic round; its own lifecycle reports
+		// the outcome. AWAITING_INPUT especially: resetting the worktree
+		// would clobber the parked run's state, and marking the row FAILED
+		// would make the user's pending answer bounce.
+		if task.State == store.JobStateExecuting || task.State == store.JobStateReceived ||
+			task.State == store.JobStateAwaitingInput {
 			w.logger.Info("ci_fix_skip_run_in_flight",
 				"pr_url", prURL, "issue", task.IssueIdentifier, "state", task.State)
 			w.postResult(ctx, sessionID, linear.Response(fmt.Sprintf(
@@ -270,10 +297,13 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 		// Give GitHub a moment to register the new head's check runs before
 		// the re-poll: a poll landing too early resolves the previous
 		// head's completed failing checks and burns a round on stale data.
-		// This narrows the race; it cannot eliminate it — the cap and the
-		// per-round escalation bound the damage if it loses. (As in
-		// pollUntilFinal, the Done branch is by-construction dead here —
-		// the ctx is detached — and kept for future cancelable callers.)
+		// The settle sleep plus the justPushed re-observation above narrow
+		// the stale-head race; between them it cannot misattribute a stale
+		// failure to the new head. (As in pollUntilFinal, the Done branch
+		// is by-construction dead here — the ctx is detached — and kept
+		// for future cancelable callers.)
+		round++
+		justPushed = true
 		select {
 		case <-ctx.Done():
 			return
@@ -344,7 +374,8 @@ func (w *CIWatcher) escalateCI(ctx context.Context, msg, sessionID, issueID, prU
 		// watch's PR, nor a row that went terminal (merged mid-round) —
 		// that row is the audit trail the discoverer advances on.
 		if t.PRURL != prURL || isTerminalTaskState(t.State) ||
-			t.State == store.JobStateExecuting || t.State == store.JobStateReceived {
+			t.State == store.JobStateExecuting || t.State == store.JobStateReceived ||
+			t.State == store.JobStateAwaitingInput {
 			return
 		}
 		t.State = store.JobStateFailed
