@@ -740,3 +740,33 @@ func TestEnsureReviewWorktree_RebuildSyncsStaleLocalRef(t *testing.T) {
 		t.Errorf("local refs/heads/%s: got %s want %s", f.branch, localRef, newTip)
 	}
 }
+
+// TestPRFixBudget: the budget must be in seconds, not Duration ticks. A
+// missing *time.Second makes it ~12 microseconds, which expires every
+// review/CI fix round before its first ctx-bounded call — the review path
+// silently stops working.
+func TestPRFixBudget(t *testing.T) {
+	tests := []struct {
+		name          string
+		maxRunSeconds int
+		retries       int
+		want          time.Duration
+	}{
+		{"defaults", 1800, 2, 1920 * 6 * time.Second},
+		{"no retries", 1800, 0, 1920 * 2 * time.Second},
+		{"negative retries clamp to 0", 600, -1, 720 * 2 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := prFixBudget(tt.maxRunSeconds, tt.retries)
+			if got != tt.want {
+				t.Errorf("prFixBudget(%d, %d) = %v, want %v", tt.maxRunSeconds, tt.retries, got, tt.want)
+			}
+			// Guard the unit explicitly: a Duration built from bare integer
+			// multiplication is nanoseconds and no sane run budget is that.
+			if got < time.Minute {
+				t.Errorf("prFixBudget = %v — implausibly small; missing *time.Second?", got)
+			}
+		})
+	}
+}

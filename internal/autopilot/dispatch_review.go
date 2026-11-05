@@ -257,7 +257,9 @@ func prFixBudget(maxRunSeconds, verifyMaxRetries int) time.Duration {
 	if retries < 0 {
 		retries = 0
 	}
-	return time.Duration(maxRunSeconds+120) * time.Duration(2+2*retries)
+	// (2+2*retries) per-run units: the initial claude run, then for each
+	// allowed retry a verify run plus a claude fix-forward run.
+	return time.Duration(maxRunSeconds+120) * time.Second * time.Duration(2+2*retries)
 }
 
 // prFixDeps is everything one fix round on a task's PR needs, resolved once:
