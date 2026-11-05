@@ -532,7 +532,7 @@ func TestWatchPR_ReportOnlyWhenNoFixRound(t *testing.T) {
 	defer cancel()
 	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
 
-	ciWatchTaskFailure(t, lc, "No automatic fix is configured")
+	ciWatchTaskFailure(t, lc, "Automatic CI fixing is disabled")
 	if state, errMsg := taskStateSnapshot(db); state != store.JobStateFailed || errMsg != "ci_failed" {
 		t.Errorf("task = %q/%q, want FAILED/ci_failed", state, errMsg)
 	}
@@ -835,5 +835,91 @@ func TestWatchPR_DuplicateSuppressed(t *testing.T) {
 	ciWatchTaskFailure(t, lc, "attempted 2 automatic fix round(s) without success")
 	if *fixCalls != 2 {
 		t.Errorf("fixRound called %d times, want exactly 2 (ONE watcher's two rounds — duplicate suppressed)", *fixCalls)
+	}
+}
+
+// TestWatchPR_RunInFlightNotFixed: a /fix or /rerun execution owns the row
+// and the worktree right now — the watcher must not race it with an
+// automatic round, and must not mark the EXECUTING row FAILED.
+func TestWatchPR_RunInFlightNotFixed(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, fixCalls := ciWatchFixFixture(ghBin, 2)
+	db.AdmiralTask.State = store.JobStateExecuting // /fix run in flight, same PR
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "a fix run is already in progress")
+	if *fixCalls != 0 {
+		t.Errorf("fixRound called %d times, want 0 (run in flight)", *fixCalls)
+	}
+	if state, errMsg := taskStateSnapshot(db); state != store.JobStateExecuting || errMsg != "" {
+		t.Errorf("in-flight row clobbered: %q/%q, want EXECUTING untouched", state, errMsg)
+	}
+}
+
+// TestWatchPR_DuplicateWaitThenWatch: a previous watcher finishing its
+// final post must not leave the new attempt unreported — the new WatchPR
+// waits for release and then watches (only a still-held claim after
+// ciClaimWait suppresses).
+func TestWatchPR_DuplicateWaitThenWatch(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, _ := ciWatchFixFixture(ghBin, 2)
+	w.fixRound = nil // report-only: the assertion keys on the disabled-fix escalation
+	oldWait := ciClaimWait
+	ciClaimWait = 3 * time.Second
+	t.Cleanup(func() { ciClaimWait = oldWait })
+
+	// A finishing watcher holds the claim, releases after 300ms.
+	if !w.claimPRWait(db.AdmiralTask.PRURL, 0) {
+		t.Fatal("initial claim failed")
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		w.releasePR(db.AdmiralTask.PRURL)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "Automatic CI fixing is disabled")
+}
+
+// TestWatchPR_TransientLookupRetried: one transient read failure at
+// failure-detection time must not leave the row DONE under red CI — the
+// watcher retries once and then records ci_failed normally.
+func TestWatchPR_TransientLookupRetried(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, _ := ciWatchFixFixture(ghBin, 2)
+	w.fixRound = nil // report-only: assert the ci_failed marker lands despite the transient
+	db.AdmiralTaskErrOnce = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "Automatic CI fixing is disabled")
+	if state, errMsg := taskStateSnapshot(db); state != store.JobStateFailed || errMsg != "ci_failed" {
+		t.Errorf("task = %q/%q after transient lookup failure, want FAILED/ci_failed", state, errMsg)
 	}
 }

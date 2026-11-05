@@ -352,8 +352,13 @@ type prFixOutcome struct {
 	// Pushed is false when the push to origin failed; the branch's local
 	// commits were discarded so the next round starts from origin.
 	Pushed bool
-	// GateAttempts is how many build-gate claude runs happened (0 when the
-	// repo has no verify_cmd).
+	// PushErr is the underlying push failure (non-fast-forward, auth,
+	// network) — surfaced so escalation messages can name the actual cause
+	// instead of claude's fix summary.
+	PushErr string
+	// GateAttempts counts verify-command executions the gate ran (initial
+	// pass + fix-forward retries; 0 when the repo has no verify_cmd) — NOT
+	// claude runs, which are at most Attempts-1.
 	GateAttempts int
 }
 
@@ -412,8 +417,10 @@ func (o *Orchestrator) runPRFix(ctx context.Context, task *store.AdmiralTask, de
 	}
 
 	pushed := true
+	pushErrMsg := ""
 	if pushErr := runCmd(ctx, deps.worktree, "git", "push", "origin", task.Branch); pushErr != nil {
 		pushed = false
+		pushErrMsg = pushErr.Error()
 		o.logger.Error("pr_fix_push_failed",
 			"pr", task.PRURL, "branch", task.Branch, "err", pushErr)
 		// Discard claude's local-only commits so the next fix round starts
@@ -434,7 +441,7 @@ func (o *Orchestrator) runPRFix(ctx context.Context, task *store.AdmiralTask, de
 		}
 	}
 
-	return prFixOutcome{Output: output, Pushed: pushed, GateAttempts: gateAttempts}, nil
+	return prFixOutcome{Output: output, Pushed: pushed, PushErr: pushErrMsg, GateAttempts: gateAttempts}, nil
 }
 
 // resolveRepoForReview fetches the Linear issue for the task and returns the

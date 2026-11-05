@@ -93,7 +93,7 @@ func newCIWatcher(lc linearClientInterface, db storeInterface, logger *slog.Logg
 // watcher detaches from it (WithoutCancel) and terminates on its own deadline
 // (w.timeout) instead.
 func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issueID, ghUser string) {
-	if !w.claimPR(prURL) {
+	if !w.claimPRWait(prURL, ciClaimWait) {
 		w.logger.Info("ci_watch_duplicate_suppressed",
 			"pr_url", prURL, "issue", issueID)
 		return
@@ -113,19 +113,36 @@ func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issu
 	}()
 }
 
-// claimPR registers prURL as actively watched; false = a watcher for this
-// PR is already running, the caller must not spawn a second one.
-func (w *CIWatcher) claimPR(prURL string) bool {
-	w.activeMu.Lock()
-	defer w.activeMu.Unlock()
-	if w.activePR == nil {
-		w.activePR = make(map[string]struct{})
+// ciClaimWait bounds how long a new watcher waits for a same-PR watcher
+// that is finishing up (its final post retries + DB write can take seconds).
+// A watcher still held after this is a genuine long-lived duplicate. Var for
+// test overrides.
+var ciClaimWait = 15 * time.Second
+
+// claimPRWait registers prURL as actively watched. If another watcher for
+// this PR is registered, it waits up to wait for it to release — dropping
+// the new watch would leave the attempt's CI outcome unreported — and only
+// then reports a duplicate.
+func (w *CIWatcher) claimPRWait(prURL string, wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for {
+		w.activeMu.Lock()
+		if w.activePR == nil {
+			w.activePR = make(map[string]struct{})
+		}
+		_, dup := w.activePR[prURL]
+		if !dup {
+			w.activePR[prURL] = struct{}{}
+		}
+		w.activeMu.Unlock()
+		if !dup {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
-	if _, dup := w.activePR[prURL]; dup {
-		return false
-	}
-	w.activePR[prURL] = struct{}{}
-	return true
 }
 
 func (w *CIWatcher) releasePR(prURL string) {
@@ -180,6 +197,13 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 		// FAILED — the live row of another attempt.
 		task, err := w.db.GetAdmiralTaskByIssue(issueID)
 		if err != nil {
+			// One retry — the realistic failure is a transient sqlite lock,
+			// and leaving the row DONE under red CI (no ci_failed marker,
+			// no recovery pointer) is worse than the retry costing a second.
+			time.Sleep(time.Second)
+			task, err = w.db.GetAdmiralTaskByIssue(issueID)
+		}
+		if err != nil {
 			w.logger.Warn("ci_fix_task_lookup_failed", "issue", issueID, "err", err)
 			w.postResult(ctx, sessionID, linear.Response(fmt.Sprintf(
 				"❌ CI failed on PR %s:\n%s\n\n(admiral could not read the task row to record the failure: %v)",
@@ -206,10 +230,21 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 				prURL, task.State, failure)))
 			return
 		}
+		// An in-flight run (/fix, /rerun execution) owns the task row and
+		// the worktree right now — never race it with an automatic round;
+		// its own lifecycle reports the outcome.
+		if task.State == store.JobStateExecuting || task.State == store.JobStateReceived {
+			w.logger.Info("ci_fix_skip_run_in_flight",
+				"pr_url", prURL, "issue", task.IssueIdentifier, "state", task.State)
+			w.postResult(ctx, sessionID, linear.Response(fmt.Sprintf(
+				"❌ CI failed on PR %s, but a fix run is already in progress — skipping the automatic fix.\n%s",
+				prURL, failure)))
+			return
+		}
 
 		if w.fixRound == nil {
 			w.escalateCI(ctx, fmt.Sprintf(
-				"❌ CI failed on PR %s:\n%s\n\nNo automatic fix is configured (ci_fix_max_rounds is 0). Manual intervention needed — use `/rerun` on the issue.",
+				"❌ CI failed on PR %s:\n%s\n\nAutomatic CI fixing is disabled for this watcher. Manual intervention needed — use `/rerun` on the issue.",
 				prURL, failure), sessionID, issueID, prURL)
 			return
 		}
@@ -308,7 +343,8 @@ func (w *CIWatcher) escalateCI(ctx context.Context, msg, sessionID, issueID, prU
 		// mutation must not clobber a row that no longer points at this
 		// watch's PR, nor a row that went terminal (merged mid-round) —
 		// that row is the audit trail the discoverer advances on.
-		if t.PRURL != prURL || isTerminalTaskState(t.State) {
+		if t.PRURL != prURL || isTerminalTaskState(t.State) ||
+			t.State == store.JobStateExecuting || t.State == store.JobStateReceived {
 			return
 		}
 		t.State = store.JobStateFailed

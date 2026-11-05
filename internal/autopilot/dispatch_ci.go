@@ -46,7 +46,7 @@ func (o *Orchestrator) runCIFixRound(ctx context.Context, task *store.AdmiralTas
 
 	if !out.Pushed {
 		return fmt.Errorf("push to origin failed — the fix is not on the PR (%s)",
-			truncate(out.Output, 200))
+			truncate(out.PushErr, 300))
 	}
 
 	output := renderFixReply(out.Output, "addressed the CI failure", out.GateAttempts)

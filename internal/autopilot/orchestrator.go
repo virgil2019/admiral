@@ -783,6 +783,11 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 	release := o.acquireRunSlot()
 	defer release()
+	// /fix works the same task worktree the CI watcher's automatic fix
+	// rounds (and review rounds) use — serialize on the branch so a manual
+	// fix cannot interleave with an in-flight automatic round.
+	unlockPRFix := o.lockPRFix(task.Branch)
+	defer unlockPRFix()
 
 	ctx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
