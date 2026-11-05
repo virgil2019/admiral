@@ -1,6 +1,12 @@
 package autopilot
 
 import (
+	"context"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -312,5 +318,47 @@ func TestNewCIWatcher(t *testing.T) {
 	}
 	if w.ghBin != "gh" {
 		t.Errorf("ghBin = %q, want gh", w.ghBin)
+	}
+}
+
+// TestWatchPR_PollsAfterCallerCancels pins the watcher's lifetime contract:
+// the caller's ctx belongs to the run that opened the PR and is cancelled as
+// soon as that run returns — CI watching must survive that cancellation and
+// still deliver the check result. Red-check: remove the WithoutCancel in
+// WatchPR and this test fails (the goroutine dies on ctx.Done before its
+// first tick, nothing is ever posted).
+func TestWatchPR_PollsAfterCallerCancels(t *testing.T) {
+	dir := t.TempDir()
+	ghBin := filepath.Join(dir, "fake-gh")
+	script := "#!/bin/sh\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+
+	lc := &mockLinearClient{}
+	db := &mockStore{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w := newCIWatcher(lc, db, logger, ghBin, 10*time.Millisecond, 5*time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the run is over before watching even starts — exactly the production shape
+	w.WatchPR(ctx, "https://github.com/acme/repo/pull/7", dir, "sess-1", "issue-1", defaultTestGhUser)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		lc.PostedBodyMu.Lock()
+		posted := lc.PostedBody
+		lc.PostedBodyMu.Unlock()
+		if posted != "" {
+			if !strings.Contains(posted, "CI failed") {
+				t.Errorf("posted body = %q, want a CI failure notice", posted)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("watcher never polled: no CI result posted after caller cancelled its ctx")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

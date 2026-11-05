@@ -53,7 +53,13 @@ func newCIWatcher(lc linearClientInterface, db storeInterface, logger *slog.Logg
 // repoDir is the directory where the git repo is located (used for gh commands).
 // ghUser is the repo's registered gh account; the poll authenticates as it.
 // On CI failure, the admiral_tasks row is transitioned to FAILED with reason "ci_failed".
+//
+// The caller's ctx belongs to the run that opened the PR and is cancelled the
+// moment that run returns — exactly when CI watching needs to start. So the
+// watcher detaches from it (WithoutCancel) and terminates on its own deadline
+// (w.timeout) instead.
 func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issueID, ghUser string) {
+	ctx = context.WithoutCancel(ctx)
 	go w.watch(ctx, prURL, repoDir, sessionID, issueID, ghUser)
 }
 
