@@ -152,6 +152,14 @@ type Orchestrator struct {
 	// A buffered chan struct{} is the idiomatic Go counted-semaphore.
 	runSlots chan struct{}
 
+	// prFixLocks serializes the runPRFix callers (review feedback, CI fix
+	// rounds) per branch: two fix rounds in one task worktree concurrently
+	// would interleave `git reset --hard` / `git clean -fd` with the other
+	// round's in-flight claude edits, or trip git's index.lock. Keyed by
+	// branch (one branch = one worktree = one PR).
+	prFixLocksMu sync.Mutex
+	prFixLocks   map[string]*sync.Mutex
+
 	// workflowStatesByTeam caches workflow states per team, keyed by teamID.
 	workflowStatesByTeam map[string][]linear.WorkflowState
 	workflowStatesMu     sync.Mutex
@@ -215,7 +223,7 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 	// Callers built from a config load always have CIFixMaxRounds non-nil
 	// (defaults applied); a directly-constructed Autopilot{} falls back to
 	// the same default here.
-	ciFixMaxRounds := 2
+	ciFixMaxRounds := config.DefaultCIFixMaxRounds
 	if cfg.CIFixMaxRounds != nil {
 		ciFixMaxRounds = *cfg.CIFixMaxRounds
 	}
@@ -232,6 +240,7 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 			cfg.CIWatchPollInterval, cfg.CIWatchTimeout, ciFixMaxRounds),
 		replier: NewAgentSessionReplier(lc),
 	}
+	o.prFixLocks = make(map[string]*sync.Mutex)
 	o.prClientFor = o.githubClientFor
 	// The CI watcher's automatic fix rounds reuse the review path's fix
 	// machinery (claude + build gate + push on the PR's branch).

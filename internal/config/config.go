@@ -401,6 +401,11 @@ func LoadDiscoverer(path string) (*Config, error) {
 	return c, nil
 }
 
+// DefaultCIFixMaxRounds is the default number of automatic CI fix rounds.
+// Single source of truth for both the yaml default (validate) and the
+// fallback autopilot.New applies to directly-constructed configs.
+const DefaultCIFixMaxRounds = 2
+
 // DefaultVerifyMaxRounds is the default cap on the autonomous verification
 // loop. Exported so the autopilot orchestrator's defensive fallback shares
 // the single source of truth with the config default applied here.
@@ -596,12 +601,12 @@ func (c *Config) validateAutopilotAndExpand() error {
 	if c.Autopilot.CIWatchTimeout <= 0 {
 		c.Autopilot.CIWatchTimeout = 15 * time.Minute
 	}
-	// CIFixMaxRounds: nil (unset) defaults to 2; an explicit 0 stays 0 —
-	// it means "report only". Negatives mean the same, so they are
-	// clamped to 0.
+	// CIFixMaxRounds: nil (unset) defaults to DefaultCIFixMaxRounds; an
+	// explicit 0 stays 0 — it means "report only". Negatives mean the
+	// same, so they are clamped to 0.
 	if c.Autopilot.CIFixMaxRounds == nil {
-		two := 2
-		c.Autopilot.CIFixMaxRounds = &two
+		def := DefaultCIFixMaxRounds
+		c.Autopilot.CIFixMaxRounds = &def
 	}
 	if *c.Autopilot.CIFixMaxRounds < 0 {
 		zero := 0

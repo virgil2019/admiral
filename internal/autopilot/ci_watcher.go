@@ -31,6 +31,12 @@ type CIWatcher struct {
 	// watcher only times the polling between rounds. Nil disables the
 	// fix loop entirely (GEO-54 report-only behavior).
 	fixRound func(ctx context.Context, task *store.AdmiralTask, failure string) error
+	// fetchTimeout bounds a single `gh pr checks` invocation. The watcher
+	// is detached from the run ctx, so a hung gh (credential-helper
+	// prompt, network black hole) would otherwise block this goroutine —
+	// and its child process — forever; exec only kills the child on ctx
+	// cancellation.
+	fetchTimeout time.Duration
 	// accounts resolves the repo's registered gh account to a token for
 	// each poll, so the check-run lookup runs as that account.
 	accounts *ghpkg.Accounts
@@ -44,6 +50,10 @@ type checkRun struct {
 	URL        string `json:"url"`        // Link to the run logs
 }
 
+// ciFetchTimeout is the default per-poll budget for one `gh pr checks`
+// invocation.
+const ciFetchTimeout = 60 * time.Second
+
 // newCIWatcher creates a CIWatcher with the given poll interval and timeout.
 func newCIWatcher(lc linearClientInterface, db storeInterface, logger *slog.Logger, ghBin string, pollInter, timeout time.Duration, maxFixRounds int) *CIWatcher {
 	return &CIWatcher{
@@ -54,6 +64,7 @@ func newCIWatcher(lc linearClientInterface, db storeInterface, logger *slog.Logg
 		timeout:      timeout,
 		ghBin:        ghBin,
 		maxFixRounds: maxFixRounds,
+		fetchTimeout: ciFetchTimeout,
 		accounts:     ghpkg.NewAccounts(ghBin),
 	}
 }
@@ -75,7 +86,17 @@ func newCIWatcher(lc linearClientInterface, db storeInterface, logger *slog.Logg
 // (w.timeout) instead.
 func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issueID, ghUser string) {
 	ctx = context.WithoutCancel(ctx)
-	go w.watch(ctx, prURL, repoDir, sessionID, issueID, ghUser)
+	go func() {
+		// The goroutine runs claude, git, and Linear posts via fixRound; a
+		// panic here would take down the whole daemon (Go kills the process
+		// on any unrecovered panic). Same guard as runReview.
+		defer func() {
+			if r := recover(); r != nil {
+				w.logger.Error("ci_watch_panic", "pr_url", prURL, "panic", r)
+			}
+		}()
+		w.watch(ctx, prURL, repoDir, sessionID, issueID, ghUser)
+	}()
 }
 
 func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueID, ghUser string) {
@@ -117,10 +138,26 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 
 		failure := describeFailedChecks(failed)
 
+		// The row may have been superseded since the watch started (a
+		// /rerun on the issue reuses it for a new attempt, possibly on a
+		// different branch): act only when it still points at THIS watch's
+		// PR. A stale watcher must not run fix rounds against — or mark
+		// FAILED — the live row of another attempt.
 		task, err := w.db.GetAdmiralTaskByIssue(issueID)
-		if err != nil || task == nil {
+		if err != nil {
 			w.logger.Warn("ci_fix_task_lookup_failed", "issue", issueID, "err", err)
-			w.escalateCI(ctx, failure, prURL, sessionID, issueID, round)
+			w.postResult(ctx, sessionID, linear.Response(fmt.Sprintf(
+				"❌ CI failed on PR %s:\n%s\n\n(admiral could not read the task row to record the failure: %v)",
+				prURL, failure, err)))
+			return
+		}
+		if task == nil {
+			w.logger.Info("ci_fix_no_task", "issue", issueID)
+			return
+		}
+		if task.PRURL != prURL {
+			w.logger.Info("ci_watch_stale_task",
+				"pr_url", prURL, "row_pr_url", task.PRURL, "issue", issueID)
 			return
 		}
 		// A terminal task's branch/worktree may be gone (merged, cancelled,
@@ -135,8 +172,16 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 			return
 		}
 
-		if round >= w.maxFixRounds || w.fixRound == nil {
-			w.escalateCI(ctx, failure, prURL, sessionID, issueID, round)
+		if w.fixRound == nil {
+			w.escalateCI(ctx, fmt.Sprintf(
+				"❌ CI failed on PR %s:\n%s\n\nNo automatic fix is configured (ci_fix_max_rounds is 0). Manual intervention needed — use `/rerun` on the issue.",
+				prURL, failure), sessionID, issueID)
+			return
+		}
+		if round >= w.maxFixRounds {
+			w.escalateCI(ctx, fmt.Sprintf(
+				"❌ CI failed on PR %s:\n%s\n\nadmiral attempted %d automatic fix round(s) without success. Manual intervention needed — use `/rerun` on the issue.",
+				prURL, failure, round), sessionID, issueID)
 			return
 		}
 
@@ -146,8 +191,9 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 
 		if err := w.fixRound(ctx, task, failure); err != nil {
 			w.logger.Warn("ci_fix_round_failed", "pr_url", prURL, "round", round+1, "err", err)
-			w.escalateCI(ctx, fmt.Sprintf("%s\n\nFix round %d failed: %v", failure, round+1, err),
-				prURL, sessionID, issueID, round+1)
+			w.escalateCI(ctx, fmt.Sprintf(
+				"❌ CI failed on PR %s:\n%s\n\nFix round %d failed: %v. Manual intervention needed — use `/rerun` on the issue.",
+				prURL, failure, round+1, err), sessionID, issueID)
 			return
 		}
 
@@ -209,10 +255,9 @@ func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber
 
 // escalateCI reports an unfixable CI failure to the Linear thread and marks
 // the admiral_tasks row FAILED with reason ci_failed — the human-recovery
-// path (comment /fix on the issue) starts from there.
-func (w *CIWatcher) escalateCI(ctx context.Context, failure, prURL, sessionID, issueID string, roundsDone int) {
-	msg := fmt.Sprintf("❌ CI failed:\n%s\n\nadmiral could not fix it after %d fix round(s). Manual intervention needed — comment `/fix` on the issue. PR: %s",
-		failure, roundsDone, prURL)
+// path (use /rerun on the issue; /fix requires a DONE run) starts from
+// there.
+func (w *CIWatcher) escalateCI(ctx context.Context, msg, sessionID, issueID string) {
 	w.postResult(ctx, sessionID, linear.Response(msg))
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -246,6 +291,13 @@ func describeFailedChecks(failed []checkRun) string {
 }
 
 func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber int, ghUser string) ([]checkRun, error) {
+	// Bound each gh invocation: exec only kills the child on ctx
+	// cancellation, and the watcher goroutine is detached from the run ctx
+	// (no cancel will arrive) — a hung gh must not block the watcher, and
+	// its child process, forever.
+	ctx, cancel := context.WithTimeout(ctx, w.fetchTimeout)
+	defer cancel()
+
 	dir := repoDir
 	if dir == "" {
 		dir = "."

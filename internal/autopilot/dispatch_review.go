@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/georgehuang/admiral/internal/claudeclient"
@@ -118,6 +119,8 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 
 	release := o.acquireRunSlot()
 	defer release()
+	unlockPRFix := o.lockPRFix(task.Branch)
+	defer unlockPRFix()
 
 	ctx, cancel := context.WithTimeout(context.Background(), prFixBudget(o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries))
 	defer cancel()
@@ -174,20 +177,17 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 			"` on origin has commits admiral didn't see. " +
 			"Local commits were discarded; trigger the review again to retry.)"
 	}
-	if output == "" {
-		output = "addressed"
-	}
-	if out.GateAttempts > 0 {
-		// Surface the attempt count so reviewers can tell at a glance whether
-		// the fix landed cleanly (1 attempt) or needed retries (2+).
-		output += fmt.Sprintf("\n\n_(admiral build gate: passed after %d attempt(s))_", out.GateAttempts)
-	}
+	output = renderFixReply(output, "addressed", out.GateAttempts)
 	_ = deps.replier.Reply(ctx, output)
 
-	// Best-effort: notify the Linear thread that the review has been addressed
-	// so the issue creator knows to come re-review. Failures are logged at
-	// warn level — the PR comment above is the authoritative signal.
-	o.postReviewHandledNotice(task)
+	// Best-effort: notify the Linear thread that the review has been
+	// addressed so the issue creator knows to come re-review — only when the
+	// fix actually landed on origin. A discarded push is already reported
+	// on the PR above; "please re-review" would send the human to a PR that
+	// contains none of the fix.
+	if out.Pushed {
+		o.postReviewHandledNotice(task)
+	}
 }
 
 // Stages resolvePRFixDeps can fail at. The caller phrases the human-facing
@@ -198,6 +198,40 @@ const (
 	prFixStageIdentity = "identity"
 	prFixStageWorktree = "worktree"
 )
+
+// lockPRFix returns an unlock func for the task's branch. The runPRFix
+// callers hold it for the whole round so two rounds never share one
+// worktree — concurrent `git reset --hard` / `git clean -fd` would discard
+// the other round's in-flight claude edits, or trip git's index.lock.
+func (o *Orchestrator) lockPRFix(branch string) func() {
+	o.prFixLocksMu.Lock()
+	defer o.prFixLocksMu.Unlock()
+	if o.prFixLocks == nil {
+		o.prFixLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := o.prFixLocks[branch]
+	if !ok {
+		mu = &sync.Mutex{}
+		o.prFixLocks[branch] = mu
+	}
+	mu.Lock()
+	return mu.Unlock
+}
+
+// renderFixReply finalizes a fix round's PR comment: fallback text when
+// claude produced no output, and the gate-attempts note when the gate ran.
+// Shared by the review and CI callers so the suffix stays in one place.
+func renderFixReply(output, emptyFallback string, gateAttempts int) string {
+	if output == "" {
+		output = emptyFallback
+	}
+	if gateAttempts > 0 {
+		// Surface the attempt count so reviewers can tell at a glance
+		// whether the fix landed cleanly (1 attempt) or needed retries (2+).
+		output += fmt.Sprintf("\n\n_(admiral build gate: passed after %d attempt(s))_", gateAttempts)
+	}
+	return output
+}
 
 // prFixBudget returns the wall-clock budget for one PR fix round: the
 // initial claude run plus every build-gate retry the verify gate allows,

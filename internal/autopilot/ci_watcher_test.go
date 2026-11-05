@@ -341,7 +341,13 @@ func TestWatchPR_PollsAfterCallerCancels(t *testing.T) {
 	}
 
 	lc := &mockLinearClient{}
-	db := &mockStore{}
+	db := &mockStore{
+		AdmiralTask: &store.AdmiralTask{
+			IssueID: "issue-1", State: store.JobStateDone,
+			PRURL: "https://github.com/acme/repo/pull/7",
+		},
+	}
+	db.LiveAdmiralTask = db.AdmiralTask
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	w := newCIWatcher(lc, db, logger, ghBin, 10*time.Millisecond, 5*time.Second, 2)
 
@@ -487,9 +493,9 @@ func TestWatchPR_CIFixCapEscalates(t *testing.T) {
 	defer cancel()
 	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
 
-	ciWatchTaskFailure(t, lc, "could not fix it after 2 fix round(s)")
-	body := ciWatchTaskFailure(t, lc, "comment `/fix` on the issue")
-	if !strings.Contains(body, "could not fix it after 2 fix round(s)") {
+	ciWatchTaskFailure(t, lc, "attempted 2 automatic fix round(s) without success")
+	body := ciWatchTaskFailure(t, lc, "use `/rerun` on the issue")
+	if !strings.Contains(body, "attempted 2 automatic fix round(s) without success") {
 		t.Errorf("escalation notice lost the round count: %q", body)
 	}
 	if *fixCalls != 2 {
@@ -526,7 +532,7 @@ func TestWatchPR_ReportOnlyWhenNoFixRound(t *testing.T) {
 	defer cancel()
 	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
 
-	ciWatchTaskFailure(t, lc, "could not fix it after 0 fix round(s)")
+	ciWatchTaskFailure(t, lc, "No automatic fix is configured")
 	if state, errMsg := taskStateSnapshot(db); state != store.JobStateFailed || errMsg != "ci_failed" {
 		t.Errorf("task = %q/%q, want FAILED/ci_failed", state, errMsg)
 	}
@@ -673,9 +679,113 @@ func TestEscalateCI_RespectsTerminalTask(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	w := newCIWatcher(&mockLinearClient{}, db, logger, "gh", time.Second, time.Minute, 2)
 
-	w.escalateCI(context.Background(), "- test (failure)", "https://github.com/acme/repo/pull/7", "sess-1", db.AdmiralTask.IssueID, 1)
+	w.escalateCI(context.Background(), "escalation message", "sess-1", db.AdmiralTask.IssueID)
 
 	if state, errMsg := taskStateSnapshot(db); state != store.JobStateDoneMerged || errMsg != "" {
 		t.Errorf("terminal row clobbered: task = %q/%q, want DONE_MERGED untouched", state, errMsg)
 	}
+}
+
+// TestWatchPR_StaleTaskRowNotActedOn: the row may have been superseded by a
+// /rerun (it now points at a different attempt's PR). A watcher for the OLD
+// PR must not run fix rounds against, post to, or mark FAILED the live row
+// of the new attempt.
+func TestWatchPR_StaleTaskRowNotActedOn(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, fixCalls := ciWatchFixFixture(ghBin, 2)
+	// The row was reused by a /rerun: it now points at a different PR.
+	db.AdmiralTask.PRURL = "https://github.com/acme/repo/pull/99"
+	db.AdmiralTask.State = store.JobStateExecuting
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, "https://github.com/acme/repo/pull/7", t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	// Nothing must EVER be posted or fixed for a stale watcher — keep
+	// asserting over a window several poll intervals wide (a fixed short
+	// sleep can miss the first poll on a loaded machine).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		lc.PostedBodyMu.Lock()
+		posted := lc.PostedBody
+		lc.PostedBodyMu.Unlock()
+		if posted != "" {
+			t.Fatalf("stale watcher posted to the thread: %q", posted)
+		}
+		if *fixCalls != 0 {
+			t.Fatalf("stale watcher ran fixRound %d times, want 0", *fixCalls)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if state, errMsg := taskStateSnapshot(db); state != store.JobStateExecuting || errMsg != "" {
+		t.Errorf("stale watcher mutated the live row: %q/%q", state, errMsg)
+	}
+}
+
+// TestFetchTimeout_KillsHungGh: the watcher is detached from the run ctx,
+// and exec only kills the child on ctx cancellation — so each `gh pr
+// checks` invocation needs its own deadline or a hung gh blocks the
+// watcher (and its child process) forever.
+func TestFetchTimeout_KillsHungGh(t *testing.T) {
+	dir := t.TempDir()
+	ghBin := filepath.Join(dir, "fake-gh")
+	// `exec` replaces sh with sleep so the ctx kill targets the process
+	// holding the stdout pipe; a plain `sleep` child would orphan-hold the
+	// pipe and Run would keep waiting even after sh dies.
+	if err := os.WriteFile(ghBin, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w := newCIWatcher(&mockLinearClient{}, &mockStore{}, logger, ghBin, time.Second, time.Minute, 2)
+	w.fetchTimeout = 100 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := w.fetchCheckRuns(ctx, dir, 7, defaultTestGhUser); err == nil {
+		t.Fatal("fetchCheckRuns succeeded against a hung gh, want deadline error")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("fetchCheckRuns took %v against a hung gh, want ~fetchTimeout (100ms)", elapsed)
+	}
+}
+
+// TestLockPRFix_SerializesSameBranch: the runPRFix callers must not share a
+// worktree — the second lock acquisition for the same branch blocks until
+// the first round releases; a different branch is independent.
+func TestLockPRFix_SerializesSameBranch(t *testing.T) {
+	o := &Orchestrator{}
+	unlock := o.lockPRFix("linear/TEST-1")
+
+	acquired := make(chan struct{})
+	go func() {
+		u := o.lockPRFix("linear/TEST-1")
+		close(acquired)
+		u()
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatal("second lockPRFix for the same branch acquired while the first is held")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	unlock()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("second lockPRFix never acquired after release")
+	}
+
+	u2 := o.lockPRFix("linear/OTHER")
+	if u2 == nil {
+		t.Fatal("different branch should lock independently")
+	}
+	u2()
 }

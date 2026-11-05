@@ -21,6 +21,8 @@ import (
 func (o *Orchestrator) runCIFixRound(ctx context.Context, task *store.AdmiralTask, failure string) error {
 	release := o.acquireRunSlot()
 	defer release()
+	unlockPRFix := o.lockPRFix(task.Branch)
+	defer unlockPRFix()
 
 	ctx, cancel := context.WithTimeout(ctx, prFixBudget(o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries))
 	defer cancel()
@@ -47,13 +49,7 @@ func (o *Orchestrator) runCIFixRound(ctx context.Context, task *store.AdmiralTas
 			truncate(out.Output, 200))
 	}
 
-	output := out.Output
-	if output == "" {
-		output = "addressed the CI failure"
-	}
-	if out.GateAttempts > 0 {
-		output += fmt.Sprintf("\n\n_(admiral build gate: passed after %d attempt(s))_", out.GateAttempts)
-	}
+	output := renderFixReply(out.Output, "addressed the CI failure", out.GateAttempts)
 	_ = deps.replier.Reply(ctx, output)
 	return nil
 }
