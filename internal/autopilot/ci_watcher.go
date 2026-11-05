@@ -44,7 +44,7 @@ type CIWatcher struct {
 	// with the fix loop a duplicate watcher means double claude spend and
 	// double escalation messages, not just a duplicate report.
 	activeMu sync.Mutex
-	activePR map[string]struct{}
+	activePR map[string]*prWatchSlot
 	// accounts resolves the repo's registered gh account to a token for
 	// each poll, so the check-run lookup runs as that account.
 	accounts *ghpkg.Accounts
@@ -93,21 +93,8 @@ func newCIWatcher(lc linearClientInterface, db storeInterface, logger *slog.Logg
 // watcher detaches from it (WithoutCancel) and terminates on its own deadline
 // (w.timeout) instead.
 func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issueID, ghUser string) {
-	if !w.claimPRWait(prURL, ciClaimWait) {
-		w.logger.Info("ci_watch_duplicate_suppressed",
-			"pr_url", prURL, "issue", issueID)
-		// CI continues to be reported on the earlier session's thread; tell
-		// THIS attempt's thread where to look instead of leaving it silent.
-		noteCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		w.postResult(noteCtx, sessionID, linear.Response(fmt.Sprintf(
-			"(CI for PR %s is already being watched — results are posted to the earlier session thread.)",
-			prURL)))
-		return
-	}
 	ctx = context.WithoutCancel(ctx)
 	go func() {
-		defer w.releasePR(prURL)
 		// The goroutine runs claude, git, and Linear posts via fixRound; a
 		// panic here would take down the whole daemon (Go kills the process
 		// on any unrecovered panic). Same guard as runReview.
@@ -116,6 +103,22 @@ func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issu
 				w.logger.Error("ci_watch_panic", "pr_url", prURL, "panic", r)
 			}
 		}()
+		// Claim from inside the goroutine: the caller (a run holding a
+		// run-slot lease) must not block on it.
+		if !w.acquireSlot(prURL, ciClaimWait) {
+			w.logger.Info("ci_watch_duplicate_suppressed",
+				"pr_url", prURL, "issue", issueID)
+			// CI continues to be reported on the earlier session's thread;
+			// tell THIS attempt's thread where to look instead of leaving
+			// it silent.
+			noteCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			w.postResult(noteCtx, sessionID, linear.Response(fmt.Sprintf(
+				"(CI for PR %s is already being watched — results are posted to the earlier session thread.)",
+				prURL)))
+			return
+		}
+		defer w.releaseSlot(prURL)
 		w.watch(ctx, prURL, repoDir, sessionID, issueID, ghUser)
 	}()
 }
@@ -126,36 +129,54 @@ func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issu
 // test overrides.
 var ciClaimWait = 15 * time.Second
 
-// claimPRWait registers prURL as actively watched. If another watcher for
-// this PR is registered, it waits up to wait for it to release — dropping
-// the new watch would leave the attempt's CI outcome unreported — and only
-// then reports a duplicate.
-func (w *CIWatcher) claimPRWait(prURL string, wait time.Duration) bool {
+// prWatchSlot is the per-PR ownership record. done is closed when the
+// active watcher releases, waking any waiter to retry.
+type prWatchSlot struct {
+	done chan struct{}
+}
+
+// acquireSlot becomes the PR's watcher, or waits up to wait for the current
+// one to release. false = a watcher was active the whole time.
+//
+// The wait runs inside the watcher goroutine, never on the caller's path:
+// WatchPR is called from a run that still holds a run-slot lease, and
+// blocking there would idle claude capacity for the wait's duration.
+func (w *CIWatcher) acquireSlot(prURL string, wait time.Duration) bool {
 	deadline := time.Now().Add(wait)
 	for {
 		w.activeMu.Lock()
 		if w.activePR == nil {
-			w.activePR = make(map[string]struct{})
+			w.activePR = make(map[string]*prWatchSlot)
 		}
-		_, dup := w.activePR[prURL]
-		if !dup {
-			w.activePR[prURL] = struct{}{}
-		}
-		w.activeMu.Unlock()
-		if !dup {
+		slot, active := w.activePR[prURL]
+		if !active {
+			w.activePR[prURL] = &prWatchSlot{done: make(chan struct{})}
+			w.activeMu.Unlock()
 			return true
 		}
-		if time.Now().After(deadline) {
+		done := slot.done
+		w.activeMu.Unlock()
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return false
 		}
-		time.Sleep(250 * time.Millisecond)
+		select {
+		case <-done:
+		case <-time.After(remaining):
+			return false
+		}
 	}
 }
 
-func (w *CIWatcher) releasePR(prURL string) {
+// releaseSlot hands the PR's watch to the next waiter (or nobody).
+func (w *CIWatcher) releaseSlot(prURL string) {
 	w.activeMu.Lock()
 	defer w.activeMu.Unlock()
-	delete(w.activePR, prURL)
+	if slot, ok := w.activePR[prURL]; ok {
+		close(slot.done)
+		delete(w.activePR, prURL)
+	}
 }
 
 func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueID, ghUser string) {
@@ -169,17 +190,18 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 	// Each iteration gets a fresh polling deadline: a fix round can run far
 	// longer than ci_watch_timeout, and the re-run CI after its push needs
 	// the full window again.
-	// justPushed spans the first observation after a fix round: that poll
-	// can still resolve the PREVIOUS head's completed failing checks
-	// (GitHub registers the new head's checks asynchronously), and acting
-	// on them burns a fix round on already-fixed code. The first failure
-	// observation after a push is therefore re-observed once, uncounted,
-	// before any round is spent.
-	justPushed := false
-	// round counts FIX ROUNDS spent, not loop iterations — the
-	// justPushed re-observation pass re-enters the loop without spending.
+	// fixedSHA is the head commit whose failing checks we already spent a
+	// fix round on. GitHub registers a new head's check runs asynchronously,
+	// and `gh pr checks` keeps serving the OLD head's completed results
+	// until then; binding each observation to the head SHA it belongs to is
+	// what stops a stale failure from burning another round on code that is
+	// already fixed. Empty = nothing fixed yet (or the SHA was unreadable),
+	// in which case every observation is trusted.
+	fixedSHA := ""
+	staleObservations := 0
+	// round counts FIX ROUNDS spent, not loop iterations.
 	for round := 0; ; {
-		runs, ok := w.pollUntilFinal(ctx, repoDir, prNumber, ghUser, prURL)
+		runs, sha, ok := w.pollUntilFinal(ctx, repoDir, prNumber, ghUser, prURL)
 		if !ok {
 			// After announcing fix rounds, silence would leave the thread
 			// dangling on "attempting an automatic fix". Round 0 timeouts
@@ -204,12 +226,24 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 			return
 		}
 
-		if justPushed {
-			// First observation after the fix push: could be the old head's
-			// stale failure. Re-observe once before spending anything.
-			justPushed = false
+		// Still looking at the head we already fixed: its check results are
+		// the failure that round was spent on, not a new verdict on the fix.
+		if fixedSHA != "" && sha == fixedSHA {
+			staleObservations++
+			w.logger.Info("ci_watch_stale_head",
+				"pr_url", prURL, "head", sha, "observations", staleObservations)
+			// The push landed but the PR head never moved (fix produced no
+			// new commit) or GitHub never propagated it — waiting longer
+			// cannot resolve it.
+			if staleObservations >= 2 {
+				w.escalateCI(ctx, fmt.Sprintf(
+					"❌ CI failed on PR %s and the fix round produced no new commit (head is still %s):\n%s\n\nManual intervention needed — use `/rerun` on the issue.",
+					prURL, shortSHA(sha), describeFailedChecks(failed)), sessionID, issueID, prURL)
+				return
+			}
 			continue
 		}
+		staleObservations = 0
 
 		failure := describeFailedChecks(failed)
 
@@ -234,7 +268,13 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 			return
 		}
 		if task == nil {
+			// The row was deleted (admin reset) while we were polling. We
+			// cannot mark it FAILED, but the thread — and the human — still
+			// need to know the PR is red.
 			w.logger.Info("ci_fix_no_task", "issue", issueID)
+			w.postResult(ctx, sessionID, linear.Response(fmt.Sprintf(
+				"❌ CI failed on PR %s:\n%s\n\n(no admiral task row for this issue — nothing to record the failure on.)",
+				prURL, failure)))
 			return
 		}
 		if task.PRURL != prURL {
@@ -269,9 +309,12 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 			return
 		}
 
-		if w.fixRound == nil {
+		// Report-only when no runner is wired OR the operator configured
+		// zero rounds (ci_fix_max_rounds: 0). New() always wires a runner,
+		// so the config path is the one that matters in production.
+		if w.fixRound == nil || w.maxFixRounds <= 0 {
 			w.escalateCI(ctx, fmt.Sprintf(
-				"❌ CI failed on PR %s:\n%s\n\nAutomatic CI fixing is disabled for this watcher. Manual intervention needed — use `/rerun` on the issue.",
+				"❌ CI failed on PR %s:\n%s\n\nAutomatic CI fixing is disabled (ci_fix_max_rounds is 0). Manual intervention needed — use `/rerun` on the issue.",
 				prURL, failure), sessionID, issueID, prURL)
 			return
 		}
@@ -303,7 +346,7 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 		// is by-construction dead here — the ctx is detached — and kept
 		// for future cancelable callers.)
 		round++
-		justPushed = true
+		fixedSHA = sha
 		select {
 		case <-ctx.Done():
 			return
@@ -315,7 +358,7 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 // pollUntilFinal polls check runs until every check has a terminal status.
 // Returns the final runs, or ok=false when the watch should stop (ctx done
 // or the per-round deadline exhausted without a conclusion).
-func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber int, ghUser, prURL string) ([]checkRun, bool) {
+func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber int, ghUser, prURL string) ([]checkRun, string, bool) {
 	ticker := time.NewTicker(w.pollInter)
 	defer ticker.Stop()
 
@@ -328,7 +371,7 @@ func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber
 		// caller remains correct instead of polling into shutdown.
 		case <-ctx.Done():
 			w.logger.Info("ci_watch_cancelled", "pr_url", prURL)
-			return nil, false
+			return nil, "", false
 		case <-ticker.C:
 			runs, err := w.fetchCheckRuns(ctx, repoDir, prNumber, ghUser)
 			if err != nil {
@@ -339,7 +382,7 @@ func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber
 				// binary, network partition — would otherwise poll forever.
 				if time.Now().After(deadline) {
 					w.logger.Info("ci_watch_timeout", "pr_url", prURL, "timeout", w.timeout)
-					return nil, false
+					return nil, "", false
 				}
 				continue
 			}
@@ -347,12 +390,20 @@ func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber
 			if len(runs) == 0 {
 				// No checks yet, keep polling
 			} else if allFinal(runs) {
-				return runs, true
+				// Bind the verdict to the head it belongs to. A read failure
+				// degrades to "" (trust the observation) rather than
+				// suppressing a real failure.
+				sha, shaErr := w.fetchHeadSHA(ctx, repoDir, prNumber, ghUser)
+				if shaErr != nil {
+					w.logger.Warn("ci_watch_head_sha_failed", "pr_url", prURL, "err", shaErr)
+					sha = ""
+				}
+				return runs, sha, true
 			}
 
 			if time.Now().After(deadline) {
 				w.logger.Info("ci_watch_timeout", "pr_url", prURL, "timeout", w.timeout)
-				return nil, false
+				return nil, "", false
 			}
 		}
 	}
@@ -398,6 +449,42 @@ func describeFailedChecks(failed []checkRun) string {
 		fmt.Fprintf(&b, "\nLogs: %s", failed[0].URL)
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// fetchHeadSHA returns the PR's current head commit SHA — the identity a
+// check-run verdict is tied to.
+func (w *CIWatcher) fetchHeadSHA(ctx context.Context, repoDir string, prNumber int, ghUser string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, w.fetchTimeout)
+	defer cancel()
+
+	dir := repoDir
+	if dir == "" {
+		dir = "."
+	}
+	env, err := w.accounts.EnvFor(ctx, ghUser)
+	if err != nil {
+		return "", fmt.Errorf("resolve gh account %q: %w", ghUser, err)
+	}
+	out, err := captureCmdEnv(ctx, dir, env, w.ghBin,
+		"pr", "view", fmt.Sprintf("%d", prNumber), "--json", "headRefOid")
+	if err != nil {
+		return "", fmt.Errorf("gh pr view: %w (output: %s)", err, truncate(out, 200))
+	}
+	var v struct {
+		HeadRefOid string `json:"headRefOid"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		return "", fmt.Errorf("parse gh pr view output: %w", err)
+	}
+	return v.HeadRefOid, nil
+}
+
+// shortSHA abbreviates a commit SHA for human-facing text.
+func shortSHA(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber int, ghUser string) ([]checkRun, error) {

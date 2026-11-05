@@ -386,6 +386,9 @@ func ciWatchFakeGh(t *testing.T, firstRuns int) (string, func() int) {
 	cnt := filepath.Join(dir, "calls")
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		// pr view → the head SHA the check results belong to. Tests that
+		// need the head to move write a `sha` file next to this script.
+		"if [ \"$2\" = \"view\" ]; then s=$(cat \"$(dirname \"$0\")/sha\" 2>/dev/null); [ -n \"$s\" ] || s=sha-const; printf '{\"headRefOid\":\"%s\"}\\n' \"$s\"; exit 0; fi\n" +
 		fmt.Sprintf("n=$(cat %s 2>/dev/null || echo 0); n=$((n+1)); echo $n > %s\n", cnt, cnt) +
 		fmt.Sprintf("if [ $n -le %d ]; then\n", firstRuns) +
 		`  echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n" +
@@ -613,9 +616,9 @@ func TestPollUntilFinal_StopsOnPersistentFetchErrors(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	start := time.Now()
-	runs, ok := w.pollUntilFinal(ctx, dir, 7, defaultTestGhUser, "https://github.com/acme/repo/pull/7")
+	runs, sha, ok := w.pollUntilFinal(ctx, dir, 7, defaultTestGhUser, "https://github.com/acme/repo/pull/7")
 	if ok {
-		t.Fatalf("pollUntilFinal reported success with a permanently failing gh: %v", runs)
+		t.Fatalf("pollUntilFinal reported success with a permanently failing gh: %v / %q", runs, sha)
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("pollUntilFinal took %v to give up, want ~deadline (150ms); the deadline check is not covering the fetch-error path", elapsed)
@@ -635,6 +638,9 @@ func TestWatchPR_TimeoutAfterFixPostsNotice(t *testing.T) {
 	// still in_progress, forever — the re-run never concludes.
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		// pr view → the head SHA the check results belong to. Tests that
+		// need the head to move write a `sha` file next to this script.
+		"if [ \"$2\" = \"view\" ]; then s=$(cat \"$(dirname \"$0\")/sha\" 2>/dev/null); [ -n \"$s\" ] || s=sha-const; printf '{\"headRefOid\":\"%s\"}\\n' \"$s\"; exit 0; fi\n" +
 		fmt.Sprintf("n=$(cat %s 2>/dev/null || echo 0); n=$((n+1)); echo $n > %s\n", cnt, cnt) +
 		"if [ $n -le 1 ]; then\n" +
 		`  echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n" +
@@ -694,6 +700,9 @@ func TestWatchPR_StaleTaskRowNotActedOn(t *testing.T) {
 	ghBin := filepath.Join(t.TempDir(), "fake-gh")
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		// pr view → the head SHA the check results belong to. Tests that
+		// need the head to move write a `sha` file next to this script.
+		"if [ \"$2\" = \"view\" ]; then s=$(cat \"$(dirname \"$0\")/sha\" 2>/dev/null); [ -n \"$s\" ] || s=sha-const; printf '{\"headRefOid\":\"%s\"}\\n' \"$s\"; exit 0; fi\n" +
 		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
 	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
@@ -813,28 +822,32 @@ func TestEscalateCI_RespectsSupersededRow(t *testing.T) {
 	}
 }
 
-// TestWatchPR_DuplicateSuppressed: a PR can get a second watcher (ensurePR
-// reuses the PR across /rerun attempts); with the fix loop a duplicate
-// means double claude spend — the second WatchPR for a PR with an active
-// watcher is a no-op.
-func TestWatchPR_DuplicateSuppressed(t *testing.T) {
-	ghBin := filepath.Join(t.TempDir(), "fake-gh")
-	script := "#!/bin/sh\n" +
-		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
-		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
-	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake gh: %v", err)
+// TestPRWatchSlot_SuppressesWhileActive pins the dedup contract directly:
+// a second watcher cannot own a PR its peer already owns, and takes over
+// as soon as that peer releases. (The earlier version of this test drove
+// two real WatchPR calls; the first finished inside the wait window, so it
+// silently exercised handoff rather than suppression and raced on the
+// fix-round count.)
+func TestPRWatchSlot_SuppressesWhileActive(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w := newCIWatcher(&mockLinearClient{}, &mockStore{}, logger, "gh", time.Second, time.Minute, 2)
+	const pr = "https://github.com/acme/repo/pull/7"
+
+	if !w.acquireSlot(pr, 0) {
+		t.Fatal("first acquire failed on a free PR")
 	}
-	w, lc, db, fixCalls := ciWatchFixFixture(ghBin, 2)
+	if w.acquireSlot(pr, 150*time.Millisecond) {
+		t.Fatal("second acquire succeeded while a watcher owns the PR")
+	}
+	w.releaseSlot(pr)
+	if !w.acquireSlot(pr, time.Second) {
+		t.Fatal("acquire failed after the owner released")
+	}
+	w.releaseSlot(pr)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
-	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
-
-	ciWatchTaskFailure(t, lc, "attempted 2 automatic fix round(s) without success")
-	if *fixCalls != 2 {
-		t.Errorf("fixRound called %d times, want exactly 2 (ONE watcher's two rounds — duplicate suppressed)", *fixCalls)
+	// A different PR is independent.
+	if !w.acquireSlot("https://github.com/acme/repo/pull/8", 0) {
+		t.Fatal("independent PR should not be gated")
 	}
 }
 
@@ -845,6 +858,9 @@ func TestWatchPR_RunInFlightNotFixed(t *testing.T) {
 	ghBin := filepath.Join(t.TempDir(), "fake-gh")
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		// pr view → the head SHA the check results belong to. Tests that
+		// need the head to move write a `sha` file next to this script.
+		"if [ \"$2\" = \"view\" ]; then s=$(cat \"$(dirname \"$0\")/sha\" 2>/dev/null); [ -n \"$s\" ] || s=sha-const; printf '{\"headRefOid\":\"%s\"}\\n' \"$s\"; exit 0; fi\n" +
 		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
 	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
@@ -873,6 +889,9 @@ func TestWatchPR_DuplicateWaitThenWatch(t *testing.T) {
 	ghBin := filepath.Join(t.TempDir(), "fake-gh")
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		// pr view → the head SHA the check results belong to. Tests that
+		// need the head to move write a `sha` file next to this script.
+		"if [ \"$2\" = \"view\" ]; then s=$(cat \"$(dirname \"$0\")/sha\" 2>/dev/null); [ -n \"$s\" ] || s=sha-const; printf '{\"headRefOid\":\"%s\"}\\n' \"$s\"; exit 0; fi\n" +
 		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
 	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
@@ -883,13 +902,13 @@ func TestWatchPR_DuplicateWaitThenWatch(t *testing.T) {
 	ciClaimWait = 3 * time.Second
 	t.Cleanup(func() { ciClaimWait = oldWait })
 
-	// A finishing watcher holds the claim, releases after 300ms.
-	if !w.claimPRWait(db.AdmiralTask.PRURL, 0) {
+	// A finishing watcher owns the slot, releases after 300ms.
+	if !w.acquireSlot(db.AdmiralTask.PRURL, 0) {
 		t.Fatal("initial claim failed")
 	}
 	go func() {
 		time.Sleep(300 * time.Millisecond)
-		w.releasePR(db.AdmiralTask.PRURL)
+		w.releaseSlot(db.AdmiralTask.PRURL)
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -906,6 +925,9 @@ func TestWatchPR_TransientLookupRetried(t *testing.T) {
 	ghBin := filepath.Join(t.TempDir(), "fake-gh")
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		// pr view → the head SHA the check results belong to. Tests that
+		// need the head to move write a `sha` file next to this script.
+		"if [ \"$2\" = \"view\" ]; then s=$(cat \"$(dirname \"$0\")/sha\" 2>/dev/null); [ -n \"$s\" ] || s=sha-const; printf '{\"headRefOid\":\"%s\"}\\n' \"$s\"; exit 0; fi\n" +
 		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
 	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
@@ -932,6 +954,9 @@ func TestWatchPR_AwaitingInputNotFixed(t *testing.T) {
 	ghBin := filepath.Join(t.TempDir(), "fake-gh")
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		// pr view → the head SHA the check results belong to. Tests that
+		// need the head to move write a `sha` file next to this script.
+		"if [ \"$2\" = \"view\" ]; then s=$(cat \"$(dirname \"$0\")/sha\" 2>/dev/null); [ -n \"$s\" ] || s=sha-const; printf '{\"headRefOid\":\"%s\"}\\n' \"$s\"; exit 0; fi\n" +
 		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
 	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
@@ -964,6 +989,9 @@ func TestWatchPR_StaleHeadReObservedBeforeSpending(t *testing.T) {
 	// from the old head. call 3+: the fix landed — green.
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		// pr view → the head SHA the check results belong to. Tests that
+		// need the head to move write a `sha` file next to this script.
+		"if [ \"$2\" = \"view\" ]; then s=$(cat \"$(dirname \"$0\")/sha\" 2>/dev/null); [ -n \"$s\" ] || s=sha-const; printf '{\"headRefOid\":\"%s\"}\\n' \"$s\"; exit 0; fi\n" +
 		fmt.Sprintf("n=$(cat %s 2>/dev/null || echo 0); n=$((n+1)); echo $n > %s\n", cnt, cnt) +
 		"if [ $n -le 1 ]; then\n" +
 		`  echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n" +
@@ -997,6 +1025,9 @@ func TestWatchPR_SuppressedSessionGetsPointer(t *testing.T) {
 	ghBin := filepath.Join(t.TempDir(), "fake-gh")
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		// pr view → the head SHA the check results belong to. Tests that
+		// need the head to move write a `sha` file next to this script.
+		"if [ \"$2\" = \"view\" ]; then s=$(cat \"$(dirname \"$0\")/sha\" 2>/dev/null); [ -n \"$s\" ] || s=sha-const; printf '{\"headRefOid\":\"%s\"}\\n' \"$s\"; exit 0; fi\n" +
 		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
 	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
@@ -1006,14 +1037,91 @@ func TestWatchPR_SuppressedSessionGetsPointer(t *testing.T) {
 	ciClaimWait = 300 * time.Millisecond
 	t.Cleanup(func() { ciClaimWait = oldWait })
 
-	// A long-lived watcher holds the claim for this PR.
-	if !w.claimPRWait(db.AdmiralTask.PRURL, 0) {
+	// A long-lived watcher owns the PR for the whole test.
+	if !w.acquireSlot(db.AdmiralTask.PRURL, 0) {
 		t.Fatal("initial claim failed")
 	}
+	t.Cleanup(func() { w.releaseSlot(db.AdmiralTask.PRURL) })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-NEW", db.AdmiralTask.IssueID, defaultTestGhUser)
 
 	ciWatchTaskFailure(t, lc, "already being watched")
+}
+
+// TestWatchPR_StaleHeadBySHA: after a fix round the PR head never moves (the
+// fix produced no commit, or GitHub never propagated it). Check results for
+// the SAME head are the failure we already spent a round on — the watcher
+// must not spend another, and must end in a clear escalation instead of
+// looping to the timeout.
+func TestWatchPR_StaleHeadBySHA(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		"if [ \"$2\" = \"view\" ]; then s=$(cat \"$(dirname \"$0\")/sha\" 2>/dev/null); [ -n \"$s\" ] || s=sha-const; printf '{\"headRefOid\":\"%s\"}\n' \"$s\"; exit 0; fi\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, fixCalls := ciWatchFixFixture(ghBin, 2)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "produced no new commit")
+	if *fixCalls != 1 {
+		t.Errorf("fixRound called %d times, want 1 (stale head must not spend a second round)", *fixCalls)
+	}
+}
+
+// TestWatchPR_ReportOnlyWhenRoundsZero: ci_fix_max_rounds: 0 means report
+// only even though New() always wires a fix runner — the message must say
+// the feature is disabled, not "attempted 0 rounds".
+func TestWatchPR_ReportOnlyWhenRoundsZero(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		"if [ \"$2\" = \"view\" ]; then echo '{\"headRefOid\":\"sha-a\"}'; exit 0; fi\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, fixCalls := ciWatchFixFixture(ghBin, 0) // zero rounds, runner still wired
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "Automatic CI fixing is disabled")
+	if *fixCalls != 0 {
+		t.Errorf("fixRound called %d times, want 0 (zero rounds configured)", *fixCalls)
+	}
+	if state, errMsg := taskStateSnapshot(db); state != store.JobStateFailed || errMsg != "ci_failed" {
+		t.Errorf("task = %q/%q, want FAILED/ci_failed", state, errMsg)
+	}
+}
+
+// TestWatchPR_DeletedRowStillReports: an admin reset can delete the
+// admiral_tasks row mid-watch. There is nothing to mark FAILED, but the
+// thread must still learn the PR is red (the pre-refactor behavior).
+func TestWatchPR_DeletedRowStillReports(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		"if [ \"$2\" = \"view\" ]; then echo '{\"headRefOid\":\"sha-a\"}'; exit 0; fi\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, _ := ciWatchFixFixture(ghBin, 2)
+	db.AdmiralTask = nil // row deleted by admin reset
+	db.LiveAdmiralTask = nil
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, "https://github.com/acme/repo/pull/7", t.TempDir(), "sess-1", "issue-1", defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "no admiral task row")
 }
