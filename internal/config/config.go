@@ -244,6 +244,14 @@ type Autopilot struct {
 	// CIWatchTimeout is how long CI watcher waits for all checks to complete.
 	// Default: 15m.
 	CIWatchTimeout time.Duration `yaml:"ci_watch_timeout"`
+	// CIFixMaxRounds is how many automatic fix rounds the CI watcher runs
+	// when checks fail: each round runs claude on the PR's branch, pushes,
+	// and re-watches CI. When the rounds are exhausted (or this is 0), the
+	// watcher falls back to GEO-54 behavior: report the failure to Linear
+	// and mark the task FAILED as ci_failed.
+	// Pointer so an explicit `0` in yaml is distinguishable from unset:
+	// unset (nil) defaults to 2; explicit 0 means report only.
+	CIFixMaxRounds *int `yaml:"ci_fix_max_rounds"`
 	// BlockerPollInterval is how often the blocker watcher re-checks tasks that
 	// were blocked on unresolved Linear dependencies. Default: 10m.
 	BlockerPollInterval time.Duration `yaml:"blocker_poll_interval"`
@@ -392,6 +400,11 @@ func LoadDiscoverer(path string) (*Config, error) {
 	}
 	return c, nil
 }
+
+// DefaultCIFixMaxRounds is the default number of automatic CI fix rounds.
+// Single source of truth for both the yaml default (validate) and the
+// fallback autopilot.New applies to directly-constructed configs.
+const DefaultCIFixMaxRounds = 2
 
 // DefaultVerifyMaxRounds is the default cap on the autonomous verification
 // loop. Exported so the autopilot orchestrator's defensive fallback shares
@@ -587,6 +600,17 @@ func (c *Config) validateAutopilotAndExpand() error {
 	}
 	if c.Autopilot.CIWatchTimeout <= 0 {
 		c.Autopilot.CIWatchTimeout = 15 * time.Minute
+	}
+	// CIFixMaxRounds: nil (unset) defaults to DefaultCIFixMaxRounds; an
+	// explicit 0 stays 0 — it means "report only". Negatives mean the
+	// same, so they are clamped to 0.
+	if c.Autopilot.CIFixMaxRounds == nil {
+		def := DefaultCIFixMaxRounds
+		c.Autopilot.CIFixMaxRounds = &def
+	}
+	if *c.Autopilot.CIFixMaxRounds < 0 {
+		zero := 0
+		c.Autopilot.CIFixMaxRounds = &zero
 	}
 	if c.Autopilot.BlockerPollInterval <= 0 {
 		c.Autopilot.BlockerPollInterval = 10 * time.Minute

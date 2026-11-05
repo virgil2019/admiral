@@ -583,6 +583,7 @@ type mockStore struct {
 	// admiral_tasks (PR-B-v2)
 	AdmiralTask             *store.AdmiralTask
 	AdmiralTaskErr          error
+	AdmiralTaskErrOnce      bool
 	AdmiralTaskByPRURL      *store.AdmiralTask
 	AdmiralTaskByPRURLErr   error
 	LiveAdmiralTask         *store.AdmiralTask // mutated by UpdateAdmiralTask via fn
@@ -732,6 +733,12 @@ func (m *mockStore) HasAnyAutopilotJobForIssue(issueID string) (bool, error) {
 // --- admiral_tasks (PR-B-v2) ---
 
 func (m *mockStore) GetAdmiralTaskByIssue(issueID string) (*store.AdmiralTask, error) {
+	// AdmiralTaskErrOnce simulates one transient read failure (locked
+	// sqlite) followed by success — the shape the watcher's retry covers.
+	if m.AdmiralTaskErrOnce {
+		m.AdmiralTaskErrOnce = false
+		return nil, errors.New("database is locked")
+	}
 	return m.AdmiralTask, m.AdmiralTaskErr
 }
 

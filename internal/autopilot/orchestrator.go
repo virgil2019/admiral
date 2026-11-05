@@ -152,6 +152,20 @@ type Orchestrator struct {
 	// A buffered chan struct{} is the idiomatic Go counted-semaphore.
 	runSlots chan struct{}
 
+	// prFixLocks serializes the runPRFix callers (review feedback, CI fix
+	// rounds) per branch: two fix rounds in one task worktree concurrently
+	// would interleave `git reset --hard` / `git clean -fd` with the other
+	// round's in-flight claude edits, or trip git's index.lock. Keyed by
+	// branch (one branch = one worktree = one PR).
+	//
+	// Entries are never deleted — the map grows by one small mutex per
+	// branch ever fix-rounded, i.e. per issue per rerun attempt. That is
+	// bounded by the issue tracker's lifetime output (~thousands of tiny
+	// entries over months), not by traffic; revisit only if that ever
+	// stops holding.
+	prFixLocksMu sync.Mutex
+	prFixLocks   map[string]*sync.Mutex
+
 	// workflowStatesByTeam caches workflow states per team, keyed by teamID.
 	workflowStatesByTeam map[string][]linear.WorkflowState
 	workflowStatesMu     sync.Mutex
@@ -212,6 +226,13 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		// caller constructs Autopilot{} directly we still want a sane cap.
 		slots = 3
 	}
+	// Callers built from a config load always have CIFixMaxRounds non-nil
+	// (defaults applied); a directly-constructed Autopilot{} falls back to
+	// the same default here.
+	ciFixMaxRounds := config.DefaultCIFixMaxRounds
+	if cfg.CIFixMaxRounds != nil {
+		ciFixMaxRounds = *cfg.CIFixMaxRounds
+	}
 	o := &Orchestrator{
 		cfg:      cfg,
 		lc:       lc,
@@ -222,10 +243,14 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		accounts: ghpkg.NewAccounts(cfg.GhBin),
 		runSlots: make(chan struct{}, slots),
 		ciWatcher: newCIWatcher(lc, db, logger, cfg.GhBin,
-			cfg.CIWatchPollInterval, cfg.CIWatchTimeout),
+			cfg.CIWatchPollInterval, cfg.CIWatchTimeout, ciFixMaxRounds),
 		replier: NewAgentSessionReplier(lc),
 	}
+	o.prFixLocks = make(map[string]*sync.Mutex)
 	o.prClientFor = o.githubClientFor
+	// The CI watcher's automatic fix rounds reuse the review path's fix
+	// machinery (claude + build gate + push on the PR's branch).
+	o.ciWatcher.fixRound = o.runCIFixRound
 	o.verifyRunner = func(ctx context.Context, repoDir, prompt string, env []string) (string, error) {
 		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, env, o.logger)
 	}
@@ -756,6 +781,12 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 // runWithAttempt's lifecycle but reuses the existing admiral_tasks row
 // rather than claiming a new one (attempt_n unchanged).
 func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
+	// /fix works the same task worktree the CI watcher's automatic fix
+	// rounds (and review rounds) use — serialize on the branch so a manual
+	// fix cannot interleave with an in-flight automatic round. Branch lock
+	// BEFORE the run slot (see runReview for the ordering note).
+	unlockPRFix := o.lockPRFix(task.Branch)
+	defer unlockPRFix()
 	release := o.acquireRunSlot()
 	defer release()
 
