@@ -113,6 +113,11 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Every long-running run roots its context here, so a SIGTERM cancels
+	// the runs (and the claude children they spawned) instead of letting
+	// process exit orphan them mid-work.
+	orch.SetRootContext(ctx)
+
 	n := cfg.Autopilot.WorkerCount
 	logger.Info("admiral-autopilot starting",
 		"listen", cfg.Autopilot.ListenAddr,
@@ -129,6 +134,11 @@ func main() {
 	alerter := newAuthAlerter(cfg, db, logger)
 
 	go orch.StartBlockerWatcher(ctx)
+
+	// The internal wakeup: recovers rows no live run owns (a crash or SIGKILL
+	// leaves them EXECUTING and every later /rerun is rejected as "currently
+	// processing"), and keeps sweeping so a stuck row self-heals.
+	go orch.StartReconciler(ctx)
 
 	// worker pool: N workers consume from events_inbox and dispatch to orchestrator
 	for i := 0; i < n; i++ {
@@ -171,13 +181,24 @@ func main() {
 	}()
 
 	<-ctx.Done()
+	// Stop accepting new work, then let the cancelled runs unwind. Anything
+	// still in flight after the grace period is stamped interrupted so the
+	// next boot resumes it rather than leaving a row stuck in EXECUTING.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("shutdown error", "err", err)
 	}
+	shutdownCancel()
+
+	orch.Shutdown(shutdownRunGrace)
 	logger.Info("admiral-autopilot stopped")
 }
+
+// shutdownRunGrace bounds how long shutdown waits for cancelled runs to
+// record their own terminal state. A cancelled run normally unwinds in
+// seconds (the claude child is killed, the error path writes the row); the
+// bound only exists so a wedged run cannot hold the process open.
+const shutdownRunGrace = 60 * time.Second
 
 func parseLevel(lvl string) slog.Level {
 	switch lvl {

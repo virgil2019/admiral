@@ -65,6 +65,12 @@ type storeInterface interface {
 	HasAnyAutopilotJobForIssue(issueID string) (bool, error)
 
 	GetAdmiralTaskByIssue(issueID string) (*store.AdmiralTask, error)
+	// Shutdown/reconcile: mark rows interrupted and enumerate in-flight rows
+	// so the reconciler can spot ones no live run owns.
+	MarkInterruptedTasks(reason string) (int, error)
+	MarkTaskInterrupted(issueID, reason string) (bool, error)
+	ListInFlightTasks() ([]store.AdmiralTask, error)
+	IncrementAutoResumeCount(issueID string) (int, error)
 	GetAdmiralTaskByPRURL(prURL string) (*store.AdmiralTask, error)
 	ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error)
 	UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask)) error
@@ -145,6 +151,24 @@ type Orchestrator struct {
 	// cached, so admiral always acts as the account the repo registered —
 	// never as whichever account happens to be active on the host.
 	accounts *ghpkg.Accounts
+
+	// rootCtx is the parent of every long-running run's context. main sets
+	// it to the signal context, so SIGTERM cancels in-flight runs (and the
+	// claude children they spawned) instead of letting process exit orphan
+	// them. Defaults to Background for tests and direct construction.
+	rootCtx context.Context
+
+	// resumeOrphanRun hands an orphaned row to the resume flow. Defaults to
+	// runResume; tests inject a stub so a sweep does not spawn claude.
+	resumeOrphanRun func(ev linear.AgentEvent, task *store.AdmiralTask)
+
+	// runWG counts in-flight run goroutines so Shutdown can wait for them.
+	runWG sync.WaitGroup
+
+	// inFlight records the ids of runs executing in THIS process, so the
+	// reconciler can tell a live run from a row orphaned by a crash.
+	inFlightMu sync.Mutex
+	inFlight   map[string]struct{}
 
 	// runSlots gates how many `claude -p` runs can be live concurrently
 	// across all issues (GEO-51). Acquired in runWithAttempt and runFix,
@@ -244,9 +268,12 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 		runSlots: make(chan struct{}, slots),
 		ciWatcher: newCIWatcher(lc, db, logger, cfg.GhBin,
 			cfg.CIWatchPollInterval, cfg.CIWatchTimeout, ciFixMaxRounds),
-		replier: NewAgentSessionReplier(lc),
+		replier:  NewAgentSessionReplier(lc),
+		rootCtx:  context.Background(),
+		inFlight: make(map[string]struct{}),
 	}
 	o.prFixLocks = make(map[string]*sync.Mutex)
+	o.resumeOrphanRun = o.runResume
 	o.prClientFor = o.githubClientFor
 	// The CI watcher's automatic fix rounds reuse the review path's fix
 	// machinery (claude + build gate + push on the PR's branch).
@@ -321,6 +348,96 @@ func (o *Orchestrator) ghEnvForProject(ctx context.Context, projectID string) ([
 // A nil runSlots (e.g. tests that construct Orchestrator directly
 // instead of via New) skips the bound and returns a no-op release.
 // Production always has a bounded chan.
+// SetRootContext makes ctx the parent of every run this orchestrator
+// starts. main passes its signal context, so a SIGTERM cancels in-flight
+// runs — killing their claude children via exec.CommandContext — instead of
+// leaving orphans behind when the process exits.
+func (o *Orchestrator) SetRootContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	o.rootCtx = ctx
+}
+
+// baseCtx is rootCtx with a nil-safe fallback: tests and directly
+// constructed orchestrators have no root context, and a nil parent panics
+// inside context.WithTimeout.
+func (o *Orchestrator) baseCtx() context.Context {
+	if o.rootCtx == nil {
+		return context.Background()
+	}
+	return o.rootCtx
+}
+
+// beginRun marks a run as in flight for this process and returns the
+// matching end func. Every long-running goroutine starts with
+//
+//	defer o.beginRun(issueID)()
+//
+// so Shutdown can wait for it and the reconciler can distinguish a live run
+// from an orphaned row. An empty issueID tracks the goroutine only (verify /
+// product-verify runs have no admiral_tasks row).
+func (o *Orchestrator) beginRun(issueID string) func() {
+	o.runWG.Add(1)
+	if issueID != "" {
+		o.inFlightMu.Lock()
+		if o.inFlight == nil {
+			o.inFlight = make(map[string]struct{})
+		}
+		o.inFlight[issueID] = struct{}{}
+		o.inFlightMu.Unlock()
+	}
+	return func() {
+		if issueID != "" {
+			o.inFlightMu.Lock()
+			delete(o.inFlight, issueID)
+			o.inFlightMu.Unlock()
+		}
+		o.runWG.Done()
+	}
+}
+
+// RunInFlight reports whether this process currently has a run for issueID.
+func (o *Orchestrator) RunInFlight(issueID string) bool {
+	o.inFlightMu.Lock()
+	defer o.inFlightMu.Unlock()
+	_, ok := o.inFlight[issueID]
+	return ok
+}
+
+// Shutdown waits up to timeout for in-flight runs to unwind, then marks every
+// admiral_tasks row still in RECEIVED/EXECUTING as interrupted so the next
+// boot can resume it.
+//
+// The caller must have cancelled the root context first — main passes its
+// signal context to SetRootContext, so SIGTERM already cancelled the runs;
+// this only waits for them and records what did not finish. Waiting matters
+// because a run's own terminal write (FAILED / TIMED_OUT / DONE) is more
+// accurate than the blanket "interrupted" stamp, and a run that is still
+// holding a worktree would otherwise be racing the next process.
+func (o *Orchestrator) Shutdown(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		o.runWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		o.logger.Info("shutdown_runs_drained")
+	case <-time.After(timeout):
+		o.logger.Warn("shutdown_runs_still_running", "timeout", timeout)
+	}
+
+	n, err := o.db.MarkInterruptedTasks(store.InterruptedByShutdown)
+	if err != nil {
+		o.logger.Error("shutdown_mark_interrupted_failed", "err", err)
+		return
+	}
+	if n > 0 {
+		o.logger.Info("shutdown_marked_interrupted", "rows", n)
+	}
+}
+
 func (o *Orchestrator) acquireRunSlot() func() {
 	if o.runSlots == nil {
 		return func() {}
@@ -781,6 +898,7 @@ func (o *Orchestrator) dispatchFix(ev linear.AgentEvent, task *store.AdmiralTask
 // runWithAttempt's lifecycle but reuses the existing admiral_tasks row
 // rather than claiming a new one (attempt_n unchanged).
 func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
+	defer o.beginRun(ev.IssueID)()
 	// /fix works the same task worktree the CI watcher's automatic fix
 	// rounds (and review rounds) use — serialize on the branch so a manual
 	// fix cannot interleave with an in-flight automatic round. Branch lock
@@ -790,7 +908,7 @@ func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
+	ctx, cancel := context.WithTimeout(o.baseCtx(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 
@@ -957,10 +1075,11 @@ func isPreparePhaseError(err error) bool {
 // existing admiral_tasks row — attempt_n is unchanged because /resume is
 // a continuation of the same attempt, not a new one.
 func (o *Orchestrator) runResume(ev linear.AgentEvent, task *store.AdmiralTask) {
+	defer o.beginRun(ev.IssueID)()
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
+	ctx, cancel := context.WithTimeout(o.baseCtx(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 
@@ -1096,10 +1215,11 @@ func (o *Orchestrator) dispatchAwaitingReply(ev linear.AgentEvent, task *store.A
 // ask_user question. It acquires a run slot, calls claude --resume with the
 // answer injected, then opens a PR as usual.
 func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.AdmiralTask, pq *store.PendingQuestion, reply string) {
+	defer o.beginRun(ev.IssueID)()
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
+	ctx, cancel := context.WithTimeout(o.baseCtx(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 
@@ -1224,10 +1344,11 @@ func (o *Orchestrator) run(ev linear.AgentEvent) {
 // the run still proceeds correctly. PR-C will drop the autopilot_jobs
 // dual-write entirely.
 func (o *Orchestrator) runWithAttempt(ev linear.AgentEvent, attemptN int) {
+	defer o.beginRun(ev.IssueID)()
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
+	ctx, cancel := context.WithTimeout(o.baseCtx(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 

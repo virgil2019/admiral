@@ -19,6 +19,7 @@ import (
 // ctx is the watcher's (cancel-detached) context; the round adds its own
 // budget on top, sized to cover the build gate's full retry allowance.
 func (o *Orchestrator) runCIFixRound(ctx context.Context, task *store.AdmiralTask, failure string) error {
+	defer o.beginRun(task.IssueID)()
 	// Branch lock BEFORE the run slot (see runReview for the ordering note).
 	unlockPRFix := o.lockPRFix(task.Branch)
 	defer unlockPRFix()

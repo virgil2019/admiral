@@ -111,6 +111,7 @@ func (o *Orchestrator) HandleReviewEvent(ctx context.Context, row *store.EventIn
 // and — when the run cannot even resolve the repo or its gh account, so there
 // is no PR client to reply with — on the Linear thread instead.
 func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
+	defer o.beginRun(task.IssueID)()
 	defer func() {
 		if r := recover(); r != nil {
 			o.logger.Error("review_run_panic", "pr", task.PRURL, "panic", r)
@@ -126,7 +127,7 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(context.Background(), prFixBudget(o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries))
+	ctx, cancel := context.WithTimeout(o.baseCtx(), prFixBudget(o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries))
 	defer cancel()
 
 	deps, stage, err := o.resolvePRFixDeps(ctx, task)

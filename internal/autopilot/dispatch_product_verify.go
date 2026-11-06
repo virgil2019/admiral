@@ -138,6 +138,7 @@ func (o *Orchestrator) HandleProductVerifyEvent(ctx context.Context, projectID s
 // L2 verify / autopilot claude runs). Every failure logs and returns, leaving
 // the verification 'active' for a later (manual) re-trigger.
 func (o *Orchestrator) runProductVerify(projectID string) {
+	defer o.beginRun("")()
 	defer func() {
 		if r := recover(); r != nil {
 			o.logger.Error("product_verify_run_panic", "project", projectID, "panic", r)
@@ -147,7 +148,7 @@ func (o *Orchestrator) runProductVerify(projectID string) {
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
+	ctx, cancel := context.WithTimeout(o.baseCtx(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 

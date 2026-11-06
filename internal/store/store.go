@@ -447,6 +447,13 @@ const migration0024 = `
 ALTER TABLE repos ADD COLUMN gh_user TEXT NOT NULL DEFAULT '';
 `
 
+// migration0025 counts how many times the boot reconciler has resumed this
+// task. Caps automatic recovery so a task that crashes the daemon on every
+// attempt escalates to a human instead of looping.
+const migration0025 = `
+ALTER TABLE admiral_tasks ADD COLUMN auto_resume_count INTEGER NOT NULL DEFAULT 0;
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -477,6 +484,7 @@ var migrations = []migration{
 	{22, migration0022},
 	{23, migration0023},
 	{24, migration0024},
+	{25, migration0025},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -1264,6 +1272,103 @@ func (s *Store) ClaimAdmiralTask(issueID, identifier, lastEventSessionID string)
 // UpdateAdmiralTask loads the task row for issueID, applies fn, writes
 // back. Atomic via single transaction. Returns sql.ErrNoRows if the row
 // is missing — callers should ClaimAdmiralTask first.
+// InterruptedByShutdown is the admiral_tasks error stamped on rows that were
+// still in flight when the daemon went down. The next boot's reconciler
+// resumes them (the resume path already accepts TIMED_OUT rows).
+const InterruptedByShutdown = "interrupted_by_shutdown"
+
+// MarkInterruptedTasks moves every in-flight admiral_tasks row to TIMED_OUT
+// with the given reason and returns how many rows changed.
+//
+// TIMED_OUT (not a new state) on purpose: /resume already accepts it and
+// continues the SAME attempt on the SAME branch with claude --resume, which
+// is exactly the semantics of "the process stopped mid-run". A distinct
+// state would have to be taught to every dispatch gate and to the
+// discoverer for no additional safety.
+//
+// Called on shutdown after the runs were cancelled, and by the boot
+// reconciler for rows orphaned by a crash (SIGKILL leaves them EXECUTING).
+func (s *Store) MarkInterruptedTasks(reason string) (int, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.DB.Exec(`
+		UPDATE admiral_tasks
+		   SET state=?, error=?, finished_at=?
+		 WHERE state IN (?, ?)`,
+		JobStateTimedOut, reason, now, JobStateReceived, JobStateExecuting)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+// MarkTaskInterrupted moves ONE row to TIMED_OUT if it is still in flight,
+// reporting whether it changed. Guarded so a row a live run just finished is
+// left alone.
+func (s *Store) MarkTaskInterrupted(issueID, reason string) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.DB.Exec(`
+		UPDATE admiral_tasks
+		   SET state=?, error=?, finished_at=?
+		 WHERE issue_id=? AND state IN (?, ?)`,
+		JobStateTimedOut, reason, now, issueID, JobStateReceived, JobStateExecuting)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// IncrementAutoResumeCount bumps and returns the row's auto-resume counter.
+func (s *Store) IncrementAutoResumeCount(issueID string) (int, error) {
+	if _, err := s.DB.Exec(`
+		UPDATE admiral_tasks SET auto_resume_count = auto_resume_count + 1
+		 WHERE issue_id=?`, issueID); err != nil {
+		return 0, err
+	}
+	var n int
+	err := s.DB.QueryRow(`SELECT auto_resume_count FROM admiral_tasks WHERE issue_id=?`, issueID).Scan(&n)
+	return n, err
+}
+
+// ListInFlightTasks returns every admiral_tasks row in RECEIVED or EXECUTING.
+// The reconciler compares this against the orchestrator's in-memory run set
+// to find rows no live run owns.
+func (s *Store) ListInFlightTasks() ([]AdmiralTask, error) {
+	rows, err := s.DB.Query(`
+		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(last_event_session_id,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,'')
+		  FROM admiral_tasks
+		 WHERE state IN (?, ?)`,
+		JobStateReceived, JobStateExecuting)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AdmiralTask
+	for rows.Next() {
+		var t AdmiralTask
+		if err := rows.Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
+			&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
+			&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
+			&t.Error, &t.StreamLogPath); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) UpdateAdmiralTask(issueID string, fn func(*AdmiralTask)) error {
 	tx, err := s.DB.Begin()
 	if err != nil {

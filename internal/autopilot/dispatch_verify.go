@@ -310,6 +310,7 @@ func hasAcceptanceCriteriaSection(desc string) bool {
 // round cap from being hit by repeated re-enqueues of a stable auto-passed
 // wrapper — once closed, the verify row is no longer eligible to run again.
 func (o *Orchestrator) runVerify(parentID string) {
+	defer o.beginRun("")()
 	defer func() {
 		if r := recover(); r != nil {
 			o.logger.Error("verify_run_panic", "parent", parentID, "panic", r)
@@ -319,7 +320,7 @@ func (o *Orchestrator) runVerify(parentID string) {
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
+	ctx, cancel := context.WithTimeout(o.baseCtx(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 
