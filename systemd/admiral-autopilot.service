@@ -27,7 +27,10 @@ ExecStart=/usr/local/bin/admiral-autopilot --config /etc/admiral/config.yaml
 
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=30
+# Must exceed admiral's own shutdown budget (30s HTTP drain + 60s run
+# grace); a shorter value makes systemd SIGKILL the daemon before it can
+# stamp interrupted rows and notify the Linear threads.
+TimeoutStopSec=120
 
 StandardOutput=journal
 StandardError=journal

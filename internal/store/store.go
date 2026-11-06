@@ -1269,9 +1269,6 @@ func (s *Store) ClaimAdmiralTask(issueID, identifier, lastEventSessionID string)
 	return n > 0, nil
 }
 
-// UpdateAdmiralTask loads the task row for issueID, applies fn, writes
-// back. Atomic via single transaction. Returns sql.ErrNoRows if the row
-// is missing — callers should ClaimAdmiralTask first.
 // InterruptedByShutdown is the admiral_tasks error stamped on rows that were
 // still in flight when the daemon went down. The next boot's reconciler
 // resumes them (the resume path already accepts TIMED_OUT rows).
@@ -1337,10 +1334,12 @@ func (s *Store) IncrementAutoResumeCount(issueID string) (int, error) {
 	return n, err
 }
 
-// ListInFlightTasks returns every admiral_tasks row in RECEIVED or EXECUTING.
-// The reconciler compares this against the orchestrator's in-memory run set
-// to find rows no live run owns.
-func (s *Store) ListInFlightTasks() ([]AdmiralTask, error) {
+// ListRecoverableTasks returns the rows a restart must look at: everything
+// still marked in flight (a crash leaves them RECEIVED/EXECUTING) plus rows
+// a clean shutdown stamped interrupted (TIMED_OUT with that reason) — those
+// are invisible to an in-flight-only query, which is exactly the case a
+// graceful restart produces.
+func (s *Store) ListRecoverableTasks() ([]AdmiralTask, error) {
 	rows, err := s.DB.Query(`
 		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
 		       COALESCE(branch,''), COALESCE(worktree_path,''),
@@ -1349,8 +1348,10 @@ func (s *Store) ListInFlightTasks() ([]AdmiralTask, error) {
 		       started_at, COALESCE(finished_at,''),
 		       COALESCE(error,''), COALESCE(stream_log_path,'')
 		  FROM admiral_tasks
-		 WHERE state IN (?, ?)`,
-		JobStateReceived, JobStateExecuting)
+		 WHERE state IN (?, ?)
+		    OR (state = ? AND error LIKE ?)`,
+		JobStateReceived, JobStateExecuting,
+		JobStateTimedOut, InterruptedByShutdown+"%")
 	if err != nil {
 		return nil, err
 	}
@@ -1369,6 +1370,9 @@ func (s *Store) ListInFlightTasks() ([]AdmiralTask, error) {
 	return out, rows.Err()
 }
 
+// UpdateAdmiralTask loads the task row for issueID, applies fn, writes
+// back. Atomic via single transaction. Returns sql.ErrNoRows if the row
+// is missing — callers should ClaimAdmiralTask first.
 func (s *Store) UpdateAdmiralTask(issueID string, fn func(*AdmiralTask)) error {
 	tx, err := s.DB.Begin()
 	if err != nil {

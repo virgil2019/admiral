@@ -18,6 +18,21 @@ const maxAutoResumes = 2
 // ReconcileInterval is how often the reconciler sweeps for orphaned work.
 const ReconcileInterval = 5 * time.Minute
 
+// reconcileGrace is how long a row must have existed before the sweep trusts
+// its in-flight state. Dispatch does Linear I/O (blocker checks, notices)
+// before beginRun registers the run, so a row can legitimately look
+// unowned for a few seconds.
+const reconcileGrace = 2 * time.Minute
+
+// orphanOutcome is tryResumeOrphan's result.
+type orphanOutcome int
+
+const (
+	orphanEscalated orphanOutcome = iota
+	orphanResumed
+	orphanDeferred
+)
+
 // ReconcileReport summarizes one sweep.
 type ReconcileReport struct {
 	// Orphans are in-flight rows no live run in this process owns.
@@ -27,6 +42,9 @@ type ReconcileReport struct {
 	// Escalated rows were reported to their Linear thread for a human —
 	// no recoverable session, or the auto-resume cap was reached.
 	Escalated int
+	// Deferred rows were left for the next sweep (too fresh to judge, or a
+	// transient store error). Not a terminal outcome.
+	Deferred int
 }
 
 // Reconcile is the internal wakeup: it sweeps for work that no live run is
@@ -45,7 +63,7 @@ type ReconcileReport struct {
 func (o *Orchestrator) Reconcile(ctx context.Context) ReconcileReport {
 	var rep ReconcileReport
 
-	rows, err := o.db.ListInFlightTasks()
+	rows, err := o.db.ListRecoverableTasks()
 	if err != nil {
 		o.logger.Warn("reconcile_list_failed", "err", err)
 		return rep
@@ -56,29 +74,47 @@ func (o *Orchestrator) Reconcile(ctx context.Context) ReconcileReport {
 		if o.RunInFlight(row.IssueID) {
 			continue // a live run owns it; leave it alone
 		}
+		// A row younger than reconcileGrace may be between its state write
+		// and beginRun (dispatch pre-flight does Linear I/O first). Judging
+		// it now would escalate work that never stopped.
+		if startedAt, err := time.Parse(time.RFC3339, row.StartedAt); err == nil {
+			if time.Since(startedAt) < reconcileGrace {
+				rep.Deferred++
+				continue
+			}
+		}
 		rep.Orphans++
 
-		changed, err := o.db.MarkTaskInterrupted(row.IssueID, store.InterruptedByShutdown)
-		if err != nil {
-			o.logger.Warn("reconcile_mark_failed", "issue", row.IssueIdentifier, "err", err)
-			continue
-		}
-		if !changed {
-			continue // a live run finished it between the read and the write
+		// A clean shutdown already stamped the row interrupted; a crash left
+		// it in flight and needs the stamp now.
+		if row.State != store.JobStateTimedOut {
+			changed, err := o.db.MarkTaskInterrupted(row.IssueID, store.InterruptedByShutdown)
+			if err != nil {
+				o.logger.Warn("reconcile_mark_failed", "issue", row.IssueIdentifier, "err", err)
+				rep.Deferred++
+				continue
+			}
+			if !changed {
+				continue // a live run finished it between the read and the write
+			}
 		}
 		row.State = store.JobStateTimedOut
 		row.Error = store.InterruptedByShutdown
 
-		if o.tryResumeOrphan(ctx, &row) {
+		switch o.tryResumeOrphan(ctx, &row) {
+		case orphanResumed:
 			rep.Resumed++
-			continue
+		case orphanDeferred:
+			rep.Deferred++
+		default:
+			rep.Escalated++
 		}
-		rep.Escalated++
 	}
 
-	if rep.Orphans > 0 || rep.Resumed > 0 || rep.Escalated > 0 {
+	if rep.Orphans > 0 || rep.Deferred > 0 {
 		o.logger.Info("reconcile_swept",
-			"orphans", rep.Orphans, "resumed", rep.Resumed, "escalated", rep.Escalated)
+			"orphans", rep.Orphans, "resumed", rep.Resumed,
+			"escalated", rep.Escalated, "deferred", rep.Deferred)
 	}
 	return rep
 }
@@ -105,7 +141,7 @@ func (o *Orchestrator) StartReconciler(ctx context.Context) {
 // tryResumeOrphan hands the row back to the resume flow when that can work,
 // and otherwise escalates to the Linear thread. Returns true when a resume
 // was started.
-func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTask) bool {
+func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTask) orphanOutcome {
 	canResume := row.ClaudeSessionID != "" && row.LastEventSessionID != "" &&
 		row.WorktreePath != ""
 	if canResume {
@@ -117,9 +153,13 @@ func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTa
 	if canResume {
 		n, err := o.db.IncrementAutoResumeCount(row.IssueID)
 		if err != nil {
+			// A store hiccup is not "the cap was reached" — escalating here
+			// would demote a resumable task to manual recovery (and the row
+			// stays recoverable, so the next sweep retries).
 			o.logger.Warn("reconcile_resume_count_failed", "issue", row.IssueIdentifier, "err", err)
+			return orphanDeferred
 		}
-		if err == nil && n <= maxAutoResumes {
+		if n <= maxAutoResumes {
 			ev := linear.AgentEvent{
 				SessionID:       row.LastEventSessionID,
 				IssueID:         row.IssueID,
@@ -131,7 +171,7 @@ func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTa
 				"admiral restarted mid-run and is resuming this task (attempt %d, automatic resume %d/%d).",
 				row.AttemptN, n, maxAutoResumes)))
 			go o.resumeOrphanRun(ev, row)
-			return true
+			return orphanResumed
 		}
 	}
 
@@ -152,7 +192,7 @@ func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTa
 	o.postToTaskThread(row, linear.Response(fmt.Sprintf(
 		"⚠️ admiral stopped this task mid-run (%s).\n\nWorktree: `%s`\nBranch: `%s`\nPR: %s\n\nReply `/rerun` on the issue to start a fresh attempt.",
 		reason, row.WorktreePath, row.Branch, row.PRURL)))
-	return false
+	return orphanEscalated
 }
 
 // postToTaskThread posts an activity on the task's Linear agent session

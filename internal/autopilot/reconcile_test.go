@@ -50,7 +50,7 @@ func reconcileFixture(t *testing.T) (*Orchestrator, *mockStore, *mockLinearClien
 		lc:       lc,
 		logger:   logger,
 		rootCtx:  context.Background(),
-		inFlight: make(map[string]struct{}),
+		inFlight: make(map[string]int),
 		runSlots: make(chan struct{}, 3),
 	}
 	rec := &resumeRecorder{}
@@ -343,3 +343,100 @@ func TestMarkFailed_RealFailureStillFails(t *testing.T) {
 
 // errTestBoom is a plain run failure.
 var errTestBoom = errors.New("claude exited 1")
+
+// TestReconcile_PicksUpCleanShutdownRows: a CLEAN shutdown stamps rows
+// TIMED_OUT/interrupted, so an in-flight-only query would never see them —
+// the exact failure mode a graceful restart produces. The sweep must pick
+// them up without re-stamping.
+func TestReconcile_PicksUpCleanShutdownRows(t *testing.T) {
+	o, db, _, rec := reconcileFixture(t)
+	wt := t.TempDir()
+	db.InFlightTasks = []store.AdmiralTask{{
+		IssueID: "issue-4", IssueIdentifier: "GEO-4",
+		State:    store.JobStateTimedOut,
+		Error:    store.InterruptedByShutdown,
+		AttemptN: 1, Branch: "linear/GEO-4", WorktreePath: wt,
+		ClaudeSessionID: "sess-claude", LastEventSessionID: "sess-linear",
+		// Old enough to clear the dispatch grace window.
+		StartedAt: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+	}}
+
+	rep := o.Reconcile(context.Background())
+
+	if rep.Resumed != 1 {
+		t.Fatalf("report = %+v, want the clean-shutdown row resumed", rep)
+	}
+	if len(db.MarkedInterruptedIDs) != 0 {
+		t.Errorf("re-stamped an already-interrupted row: %v", db.MarkedInterruptedIDs)
+	}
+	waitFor(t, func() bool { return len(rec.snapshot()) == 1 })
+}
+
+// TestReconcile_RespectsDispatchGrace: a row that is only seconds old may be
+// between its state write and beginRun (dispatch does Linear I/O first), so
+// the sweep must not judge it yet.
+func TestReconcile_RespectsDispatchGrace(t *testing.T) {
+	o, db, lc, rec := reconcileFixture(t)
+	db.InFlightTasks = []store.AdmiralTask{{
+		IssueID: "issue-5", IssueIdentifier: "GEO-5", State: store.JobStateReceived,
+		StartedAt: time.Now().UTC().Format(time.RFC3339), // just now
+	}}
+
+	rep := o.Reconcile(context.Background())
+
+	if rep.Orphans != 0 || rep.Deferred != 1 {
+		t.Fatalf("report = %+v, want the fresh row deferred", rep)
+	}
+	if len(db.MarkedInterruptedIDs) != 0 || len(rec.snapshot()) != 0 {
+		t.Error("acted on a row inside the dispatch grace window")
+	}
+	if lc.GetPostedBody() != "" {
+		t.Errorf("spurious escalation: %q", lc.GetPostedBody())
+	}
+}
+
+// TestReconcile_ResumeCountErrorDefers: a store hiccup while bumping the
+// auto-resume counter must not be reported to the human as "cap reached".
+func TestReconcile_ResumeCountErrorDefers(t *testing.T) {
+	o, db, lc, rec := reconcileFixture(t)
+	db.AutoResumeErr = os.ErrPermission
+	db.InFlightTasks = []store.AdmiralTask{{
+		IssueID: "issue-6", IssueIdentifier: "GEO-6", State: store.JobStateExecuting,
+		WorktreePath:    t.TempDir(),
+		ClaudeSessionID: "sess-claude", LastEventSessionID: "sess-linear",
+		StartedAt: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+	}}
+
+	rep := o.Reconcile(context.Background())
+
+	if rep.Deferred != 1 || rep.Escalated != 0 {
+		t.Fatalf("report = %+v, want deferred (not escalated)", rep)
+	}
+	if len(rec.snapshot()) != 0 {
+		t.Error("resumed despite the counter error")
+	}
+	if lc.GetPostedBody() != "" {
+		t.Errorf("posted a false 'cap reached' notice: %q", lc.GetPostedBody())
+	}
+}
+
+// TestBeginRun_RefCountsPerIssue: two overlapping runs for one issue (a fix
+// round on a DONE task plus a /rerun attempt) must both stay visible; the
+// first one finishing must not make the second look orphaned.
+func TestBeginRun_RefCountsPerIssue(t *testing.T) {
+	o, _, _, _ := reconcileFixture(t)
+
+	end1 := o.beginRun("issue-7")
+	end2 := o.beginRun("issue-7")
+	if !o.RunInFlight("issue-7") {
+		t.Fatal("not in flight after two begins")
+	}
+	end1()
+	if !o.RunInFlight("issue-7") {
+		t.Fatal("first end cleared a still-running issue")
+	}
+	end2()
+	if o.RunInFlight("issue-7") {
+		t.Fatal("still in flight after both ends")
+	}
+}

@@ -69,7 +69,7 @@ type storeInterface interface {
 	// so the reconciler can spot ones no live run owns.
 	MarkInterruptedTasks(reason string) (int, error)
 	MarkTaskInterrupted(issueID, reason string) (bool, error)
-	ListInFlightTasks() ([]store.AdmiralTask, error)
+	ListRecoverableTasks() ([]store.AdmiralTask, error)
 	IncrementAutoResumeCount(issueID string) (int, error)
 	GetAdmiralTaskByPRURL(prURL string) (*store.AdmiralTask, error)
 	ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error)
@@ -162,13 +162,19 @@ type Orchestrator struct {
 	// runResume; tests inject a stub so a sweep does not spawn claude.
 	resumeOrphanRun func(ev linear.AgentEvent, task *store.AdmiralTask)
 
-	// runWG counts in-flight run goroutines so Shutdown can wait for them.
-	runWG sync.WaitGroup
+	// runsActive counts in-flight run goroutines so Shutdown can wait for
+	// them. A counter + cond instead of sync.WaitGroup: a worker can still
+	// dispatch a run while Shutdown waits, and Add racing Wait is undefined
+	// behaviour (it panics). The counter tolerates a late arrival — the
+	// wait re-checks until it reaches zero or the deadline passes.
+	runsMu     sync.Mutex
+	runsActive int
+	runsCond   *sync.Cond
 
 	// inFlight records the ids of runs executing in THIS process, so the
 	// reconciler can tell a live run from a row orphaned by a crash.
 	inFlightMu sync.Mutex
-	inFlight   map[string]struct{}
+	inFlight   map[string]int
 
 	// runSlots gates how many `claude -p` runs can be live concurrently
 	// across all issues (GEO-51). Acquired in runWithAttempt and runFix,
@@ -270,7 +276,7 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 			cfg.CIWatchPollInterval, cfg.CIWatchTimeout, ciFixMaxRounds),
 		replier:  NewAgentSessionReplier(lc),
 		rootCtx:  context.Background(),
-		inFlight: make(map[string]struct{}),
+		inFlight: make(map[string]int),
 	}
 	o.prFixLocks = make(map[string]*sync.Mutex)
 	o.resumeOrphanRun = o.runResume
@@ -378,22 +384,35 @@ func (o *Orchestrator) baseCtx() context.Context {
 // from an orphaned row. An empty issueID tracks the goroutine only (verify /
 // product-verify runs have no admiral_tasks row).
 func (o *Orchestrator) beginRun(issueID string) func() {
-	o.runWG.Add(1)
+	o.runsMu.Lock()
+	o.runsActive++
+	o.runsMu.Unlock()
+
 	if issueID != "" {
 		o.inFlightMu.Lock()
 		if o.inFlight == nil {
-			o.inFlight = make(map[string]struct{})
+			o.inFlight = make(map[string]int)
 		}
-		o.inFlight[issueID] = struct{}{}
+		// Refcount, not a set: a DONE task can have a review/CI fix round
+		// running while a /rerun starts a second run for the same issue, and
+		// the first one finishing must not make the second look orphaned.
+		o.inFlight[issueID]++
 		o.inFlightMu.Unlock()
 	}
 	return func() {
 		if issueID != "" {
 			o.inFlightMu.Lock()
-			delete(o.inFlight, issueID)
+			if n := o.inFlight[issueID]; n <= 1 {
+				delete(o.inFlight, issueID)
+			} else {
+				o.inFlight[issueID] = n - 1
+			}
 			o.inFlightMu.Unlock()
 		}
-		o.runWG.Done()
+		o.runsMu.Lock()
+		o.runsActive--
+		o.runsMu.Unlock()
+		o.runCond().Broadcast()
 	}
 }
 
@@ -401,8 +420,16 @@ func (o *Orchestrator) beginRun(issueID string) func() {
 func (o *Orchestrator) RunInFlight(issueID string) bool {
 	o.inFlightMu.Lock()
 	defer o.inFlightMu.Unlock()
-	_, ok := o.inFlight[issueID]
-	return ok
+	return o.inFlight[issueID] > 0
+}
+
+// runCond lazily builds the shutdown condition variable, so orchestrators
+// built as struct literals (tests) need no extra setup. Callers hold runsMu.
+func (o *Orchestrator) runCond() *sync.Cond {
+	if o.runsCond == nil {
+		o.runsCond = sync.NewCond(&o.runsMu)
+	}
+	return o.runsCond
 }
 
 // Shutdown waits up to timeout for in-flight runs to unwind, then marks every
@@ -418,7 +445,11 @@ func (o *Orchestrator) RunInFlight(issueID string) bool {
 func (o *Orchestrator) Shutdown(timeout time.Duration) {
 	done := make(chan struct{})
 	go func() {
-		o.runWG.Wait()
+		o.runsMu.Lock()
+		for o.runsActive > 0 {
+			o.runCond().Wait()
+		}
+		o.runsMu.Unlock()
 		close(done)
 	}()
 	select {
@@ -1229,10 +1260,8 @@ func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.Admir
 			"worktree", pq.WorktreePath,
 			"claude_session", pq.ClaudeSessionID)
 		o.postBusyAck(ev.SessionID, "admiral: resume failed — missing worktree or claude session. Use /rerun.")
-		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
-			t.State = store.JobStateFailed
-			t.Error = "awaiting_resume: missing worktree or claude_session_id"
-		})
+		o.failTaskUnlessShuttingDown(ev.IssueID,
+			errors.New("awaiting_resume: missing worktree or claude_session_id"))
 		return
 	}
 
@@ -1252,10 +1281,7 @@ func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.Admir
 	if err != nil {
 		o.logger.Error("awaiting_resume_fetch_issue_failed",
 			"err", err, "issue", ev.IssueID)
-		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
-			t.State = store.JobStateFailed
-			t.Error = fmt.Sprintf("fetch issue: %v", err)
-		})
+		o.failTaskUnlessShuttingDown(ev.IssueID, fmt.Errorf("fetch issue: %w", err))
 		return
 	}
 	// Identity for this repo: every gh call below (PR lookup, push, CI) runs
@@ -1286,10 +1312,7 @@ func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.Admir
 	if err := f.runClaudeResume(userMsg); err != nil {
 		o.logger.Error("awaiting_resume_claude_failed",
 			"issue", ev.IssueIdentifier, "err", err)
-		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
-			t.State = store.JobStateFailed
-			t.Error = err.Error()
-		})
+		o.failTaskUnlessShuttingDown(ev.IssueID, err)
 		f.postActivity(linear.ErrorActivity(fmt.Sprintf("claude resume failed: %v", err)))
 		return
 	}
@@ -1307,10 +1330,7 @@ func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.Admir
 	if err != nil && !isNoop {
 		o.logger.Error("awaiting_resume_pr_failed",
 			"issue", ev.IssueIdentifier, "err", err)
-		_ = o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
-			t.State = store.JobStateFailed
-			t.Error = err.Error()
-		})
+		o.failTaskUnlessShuttingDown(ev.IssueID, err)
 		return
 	}
 	f.prURL = prURL
@@ -1369,6 +1389,13 @@ func (o *Orchestrator) runWithAttempt(ev linear.AgentEvent, attemptN int) {
 	flow := newFlow(o, ctx, ev)
 	flow.attemptN = attemptN
 	if err := flow.execute(); err != nil {
+		// Check shutdown before the timeout heuristics: a cancelled run is
+		// also killed (claude exits with "signal: killed"), and reporting it
+		// as a timeout would be both wrong and noisy.
+		if o.shuttingDown() {
+			flow.markInterrupted(err)
+			return
+		}
 		if errors.Is(err, context.DeadlineExceeded) ||
 			strings.Contains(err.Error(), "signal: killed") ||
 			strings.Contains(err.Error(), "signal: terminated") {
@@ -2219,6 +2246,12 @@ func (f *flow) runClaudeResume(userMessage string) error {
 		}
 	}
 	if waitErr != nil {
+		if errors.Is(cctx.Err(), context.Canceled) {
+			// A cancelled run (shutdown) is not a timeout: callers route
+			// DeadlineExceeded to the timeout path, which would report a
+			// restart as "task timed out".
+			return fmt.Errorf("claude exit: %w: %w", waitErr, context.Canceled)
+		}
 		if cctx.Err() != nil {
 			return fmt.Errorf("claude exit: %w: %w", waitErr, context.DeadlineExceeded)
 		}
@@ -2394,6 +2427,21 @@ func (f *flow) markOpenPRByOther(prURL, author string) error {
 // "this work is broken".
 func (o *Orchestrator) shuttingDown() bool {
 	return o.rootCtx != nil && o.rootCtx.Err() != nil
+}
+
+// failTaskUnlessShuttingDown writes FAILED for a run failure, except while
+// the process is winding down — there the task is resumable, and FAILED is
+// terminal for /resume and the reconciler.
+func (o *Orchestrator) failTaskUnlessShuttingDown(issueID string, runErr error) {
+	_ = o.db.UpdateAdmiralTask(issueID, func(t *store.AdmiralTask) {
+		if o.shuttingDown() {
+			t.State = store.JobStateTimedOut
+			t.Error = store.InterruptedByShutdown
+			return
+		}
+		t.State = store.JobStateFailed
+		t.Error = runErr.Error()
+	})
 }
 
 // markInterrupted records a run that was stopped by a shutdown: TIMED_OUT
@@ -2887,6 +2935,12 @@ func (f *flow) runClaude(issue *linear.Issue) error {
 		}
 	}
 	if waitErr != nil {
+		if errors.Is(cctx.Err(), context.Canceled) {
+			// A cancelled run (shutdown) is not a timeout: callers route
+			// DeadlineExceeded to the timeout path, which would report a
+			// restart as "task timed out".
+			return fmt.Errorf("claude exit: %w: %w", waitErr, context.Canceled)
+		}
 		if cctx.Err() != nil {
 			return fmt.Errorf("claude exit: %w: %w", waitErr, context.DeadlineExceeded)
 		}

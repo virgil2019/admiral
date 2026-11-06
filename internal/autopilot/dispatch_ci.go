@@ -26,8 +26,17 @@ func (o *Orchestrator) runCIFixRound(ctx context.Context, task *store.AdmiralTas
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(ctx, prFixBudget(o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries))
+	// The watcher's context is deliberately detached from the run that
+	// opened the PR (it must outlive it), so it does NOT inherit SIGTERM.
+	// Tie the round to the root context as well, or a shutdown would leave
+	// this claude child running against a dead parent.
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stopOnShutdown := context.AfterFunc(o.baseCtx(), cancel)
+	defer stopOnShutdown()
+
+	ctx, cancelTimeout := context.WithTimeout(ctx, prFixBudget(o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries))
+	defer cancelTimeout()
 
 	deps, stage, err := o.resolvePRFixDeps(ctx, task)
 	if err != nil {

@@ -776,7 +776,7 @@ func (m *mockStore) IncrementAutoResumeCount(issueID string) (int, error) {
 	return m.AutoResumeCount, m.AutoResumeErr
 }
 
-func (m *mockStore) ListInFlightTasks() ([]store.AdmiralTask, error) {
+func (m *mockStore) ListRecoverableTasks() ([]store.AdmiralTask, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.InFlightTasks != nil || m.ListInFlightErr != nil {
