@@ -25,15 +25,6 @@ const ReconcileInterval = 5 * time.Minute
 // unowned for a few seconds.
 const reconcileGrace = 2 * time.Minute
 
-// orphanOutcome is tryResumeOrphan's result.
-type orphanOutcome int
-
-const (
-	orphanEscalated orphanOutcome = iota
-	orphanResumed
-	orphanDeferred
-)
-
 // ReconcileReport summarizes one sweep.
 type ReconcileReport struct {
 	// Orphans are in-flight rows no live run in this process owns.
@@ -70,6 +61,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) ReconcileReport {
 		return rep
 	}
 
+	var pending []orphanEscalation
 	for i := range rows {
 		if ctx.Err() != nil {
 			// Shutting down: launching a resume now would fail in its
@@ -108,14 +100,38 @@ func (o *Orchestrator) Reconcile(ctx context.Context) ReconcileReport {
 		row.State = store.JobStateTimedOut
 		row.Error = store.InterruptedByShutdown
 
-		switch o.tryResumeOrphan(ctx, &row) {
-		case orphanResumed:
-			rep.Resumed++
-		case orphanDeferred:
-			rep.Deferred++
-		default:
+		reason, canResume := resumability(row)
+		if !canResume {
+			// Collect and escalate AFTER the loop: a Linear post blocks for
+			// its whole timeout, and a host restart commonly takes Linear
+			// down with it — serialising 30s per orphan would starve the
+			// healthy rows behind them.
+			rc := row
+			pending = append(pending, orphanEscalation{row: &rc, reason: reason})
 			rep.Escalated++
+			continue
 		}
+		if blocked, berr := o.issueBlocked(ctx, row.IssueID); berr != nil {
+			o.logger.Warn("reconcile_blocker_check_failed",
+				"issue", row.IssueIdentifier, "err", berr)
+			rep.Deferred++
+			continue
+		} else if blocked {
+			// A dependency added while the daemon was down still holds the
+			// task back. Defer instead of parking: the blocker watcher
+			// resumes a parked row with a FRESH run (createWorktree wipes
+			// the preserved worktree and branch), which would destroy the
+			// very work this sweep is trying to continue.
+			o.logger.Info("reconcile_resume_blocked", "issue", row.IssueIdentifier)
+			rep.Deferred++
+			continue
+		}
+		o.launchResume(ctx, &row)
+		rep.Resumed++
+	}
+
+	for _, e := range pending {
+		o.escalateOrphan(e.row, e.reason)
 	}
 
 	if rep.Orphans > 0 || rep.Deferred > 0 {
@@ -145,89 +161,87 @@ func (o *Orchestrator) StartReconciler(ctx context.Context) {
 	}
 }
 
-// tryResumeOrphan hands the row back to the resume flow when that can work,
-// and otherwise escalates to the Linear thread. Returns true when a resume
-// was started.
-func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTask) orphanOutcome {
-	canResume := row.ClaudeSessionID != "" && row.LastEventSessionID != "" &&
-		row.WorktreePath != ""
-	if canResume {
-		if _, err := os.Stat(row.WorktreePath); err != nil {
-			canResume = false
-		}
-	}
+// orphanEscalation is an orphan that needs a human, deferred until every
+// resumable row has been launched.
+type orphanEscalation struct {
+	row    *store.AdmiralTask
+	reason string
+}
 
-	if canResume {
-		ev := linear.AgentEvent{
-			SessionID:       row.LastEventSessionID,
-			IssueID:         row.IssueID,
-			IssueIdentifier: row.IssueIdentifier,
-		}
-		// Every side effect — the credit, the notice, the resume — happens
-		// in the goroutine, and only AFTER ownership is re-verified: a /rerun
-		// can supersede the row at any point, and spending a credit or
-		// promising a resume for a row we no longer own is a silent lie.
-		go func() {
-			if !o.stillResumable(*row) {
-				o.logger.Info("reconcile_resume_superseded",
-					"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
-				return
-			}
-			if o.parkIfBlocked(ev) {
-				// A dependency added while the daemon was down still holds
-				// the task back; the blocker watcher resumes it later.
-				o.logger.Info("reconcile_resume_blocked",
-					"issue", row.IssueIdentifier)
-				return
-			}
-			n, err := o.db.IncrementAutoResumeCount(row.IssueID, row.AttemptN)
-			if err != nil {
-				if errors.Is(err, store.ErrNoSuchAttempt) {
-					o.logger.Info("reconcile_resume_superseded",
-						"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
-				} else {
-					// A store hiccup is not "the cap was reached"; the row
-					// stays recoverable and the next sweep retries.
-					o.logger.Warn("reconcile_resume_count_failed",
-						"issue", row.IssueIdentifier, "err", err)
-				}
-				return
-			}
-			if n > maxAutoResumes {
-				o.escalateOrphan(row, fmt.Sprintf(
-					"the run was interrupted and automatic resume was already used %d times", maxAutoResumes))
-				return
-			}
-			o.logger.Info("reconcile_resuming",
-				"issue", row.IssueIdentifier, "attempt_n", row.AttemptN, "auto_resume", n)
-			if !o.stillResumable(*row) {
-				o.logger.Info("reconcile_resume_superseded",
-					"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
-				return
-			}
-			o.postToTaskThread(row, linear.Response(fmt.Sprintf(
-				"admiral restarted mid-run and is resuming this task (attempt %d, automatic resume %d/%d).",
-				row.AttemptN, n, maxAutoResumes)))
-			o.resumeOrphanRun(ev, row)
-		}()
-		return orphanResumed
-	}
-
-	// Cannot resume (or the cap is spent): say so where a human is looking,
-	// with the command that recovers.
-	var reason string
+// resumability reports whether the reconciler can continue this row, and the
+// human-facing reason when it cannot.
+func resumability(row store.AdmiralTask) (string, bool) {
 	switch {
 	case row.ClaudeSessionID == "" || row.LastEventSessionID == "":
-		reason = "the run was interrupted and has no recoverable claude session"
+		return "the run was interrupted and has no recoverable claude session", false
 	case row.WorktreePath == "":
-		reason = "the run was interrupted and its worktree is no longer recorded"
-	case !canResume:
-		reason = "the run was interrupted and its worktree is gone"
-	default:
-		reason = fmt.Sprintf("the run was interrupted and automatic resume was already used %d times", maxAutoResumes)
+		return "the run was interrupted and its worktree is no longer recorded", false
 	}
-	o.escalateOrphan(row, reason)
-	return orphanEscalated
+	if _, err := os.Stat(row.WorktreePath); err != nil {
+		return "the run was interrupted and its worktree is gone", false
+	}
+	return "", true
+}
+
+// issueBlocked is a read-only blocked_by check. It deliberately does not use
+// parkIfBlocked: parking hands the row to the blocker watcher, which resumes
+// with a fresh run and wipes the preserved worktree.
+func (o *Orchestrator) issueBlocked(ctx context.Context, issueID string) (bool, error) {
+	bctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	blockers, err := o.lc.GetIssueBlockers(bctx, issueID)
+	if err != nil {
+		return false, err
+	}
+	return len(blockers) > 0, nil
+}
+
+// launchResume queues the resume. Every side effect — the credit, the notice,
+// the resume itself — happens in the goroutine and only after ownership is
+// re-verified: a /rerun can supersede the row at any point, and spending a
+// credit or promising a resume for a row we no longer own is a silent lie.
+func (o *Orchestrator) launchResume(ctx context.Context, row *store.AdmiralTask) {
+	ev := linear.AgentEvent{
+		SessionID:       row.LastEventSessionID,
+		IssueID:         row.IssueID,
+		IssueIdentifier: row.IssueIdentifier,
+	}
+	go func() {
+		if !o.stillResumable(*row) {
+			o.logger.Info("reconcile_resume_superseded",
+				"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
+			return
+		}
+		n, err := o.db.IncrementAutoResumeCount(row.IssueID, row.AttemptN)
+		if err != nil {
+			if errors.Is(err, store.ErrNoSuchAttempt) {
+				o.logger.Info("reconcile_resume_superseded",
+					"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
+			} else {
+				// A store hiccup is not "the cap was reached"; the row stays
+				// recoverable and the next sweep retries.
+				o.logger.Warn("reconcile_resume_count_failed",
+					"issue", row.IssueIdentifier, "err", err)
+			}
+			return
+		}
+		if n > maxAutoResumes {
+			o.escalateOrphan(row, fmt.Sprintf(
+				"the run was interrupted and automatic resume was already used %d times", maxAutoResumes))
+			return
+		}
+		o.logger.Info("reconcile_resuming",
+			"issue", row.IssueIdentifier, "attempt_n", row.AttemptN, "auto_resume", n)
+		if !o.stillResumable(*row) {
+			o.logger.Info("reconcile_resume_superseded",
+				"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
+			return
+		}
+		o.postToTaskThread(row, linear.Response(fmt.Sprintf(
+			"admiral restarted mid-run and is resuming this task (attempt %d, automatic resume %d/%d).",
+			row.AttemptN, n, maxAutoResumes)))
+		o.resumeOrphanRun(ev, row)
+	}()
 }
 
 // escalateOrphan tells a human that this row needs them, and only then stops

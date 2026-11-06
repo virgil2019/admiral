@@ -624,3 +624,68 @@ func TestReconcile_ResumeHonoursBlockers(t *testing.T) {
 		t.Errorf("resumed a blocked task: %+v", rec.snapshot())
 	}
 }
+
+// TestRunResume_AbortsWhenSuperseded: the run-slot wait can last minutes, and
+// a /rerun drained during it supersedes the row. Writing EXECUTING after that
+// would run the OLD branch/session while the live row describes the new
+// attempt — two claude runs on one issue.
+func TestRunResume_AbortsWhenSuperseded(t *testing.T) {
+	o, db, _, rec := reconcileFixture(t)
+	// The row the resume was queued for is attempt 1; the store now holds
+	// attempt 2 (a /rerun landed while the resume waited for a slot).
+	// LiveAdmiralTask is the row writes land on.
+	db.AdmiralTask = &store.AdmiralTask{
+		IssueID: "issue-50", State: store.JobStateReceived, AttemptN: 2,
+		Branch: "linear/GEO-50-rerun-2",
+	}
+	db.LiveAdmiralTask = db.AdmiralTask
+	task := &store.AdmiralTask{
+		IssueID: "issue-50", IssueIdentifier: "GEO-50", State: store.JobStateTimedOut,
+		AttemptN: 1, Branch: "linear/GEO-50",
+	}
+
+	o.runResume(linear.AgentEvent{SessionID: "s", IssueID: "issue-50", IssueIdentifier: "GEO-50"}, task)
+
+	if db.LiveAdmiralTask.State == store.JobStateExecuting {
+		t.Fatal("resume wrote EXECUTING onto a superseded row")
+	}
+	for _, st := range db.StateTransitionSnapshot() {
+		if st == store.JobStateExecuting {
+			t.Fatalf("resume drove the superseded row to EXECUTING (transitions: %v)",
+				db.StateTransitionSnapshot())
+		}
+	}
+	if len(rec.snapshot()) != 0 {
+		t.Error("unexpected resume call")
+	}
+}
+
+// TestReconcile_BlockedRowIsDeferredNotParked: parking hands the row to the
+// blocker watcher, which resumes with a FRESH run — createWorktree wipes the
+// preserved worktree and branch, destroying the work the sweep is trying to
+// continue. A blocked orphan must simply be deferred.
+func TestReconcile_BlockedRowIsDeferredNotParked(t *testing.T) {
+	o, db, lc, rec := reconcileFixture(t)
+	lc.IssueBlockers = []linear.IssueBlocker{{}}
+	row := store.AdmiralTask{
+		IssueID: "issue-51", IssueIdentifier: "GEO-51", State: store.JobStateExecuting,
+		AttemptN: 1, Branch: "linear/GEO-51", WorktreePath: t.TempDir(),
+		ClaudeSessionID: "sess-claude", LastEventSessionID: "sess-linear",
+		StartedAt: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+	}
+	db.InFlightTasks = []store.AdmiralTask{row}
+	db.AdmiralTask = &store.AdmiralTask{
+		IssueID: row.IssueID, State: store.JobStateTimedOut,
+		AttemptN: row.AttemptN, Branch: row.Branch,
+	}
+
+	rep := o.Reconcile(context.Background())
+	time.Sleep(150 * time.Millisecond)
+
+	if rep.Resumed != 0 || rep.Deferred != 1 {
+		t.Errorf("report = %+v, want the blocked row deferred", rep)
+	}
+	if len(rec.snapshot()) != 0 {
+		t.Error("resumed a blocked task")
+	}
+}

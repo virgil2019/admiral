@@ -1020,6 +1020,10 @@ func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 	}); err != nil {
 		o.logger.Warn("fix_admiral_task_to_done_failed",
 			"err", err, "issue", ev.IssueID)
+	} else {
+		// DONE proves the task healthy: refresh the automatic-resume budget
+		// exactly as persistAdmiralTask does on the other completion paths.
+		o.db.ResetAutoResumeCount(ev.IssueID)
 	}
 
 	o.logger.Info("autopilot_fix_done",
@@ -1114,6 +1118,18 @@ func (o *Orchestrator) runResume(ev linear.AgentEvent, task *store.AdmiralTask) 
 	defer o.beginRun(ev.IssueID)()
 	release := o.acquireRunSlot()
 	defer release()
+
+	// The slot wait can last minutes, and a /rerun drained during it
+	// supersedes the row. Re-verify before touching it: the resume drives the
+	// OLD branch and session, so writing onto the new attempt's row would run
+	// two claude processes against one issue and leave the row describing
+	// neither.
+	if cur, err := o.db.GetAdmiralTaskByIssue(ev.IssueID); err != nil || cur == nil ||
+		cur.AttemptN != task.AttemptN {
+		o.logger.Info("resume_superseded",
+			"issue", ev.IssueIdentifier, "attempt_n", task.AttemptN, "err", err)
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(o.baseCtx(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
@@ -1350,6 +1366,9 @@ func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.Admir
 	// The answer has been acted on; keeping the pointer would let a much
 	// later resume replay an instruction claude already followed.
 	o.db.ClearPendingQuestion(ev.IssueID)
+	// DONE proves the task healthy — refresh the automatic-resume budget the
+	// same way persistAdmiralTask does for the other completion paths.
+	o.db.ResetAutoResumeCount(ev.IssueID)
 	if !isNoop && prURL != "" && o.ciWatcher != nil {
 		o.ciWatcher.WatchPR(ctx, prURL, f.repoDir, ev.SessionID, ev.IssueID, f.ghUser)
 	}
@@ -2541,8 +2560,15 @@ func (f *flow) markInterrupted(runErr error) {
 	// Only promise auto-resume when the reconciler will be able to: no
 	// recorded claude session or worktree means it escalates instead, and
 	// the thread must not hear two contradictory stories.
+	// Resume flows (runResume / runAwaitingResume) carry the session on the
+	// job, not on the flow: checking only f.claudeSessionID told /resume and
+	// /fix users to start over when their row was in fact resumable.
+	sessionID := f.claudeSessionID
+	if sessionID == "" && f.job != nil {
+		sessionID = f.job.ClaudeSessionID
+	}
 	outcome := "will resume automatically on the next start"
-	if f.claudeSessionID == "" || f.worktreePath == "" {
+	if sessionID == "" || f.worktreePath == "" {
 		outcome = "could not be resumed automatically — reply `/rerun` on the issue after the restart"
 	}
 	body := f.creatorMention() + "admiral is restarting — this run was stopped mid-flight and " + outcome + ".\n\n"

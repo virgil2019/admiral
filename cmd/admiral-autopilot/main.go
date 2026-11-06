@@ -39,6 +39,19 @@ func main() {
 	}
 	logger := newLogger(cfg.Logging)
 
+	// One daemon per database. Run ownership lives in this process's memory
+	// (the reconciler treats "no live run here" as orphaned), so a second
+	// instance started by mistake would adopt the first one's in-flight rows
+	// and resume them — two claude runs on one worktree.
+	lockPath := cfg.Storage.SQLitePath + ".lock"
+	releaseLock, err := lockInstance(lockPath)
+	if err != nil {
+		logger.Error("another admiral-autopilot is running; refusing to start",
+			"lock", lockPath, "err", err)
+		os.Exit(1)
+	}
+	defer releaseLock()
+
 	db, err := store.Open(cfg.Storage.SQLitePath)
 	if err != nil {
 		logger.Error("sqlite open failed", "err", err)
@@ -192,6 +205,25 @@ func main() {
 
 	orch.Shutdown(shutdownRunGrace)
 	logger.Info("admiral-autopilot stopped")
+}
+
+// lockInstance takes an exclusive advisory lock so two daemons cannot share
+// one database. The lock lives on a file next to the sqlite database and is
+// released by the OS when the process exits (including on a crash), so it
+// never needs stale-lock cleanup.
+func lockInstance(path string) (func(), error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open lock file: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("flock: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}, nil
 }
 
 // shutdownRunGrace bounds how long shutdown waits for cancelled runs to
