@@ -44,10 +44,22 @@ func main() {
 	// instance started by mistake would adopt the first one's in-flight rows
 	// and resume them — two claude runs on one worktree.
 	lockPath := cfg.Storage.SQLitePath + ".lock"
+	// The lock lives beside the database, which store.Open would create —
+	// but Open runs after this, so on a fresh install the directory does not
+	// exist yet.
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		logger.Error("cannot create the admiral data directory",
+			"path", filepath.Dir(lockPath), "err", err)
+		os.Exit(1)
+	}
 	releaseLock, err := lockInstance(lockPath)
 	if err != nil {
-		logger.Error("another admiral-autopilot is running; refusing to start",
-			"lock", lockPath, "err", err)
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			logger.Error("another admiral-autopilot is running; refusing to start",
+				"lock", lockPath)
+		} else {
+			logger.Error("cannot take the instance lock", "lock", lockPath, "err", err)
+		}
 		os.Exit(1)
 	}
 	defer releaseLock()

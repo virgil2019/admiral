@@ -87,7 +87,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) ReconcileReport {
 		// A clean shutdown already stamped the row interrupted; a crash left
 		// it in flight and needs the stamp now.
 		if row.State != store.JobStateTimedOut {
-			changed, err := o.db.MarkTaskInterrupted(row.IssueID, store.InterruptedByShutdown)
+			changed, err := o.db.MarkTaskInterrupted(row.IssueID, row.AttemptN, store.InterruptedByShutdown)
 			if err != nil {
 				o.logger.Warn("reconcile_mark_failed", "issue", row.IssueIdentifier, "err", err)
 				rep.Deferred++

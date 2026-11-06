@@ -1317,13 +1317,22 @@ func (s *Store) MarkInterruptedTasks(reason string) (int, error) {
 // MarkTaskInterrupted moves ONE row to TIMED_OUT if it is still in flight,
 // reporting whether it changed. Guarded so a row a live run just finished is
 // left alone.
-func (s *Store) MarkTaskInterrupted(issueID, reason string) (bool, error) {
+func (s *Store) MarkTaskInterrupted(issueID string, attemptN int, reason string) (bool, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
-	res, err := s.DB.Exec(`
+	// Scoped by attempt: a /rerun can move the row to history and insert a
+	// fresh attempt between the reconciler's read and this write, and the
+	// live attempt must not be stamped interrupted. attemptN <= 0 skips the
+	// scope (shutdown's blanket stamp).
+	query := `
 		UPDATE admiral_tasks
 		   SET state=?, error=?, finished_at=?
-		 WHERE issue_id=? AND state IN (?, ?)`,
-		JobStateTimedOut, reason, now, issueID, JobStateReceived, JobStateExecuting)
+		 WHERE issue_id=? AND state IN (?, ?)`
+	args := []any{JobStateTimedOut, reason, now, issueID, JobStateReceived, JobStateExecuting}
+	if attemptN > 0 {
+		query += ` AND attempt_n=?`
+		args = append(args, attemptN)
+	}
+	res, err := s.DB.Exec(query, args...)
 	if err != nil {
 		return false, err
 	}
@@ -1337,6 +1346,15 @@ func (s *Store) MarkTaskInterrupted(issueID, reason string) (bool, error) {
 // ErrNoSuchAttempt is returned when a task's attempt is gone (superseded by
 // a /rerun), so callers can distinguish "not ours anymore" from "over cap".
 var ErrNoSuchAttempt = errors.New("admiral task attempt no longer exists")
+
+// RefundAutoResumeCount gives back one credit. Used when a resume was
+// interrupted before it could start: charging for a retry that never happened
+// would let three restarts exhaust a two-attempt budget.
+func (s *Store) RefundAutoResumeCount(issueID string) {
+	_, _ = s.DB.Exec(`
+		UPDATE admiral_tasks SET auto_resume_count = auto_resume_count - 1
+		 WHERE issue_id=? AND auto_resume_count > 0`, issueID)
+}
 
 // ResetAutoResumeCount clears the row's auto-resume counter; a task that
 // reached DONE is healthy, so a later interruption should get a fresh budget.
@@ -1397,9 +1415,9 @@ func (s *Store) ListRecoverableTasks() ([]AdmiralTask, error) {
 		       COALESCE(error,''), COALESCE(stream_log_path,'')
 		  FROM admiral_tasks
 		 WHERE state IN (?, ?)
-		    OR (state = ? AND error LIKE ?)`,
+		    OR (state = ? AND error GLOB ?)`,
 		JobStateReceived, JobStateExecuting,
-		JobStateTimedOut, InterruptedByShutdown+"%")
+		JobStateTimedOut, InterruptedByShutdown+"*")
 	if err != nil {
 		return nil, err
 	}

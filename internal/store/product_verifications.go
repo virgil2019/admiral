@@ -67,6 +67,18 @@ func (s *Store) BumpProductVerificationRound(projectID string) (*ProductVerifica
 //
 // Same recovery rationale as ListStuckTaskVerifications: a row bumped
 // to rounds=1 whose apply step never ran. See PR #187 / GEO-267.
+// ResetProductVerificationRound is the product-verification counterpart of
+// ResetTaskVerificationRound: a restart mid-verification must not burn the
+// round, or the boot rescan (rounds=1) can never pick it up again.
+func (s *Store) ResetProductVerificationRound(projectID string) error {
+	_, err := s.DB.Exec(`
+		UPDATE product_verifications
+		   SET rounds=1, updated_at=?
+		 WHERE project_id=? AND status='active'`,
+		time.Now().UTC().Format(time.RFC3339), projectID)
+	return err
+}
+
 func (s *Store) ListStuckProductVerifications(ctx context.Context) ([]ProductVerification, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT project_id, rounds, status, updated_at

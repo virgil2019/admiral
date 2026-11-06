@@ -321,10 +321,13 @@ func TestMarkFailed_ShutdownIsResumable(t *testing.T) {
 	f := newFlow(o, context.Background(), linear.AgentEvent{
 		SessionID: "sess-9", IssueID: "issue-9", IssueIdentifier: "GEO-9"})
 	f.branch = "linear/GEO-9"
-	// Resumable: a session and a worktree were recorded, so the notice may
-	// promise automatic continuation.
-	f.claudeSessionID = "sess-claude"
-	f.worktreePath = t.TempDir()
+	// Resumable means the PERSISTED row has everything the reconciler needs:
+	// session, thread session, and a worktree on disk.
+	wt := t.TempDir()
+	task.ClaudeSessionID = "sess-claude"
+	task.LastEventSessionID = "sess-linear"
+	task.WorktreePath = wt
+	f.worktreePath = wt
 
 	f.markFailed(context.Canceled)
 
@@ -702,5 +705,33 @@ func TestTaskSettled_TimedOutKeepsTheAnswer(t *testing.T) {
 	}
 	if !taskSettled(store.JobStateFailed, "claude exited 1") {
 		t.Error("FAILED should be settled")
+	}
+}
+
+// TestRunVerify_ShutdownReturnsTheRound: a verification cut short by a restart
+// never produced a verdict; the round must go back so the discoverer's boot
+// rescan (rounds=1) re-runs it instead of leaving it active with no wakeup.
+func TestRunVerify_ShutdownReturnsTheRound(t *testing.T) {
+	o, db, _, _ := reconcileFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	o.SetRootContext(ctx)
+	cancel()
+
+	// gatherVerifyMaterial fails on the cancelled ctx; the deferred reset must
+	// still run.
+	o.runVerify("parent-issue-1")
+
+	if len(db.TaskVerifyResets) != 1 || db.TaskVerifyResets[0] != "parent-issue-1" {
+		t.Fatalf("verification round resets = %v, want one for parent-issue-1", db.TaskVerifyResets)
+	}
+}
+
+// TestRunVerify_RealFailureKeepsTheRound: a genuine verification failure must
+// not be refunded — only a shutdown refunds.
+func TestRunVerify_RealFailureKeepsTheRound(t *testing.T) {
+	o, db, _, _ := reconcileFixture(t) // root context not cancelled
+	o.runVerify("parent-issue-2")
+	if len(db.TaskVerifyResets) != 0 {
+		t.Errorf("refunded a round outside shutdown: %v", db.TaskVerifyResets)
 	}
 }

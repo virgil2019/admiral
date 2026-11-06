@@ -68,11 +68,14 @@ type storeInterface interface {
 	// Shutdown/reconcile: mark rows interrupted and enumerate in-flight rows
 	// so the reconciler can spot ones no live run owns.
 	MarkInterruptedTasks(reason string) (int, error)
-	MarkTaskInterrupted(issueID, reason string) (bool, error)
+	MarkTaskInterrupted(issueID string, attemptN int, reason string) (bool, error)
 	ListRecoverableTasks() ([]store.AdmiralTask, error)
 	IncrementAutoResumeCount(issueID string, attemptN int) (int, error)
 	ResetAutoResumeCount(issueID string)
 	ClearPendingQuestion(issueID string)
+	RefundAutoResumeCount(issueID string)
+	ResetTaskVerificationRound(parentIssueID string) error
+	ResetProductVerificationRound(projectID string) error
 	MarkTaskUnrecoverable(issueID, reason string) error
 	GetAdmiralTaskByPRURL(prURL string) (*store.AdmiralTask, error)
 	ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error)
@@ -1129,8 +1132,11 @@ func (o *Orchestrator) runResume(ev linear.AgentEvent, task *store.AdmiralTask) 
 	// OLD branch and session, so writing onto the new attempt's row would run
 	// two claude processes against one issue and leave the row describing
 	// neither.
+	// Same predicate the reconciler uses: an attempt_n match alone lets a
+	// second resume of the same attempt through once the first one finished
+	// (the row is DONE by then), running claude twice on one session.
 	if cur, err := o.db.GetAdmiralTaskByIssue(ev.IssueID); err != nil || cur == nil ||
-		cur.AttemptN != task.AttemptN {
+		cur.AttemptN != task.AttemptN || cur.State != store.JobStateTimedOut {
 		o.logger.Info("resume_superseded",
 			"issue", ev.IssueIdentifier, "attempt_n", task.AttemptN, "err", err)
 		return
@@ -1524,6 +1530,23 @@ func (f *flow) resumeUserMessage() string {
 	return fmt.Sprintf(
 		"The user has answered the pending question.\n\nQuestion: %s\nAnswer: %s\n\nContinue from where you left off.",
 		pq.Question, pq.Answer)
+}
+
+// resumableAfterRestart reports whether the reconciler will be able to
+// resume this task, using the same criteria it applies to the stored row.
+func (f *flow) resumableAfterRestart() bool {
+	if f.ev.IssueID == "" {
+		return false
+	}
+	t, err := f.o.db.GetAdmiralTaskByIssue(f.ev.IssueID)
+	if err != nil || t == nil {
+		return false
+	}
+	if t.ClaudeSessionID == "" || t.LastEventSessionID == "" || t.WorktreePath == "" {
+		return false
+	}
+	_, statErr := os.Stat(t.WorktreePath)
+	return statErr == nil
 }
 
 // taskSettled reports whether a state consumed any pending answer. TIMED_OUT
@@ -2561,6 +2584,11 @@ func (f *flow) markInterrupted(runErr error) {
 		t.Error = reason
 		t.FinishedAt = now
 	})
+	// A resume flow that was interrupted never actually retried the task;
+	// give its credit back so restarts alone cannot exhaust the budget.
+	if f.job != nil {
+		f.o.db.RefundAutoResumeCount(f.ev.IssueID)
+	}
 	f.o.logger.Info("run_interrupted_by_shutdown",
 		"issue", f.ev.IssueIdentifier, "session", f.ev.SessionID)
 
@@ -2569,15 +2597,12 @@ func (f *flow) markInterrupted(runErr error) {
 	// Only promise auto-resume when the reconciler will be able to: no
 	// recorded claude session or worktree means it escalates instead, and
 	// the thread must not hear two contradictory stories.
-	// Resume flows (runResume / runAwaitingResume) carry the session on the
-	// job, not on the flow: checking only f.claudeSessionID told /resume and
-	// /fix users to start over when their row was in fact resumable.
-	sessionID := f.claudeSessionID
-	if sessionID == "" && f.job != nil {
-		sessionID = f.job.ClaudeSessionID
-	}
+	// Decide from the PERSISTED row, which is what the reconciler checks.
+	// The flow's in-memory fields lag (worktreePath is only set inside
+	// ensureWorktree, resume flows keep the session on the job), so trusting
+	// them made the notice contradict what happened on the next boot.
 	outcome := "will resume automatically on the next start"
-	if sessionID == "" || f.worktreePath == "" {
+	if !f.resumableAfterRestart() {
 		outcome = "could not be resumed automatically — reply `/rerun` on the issue after the restart"
 	}
 	body := f.creatorMention() + "admiral is restarting — this run was stopped mid-flight and " + outcome + ".\n\n"

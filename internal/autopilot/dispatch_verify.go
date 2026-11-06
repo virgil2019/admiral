@@ -311,6 +311,19 @@ func hasAcceptanceCriteriaSection(desc string) bool {
 // wrapper — once closed, the verify row is no longer eligible to run again.
 func (o *Orchestrator) runVerify(parentID string) {
 	defer o.beginRun("")()
+	// A verification cut short by a restart never produced a verdict. Give
+	// the round back so the discoverer's boot rescan (status=active AND
+	// rounds=1) re-runs it; otherwise it sits active with no wakeup.
+	defer func() {
+		if !o.shuttingDown() {
+			return
+		}
+		if err := o.db.ResetTaskVerificationRound(parentID); err != nil {
+			o.logger.Warn("verify_round_reset_failed", "parent", parentID, "err", err)
+		} else {
+			o.logger.Info("verify_interrupted_by_shutdown", "parent", parentID)
+		}
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			o.logger.Error("verify_run_panic", "parent", parentID, "panic", r)

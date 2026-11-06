@@ -594,6 +594,9 @@ type mockStore struct {
 	AutoResumeErr           error
 	AutoResumeResets        int
 	ClearedPendingQuestion  string
+	AutoResumeRefunds       int
+	TaskVerifyResets        []string
+	ProductVerifyResets     []string
 	MarkedUnrecoverable     []string
 	MarkUnrecoverableErr    error
 	InFlightTasks           []store.AdmiralTask
@@ -762,7 +765,7 @@ func (m *mockStore) MarkInterruptedTasks(reason string) (int, error) {
 	return m.InterruptedCount, m.MarkInterruptedErr
 }
 
-func (m *mockStore) MarkTaskInterrupted(issueID, reason string) (bool, error) {
+func (m *mockStore) MarkTaskInterrupted(issueID string, attemptN int, reason string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.InterruptedReason = reason
@@ -771,6 +774,26 @@ func (m *mockStore) MarkTaskInterrupted(issueID, reason string) (bool, error) {
 		return false, m.MarkInterruptedErr
 	}
 	return true, nil
+}
+
+func (m *mockStore) ResetTaskVerificationRound(parentIssueID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.TaskVerifyResets = append(m.TaskVerifyResets, parentIssueID)
+	return nil
+}
+
+func (m *mockStore) ResetProductVerificationRound(projectID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ProductVerifyResets = append(m.ProductVerifyResets, projectID)
+	return nil
+}
+
+func (m *mockStore) RefundAutoResumeCount(issueID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.AutoResumeRefunds++
 }
 
 func (m *mockStore) ClearPendingQuestion(issueID string) {

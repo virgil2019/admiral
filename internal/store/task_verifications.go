@@ -120,6 +120,20 @@ func (s *Store) SetTaskVerificationSummary(parentIssueID, summary string) error 
 // discriminator from a successful first round that was simply not
 // closed yet (the auto-pass branch in runVerify writes a non-empty
 // summary before flipping status).
+// ResetTaskVerificationRound hands a verification a fresh round after a
+// restart interrupted it. The round it burned never produced a verdict, and
+// the discoverer's boot rescan only re-enqueues rounds=1 rows — without the
+// reset the verification sits active forever, which is exactly the lost-event
+// jam the reconciler exists to prevent.
+func (s *Store) ResetTaskVerificationRound(parentIssueID string) error {
+	_, err := s.DB.Exec(`
+		UPDATE task_verifications
+		   SET rounds=1, summary='', updated_at=?
+		 WHERE parent_issue_id=? AND status='active'`,
+		time.Now().UTC().Format(time.RFC3339), parentIssueID)
+	return err
+}
+
 func (s *Store) ListStuckTaskVerifications(ctx context.Context) ([]TaskVerification, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT parent_issue_id, rounds, status, summary, updated_at

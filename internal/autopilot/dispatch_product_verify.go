@@ -139,6 +139,17 @@ func (o *Orchestrator) HandleProductVerifyEvent(ctx context.Context, projectID s
 // the verification 'active' for a later (manual) re-trigger.
 func (o *Orchestrator) runProductVerify(projectID string) {
 	defer o.beginRun("")()
+	// Same reasoning as runVerify: a restart must not consume the round.
+	defer func() {
+		if !o.shuttingDown() {
+			return
+		}
+		if err := o.db.ResetProductVerificationRound(projectID); err != nil {
+			o.logger.Warn("product_verify_round_reset_failed", "project", projectID, "err", err)
+		} else {
+			o.logger.Info("product_verify_interrupted_by_shutdown", "project", projectID)
+		}
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			o.logger.Error("product_verify_run_panic", "project", projectID, "panic", r)

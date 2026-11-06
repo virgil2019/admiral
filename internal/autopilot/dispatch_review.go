@@ -136,8 +136,11 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 			"stage", stage, "issue", task.IssueIdentifier, "err", err)
 		switch stage {
 		case prFixStageRepo:
-			o.postReviewLinearNotice(task, linear.Response(
-				"admiral: cannot address review — could not resolve repo for this issue."))
+			// err carries the actionable reason (no repo, or a disabled repo
+			// with the PATCH that re-enables it); dropping it leaves the
+			// reviewer unable to tell a stop switch from a missing config.
+			o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
+				"admiral: cannot address review — %v", err)))
 		case prFixStageIdentity:
 			o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
 				"admiral: cannot address review — %v", err)))
@@ -197,6 +200,16 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 
 	output := out.Output
 	if !out.Pushed {
+		if o.shuttingDown() || ctx.Err() != nil {
+			// The push was cut short by the restart, not rejected by origin.
+			// ctx is already cancelled, so reply on a fresh one or the
+			// reviewer hears nothing at all.
+			o.logger.Info("review_run_interrupted_by_shutdown", "pr", task.PRURL, "stage", "push")
+			nctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = deps.replier.Fail(nctx, "admiral is restarting — this review round was stopped before it finished. Comment again to re-trigger it.")
+			return
+		}
 		output += "\n\n(note: push to origin failed — `" + task.Branch +
 			"` on origin has commits admiral didn't see. " +
 			"Local commits were discarded; trigger the review again to retry.)"
