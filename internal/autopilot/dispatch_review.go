@@ -142,7 +142,15 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 			o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
 				"admiral: cannot address review — %v", err)))
 		case prFixStageWorktree:
-			_ = deps.replier.Fail(ctx, fmt.Sprintf(
+			// On a cancelled ctx the reply would be dropped silently; a
+			// restart must still tell the reviewer to re-trigger.
+			rctx := ctx
+			if o.shuttingDown() || errors.Is(err, context.Canceled) {
+				var rcancel context.CancelFunc
+				rctx, rcancel = context.WithTimeout(context.Background(), 30*time.Second)
+				defer rcancel()
+			}
+			_ = deps.replier.Fail(rctx, fmt.Sprintf(
 				"admiral: cannot address review — failed to prepare worktree for branch %s: %v",
 				task.Branch, err))
 		}

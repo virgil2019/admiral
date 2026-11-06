@@ -150,22 +150,27 @@ func TestReconcile_EscalatesWithoutSession(t *testing.T) {
 func TestReconcile_ResumeCapEscalates(t *testing.T) {
 	o, db, lc, rec := reconcileFixture(t)
 	db.AutoResumeCount = maxAutoResumes // the next increment exceeds the cap
-	db.InFlightTasks = []store.AdmiralTask{{
+	row := store.AdmiralTask{
 		IssueID: "issue-3", IssueIdentifier: "GEO-3", State: store.JobStateExecuting,
 		WorktreePath:    t.TempDir(),
 		ClaudeSessionID: "sess-claude", LastEventSessionID: "sess-linear",
-	}}
-
-	rep := o.Reconcile(context.Background())
-
-	if rep.Resumed != 0 || rep.Escalated != 1 {
-		t.Fatalf("report = %+v, want cap to escalate instead of resuming", rep)
+		StartedAt: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
 	}
+	db.InFlightTasks = []store.AdmiralTask{row}
+	db.AdmiralTask = &store.AdmiralTask{
+		IssueID: row.IssueID, State: store.JobStateTimedOut, Branch: row.Branch,
+	}
+	// parkIfBlocked calls GetIssueBlockers; the mock returns none by default.
+
+	o.Reconcile(context.Background())
+
+	// The decision moved into the goroutine (side effects after the ownership
+	// check), so wait for the escalation rather than reading the report.
+	waitFor(t, func() bool {
+		return strings.Contains(lc.GetPostedBody(), "automatic resume was already used")
+	})
 	if len(rec.snapshot()) != 0 {
 		t.Errorf("resumed past the cap")
-	}
-	if !strings.Contains(lc.GetPostedBody(), "automatic resume was already used") {
-		t.Errorf("escalation = %q, want the cap reason", lc.GetPostedBody())
 	}
 }
 
@@ -316,6 +321,10 @@ func TestMarkFailed_ShutdownIsResumable(t *testing.T) {
 	f := newFlow(o, context.Background(), linear.AgentEvent{
 		SessionID: "sess-9", IssueID: "issue-9", IssueIdentifier: "GEO-9"})
 	f.branch = "linear/GEO-9"
+	// Resumable: a session and a worktree were recorded, so the notice may
+	// promise automatic continuation.
+	f.claudeSessionID = "sess-claude"
+	f.worktreePath = t.TempDir()
 
 	f.markFailed(context.Canceled)
 
@@ -408,23 +417,28 @@ func TestReconcile_RespectsDispatchGrace(t *testing.T) {
 func TestReconcile_ResumeCountErrorDefers(t *testing.T) {
 	o, db, lc, rec := reconcileFixture(t)
 	db.AutoResumeErr = os.ErrPermission
-	db.InFlightTasks = []store.AdmiralTask{{
+	row := store.AdmiralTask{
 		IssueID: "issue-6", IssueIdentifier: "GEO-6", State: store.JobStateExecuting,
 		WorktreePath:    t.TempDir(),
 		ClaudeSessionID: "sess-claude", LastEventSessionID: "sess-linear",
 		StartedAt: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
-	}}
-
-	rep := o.Reconcile(context.Background())
-
-	if rep.Deferred != 1 || rep.Escalated != 0 {
-		t.Fatalf("report = %+v, want deferred (not escalated)", rep)
 	}
+	db.InFlightTasks = []store.AdmiralTask{row}
+	db.AdmiralTask = &store.AdmiralTask{
+		IssueID: row.IssueID, State: store.JobStateTimedOut, Branch: row.Branch,
+	}
+
+	o.Reconcile(context.Background())
+	time.Sleep(200 * time.Millisecond) // let the goroutine reach the counter
+
 	if len(rec.snapshot()) != 0 {
 		t.Error("resumed despite the counter error")
 	}
-	if lc.GetPostedBody() != "" {
+	if strings.Contains(lc.GetPostedBody(), "cap") {
 		t.Errorf("posted a false 'cap reached' notice: %q", lc.GetPostedBody())
+	}
+	if len(db.MarkedUnrecoverable) != 0 {
+		t.Errorf("escalated on a transient store error: %v", db.MarkedUnrecoverable)
 	}
 }
 
@@ -468,8 +482,8 @@ func TestReconcile_EscalatesOnce(t *testing.T) {
 	// produces the same single marker rather than a second post.
 	before := len(db.MarkedUnrecoverable)
 	o.Reconcile(context.Background())
-	if len(db.MarkedUnrecoverable) > before+1 {
-		t.Errorf("escalation re-ran more than once per sweep")
+	if got := len(db.MarkedUnrecoverable) - before; got != 0 {
+		t.Errorf("escalation re-ran for a row the store no longer lists: %d extra markers", got)
 	}
 }
 
@@ -553,5 +567,60 @@ func TestResumeUserMessage_GenericWhenNoAnswer(t *testing.T) {
 		SessionID: "s", IssueID: "issue-21", IssueIdentifier: "GEO-21"})
 	if msg := f.resumeUserMessage(); !strings.Contains(msg, "interrupted by timeout") {
 		t.Errorf("resume message = %q, want the generic instruction", msg)
+	}
+}
+
+// TestMarkInterrupted_NoSessionPromisesRerun: without a recorded session or
+// worktree the reconciler will escalate, so the shutdown notice must not
+// promise an automatic resume the user will never see.
+func TestMarkInterrupted_NoSessionPromisesRerun(t *testing.T) {
+	o, db, lc, _ := reconcileFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	o.SetRootContext(ctx)
+	cancel()
+
+	task := &store.AdmiralTask{IssueID: "issue-30", IssueIdentifier: "GEO-30",
+		State: store.JobStateExecuting, Branch: "linear/GEO-30"}
+	db.LiveAdmiralTask = task
+	db.AdmiralTask = task
+
+	f := newFlow(o, context.Background(), linear.AgentEvent{
+		SessionID: "sess-30", IssueID: "issue-30", IssueIdentifier: "GEO-30"})
+	f.branch = "linear/GEO-30"
+
+	f.markFailed(context.Canceled)
+
+	body := lc.GetPostedBody()
+	if !strings.Contains(body, "/rerun") {
+		t.Errorf("notice = %q, want a /rerun pointer", body)
+	}
+	if strings.Contains(body, "will resume automatically") {
+		t.Errorf("notice = %q, promises a resume that cannot happen", body)
+	}
+}
+
+// TestReconcile_ResumeHonoursBlockers: a dependency added while the daemon
+// was down must still hold the task back — the automatic resume path goes
+// through the same blocked_by gate as a fresh dispatch.
+func TestReconcile_ResumeHonoursBlockers(t *testing.T) {
+	o, db, lc, rec := reconcileFixture(t)
+	lc.IssueBlockers = []linear.IssueBlocker{{ /* any unresolved blocker */ }}
+	row := store.AdmiralTask{
+		IssueID: "issue-40", IssueIdentifier: "GEO-40", State: store.JobStateExecuting,
+		AttemptN: 1, Branch: "linear/GEO-40", WorktreePath: t.TempDir(),
+		ClaudeSessionID: "sess-claude", LastEventSessionID: "sess-linear",
+		StartedAt: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+	}
+	db.InFlightTasks = []store.AdmiralTask{row}
+	db.AdmiralTask = &store.AdmiralTask{
+		IssueID: row.IssueID, State: store.JobStateTimedOut,
+		AttemptN: row.AttemptN, Branch: row.Branch,
+	}
+
+	o.Reconcile(context.Background())
+	time.Sleep(200 * time.Millisecond) // let the goroutine reach the gate
+
+	if len(rec.snapshot()) != 0 {
+		t.Errorf("resumed a blocked task: %+v", rec.snapshot())
 	}
 }

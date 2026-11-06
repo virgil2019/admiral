@@ -807,7 +807,19 @@ func (m *mockStore) ListRecoverableTasks() ([]store.AdmiralTask, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.InFlightTasks != nil || m.ListInFlightErr != nil {
-		return m.InFlightTasks, m.ListInFlightErr
+		// Mirror the real query: a row whose escalation was delivered no
+		// longer matches, which is what stops the sweep re-posting it.
+		skip := make(map[string]bool, len(m.MarkedUnrecoverable))
+		for _, id := range m.MarkedUnrecoverable {
+			skip[id] = true
+		}
+		var out []store.AdmiralTask
+		for _, t := range m.InFlightTasks {
+			if !skip[t.IssueID] {
+				out = append(out, t)
+			}
+		}
+		return out, m.ListInFlightErr
 	}
 	if m.LiveAdmiralTask != nil {
 		return []store.AdmiralTask{*m.LiveAdmiralTask}, nil

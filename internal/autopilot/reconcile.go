@@ -2,6 +2,7 @@ package autopilot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -157,39 +158,59 @@ func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTa
 	}
 
 	if canResume {
-		n, err := o.db.IncrementAutoResumeCount(row.IssueID, row.AttemptN)
-		if err != nil {
-			// A store hiccup is not "the cap was reached" — escalating here
-			// would demote a resumable task to manual recovery (and the row
-			// stays recoverable, so the next sweep retries).
-			o.logger.Warn("reconcile_resume_count_failed", "issue", row.IssueIdentifier, "err", err)
-			return orphanDeferred
+		ev := linear.AgentEvent{
+			SessionID:       row.LastEventSessionID,
+			IssueID:         row.IssueID,
+			IssueIdentifier: row.IssueIdentifier,
 		}
-		if n <= maxAutoResumes {
-			ev := linear.AgentEvent{
-				SessionID:       row.LastEventSessionID,
-				IssueID:         row.IssueID,
-				IssueIdentifier: row.IssueIdentifier,
+		// Every side effect — the credit, the notice, the resume — happens
+		// in the goroutine, and only AFTER ownership is re-verified: a /rerun
+		// can supersede the row at any point, and spending a credit or
+		// promising a resume for a row we no longer own is a silent lie.
+		go func() {
+			if !o.stillResumable(*row) {
+				o.logger.Info("reconcile_resume_superseded",
+					"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
+				return
+			}
+			if o.parkIfBlocked(ev) {
+				// A dependency added while the daemon was down still holds
+				// the task back; the blocker watcher resumes it later.
+				o.logger.Info("reconcile_resume_blocked",
+					"issue", row.IssueIdentifier)
+				return
+			}
+			n, err := o.db.IncrementAutoResumeCount(row.IssueID, row.AttemptN)
+			if err != nil {
+				if errors.Is(err, store.ErrNoSuchAttempt) {
+					o.logger.Info("reconcile_resume_superseded",
+						"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
+				} else {
+					// A store hiccup is not "the cap was reached"; the row
+					// stays recoverable and the next sweep retries.
+					o.logger.Warn("reconcile_resume_count_failed",
+						"issue", row.IssueIdentifier, "err", err)
+				}
+				return
+			}
+			if n > maxAutoResumes {
+				o.escalateOrphan(row, fmt.Sprintf(
+					"the run was interrupted and automatic resume was already used %d times", maxAutoResumes))
+				return
 			}
 			o.logger.Info("reconcile_resuming",
 				"issue", row.IssueIdentifier, "attempt_n", row.AttemptN, "auto_resume", n)
-			go func() {
-				// Ownership is re-checked first: a /rerun can supersede the
-				// row between the sweep's read and this launch, and telling
-				// the thread "resuming" for a resume we then abandon is a
-				// promise nobody keeps.
-				if !o.stillResumable(*row) {
-					o.logger.Info("reconcile_resume_superseded",
-						"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
-					return
-				}
-				o.postToTaskThread(row, linear.Response(fmt.Sprintf(
-					"admiral restarted mid-run and is resuming this task (attempt %d, automatic resume %d/%d).",
-					row.AttemptN, n, maxAutoResumes)))
-				o.resumeOrphanRun(ev, row)
-			}()
-			return orphanResumed
-		}
+			if !o.stillResumable(*row) {
+				o.logger.Info("reconcile_resume_superseded",
+					"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
+				return
+			}
+			o.postToTaskThread(row, linear.Response(fmt.Sprintf(
+				"admiral restarted mid-run and is resuming this task (attempt %d, automatic resume %d/%d).",
+				row.AttemptN, n, maxAutoResumes)))
+			o.resumeOrphanRun(ev, row)
+		}()
+		return orphanResumed
 	}
 
 	// Cannot resume (or the cap is spent): say so where a human is looking,
@@ -205,6 +226,14 @@ func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTa
 	default:
 		reason = fmt.Sprintf("the run was interrupted and automatic resume was already used %d times", maxAutoResumes)
 	}
+	o.escalateOrphan(row, reason)
+	return orphanEscalated
+}
+
+// escalateOrphan tells a human that this row needs them, and only then stops
+// sweeping it — marking first would drop the row from every later sweep even
+// when both delivery paths failed (Linear restarting is the common case).
+func (o *Orchestrator) escalateOrphan(row *store.AdmiralTask, reason string) {
 	o.logger.Warn("reconcile_escalate", "issue", row.IssueIdentifier, "reason", reason)
 	posted := o.postToTaskThread(row, linear.Response(fmt.Sprintf(
 		"⚠️ admiral stopped this task mid-run (%s).\n\nWorktree: `%s`\nBranch: `%s`\nPR: %s\n\nReply `/rerun` on the issue to start a fresh attempt.",
@@ -219,7 +248,6 @@ func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTa
 				"issue", row.IssueIdentifier, "err", err)
 		}
 	}
-	return orphanEscalated
 }
 
 // stillResumable re-checks the row right before a queued resume starts. The

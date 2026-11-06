@@ -1347,6 +1347,9 @@ func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.Admir
 		t.ClaudeSessionID = pq.ClaudeSessionID
 		t.FinishedAt = now
 	})
+	// The answer has been acted on; keeping the pointer would let a much
+	// later resume replay an instruction claude already followed.
+	o.db.ClearPendingQuestion(ev.IssueID)
 	if !isNoop && prURL != "" && o.ciWatcher != nil {
 		o.ciWatcher.WatchPR(ctx, prURL, f.repoDir, ev.SessionID, ev.IssueID, f.ghUser)
 	}
@@ -1499,23 +1502,16 @@ func (f *flow) resumeUserMessage() string {
 		pq.Question, pq.Answer)
 }
 
-// settled reports whether the task row reached an outcome that consumed any
-// pending answer. TIMED_OUT with the interrupted marker does NOT count: that
-// run never consumed the answer, and the reconciler needs to find it.
-func (f *flow) settled() bool {
-	if f.ev.IssueID == "" {
-		return false
-	}
-	t, err := f.o.db.GetAdmiralTaskByIssue(f.ev.IssueID)
-	if err != nil || t == nil {
-		return false
-	}
-	switch t.State {
+// taskSettled reports whether a state consumed any pending answer. TIMED_OUT
+// with the interrupted marker does NOT count: that run never consumed the
+// answer, and the reconciler needs to find it.
+func taskSettled(state, errText string) bool {
+	switch state {
 	case store.JobStateDone, store.JobStateDoneThreadInconsistent,
 		store.JobStateDoneMerged, store.JobStateFailed, store.JobStateCancelled:
 		return true
 	case store.JobStateTimedOut:
-		return !strings.HasPrefix(t.Error, store.InterruptedByShutdown)
+		return !strings.HasPrefix(errText, store.InterruptedByShutdown)
 	}
 	return false
 }
@@ -1528,9 +1524,11 @@ func (f *flow) persistAdmiralTask(fn func(*store.AdmiralTask)) {
 	// the row's transaction (and under the mock's lock), so a nested write
 	// either deadlocks or lands outside the transaction.
 	reachedDone := false
+	settled := false
 	err := f.o.db.UpdateAdmiralTask(f.ev.IssueID, func(t *store.AdmiralTask) {
 		fn(t)
 		reachedDone = t.State == store.JobStateDone
+		settled = taskSettled(t.State, t.Error)
 	})
 	if err == nil && reachedDone {
 		// Reaching DONE proves the task is healthy, which resets the
@@ -1538,7 +1536,7 @@ func (f *flow) persistAdmiralTask(fn func(*store.AdmiralTask)) {
 		// to count every interruption a long-lived row ever suffered.
 		f.o.db.ResetAutoResumeCount(f.ev.IssueID)
 	}
-	if err == nil && f.settled() {
+	if err == nil && settled {
 		// The answer (if any) has been consumed by a non-interrupted
 		// outcome; keeping the pointer would let a much later resume
 		// replay an old instruction.
@@ -2540,7 +2538,14 @@ func (f *flow) markInterrupted(runErr error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	body := f.creatorMention() + "admiral is restarting — this run was stopped mid-flight and will resume automatically on the next start.\n\n"
+	// Only promise auto-resume when the reconciler will be able to: no
+	// recorded claude session or worktree means it escalates instead, and
+	// the thread must not hear two contradictory stories.
+	outcome := "will resume automatically on the next start"
+	if f.claudeSessionID == "" || f.worktreePath == "" {
+		outcome = "could not be resumed automatically — reply `/rerun` on the issue after the restart"
+	}
+	body := f.creatorMention() + "admiral is restarting — this run was stopped mid-flight and " + outcome + ".\n\n"
 	if f.branch != "" {
 		body += "Branch: `" + f.branch + "`"
 	}

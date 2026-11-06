@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1333,14 +1334,17 @@ func (s *Store) MarkTaskInterrupted(issueID, reason string) (bool, error) {
 	return n > 0, nil
 }
 
+// ErrNoSuchAttempt is returned when a task's attempt is gone (superseded by
+// a /rerun), so callers can distinguish "not ours anymore" from "over cap".
+var ErrNoSuchAttempt = errors.New("admiral task attempt no longer exists")
+
 // ResetAutoResumeCount clears the row's auto-resume counter; a task that
 // reached DONE is healthy, so a later interruption should get a fresh budget.
 func (s *Store) ResetAutoResumeCount(issueID string) {
-	if _, err := s.DB.Exec(`
-		UPDATE admiral_tasks SET auto_resume_count = 0 WHERE issue_id=?`, issueID); err != nil {
-		// Best effort: a stale counter only makes the cap slightly stricter.
-		_ = err
-	}
+	// Best effort: a stale counter only makes the cap slightly stricter, so a
+	// failure is not worth failing the caller's write over.
+	_, _ = s.DB.Exec(`
+		UPDATE admiral_tasks SET auto_resume_count = 0 WHERE issue_id=?`, issueID)
 }
 
 // MarkTaskUnrecoverable records that the reconciler already told a human
@@ -1358,13 +1362,23 @@ func (s *Store) IncrementAutoResumeCount(issueID string, attemptN int) (int, err
 	// Scoped by attempt: a /rerun can supersede the row between the sweep's
 	// read and this write, and the new attempt must not be charged a resume
 	// credit for the old one's interruption.
-	if _, err := s.DB.Exec(`
+	res, err := s.DB.Exec(`
 		UPDATE admiral_tasks SET auto_resume_count = auto_resume_count + 1
-		 WHERE issue_id=? AND attempt_n=?`, issueID, attemptN); err != nil {
+		 WHERE issue_id=? AND attempt_n=?`, issueID, attemptN)
+	if err != nil {
 		return 0, err
 	}
+	if n, err := res.RowsAffected(); err != nil {
+		return 0, err
+	} else if n == 0 {
+		// The row was superseded (a /rerun moved it to history). Returning
+		// another attempt's counter here would read as "under the cap".
+		return 0, ErrNoSuchAttempt
+	}
 	var n int
-	err := s.DB.QueryRow(`SELECT auto_resume_count FROM admiral_tasks WHERE issue_id=?`, issueID).Scan(&n)
+	err = s.DB.QueryRow(`
+		SELECT auto_resume_count FROM admiral_tasks
+		 WHERE issue_id=? AND attempt_n=?`, issueID, attemptN).Scan(&n)
 	return n, err
 }
 
