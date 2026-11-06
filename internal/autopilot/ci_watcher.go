@@ -387,7 +387,7 @@ func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber
 			w.logger.Info("ci_watch_cancelled", "pr_url", prURL)
 			return nil, "", false
 		case <-ticker.C:
-			runs, err := w.fetchCheckRuns(ctx, repoDir, prNumber, ghUser)
+			runs, head, err := w.fetchCheckRuns(ctx, repoDir, prNumber, ghUser)
 			if err != nil {
 				w.logger.Warn("ci_fetch_runs_failed", "pr_url", prURL, "err", err)
 				// The deadline check must also cover this path: the watcher
@@ -402,17 +402,20 @@ func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber
 			}
 
 			if len(runs) == 0 {
-				// No checks yet, keep polling
+				// No checks registered for this head yet, keep polling.
 			} else if allFinal(runs) {
-				// Bind the verdict to the head it belongs to. A read failure
-				// degrades to "" (trust the observation) rather than
-				// suppressing a real failure.
-				sha, shaErr := w.fetchHeadSHA(ctx, repoDir, prNumber, ghUser)
-				if shaErr != nil {
-					w.logger.Warn("ci_watch_head_sha_failed", "pr_url", prURL, "err", shaErr)
-					sha = ""
+				// The verdict is already bound to `head`: fetchCheckRuns
+				// queried that commit's checks specifically. Only the
+				// head-agnostic fallback leaves it empty, in which case it is
+				// resolved here.
+				if head == "" {
+					sha, shaErr := w.fetchHeadSHA(ctx, repoDir, prNumber, ghUser)
+					if shaErr != nil {
+						w.logger.Warn("ci_watch_head_sha_failed", "pr_url", prURL, "err", shaErr)
+					}
+					head = sha
 				}
-				return runs, sha, true
+				return runs, head, true
 			}
 
 			if time.Now().After(deadline) {
@@ -501,7 +504,7 @@ func shortSHA(sha string) string {
 	return sha
 }
 
-func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber int, ghUser string) ([]checkRun, error) {
+func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber int, ghUser string) ([]checkRun, string, error) {
 	// Bound each gh invocation: exec only kills the child on ctx
 	// cancellation, and the watcher goroutine is detached from the run ctx
 	// (no cancel will arrive) — a hung gh must not block the watcher, and
@@ -517,7 +520,7 @@ func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber
 	// private repo's checks are visible to admiral at all.
 	env, err := w.accounts.EnvFor(ctx, ghUser)
 	if err != nil {
-		return nil, fmt.Errorf("resolve gh account %q: %w", ghUser, err)
+		return nil, "", fmt.Errorf("resolve gh account %q: %w", ghUser, err)
 	}
 	// Resolve the head FIRST and ask for that commit's check runs
 	// specifically. `gh pr checks` serves whatever GitHub has finished
@@ -529,7 +532,8 @@ func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber
 	if err != nil || head == "" {
 		// Without a head we cannot bind the verdict; fall back to the PR
 		// view and let the stale-head guard in watch() judge it.
-		return w.fetchPRChecks(ctx, dir, prNumber, env)
+		runs, ferr := w.fetchPRChecks(ctx, dir, prNumber, env)
+		return runs, "", ferr
 	}
 	out, err := captureCmdEnv(ctx, dir, env, w.ghBin,
 		"api", "--paginate",
@@ -539,16 +543,20 @@ func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber
 		"--jq", `.check_runs[] | {name: .name, status: .status, conclusion: (.conclusion // ""), url: (.html_url // "")}`,
 	)
 	if err != nil {
-		return w.fetchPRChecks(ctx, dir, prNumber, env)
+		// An older gh or an enterprise host without the endpoint.
+		runs, ferr := w.fetchPRChecks(ctx, dir, prNumber, env)
+		return runs, "", ferr
 	}
 	runs, perr := parseCheckRunLines(out)
-	if perr != nil || len(runs) == 0 {
-		// An older gh, an enterprise host, or a PR with no registered checks
-		// yet: fall back to the head-agnostic view and let the stale-head
-		// guard judge it.
-		return w.fetchPRChecks(ctx, dir, prNumber, env)
+	if perr != nil {
+		runs, ferr := w.fetchPRChecks(ctx, dir, prNumber, env)
+		return runs, "", ferr
 	}
-	return runs, nil
+	// Zero runs is a legitimate answer — GitHub has not registered this
+	// head's checks yet. Returning it (rather than falling back to the
+	// head-agnostic view) is what stops the previous head's failures from
+	// being read as this head's verdict.
+	return runs, head, nil
 }
 
 // parseCheckRunLines decodes one checkRun per line, skipping blanks.

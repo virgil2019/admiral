@@ -757,7 +757,7 @@ func TestFetchTimeout_KillsHungGh(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	start := time.Now()
-	if _, err := w.fetchCheckRuns(ctx, dir, 7, defaultTestGhUser); err == nil {
+	if _, _, err := w.fetchCheckRuns(ctx, dir, 7, defaultTestGhUser); err == nil {
 		t.Fatal("fetchCheckRuns succeeded against a hung gh, want deadline error")
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
@@ -1151,5 +1151,34 @@ func TestWatchPR_InterruptedFixRoundDoesNotFailTask(t *testing.T) {
 	ciWatchTaskFailure(t, lc, "was NOT resumed")
 	if state, errMsg := taskStateSnapshot(db); state != store.JobStateDone || errMsg != "" {
 		t.Errorf("task = %q/%q, want it left DONE for the next boot", state, errMsg)
+	}
+}
+
+// TestFetchCheckRuns_EmptyHeadIsNotFallback: right after a push GitHub has no
+// check runs for the new head yet. Falling back to the head-agnostic view
+// there re-introduces the stale-head verdict — the previous head's failures
+// read as the new head's.
+func TestFetchCheckRuns_EmptyHeadIsNotFallback(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"auth\" ]; then echo fake-token; exit 0; fi\n" +
+		"if [ \"$1\" = \"api\" ]; then exit 0; fi\n" + // empty body: no runs yet
+		"if [ \"$2\" = \"view\" ]; then echo '{\"headRefOid\":\"sha-b\"}'; exit 0; fi\n" +
+		`echo '[{"name":"old-head","status":"completed","conclusion":"failure","url":"u"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w := newCIWatcher(&mockLinearClient{}, &mockStore{}, logger, ghBin, time.Second, time.Minute, 2)
+
+	runs, head, err := w.fetchCheckRuns(context.Background(), t.TempDir(), 7, defaultTestGhUser)
+	if err != nil {
+		t.Fatalf("fetchCheckRuns: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Errorf("runs = %+v, want none (the old head's failures must not be served as this head's)", runs)
+	}
+	if head != "sha-b" {
+		t.Errorf("head = %q, want sha-b", head)
 	}
 }

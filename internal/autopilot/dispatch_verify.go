@@ -314,8 +314,11 @@ func (o *Orchestrator) runVerify(parentID string) {
 	// A verification cut short by a restart never produced a verdict. Give
 	// the round back so the discoverer's boot rescan (status=active AND
 	// rounds=1) re-runs it; otherwise it sits active with no wakeup.
+	verdictApplied := false
 	defer func() {
-		if !o.shuttingDown() {
+		// A verdict that already landed describes the work; refunding its
+		// round would make the boot rescan run the whole judge again.
+		if !o.shuttingDown() || verdictApplied {
 			return
 		}
 		if err := o.db.ResetTaskVerificationRound(parentID); err != nil {
@@ -367,6 +370,7 @@ func (o *Orchestrator) runVerify(parentID string) {
 	if !hasAcceptanceCriteriaSection(mat.PRD) && len(mat.Subs) > 0 {
 		o.logger.Info("verify_auto_pass",
 			"parent", parentID, "identifier", mat.ParentIdentifier)
+		verdictApplied = true
 		o.applyVerifyVerdict(ctx, parentID, mat.ParentIdentifier, teamID, projectID,
 			&verifyVerdict{
 				Complete: true,
@@ -440,6 +444,7 @@ func (o *Orchestrator) runVerify(parentID string) {
 	// PR. The judge prompt already requires this on its own; this enforces it.
 	overrideVerdictOnBuildFail(verdict, mat.BuildResult)
 
+	verdictApplied = true
 	o.applyVerifyVerdict(ctx, parentID, mat.ParentIdentifier, teamID, projectID, verdict)
 }
 

@@ -233,8 +233,10 @@ func (o *Orchestrator) launchResume(ctx context.Context, row *store.AdmiralTask)
 		o.logger.Info("reconcile_resuming",
 			"issue", row.IssueIdentifier, "attempt_n", row.AttemptN, "auto_resume", n)
 		if !o.stillResumable(*row) {
+			// The credit was already spent on a resume that will not run.
 			o.logger.Info("reconcile_resume_superseded",
 				"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
+			o.db.RefundAutoResumeCount(row.IssueID)
 			return
 		}
 		o.postToTaskThread(row, linear.Response(fmt.Sprintf(

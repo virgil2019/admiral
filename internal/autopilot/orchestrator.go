@@ -1449,7 +1449,7 @@ func (o *Orchestrator) runWithAttempt(ev linear.AgentEvent, attemptN int) {
 		// Check shutdown before the timeout heuristics: a cancelled run is
 		// also killed (claude exits with "signal: killed"), and reporting it
 		// as a timeout would be both wrong and noisy.
-		if o.shuttingDown() {
+		if o.shuttingDown() && !flow.alreadyTerminal() {
 			flow.markInterrupted(err)
 			return
 		}
@@ -1530,6 +1530,36 @@ func newResumeFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent, j
 // source of truth for dispatch but flow.execute can still complete its
 // autopilot_jobs path even if the admiral_tasks write transiently
 // fails (next event will reconcile by reading whatever sticks).
+func (f *flow) persistAdmiralTask(fn func(*store.AdmiralTask)) {
+	if f.ev.IssueID == "" {
+		return
+	}
+	// Never call the store from inside the update callback: it runs inside
+	// the row's transaction (and under the mock's lock), so a nested write
+	// either deadlocks or lands outside the transaction. The attempt guard
+	// keeps a superseded flow from writing onto the new attempt's row.
+	reachedDone := false
+	settled := false
+	err := f.o.db.UpdateAdmiralTask(f.ev.IssueID, func(t *store.AdmiralTask) {
+		if f.expectAttemptN > 0 && t.AttemptN != f.expectAttemptN {
+			return
+		}
+		fn(t)
+		reachedDone = t.State == store.JobStateDone
+		settled = taskSettled(t.State)
+	})
+	if err == nil && reachedDone {
+		f.o.db.ResetAutoResumeCount(f.ev.IssueID)
+	}
+	if err == nil && settled {
+		f.o.db.ClearPendingQuestion(f.ev.IssueID)
+	}
+	if err != nil {
+		f.o.logger.Warn("update_admiral_task_failed",
+			"err", err, "issue", f.ev.IssueID)
+	}
+}
+
 // resumeUserMessage is what a resumed run continues with. Normally the
 // generic "continue" instruction is enough — claude resumes its own session.
 // But when the interruption hit while the run was waiting on an ask_user
@@ -1587,45 +1617,6 @@ func taskSettled(state string) bool {
 		return false
 	}
 	return false
-}
-
-func (f *flow) persistAdmiralTask(fn func(*store.AdmiralTask)) {
-	if f.ev.IssueID == "" {
-		return
-	}
-	// Never call the store from inside the update callback: it runs inside
-	// the row's transaction (and under the mock's lock), so a nested write
-	// either deadlocks or lands outside the transaction.
-	reachedDone := false
-	settled := false
-	err := f.o.db.UpdateAdmiralTask(f.ev.IssueID, func(t *store.AdmiralTask) {
-		// A /rerun can supersede the row while this flow was waiting for a
-		// lock or a slot. Its writes describe the OLD attempt; applying them
-		// to the new row would flip a live attempt to DONE/FAILED and clear
-		// its error, resume budget and pending question.
-		if f.expectAttemptN > 0 && t.AttemptN != f.expectAttemptN {
-			return
-		}
-		fn(t)
-		reachedDone = t.State == store.JobStateDone
-		settled = taskSettled(t.State)
-	})
-	if err == nil && reachedDone {
-		// Reaching DONE proves the task is healthy, which resets the
-		// automatic-resume budget: the cap exists to stop a crash loop, not
-		// to count every interruption a long-lived row ever suffered.
-		f.o.db.ResetAutoResumeCount(f.ev.IssueID)
-	}
-	if err == nil && settled {
-		// The answer (if any) has been consumed by a non-interrupted
-		// outcome; keeping the pointer would let a much later resume
-		// replay an old instruction.
-		f.o.db.ClearPendingQuestion(f.ev.IssueID)
-	}
-	if err != nil {
-		f.o.logger.Warn("update_admiral_task_failed",
-			"err", err, "issue", f.ev.IssueID)
-	}
 }
 
 func (f *flow) postActivity(a linear.AgentActivity) {
@@ -2594,6 +2585,26 @@ func (o *Orchestrator) failTaskUnlessShuttingDown(issueID string, runErr error) 
 	})
 }
 
+// alreadyTerminal reports whether the row already reached a state that
+// describes the work (e.g. the build gate persisted FAILED before the
+// shutdown arrived). Overwriting that with "interrupted" would make the
+// reconciler resume a task whose build genuinely fails.
+func (f *flow) alreadyTerminal() bool {
+	if f.ev.IssueID == "" {
+		return false
+	}
+	t, err := f.o.db.GetAdmiralTaskByIssue(f.ev.IssueID)
+	if err != nil || t == nil {
+		return false
+	}
+	switch t.State {
+	case store.JobStateFailed, store.JobStateDone, store.JobStateDoneMerged,
+		store.JobStateCancelled, store.JobStateDoneThreadInconsistent:
+		return true
+	}
+	return false
+}
+
 // markInterrupted records a run that was stopped by a shutdown: TIMED_OUT
 // with the interrupted reason, which /resume accepts and the boot reconciler
 // picks up to continue the same attempt automatically.
@@ -2755,6 +2766,13 @@ func (f *flow) markTimedOutWithMessage(runErr error, body string) {
 // say, the repo's gh account had not been registered yet. DONE keeps /fix
 // retryable once the blocker is fixed.
 func (f *flow) abortFixBeforeStart(runErr error) {
+	// A /fix stopped by shutdown never ran; recording it DONE would drop it
+	// out of the reconciler's reach entirely. Route it to the interrupted
+	// marker instead so the next boot continues it.
+	if f.o.shuttingDown() {
+		f.markInterrupted(runErr)
+		return
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	// The per-session audit row did fail; only the aggregate task state is
 	// rolled back.
