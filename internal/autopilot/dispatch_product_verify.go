@@ -140,8 +140,11 @@ func (o *Orchestrator) HandleProductVerifyEvent(ctx context.Context, projectID s
 func (o *Orchestrator) runProductVerify(projectID string) {
 	defer o.beginRun("")()
 	// Same reasoning as runVerify: a restart must not consume the round.
+	verdictApplied := false
 	defer func() {
-		if !o.shuttingDown() {
+		// A filed verdict already describes the work; refunding its round
+		// would re-run the judge AND re-file the same gap issues.
+		if !o.shuttingDown() || verdictApplied {
 			return
 		}
 		if err := o.db.ResetProductVerificationRound(projectID); err != nil {
@@ -198,6 +201,7 @@ func (o *Orchestrator) runProductVerify(projectID string) {
 		return
 	}
 
+	verdictApplied = true
 	o.applyProductVerifyVerdict(ctx, projectID, teamID, verdict)
 }
 

@@ -67,7 +67,7 @@ func (o *Orchestrator) runCIFixRound(ctx context.Context, task *store.AdmiralTas
 	}
 
 	if !out.Pushed {
-		if o.shuttingDown() || ctx.Err() != nil {
+		if o.shuttingDown() || errors.Is(ctx.Err(), context.Canceled) {
 			// runPRFix swallows a cancelled push into Pushed=false with a nil
 			// error; reporting that as a push failure makes the watcher
 			// escalate a restart and mark the DONE task FAILED/ci_failed.

@@ -482,6 +482,13 @@ func (w *CIWatcher) fetchHeadSHA(ctx context.Context, repoDir string, prNumber i
 	if err != nil {
 		return "", fmt.Errorf("resolve gh account %q: %w", ghUser, err)
 	}
+	return w.fetchHeadSHAEnv(ctx, dir, prNumber, env)
+}
+
+// fetchHeadSHAEnv resolves the head with an already-resolved environment:
+// EnvFor shells out to `gh auth token`, and a poll makes several gh calls —
+// resolving the account once per poll instead of once per call halves that.
+func (w *CIWatcher) fetchHeadSHAEnv(ctx context.Context, dir string, prNumber int, env []string) (string, error) {
 	out, err := captureCmdEnv(ctx, dir, env, w.ghBin,
 		"pr", "view", fmt.Sprintf("%d", prNumber), "--json", "headRefOid")
 	if err != nil {
@@ -528,7 +535,7 @@ func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber
 	// head's completed failures — reading that as the new head's verdict
 	// spends a fix round on code that is already fixed, and with the round
 	// cap reached it escalates a PR that is actually green.
-	head, err := w.fetchHeadSHA(ctx, dir, prNumber, ghUser)
+	head, err := w.fetchHeadSHAEnv(ctx, dir, prNumber, env)
 	if err != nil || head == "" {
 		// Without a head we cannot bind the verdict; fall back to the PR
 		// view and let the stale-head guard in watch() judge it.

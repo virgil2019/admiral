@@ -76,10 +76,16 @@ func (o *Orchestrator) Reconcile(ctx context.Context) ReconcileReport {
 		// A row younger than reconcileGrace may be between its state write
 		// and beginRun (dispatch pre-flight does Linear I/O first). Judging
 		// it now would escalate work that never stopped.
-		if startedAt, err := time.Parse(time.RFC3339, row.StartedAt); err == nil {
-			if time.Since(startedAt) < reconcileGrace {
-				rep.Deferred++
-				continue
+		// The grace exists for rows a LIVE process may be about to pick up.
+		// A row a clean shutdown stamped interrupted has no owner anywhere —
+		// skipping it here would delay the advertised boot recovery by a full
+		// sweep interval.
+		if row.State != store.JobStateTimedOut {
+			if startedAt, err := time.Parse(time.RFC3339, row.StartedAt); err == nil {
+				if time.Since(startedAt) < reconcileGrace {
+					rep.Deferred++
+					continue
+				}
 			}
 		}
 		rep.Orphans++
@@ -207,6 +213,15 @@ func (o *Orchestrator) launchResume(ctx context.Context, row *store.AdmiralTask)
 		IssueIdentifier: row.IssueIdentifier,
 	}
 	go func() {
+		// Unrecovered, a panic here kills the daemon — re-orphaning every
+		// other in-flight row. Every other long-running goroutine in this
+		// package carries the same guard.
+		defer func() {
+			if r := recover(); r != nil {
+				o.logger.Error("reconcile_resume_panic",
+					"issue", row.IssueIdentifier, "panic", r)
+			}
+		}()
 		if !o.stillResumable(*row) {
 			o.logger.Info("reconcile_resume_superseded",
 				"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)

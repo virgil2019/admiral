@@ -200,7 +200,7 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 
 	output := out.Output
 	if !out.Pushed {
-		if o.shuttingDown() || ctx.Err() != nil {
+		if o.shuttingDown() || errors.Is(ctx.Err(), context.Canceled) {
 			// The push was cut short by the restart, not rejected by origin.
 			// ctx is already cancelled, so reply on a fresh one or the
 			// reviewer hears nothing at all.

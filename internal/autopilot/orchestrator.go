@@ -970,14 +970,25 @@ func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 			"err", err, "session", ev.SessionID)
 	}
 
-	// Transition admiral_tasks: DONE → EXECUTING. Future events on this
-	// task will see "currently processing" until /fix completes.
+	// Transition admiral_tasks: DONE → EXECUTING. Guarded inside the write:
+	// the attempt check above is still TOCTOU, because a /rerun can move the
+	// row to history and insert a new attempt in between.
+	superseded := false
 	if err := o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+		if t.AttemptN != task.AttemptN {
+			superseded = true
+			return
+		}
 		t.State = store.JobStateExecuting
 		t.LastEventSessionID = ev.SessionID
 	}); err != nil {
 		o.logger.Warn("fix_admiral_task_to_executing_failed",
 			"err", err, "issue", ev.IssueID)
+	}
+	if superseded {
+		o.logger.Info("fix_superseded",
+			"issue", ev.IssueIdentifier, "attempt_n", task.AttemptN)
+		return
 	}
 
 	// executeResume operates on a flow.job (*store.AutopilotJob); synthesize
@@ -1163,12 +1174,22 @@ func (o *Orchestrator) runResume(ev linear.AgentEvent, task *store.AdmiralTask) 
 			"err", err, "session", ev.SessionID)
 	}
 
+	superseded := false
 	if err := o.db.UpdateAdmiralTask(ev.IssueID, func(t *store.AdmiralTask) {
+		if t.AttemptN != task.AttemptN {
+			superseded = true
+			return
+		}
 		t.State = store.JobStateExecuting
 		t.LastEventSessionID = ev.SessionID
 	}); err != nil {
 		o.logger.Warn("resume_admiral_task_to_executing_failed",
 			"err", err, "issue", ev.IssueID)
+	}
+	if superseded {
+		o.logger.Info("resume_superseded",
+			"issue", ev.IssueIdentifier, "attempt_n", task.AttemptN)
+		return
 	}
 
 	syntheticPrior := &store.AutopilotJob{
@@ -1209,7 +1230,10 @@ func (o *Orchestrator) runResume(ev linear.AgentEvent, task *store.AdmiralTask) 
 		if isPreparePhaseError(err) {
 			o.logger.Warn("autopilot_resume_failed_in_prepare_phase_keeping_timed_out",
 				"issue", ev.IssueIdentifier, "session", ev.SessionID)
-			resumeFlow.markTimedOut(err)
+			// markTimedOut would tell the user "timed out after MaxRunSeconds"
+			// when claude never started; the pre-flight variant keeps
+			// TIMED_OUT (so /resume still works) with the real cause.
+			resumeFlow.markTimedOutBeforeStart(err)
 		} else {
 			resumeFlow.markFailed(err)
 		}
@@ -1449,8 +1473,8 @@ func (o *Orchestrator) runWithAttempt(ev linear.AgentEvent, attemptN int) {
 		// Check shutdown before the timeout heuristics: a cancelled run is
 		// also killed (claude exits with "signal: killed"), and reporting it
 		// as a timeout would be both wrong and noisy.
-		if o.shuttingDown() && !flow.alreadyTerminal() {
-			flow.markInterrupted(err)
+		if o.shuttingDown() {
+			flow.markInterrupted(err) // no-ops when the flow already persisted a terminal state
 			return
 		}
 		if errors.Is(err, context.DeadlineExceeded) ||
@@ -2609,6 +2633,14 @@ func (f *flow) alreadyTerminal() bool {
 // with the interrupted reason, which /resume accepts and the boot reconciler
 // picks up to continue the same attempt automatically.
 func (f *flow) markInterrupted(runErr error) {
+	// A row that already reached a terminal state describes the work (the
+	// build gate wrote FAILED, say). Overwriting it with "interrupted" makes
+	// the reconciler resume a task whose build deterministically fails. The
+	// guard lives HERE because markFailed and markTimedOut both delegate to
+	// this function during shutdown.
+	if f.alreadyTerminal() {
+		return
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	reason := store.InterruptedByShutdown
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {

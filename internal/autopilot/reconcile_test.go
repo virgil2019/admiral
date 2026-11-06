@@ -801,3 +801,31 @@ func TestRunFix_AbortsWhenSuperseded(t *testing.T) {
 		}
 	}
 }
+
+// TestMarkInterrupted_KeepsAnAlreadyTerminalRow: a FAILED the build gate
+// persists just before SIGTERM describes the work. Rewriting it as
+// "interrupted" makes the reconciler auto-resume a task whose build
+// deterministically fails. The guard lives in markInterrupted because
+// markFailed and markTimedOut both delegate to it during shutdown.
+func TestMarkInterrupted_KeepsAnAlreadyTerminalRow(t *testing.T) {
+	o, db, _, _ := reconcileFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	o.SetRootContext(ctx)
+	cancel()
+
+	task := &store.AdmiralTask{IssueID: "issue-70", IssueIdentifier: "GEO-70",
+		State: store.JobStateFailed, Error: "build gate failed after 2 attempts"}
+	db.LiveAdmiralTask = task
+	db.AdmiralTask = task
+
+	f := newFlow(o, context.Background(), linear.AgentEvent{
+		SessionID: "s", IssueID: "issue-70", IssueIdentifier: "GEO-70"})
+	f.markFailed(errTestBoom) // routes through markInterrupted during shutdown
+
+	if task.State != store.JobStateFailed {
+		t.Fatalf("state = %q, want the build-gate FAILED preserved", task.State)
+	}
+	if task.Error != "build gate failed after 2 attempts" {
+		t.Errorf("error = %q, want the original failure", task.Error)
+	}
+}
