@@ -1237,9 +1237,14 @@ func (s *Store) GetBlockedAdmiralTasks() ([]BlockedTask, error) {
 // (i.e. it was still BLOCKED), false when another goroutine already
 // changed the state.
 func (s *Store) TransitionBlockedToReceived(issueID string) (bool, error) {
+	// started_at is refreshed because this is the moment the runnable window
+	// restarts: the reconciler uses it as the "too fresh to judge" marker,
+	// and a row blocked for days would otherwise look orphaned during the
+	// dispatcher's pre-run Linear calls. It also matches what the field
+	// means everywhere else — when the current run began.
 	res, err := s.DB.Exec(`
-		UPDATE admiral_tasks SET state=?, blocker_ids=NULL WHERE issue_id=? AND state=?
-	`, JobStateReceived, issueID, JobStateBlocked)
+		UPDATE admiral_tasks SET state=?, blocker_ids=NULL, started_at=? WHERE issue_id=? AND state=?
+	`, JobStateReceived, time.Now().UTC().Format(time.RFC3339), issueID, JobStateBlocked)
 	if err != nil {
 		return false, err
 	}
@@ -1349,10 +1354,13 @@ func (s *Store) MarkTaskUnrecoverable(issueID, reason string) error {
 }
 
 // IncrementAutoResumeCount bumps and returns the row's auto-resume counter.
-func (s *Store) IncrementAutoResumeCount(issueID string) (int, error) {
+func (s *Store) IncrementAutoResumeCount(issueID string, attemptN int) (int, error) {
+	// Scoped by attempt: a /rerun can supersede the row between the sweep's
+	// read and this write, and the new attempt must not be charged a resume
+	// credit for the old one's interruption.
 	if _, err := s.DB.Exec(`
 		UPDATE admiral_tasks SET auto_resume_count = auto_resume_count + 1
-		 WHERE issue_id=?`, issueID); err != nil {
+		 WHERE issue_id=? AND attempt_n=?`, issueID, attemptN); err != nil {
 		return 0, err
 	}
 	var n int
@@ -2286,13 +2294,26 @@ func (s *Store) SetAdmiralTaskAwaitingInput(issueID, pendingQuestionID string) e
 	return err
 }
 
+// ClearPendingQuestion drops the task's pending-question pointer once the
+// resumed run has consumed the answer (DONE or any terminal write). Kept
+// separate from the AWAITING_INPUT transition on purpose: a restart between
+// "answer recorded" and "claude consumed it" must still be able to find the
+// answer, which is the only place that instruction exists.
+func (s *Store) ClearPendingQuestion(issueID string) {
+	if _, err := s.DB.Exec(`
+		UPDATE admiral_tasks SET pending_question_id=NULL
+		 WHERE issue_id=? AND pending_question_id IS NOT NULL`, issueID); err != nil {
+		_ = err // best effort: a stale pointer only risks re-sending an answer
+	}
+}
+
 // TransitionAwaitingInputToExecuting atomically moves an AWAITING_INPUT task
 // back to EXECUTING. Returns true when the row was updated (i.e. this caller
 // won the race), false when another goroutine already changed the state.
 func (s *Store) TransitionAwaitingInputToExecuting(issueID string) (bool, error) {
 	res, err := s.DB.Exec(`
 		UPDATE admiral_tasks
-		SET state=?, pending_question_id=NULL
+		SET state=?
 		WHERE issue_id=? AND state=?
 	`, JobStateExecuting, issueID, JobStateAwaitingInput)
 	if err != nil {

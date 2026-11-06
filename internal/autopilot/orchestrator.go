@@ -70,8 +70,9 @@ type storeInterface interface {
 	MarkInterruptedTasks(reason string) (int, error)
 	MarkTaskInterrupted(issueID, reason string) (bool, error)
 	ListRecoverableTasks() ([]store.AdmiralTask, error)
-	IncrementAutoResumeCount(issueID string) (int, error)
+	IncrementAutoResumeCount(issueID string, attemptN int) (int, error)
 	ResetAutoResumeCount(issueID string)
+	ClearPendingQuestion(issueID string)
 	MarkTaskUnrecoverable(issueID, reason string) error
 	GetAdmiralTaskByPRURL(prURL string) (*store.AdmiralTask, error)
 	ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error)
@@ -1498,6 +1499,27 @@ func (f *flow) resumeUserMessage() string {
 		pq.Question, pq.Answer)
 }
 
+// settled reports whether the task row reached an outcome that consumed any
+// pending answer. TIMED_OUT with the interrupted marker does NOT count: that
+// run never consumed the answer, and the reconciler needs to find it.
+func (f *flow) settled() bool {
+	if f.ev.IssueID == "" {
+		return false
+	}
+	t, err := f.o.db.GetAdmiralTaskByIssue(f.ev.IssueID)
+	if err != nil || t == nil {
+		return false
+	}
+	switch t.State {
+	case store.JobStateDone, store.JobStateDoneThreadInconsistent,
+		store.JobStateDoneMerged, store.JobStateFailed, store.JobStateCancelled:
+		return true
+	case store.JobStateTimedOut:
+		return !strings.HasPrefix(t.Error, store.InterruptedByShutdown)
+	}
+	return false
+}
+
 func (f *flow) persistAdmiralTask(fn func(*store.AdmiralTask)) {
 	if f.ev.IssueID == "" {
 		return
@@ -1515,6 +1537,12 @@ func (f *flow) persistAdmiralTask(fn func(*store.AdmiralTask)) {
 		// automatic-resume budget: the cap exists to stop a crash loop, not
 		// to count every interruption a long-lived row ever suffered.
 		f.o.db.ResetAutoResumeCount(f.ev.IssueID)
+	}
+	if err == nil && f.settled() {
+		// The answer (if any) has been consumed by a non-interrupted
+		// outcome; keeping the pointer would let a much later resume
+		// replay an old instruction.
+		f.o.db.ClearPendingQuestion(f.ev.IssueID)
 	}
 	if err != nil {
 		f.o.logger.Warn("update_admiral_task_failed",
@@ -2598,6 +2626,13 @@ func (f *flow) markTimedOutBeforeStart(runErr error) {
 // thread. Shared by the run-length timeout and the pre-flight failure above,
 // which differ only in what they tell the user.
 func (f *flow) markTimedOutWithMessage(runErr error, body string) {
+	// A run cut short by shutdown is resumable, and the reconciler only
+	// recognises the interrupted marker: recording "fetch issue: context
+	// canceled" here would drop the row out of automatic recovery.
+	if f.o.shuttingDown() {
+		f.markInterrupted(runErr)
+		return
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
 		j.State = store.JobStateTimedOut

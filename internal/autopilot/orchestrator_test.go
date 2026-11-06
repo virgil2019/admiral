@@ -593,6 +593,7 @@ type mockStore struct {
 	AutoResumeCount         int
 	AutoResumeErr           error
 	AutoResumeResets        int
+	ClearedPendingQuestion  string
 	MarkedUnrecoverable     []string
 	MarkUnrecoverableErr    error
 	InFlightTasks           []store.AdmiralTask
@@ -772,6 +773,15 @@ func (m *mockStore) MarkTaskInterrupted(issueID, reason string) (bool, error) {
 	return true, nil
 }
 
+func (m *mockStore) ClearPendingQuestion(issueID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ClearedPendingQuestion = issueID
+	if m.AdmiralTask != nil {
+		m.AdmiralTask.PendingQuestionID = ""
+	}
+}
+
 func (m *mockStore) ResetAutoResumeCount(issueID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -786,7 +796,7 @@ func (m *mockStore) MarkTaskUnrecoverable(issueID, reason string) error {
 	return m.MarkUnrecoverableErr
 }
 
-func (m *mockStore) IncrementAutoResumeCount(issueID string) (int, error) {
+func (m *mockStore) IncrementAutoResumeCount(issueID string, attemptN int) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.AutoResumeCount++

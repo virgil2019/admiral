@@ -257,7 +257,7 @@ func TestRunFunctionsRootAtBaseCtx(t *testing.T) {
 	if err != nil {
 		t.Fatalf("glob: %v", err)
 	}
-	bad := regexp.MustCompile(`context\.WithTimeout\(context\.Background\(\)`)
+	bad := regexp.MustCompile(`(^|\s)ctx, cancel := context\.WithTimeout\(context\.Background\(\)`)
 	for _, f := range files {
 		if strings.HasSuffix(f, "_test.go") {
 			continue
@@ -519,5 +519,39 @@ func TestReconcile_CancelledSweepLaunchesNothing(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if len(rec.snapshot()) != 0 {
 		t.Error("launched a resume from a cancelled sweep")
+	}
+}
+
+// TestResumeUserMessage_CarriesAskUserAnswer: a run interrupted while waiting
+// on an ask_user answer must resume WITH that answer — the generic "continue"
+// prompt silently drops the instruction, and the question is already marked
+// answered so nothing else would ever deliver it.
+func TestResumeUserMessage_CarriesAskUserAnswer(t *testing.T) {
+	o, db, _, _ := reconcileFixture(t)
+	db.AdmiralTask = &store.AdmiralTask{IssueID: "issue-20", PendingQuestionID: "q-1"}
+	db.PendingQuestion = &store.PendingQuestion{
+		ID: "q-1", IssueID: "issue-20", Question: "Which DB?",
+		Answer: "Postgres", AnsweredAt: "2026-11-06T10:00:00Z",
+	}
+
+	f := newFlow(o, context.Background(), linear.AgentEvent{
+		SessionID: "s", IssueID: "issue-20", IssueIdentifier: "GEO-20"})
+	msg := f.resumeUserMessage()
+
+	if !strings.Contains(msg, "Postgres") || !strings.Contains(msg, "Which DB?") {
+		t.Errorf("resume message = %q, want the recorded answer", msg)
+	}
+}
+
+// TestResumeUserMessage_GenericWhenNoAnswer: the normal resume path keeps its
+// generic instruction.
+func TestResumeUserMessage_GenericWhenNoAnswer(t *testing.T) {
+	o, db, _, _ := reconcileFixture(t)
+	db.AdmiralTask = &store.AdmiralTask{IssueID: "issue-21"}
+
+	f := newFlow(o, context.Background(), linear.AgentEvent{
+		SessionID: "s", IssueID: "issue-21", IssueIdentifier: "GEO-21"})
+	if msg := f.resumeUserMessage(); !strings.Contains(msg, "interrupted by timeout") {
+		t.Errorf("resume message = %q, want the generic instruction", msg)
 	}
 }

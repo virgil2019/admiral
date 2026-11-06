@@ -336,8 +336,11 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 				// say so. Stamping FAILED here would strand a healthy task
 				// (FAILED is terminal for /resume and the reconciler).
 				w.logger.Info("ci_fix_round_interrupted", "pr_url", prURL, "round", round+1)
+				// Do NOT promise continuation: CI watches are in-process
+				// only, so nothing re-attaches after a restart (persisting
+				// them is the follow-up). Say what actually happened.
 				w.postResult(ctx, sessionID, linear.Response(fmt.Sprintf(
-					"⏸ admiral is restarting — the automatic CI fix round was stopped and will continue after the restart. PR: %s",
+					"⏸ admiral is restarting — the automatic CI fix round was stopped and was NOT resumed. The task stays DONE; check the PR's CI and comment `/fix` if it still fails. PR: %s",
 					prURL)))
 				return
 			}

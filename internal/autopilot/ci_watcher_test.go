@@ -1148,7 +1148,7 @@ func TestWatchPR_InterruptedFixRoundDoesNotFailTask(t *testing.T) {
 	defer cancel()
 	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
 
-	ciWatchTaskFailure(t, lc, "will continue after the restart")
+	ciWatchTaskFailure(t, lc, "was NOT resumed")
 	if state, errMsg := taskStateSnapshot(db); state != store.JobStateDone || errMsg != "" {
 		t.Errorf("task = %q/%q, want it left DONE for the next boot", state, errMsg)
 	}

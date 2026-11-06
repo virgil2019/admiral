@@ -157,7 +157,7 @@ func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTa
 	}
 
 	if canResume {
-		n, err := o.db.IncrementAutoResumeCount(row.IssueID)
+		n, err := o.db.IncrementAutoResumeCount(row.IssueID, row.AttemptN)
 		if err != nil {
 			// A store hiccup is not "the cap was reached" — escalating here
 			// would demote a resumable task to manual recovery (and the row
@@ -173,15 +173,19 @@ func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTa
 			}
 			o.logger.Info("reconcile_resuming",
 				"issue", row.IssueIdentifier, "attempt_n", row.AttemptN, "auto_resume", n)
-			o.postToTaskThread(row, linear.Response(fmt.Sprintf(
-				"admiral restarted mid-run and is resuming this task (attempt %d, automatic resume %d/%d).",
-				row.AttemptN, n, maxAutoResumes)))
 			go func() {
+				// Ownership is re-checked first: a /rerun can supersede the
+				// row between the sweep's read and this launch, and telling
+				// the thread "resuming" for a resume we then abandon is a
+				// promise nobody keeps.
 				if !o.stillResumable(*row) {
 					o.logger.Info("reconcile_resume_superseded",
 						"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
 					return
 				}
+				o.postToTaskThread(row, linear.Response(fmt.Sprintf(
+					"admiral restarted mid-run and is resuming this task (attempt %d, automatic resume %d/%d).",
+					row.AttemptN, n, maxAutoResumes)))
 				o.resumeOrphanRun(ev, row)
 			}()
 			return orphanResumed
@@ -202,15 +206,19 @@ func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTa
 		reason = fmt.Sprintf("the run was interrupted and automatic resume was already used %d times", maxAutoResumes)
 	}
 	o.logger.Warn("reconcile_escalate", "issue", row.IssueIdentifier, "reason", reason)
-	// Leave the recoverable set so this sweep does not re-post the same
-	// warning every ReconcileInterval; /rerun and /resume still work.
-	if err := o.db.MarkTaskUnrecoverable(row.IssueID, reason); err != nil {
-		o.logger.Warn("reconcile_mark_unrecoverable_failed",
-			"issue", row.IssueIdentifier, "err", err)
-	}
-	o.postToTaskThread(row, linear.Response(fmt.Sprintf(
+	posted := o.postToTaskThread(row, linear.Response(fmt.Sprintf(
 		"⚠️ admiral stopped this task mid-run (%s).\n\nWorktree: `%s`\nBranch: `%s`\nPR: %s\n\nReply `/rerun` on the issue to start a fresh attempt.",
 		reason, row.WorktreePath, row.Branch, row.PRURL)))
+
+	// Only leave the recoverable set once the human was actually told —
+	// marking first would drop the row from every later sweep even when both
+	// delivery paths failed (Linear restarting is the common case).
+	if posted {
+		if err := o.db.MarkTaskUnrecoverable(row.IssueID, reason); err != nil {
+			o.logger.Warn("reconcile_mark_unrecoverable_failed",
+				"issue", row.IssueIdentifier, "err", err)
+		}
+	}
 	return orphanEscalated
 }
 
@@ -234,26 +242,28 @@ func (o *Orchestrator) stillResumable(row store.AdmiralTask) bool {
 // stored one) the message goes onto the issue itself instead: an escalation
 // that lands nowhere is the silent failure this whole sweep exists to
 // prevent.
-func (o *Orchestrator) postToTaskThread(task *store.AdmiralTask, a linear.AgentActivity) {
+func (o *Orchestrator) postToTaskThread(task *store.AdmiralTask, a linear.AgentActivity) bool {
 	if task == nil {
-		return
+		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if task.LastEventSessionID != "" {
 		if err := o.lc.PostAgentActivity(ctx, task.LastEventSessionID, a); err == nil {
-			return
+			return true
 		} else {
 			o.logger.Warn("task_thread_post_failed",
 				"issue", task.IssueIdentifier, "err", err)
 		}
 	}
 	if task.IssueID == "" {
-		return
+		return false
 	}
 	if err := o.lc.CreateComment(ctx, task.IssueID, a.Body); err != nil {
 		o.logger.Error("task_issue_comment_failed",
 			"issue", task.IssueIdentifier, "err", err)
+		return false
 	}
+	return true
 }

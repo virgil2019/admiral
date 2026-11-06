@@ -171,6 +171,17 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 				task.PRURL, gateFail.Attempts)))
 			return
 		}
+		if o.shuttingDown() || errors.Is(err, context.Canceled) {
+			// The daemon is going down mid-round. Report on a fresh context
+			// (ctx is already cancelled) so the reviewer is not left
+			// wondering why nothing happened; the feedback must be
+			// re-triggered after the restart.
+			o.logger.Info("review_run_interrupted_by_shutdown", "pr", task.PRURL)
+			nctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = deps.replier.Fail(nctx, "admiral is restarting — this review round was stopped before it finished. Comment again to re-trigger it.")
+			return
+		}
 		o.logger.Error("review_run_claude_failed", "pr", task.PRURL, "err", err)
 		_ = deps.replier.Fail(ctx, fmt.Sprintf("admiral: review run failed: %v", err))
 		return
