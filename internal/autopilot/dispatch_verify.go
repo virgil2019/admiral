@@ -310,6 +310,23 @@ func hasAcceptanceCriteriaSection(desc string) bool {
 // round cap from being hit by repeated re-enqueues of a stable auto-passed
 // wrapper — once closed, the verify row is no longer eligible to run again.
 func (o *Orchestrator) runVerify(parentID string) {
+	defer o.beginRun("")()
+	// A verification cut short by a restart never produced a verdict. Give
+	// the round back so the discoverer's boot rescan (status=active AND
+	// rounds=1) re-runs it; otherwise it sits active with no wakeup.
+	verdictApplied := false
+	defer func() {
+		// A verdict that already landed describes the work; refunding its
+		// round would make the boot rescan run the whole judge again.
+		if !o.shuttingDown() || verdictApplied {
+			return
+		}
+		if err := o.db.ResetTaskVerificationRound(parentID); err != nil {
+			o.logger.Warn("verify_round_reset_failed", "parent", parentID, "err", err)
+		} else {
+			o.logger.Info("verify_interrupted_by_shutdown", "parent", parentID)
+		}
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			o.logger.Error("verify_run_panic", "parent", parentID, "panic", r)
@@ -319,7 +336,7 @@ func (o *Orchestrator) runVerify(parentID string) {
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
+	ctx, cancel := context.WithTimeout(o.baseCtx(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 
@@ -353,6 +370,7 @@ func (o *Orchestrator) runVerify(parentID string) {
 	if !hasAcceptanceCriteriaSection(mat.PRD) && len(mat.Subs) > 0 {
 		o.logger.Info("verify_auto_pass",
 			"parent", parentID, "identifier", mat.ParentIdentifier)
+		verdictApplied = true
 		o.applyVerifyVerdict(ctx, parentID, mat.ParentIdentifier, teamID, projectID,
 			&verifyVerdict{
 				Complete: true,
@@ -426,6 +444,7 @@ func (o *Orchestrator) runVerify(parentID string) {
 	// PR. The judge prompt already requires this on its own; this enforces it.
 	overrideVerdictOnBuildFail(verdict, mat.BuildResult)
 
+	verdictApplied = true
 	o.applyVerifyVerdict(ctx, parentID, mat.ParentIdentifier, teamID, projectID, verdict)
 }
 

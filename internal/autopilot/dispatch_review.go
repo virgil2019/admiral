@@ -111,6 +111,7 @@ func (o *Orchestrator) HandleReviewEvent(ctx context.Context, row *store.EventIn
 // and — when the run cannot even resolve the repo or its gh account, so there
 // is no PR client to reply with — on the Linear thread instead.
 func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
+	defer o.beginRun(task.IssueID)()
 	defer func() {
 		if r := recover(); r != nil {
 			o.logger.Error("review_run_panic", "pr", task.PRURL, "panic", r)
@@ -126,7 +127,7 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(context.Background(), prFixBudget(o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries))
+	ctx, cancel := context.WithTimeout(o.baseCtx(), prFixBudget(o.cfg.MaxRunSeconds, o.cfg.VerifyMaxRetries))
 	defer cancel()
 
 	deps, stage, err := o.resolvePRFixDeps(ctx, task)
@@ -135,13 +136,24 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 			"stage", stage, "issue", task.IssueIdentifier, "err", err)
 		switch stage {
 		case prFixStageRepo:
-			o.postReviewLinearNotice(task, linear.Response(
-				"admiral: cannot address review — could not resolve repo for this issue."))
+			// err carries the actionable reason (no repo, or a disabled repo
+			// with the PATCH that re-enables it); dropping it leaves the
+			// reviewer unable to tell a stop switch from a missing config.
+			o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
+				"admiral: cannot address review — %v", err)))
 		case prFixStageIdentity:
 			o.postReviewLinearNotice(task, linear.Response(fmt.Sprintf(
 				"admiral: cannot address review — %v", err)))
 		case prFixStageWorktree:
-			_ = deps.replier.Fail(ctx, fmt.Sprintf(
+			// On a cancelled ctx the reply would be dropped silently; a
+			// restart must still tell the reviewer to re-trigger.
+			rctx := ctx
+			if o.shuttingDown() || errors.Is(err, context.Canceled) {
+				var rcancel context.CancelFunc
+				rctx, rcancel = context.WithTimeout(context.Background(), 30*time.Second)
+				defer rcancel()
+			}
+			_ = deps.replier.Fail(rctx, fmt.Sprintf(
 				"admiral: cannot address review — failed to prepare worktree for branch %s: %v",
 				task.Branch, err))
 		}
@@ -170,6 +182,17 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 				task.PRURL, gateFail.Attempts)))
 			return
 		}
+		if o.shuttingDown() || errors.Is(err, context.Canceled) {
+			// The daemon is going down mid-round. Report on a fresh context
+			// (ctx is already cancelled) so the reviewer is not left
+			// wondering why nothing happened; the feedback must be
+			// re-triggered after the restart.
+			o.logger.Info("review_run_interrupted_by_shutdown", "pr", task.PRURL)
+			nctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = deps.replier.Fail(nctx, "admiral is restarting — this review round was stopped before it finished. Comment again to re-trigger it.")
+			return
+		}
 		o.logger.Error("review_run_claude_failed", "pr", task.PRURL, "err", err)
 		_ = deps.replier.Fail(ctx, fmt.Sprintf("admiral: review run failed: %v", err))
 		return
@@ -177,6 +200,16 @@ func (o *Orchestrator) runReview(task *store.AdmiralTask, reviewBody string) {
 
 	output := out.Output
 	if !out.Pushed {
+		if o.shuttingDown() || errors.Is(ctx.Err(), context.Canceled) {
+			// The push was cut short by the restart, not rejected by origin.
+			// ctx is already cancelled, so reply on a fresh one or the
+			// reviewer hears nothing at all.
+			o.logger.Info("review_run_interrupted_by_shutdown", "pr", task.PRURL, "stage", "push")
+			nctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = deps.replier.Fail(nctx, "admiral is restarting — this review round was stopped before it finished. Comment again to re-trigger it.")
+			return
+		}
 		output += "\n\n(note: push to origin failed — `" + task.Branch +
 			"` on origin has commits admiral didn't see. " +
 			"Local commits were discarded; trigger the review again to retry.)"
@@ -285,6 +318,14 @@ func (o *Orchestrator) resolvePRFixDeps(ctx context.Context, task *store.Admiral
 	repo, err := o.resolveRepoForReview(ctx, task)
 	if err != nil {
 		return nil, prFixStageRepo, err
+	}
+	// A disabled repo is the operator's "stop working here" switch; new runs,
+	// /fix and /resume already honour it, so review and CI fix rounds must
+	// too — they spawn claude and push to origin exactly like those paths.
+	if !repo.Enabled {
+		return nil, prFixStageRepo, fmt.Errorf(
+			"the repo for project %s is disabled — re-enable it with `PATCH /admin/repos/%s {\"enabled\":true}` before retrying",
+			repo.ProjectID, repo.ProjectID)
 	}
 
 	client, err := o.prClientFor(ctx, repo)

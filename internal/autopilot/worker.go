@@ -48,7 +48,7 @@ func (w *Worker) Run(ctx context.Context) {
 	w.logger.Info("worker_starting")
 
 	// Drain backlog on startup — natural recovery after restart
-	w.drain()
+	w.drain(ctx)
 
 	for {
 		select {
@@ -57,10 +57,10 @@ func (w *Worker) Run(ctx context.Context) {
 			return
 		case <-w.signal:
 			// New event enqueued; drain until empty
-			w.drain()
+			w.drain(ctx)
 		case <-time.After(w.pollEvery):
 			// Fallback polling; also catches missed signals
-			w.drain()
+			w.drain(ctx)
 		}
 	}
 }
@@ -69,11 +69,24 @@ func (w *Worker) Run(ctx context.Context) {
 // OAuth circuit breaker is open it short-circuits without touching the
 // queue — events stay pending and naturally drain once the user re-OAuths
 // and ClearAuthError fires.
-func (w *Worker) drain() {
+// drain claims pending events until the queue is empty or the process is
+// shutting down. Checking ctx matters now that a run's context descends from
+// the signal context: dispatching during shutdown would start a run that is
+// cancelled immediately, and each one becomes an interrupted row with no
+// session to resume — the reconciler can only escalate those. Leaving the
+// events pending lets the next boot process them properly.
+func (w *Worker) drain(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if w.authBroken() {
 		return
 	}
 	for {
+		if ctx.Err() != nil {
+			w.logger.Info("worker_drain_stopped_for_shutdown")
+			return
+		}
 		row, err := w.db.ClaimNextPendingEvent()
 		if err != nil {
 			w.logger.Error("worker_claim_failed", "err", err)

@@ -60,6 +60,33 @@ func (s *Store) BumpProductVerificationRound(projectID string) (*ProductVerifica
 	return s.GetProductVerification(projectID)
 }
 
+// ResetProductVerificationRound is the product-verification counterpart of
+// ResetTaskVerificationRound: a restart mid-verification must not burn the
+// round, or the boot rescan (rounds=1) can never pick it up again.
+func (s *Store) ResetProductVerificationRound(projectID string) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		UPDATE product_verifications
+		   SET rounds=1, updated_at=?
+		 WHERE project_id=? AND status='active'`,
+		time.Now().UTC().Format(time.RFC3339), projectID); err != nil {
+		return err
+	}
+	// Same rescan-dedup hazard as the task-level reset: the rescan enqueues
+	// under 'rescan-product-<project>-<rounds>', so a second interruption
+	// would collide with the first event and never be re-enqueued.
+	if _, err := tx.Exec(`
+		DELETE FROM events_inbox
+		 WHERE webhook_id LIKE 'rescan-product-' || ? || '-%'`, projectID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ListStuckProductVerifications mirrors ListStuckTaskVerifications for
 // the product-level table. product_verifications has no `summary`
 // column — the auto-pass marker for the task side has no analog here —

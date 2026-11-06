@@ -106,6 +106,36 @@ func (s *Store) SetTaskVerificationSummary(parentIssueID, summary string) error 
 	return nil
 }
 
+// ResetTaskVerificationRound hands a verification a fresh round after a
+// restart interrupted it. The round it burned never produced a verdict, and
+// the discoverer's boot rescan only re-enqueues rounds=1 rows — without the
+// reset the verification sits active forever, which is exactly the lost-event
+// jam the reconciler exists to prevent.
+func (s *Store) ResetTaskVerificationRound(parentIssueID string) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		UPDATE task_verifications
+		   SET rounds=1, summary='', updated_at=?
+		 WHERE parent_issue_id=? AND status='active'`,
+		time.Now().UTC().Format(time.RFC3339), parentIssueID); err != nil {
+		return err
+	}
+	// The rescan enqueues under a deterministic webhook_id
+	// (rescan-<parent>-<rounds>), so a SECOND interruption of the same
+	// verification would collide with the first rescan event and be dropped
+	// by INSERT OR IGNORE. Clear the old ones so the next rescan can enqueue.
+	if _, err := tx.Exec(`
+		DELETE FROM events_inbox
+		 WHERE webhook_id LIKE 'rescan-' || ? || '-%'`, parentIssueID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ListStuckTaskVerifications returns every task_verifications row in the
 // stuck shape that the discoverer's boot-time rescan is designed to
 // recover: status='active' AND rounds=1 AND summary is empty. This is the

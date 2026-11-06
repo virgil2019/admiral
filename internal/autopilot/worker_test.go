@@ -1,6 +1,7 @@
 package autopilot
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"log/slog"
@@ -342,7 +343,7 @@ func TestWorker_AuthBroken_SkipsDrain(t *testing.T) {
 	}
 
 	w := NewWorker(env.db, nil, slog.New(slog.NewTextHandler(&discardHandler{t}, nil)), env.sig)
-	w.drain()
+	w.drain(context.Background())
 
 	// Event must still be pending — drain bailed before claiming.
 	var status string
@@ -372,9 +373,9 @@ func TestWorker_AuthBroken_AlertOnceAndDedup(t *testing.T) {
 		return nil
 	}
 
-	w.drain() // first tick — should alert
-	w.drain() // second tick — should be deduped
-	w.drain() // third tick — still deduped
+	w.drain(context.Background()) // first tick — should alert
+	w.drain(context.Background()) // second tick — should be deduped
+	w.drain(context.Background()) // third tick — still deduped
 
 	if len(sent) != 1 {
 		t.Fatalf("expected exactly 1 alert, got %d: %v", len(sent), sent)
@@ -399,7 +400,7 @@ func TestWorker_AuthRecovery_ResumesDrain(t *testing.T) {
 	}
 
 	w := NewWorker(env.db, nil, slog.New(slog.NewTextHandler(&discardHandler{t}, nil)), env.sig)
-	w.drain()
+	w.drain(context.Background())
 	// Still pending — breaker is open.
 
 	if err := env.db.ClearAuthError(); err != nil {
@@ -410,7 +411,7 @@ func TestWorker_AuthRecovery_ResumesDrain(t *testing.T) {
 	// will panic on `w.orch.HandleAgentEvent`; the worker recovers it via
 	// the deferred recover() and marks the event failed/retry. Either way
 	// the event status moves off "pending", which is what we assert.
-	w.drain()
+	w.drain(context.Background())
 
 	var status string
 	if err := env.db.DB.QueryRow(`SELECT status FROM events_inbox WHERE webhook_id=?`, wh).Scan(&status); err != nil {
