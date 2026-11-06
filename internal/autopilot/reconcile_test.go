@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"errors"
+
 	"github.com/georgehuang/admiral/internal/config"
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
@@ -289,3 +291,55 @@ func funcName(decl string) string {
 	}
 	return ""
 }
+
+// TestMarkFailed_ShutdownIsResumable: a run stopped by SIGTERM must land in
+// TIMED_OUT/interrupted, not FAILED — FAILED is terminal for /resume and the
+// reconciler, so it would strand the task exactly when the next boot could
+// continue it.
+func TestMarkFailed_ShutdownIsResumable(t *testing.T) {
+	o, db, lc, _ := reconcileFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	o.SetRootContext(ctx)
+	cancel() // SIGTERM
+
+	task := &store.AdmiralTask{IssueID: "issue-9", IssueIdentifier: "GEO-9",
+		State: store.JobStateExecuting, Branch: "linear/GEO-9"}
+	db.LiveAdmiralTask = task
+	db.AdmiralTask = task
+
+	f := newFlow(o, context.Background(), linear.AgentEvent{
+		SessionID: "sess-9", IssueID: "issue-9", IssueIdentifier: "GEO-9"})
+	f.branch = "linear/GEO-9"
+
+	f.markFailed(context.Canceled)
+
+	if task.State != store.JobStateTimedOut {
+		t.Fatalf("state = %q, want TIMED_OUT (resumable)", task.State)
+	}
+	if !strings.HasPrefix(task.Error, store.InterruptedByShutdown) {
+		t.Errorf("error = %q, want the interrupted reason", task.Error)
+	}
+	if !strings.Contains(lc.GetPostedBody(), "will resume automatically") {
+		t.Errorf("notice = %q, want the resume promise", lc.GetPostedBody())
+	}
+}
+
+// TestMarkFailed_RealFailureStillFails: the shutdown special case must not
+// swallow genuine failures.
+func TestMarkFailed_RealFailureStillFails(t *testing.T) {
+	o, db, _, _ := reconcileFixture(t) // rootCtx not cancelled
+	task := &store.AdmiralTask{IssueID: "issue-10", State: store.JobStateExecuting}
+	db.LiveAdmiralTask = task
+	db.AdmiralTask = task
+
+	f := newFlow(o, context.Background(), linear.AgentEvent{
+		SessionID: "sess-10", IssueID: "issue-10", IssueIdentifier: "GEO-10"})
+	f.markFailed(errTestBoom)
+
+	if task.State != store.JobStateFailed {
+		t.Fatalf("state = %q, want FAILED", task.State)
+	}
+}
+
+// errTestBoom is a plain run failure.
+var errTestBoom = errors.New("claude exited 1")

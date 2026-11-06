@@ -2389,7 +2389,54 @@ func (f *flow) markOpenPRByOther(prURL, author string) error {
 	return nil
 }
 
+// shuttingDown reports whether the process is winding down: main roots
+// every run in the signal context, so a cancelled root means "stop", not
+// "this work is broken".
+func (o *Orchestrator) shuttingDown() bool {
+	return o.rootCtx != nil && o.rootCtx.Err() != nil
+}
+
+// markInterrupted records a run that was stopped by a shutdown: TIMED_OUT
+// with the interrupted reason, which /resume accepts and the boot reconciler
+// picks up to continue the same attempt automatically.
+func (f *flow) markInterrupted(runErr error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	reason := store.InterruptedByShutdown
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		reason = store.InterruptedByShutdown + ": " + truncate(runErr.Error(), 200)
+	}
+	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateTimedOut
+		j.Error = reason
+		j.FinishedAt = now
+	})
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateTimedOut
+		t.Error = reason
+		t.FinishedAt = now
+	})
+	f.o.logger.Info("run_interrupted_by_shutdown",
+		"issue", f.ev.IssueIdentifier, "session", f.ev.SessionID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	body := f.creatorMention() + "admiral is restarting — this run was stopped mid-flight and will resume automatically on the next start.\n\n"
+	if f.branch != "" {
+		body += "Branch: `" + f.branch + "`"
+	}
+	_ = f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, linear.Response(body))
+}
+
 func (f *flow) markFailed(runErr error) {
+	// A run killed by shutdown is not a failure: the work is resumable, and
+	// FAILED is terminal for both /resume and the reconciler, so stamping it
+	// would strand the task exactly when the next boot could have continued
+	// it. Record it as interrupted instead.
+	if f.o.shuttingDown() {
+		f.markInterrupted(runErr)
+		return
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
 		j.State = store.JobStateFailed
