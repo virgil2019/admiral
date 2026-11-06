@@ -519,6 +519,58 @@ func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber
 	if err != nil {
 		return nil, fmt.Errorf("resolve gh account %q: %w", ghUser, err)
 	}
+	// Resolve the head FIRST and ask for that commit's check runs
+	// specifically. `gh pr checks` serves whatever GitHub has finished
+	// reporting for the PR, which after a push can still be the PREVIOUS
+	// head's completed failures — reading that as the new head's verdict
+	// spends a fix round on code that is already fixed, and with the round
+	// cap reached it escalates a PR that is actually green.
+	head, err := w.fetchHeadSHA(ctx, dir, prNumber, ghUser)
+	if err != nil || head == "" {
+		// Without a head we cannot bind the verdict; fall back to the PR
+		// view and let the stale-head guard in watch() judge it.
+		return w.fetchPRChecks(ctx, dir, prNumber, env)
+	}
+	out, err := captureCmdEnv(ctx, dir, env, w.ghBin,
+		"api", "--paginate",
+		fmt.Sprintf("repos/{owner}/{repo}/commits/%s/check-runs", head),
+		// One object per line (NDJSON): --paginate concatenates pages, so a
+		// single JSON array per page would not parse.
+		"--jq", `.check_runs[] | {name: .name, status: .status, conclusion: (.conclusion // ""), url: (.html_url // "")}`,
+	)
+	if err != nil {
+		return w.fetchPRChecks(ctx, dir, prNumber, env)
+	}
+	runs, perr := parseCheckRunLines(out)
+	if perr != nil || len(runs) == 0 {
+		// An older gh, an enterprise host, or a PR with no registered checks
+		// yet: fall back to the head-agnostic view and let the stale-head
+		// guard judge it.
+		return w.fetchPRChecks(ctx, dir, prNumber, env)
+	}
+	return runs, nil
+}
+
+// parseCheckRunLines decodes one checkRun per line, skipping blanks.
+func parseCheckRunLines(out string) ([]checkRun, error) {
+	var runs []checkRun
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var r checkRun
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			return nil, err
+		}
+		runs = append(runs, r)
+	}
+	return runs, nil
+}
+
+// fetchPRChecks is the head-agnostic fallback: whatever GitHub reports for
+// the PR. Used only when the head SHA could not be resolved.
+func (w *CIWatcher) fetchPRChecks(ctx context.Context, dir string, prNumber int, env []string) ([]checkRun, error) {
 	out, err := captureCmdEnv(ctx, dir, env, w.ghBin,
 		"pr", "checks", fmt.Sprintf("%d", prNumber),
 		"--json", "name,status,conclusion,url",

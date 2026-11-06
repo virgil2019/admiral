@@ -947,6 +947,17 @@ func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 	release := o.acquireRunSlot()
 	defer release()
 
+	// The branch lock and the run slot can both wait for a long time. A
+	// /rerun drained meanwhile supersedes the row, and this /fix would then
+	// drive the OLD branch while writing onto the NEW attempt — same guard
+	// runResume already carries.
+	if cur, err := o.db.GetAdmiralTaskByIssue(ev.IssueID); err != nil || cur == nil ||
+		cur.AttemptN != task.AttemptN {
+		o.logger.Info("fix_superseded",
+			"issue", ev.IssueIdentifier, "attempt_n", task.AttemptN, "err", err)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(o.baseCtx(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
@@ -985,6 +996,7 @@ func (o *Orchestrator) runFix(ev linear.AgentEvent, task *store.AdmiralTask) {
 		ClaudeSessionID: task.ClaudeSessionID,
 	}
 	resumeFlow := newResumeFlow(o, ctx, ev, syntheticPrior)
+	resumeFlow.expectAttemptN = task.AttemptN
 	// Identity gate: the run's gh calls (PR lookups, PR comments, CI checks,
 	// the claude subprocess) authenticate as the repo's registered account.
 	// (The branch push itself goes over the remote's SSH identity, which is
@@ -1170,6 +1182,7 @@ func (o *Orchestrator) runResume(ev linear.AgentEvent, task *store.AdmiralTask) 
 		ClaudeSessionID: task.ClaudeSessionID,
 	}
 	resumeFlow := newResumeFlow(o, ctx, ev, syntheticPrior)
+	resumeFlow.expectAttemptN = task.AttemptN
 	if err := o.prepareResume(resumeFlow, ev); err != nil {
 		o.logger.Error("resume_resolve_identity_failed",
 			"issue", ev.IssueIdentifier, "session", ev.SessionID, "err", err)
@@ -1279,6 +1292,11 @@ func (o *Orchestrator) dispatchAwaitingReply(ev linear.AgentEvent, task *store.A
 // answer injected, then opens a PR as usual.
 func (o *Orchestrator) runAwaitingResume(ev linear.AgentEvent, task *store.AdmiralTask, pq *store.PendingQuestion, reply string) {
 	defer o.beginRun(ev.IssueID)()
+	// Same branch as every other worktree-using path: a review or CI round
+	// running ensureReviewWorktree (git reset --hard + clean) against this
+	// worktree while claude is mid-edit would wipe the run's work.
+	unlockPRFix := o.lockPRFix(task.Branch)
+	defer unlockPRFix()
 	release := o.acquireRunSlot()
 	defer release()
 
@@ -1426,6 +1444,7 @@ func (o *Orchestrator) runWithAttempt(ev linear.AgentEvent, attemptN int) {
 
 	flow := newFlow(o, ctx, ev)
 	flow.attemptN = attemptN
+	flow.expectAttemptN = attemptN
 	if err := flow.execute(); err != nil {
 		// Check shutdown before the timeout heuristics: a cancelled run is
 		// also killed (claude exits with "signal: killed"), and reporting it
@@ -1479,6 +1498,9 @@ type flow struct {
 	// attemptN  > 1 → /rerun, branch becomes linear/<id>-rerun-<N>.
 	// Set by Orchestrator.runWithAttempt before flow.execute.
 	attemptN int
+	// expectAttemptN guards every row write this flow performs: when set, a
+	// row whose attempt_n moved on (a /rerun superseded it) is left alone.
+	expectAttemptN int
 
 	// followupSuffix, when non-empty, is appended to the deterministic
 	// branch name and worktree path so a follow-up after a merged PR
@@ -1552,7 +1574,7 @@ func (f *flow) resumableAfterRestart() bool {
 // taskSettled reports whether a state consumed any pending answer. TIMED_OUT
 // with the interrupted marker does NOT count: that run never consumed the
 // answer, and the reconciler needs to find it.
-func taskSettled(state, errText string) bool {
+func taskSettled(state string) bool {
 	switch state {
 	case store.JobStateDone, store.JobStateDoneThreadInconsistent,
 		store.JobStateDoneMerged, store.JobStateFailed, store.JobStateCancelled:
@@ -1577,9 +1599,16 @@ func (f *flow) persistAdmiralTask(fn func(*store.AdmiralTask)) {
 	reachedDone := false
 	settled := false
 	err := f.o.db.UpdateAdmiralTask(f.ev.IssueID, func(t *store.AdmiralTask) {
+		// A /rerun can supersede the row while this flow was waiting for a
+		// lock or a slot. Its writes describe the OLD attempt; applying them
+		// to the new row would flip a live attempt to DONE/FAILED and clear
+		// its error, resume budget and pending question.
+		if f.expectAttemptN > 0 && t.AttemptN != f.expectAttemptN {
+			return
+		}
 		fn(t)
 		reachedDone = t.State == store.JobStateDone
-		settled = taskSettled(t.State, t.Error)
+		settled = taskSettled(t.State)
 	})
 	if err == nil && reachedDone {
 		// Reaching DONE proves the task is healthy, which resets the

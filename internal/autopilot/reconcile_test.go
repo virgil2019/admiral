@@ -697,13 +697,13 @@ func TestReconcile_BlockedRowIsDeferredNotParked(t *testing.T) {
 // never ran, so the ask_user answer is still unconsumed. Clearing the pointer
 // there destroys the only copy of the user's instruction.
 func TestTaskSettled_TimedOutKeepsTheAnswer(t *testing.T) {
-	if taskSettled(store.JobStateTimedOut, "fetch issue: boom") {
+	if taskSettled(store.JobStateTimedOut) {
 		t.Error("TIMED_OUT reported as settled — the pending answer would be dropped")
 	}
-	if !taskSettled(store.JobStateDone, "") {
+	if !taskSettled(store.JobStateDone) {
 		t.Error("DONE should be settled")
 	}
-	if !taskSettled(store.JobStateFailed, "claude exited 1") {
+	if !taskSettled(store.JobStateFailed) {
 		t.Error("FAILED should be settled")
 	}
 }
@@ -733,5 +733,71 @@ func TestRunVerify_RealFailureKeepsTheRound(t *testing.T) {
 	o.runVerify("parent-issue-2")
 	if len(db.TaskVerifyResets) != 0 {
 		t.Errorf("refunded a round outside shutdown: %v", db.TaskVerifyResets)
+	}
+}
+
+// TestPersistAdmiralTask_IgnoresSupersededAttempt: a flow whose row was
+// superseded by a /rerun must not write onto the new attempt — its writes
+// describe the old branch/worktree, and DONE/FAILED there would flip a live
+// attempt and clear its error, resume budget and pending question.
+func TestPersistAdmiralTask_IgnoresSupersededAttempt(t *testing.T) {
+	o, db, _, _ := reconcileFixture(t)
+	live := &store.AdmiralTask{IssueID: "issue-60", State: store.JobStateExecuting, AttemptN: 2}
+	db.LiveAdmiralTask = live
+	db.AdmiralTask = live
+
+	f := newFlow(o, context.Background(), linear.AgentEvent{
+		SessionID: "s", IssueID: "issue-60", IssueIdentifier: "GEO-60"})
+	f.expectAttemptN = 1 // this flow belongs to attempt 1
+
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateDone
+	})
+
+	if live.State != store.JobStateExecuting {
+		t.Fatalf("live attempt state = %q, want it untouched (EXECUTING)", live.State)
+	}
+}
+
+// TestPersistAdmiralTask_AppliesOwnAttempt: the guard must not block the
+// flow's own writes.
+func TestPersistAdmiralTask_AppliesOwnAttempt(t *testing.T) {
+	o, db, _, _ := reconcileFixture(t)
+	live := &store.AdmiralTask{IssueID: "issue-61", State: store.JobStateExecuting, AttemptN: 2}
+	db.LiveAdmiralTask = live
+	db.AdmiralTask = live
+
+	f := newFlow(o, context.Background(), linear.AgentEvent{
+		SessionID: "s", IssueID: "issue-61", IssueIdentifier: "GEO-61"})
+	f.expectAttemptN = 2
+
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateDone
+	})
+
+	if live.State != store.JobStateDone {
+		t.Fatalf("state = %q, want DONE for the flow's own attempt", live.State)
+	}
+}
+
+// TestRunFix_AbortsWhenSuperseded: the branch lock and run slot can wait for
+// a long time; a /rerun drained meanwhile must win.
+func TestRunFix_AbortsWhenSuperseded(t *testing.T) {
+	o, db, _, _ := reconcileFixture(t)
+	live := &store.AdmiralTask{IssueID: "issue-62", State: store.JobStateExecuting, AttemptN: 3}
+	db.LiveAdmiralTask = live
+	db.AdmiralTask = live
+
+	task := &store.AdmiralTask{
+		IssueID: "issue-62", IssueIdentifier: "GEO-62", State: store.JobStateDone,
+		AttemptN: 1, Branch: "linear/GEO-62", PRURL: "https://github.com/acme/repo/pull/1",
+	}
+
+	o.runFix(linear.AgentEvent{SessionID: "s", IssueID: "issue-62", IssueIdentifier: "GEO-62"}, task)
+
+	for _, st := range db.StateTransitionSnapshot() {
+		if st == store.JobStateExecuting {
+			t.Fatalf("superseded /fix drove the live row to EXECUTING: %v", db.StateTransitionSnapshot())
+		}
 	}
 }

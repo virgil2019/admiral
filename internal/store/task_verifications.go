@@ -106,20 +106,6 @@ func (s *Store) SetTaskVerificationSummary(parentIssueID, summary string) error 
 	return nil
 }
 
-// ListStuckTaskVerifications returns every task_verifications row in the
-// stuck shape that the discoverer's boot-time rescan is designed to
-// recover: status='active' AND rounds=1 AND summary is empty. This is the
-// signature left behind when runClaudeForVerify (or runProductVerify)
-// bumped rounds to 1 but the apply step never ran — historically because
-// the argv exceeded ARG_MAX and the kernel rejected fork(2) before
-// claude even started. See GEO-267 incident and PR #187 / #<rescan-PR>.
-//
-// `rounds=1` is the lower bound: a row stuck at rounds=2 would mean a
-// re-verify already attempted and failed, which the in-flight check in
-// the rescan helper handles separately. The empty `summary` is the
-// discriminator from a successful first round that was simply not
-// closed yet (the auto-pass branch in runVerify writes a non-empty
-// summary before flipping status).
 // ResetTaskVerificationRound hands a verification a fresh round after a
 // restart interrupted it. The round it burned never produced a verdict, and
 // the discoverer's boot rescan only re-enqueues rounds=1 rows — without the
@@ -134,6 +120,20 @@ func (s *Store) ResetTaskVerificationRound(parentIssueID string) error {
 	return err
 }
 
+// ListStuckTaskVerifications returns every task_verifications row in the
+// stuck shape that the discoverer's boot-time rescan is designed to
+// recover: status='active' AND rounds=1 AND summary is empty. This is the
+// signature left behind when runClaudeForVerify (or runProductVerify)
+// bumped rounds to 1 but the apply step never ran — historically because
+// the argv exceeded ARG_MAX and the kernel rejected fork(2) before
+// claude even started. See GEO-267 incident and PR #187 / #<rescan-PR>.
+//
+// `rounds=1` is the lower bound: a row stuck at rounds=2 would mean a
+// re-verify already attempted and failed, which the in-flight check in
+// the rescan helper handles separately. The empty `summary` is the
+// discriminator from a successful first round that was simply not
+// closed yet (the auto-pass branch in runVerify writes a non-empty
+// summary before flipping status).
 func (s *Store) ListStuckTaskVerifications(ctx context.Context) ([]TaskVerification, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT parent_issue_id, rounds, status, summary, updated_at

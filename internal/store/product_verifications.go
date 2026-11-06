@@ -60,13 +60,6 @@ func (s *Store) BumpProductVerificationRound(projectID string) (*ProductVerifica
 	return s.GetProductVerification(projectID)
 }
 
-// ListStuckProductVerifications mirrors ListStuckTaskVerifications for
-// the product-level table. product_verifications has no `summary`
-// column — the auto-pass marker for the task side has no analog here —
-// so the stuck shape is solely `status='active' AND rounds=1`.
-//
-// Same recovery rationale as ListStuckTaskVerifications: a row bumped
-// to rounds=1 whose apply step never ran. See PR #187 / GEO-267.
 // ResetProductVerificationRound is the product-verification counterpart of
 // ResetTaskVerificationRound: a restart mid-verification must not burn the
 // round, or the boot rescan (rounds=1) can never pick it up again.
@@ -79,6 +72,13 @@ func (s *Store) ResetProductVerificationRound(projectID string) error {
 	return err
 }
 
+// ListStuckProductVerifications mirrors ListStuckTaskVerifications for
+// the product-level table. product_verifications has no `summary`
+// column — the auto-pass marker for the task side has no analog here —
+// so the stuck shape is solely `status='active' AND rounds=1`.
+//
+// Same recovery rationale as ListStuckTaskVerifications: a row bumped
+// to rounds=1 whose apply step never ran. See PR #187 / GEO-267.
 func (s *Store) ListStuckProductVerifications(ctx context.Context) ([]ProductVerification, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT project_id, rounds, status, updated_at
