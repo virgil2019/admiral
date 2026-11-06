@@ -2325,11 +2325,15 @@ func (s *Store) ClearPendingQuestion(issueID string) {
 // back to EXECUTING. Returns true when the row was updated (i.e. this caller
 // won the race), false when another goroutine already changed the state.
 func (s *Store) TransitionAwaitingInputToExecuting(issueID string) (bool, error) {
+	// started_at is refreshed because the runnable window restarts here: the
+	// reconciler uses it as its "too fresh to judge" marker, and without the
+	// bump the gap between this write and beginRun() would look like an
+	// orphaned EXECUTING row (see TransitionBlockedToReceived).
 	res, err := s.DB.Exec(`
 		UPDATE admiral_tasks
-		SET state=?
+		SET state=?, started_at=?
 		WHERE issue_id=? AND state=?
-	`, JobStateExecuting, issueID, JobStateAwaitingInput)
+	`, JobStateExecuting, time.Now().UTC().Format(time.RFC3339), issueID, JobStateAwaitingInput)
 	if err != nil {
 		return false, err
 	}

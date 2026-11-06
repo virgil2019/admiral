@@ -306,6 +306,14 @@ func (o *Orchestrator) resolvePRFixDeps(ctx context.Context, task *store.Admiral
 	if err != nil {
 		return nil, prFixStageRepo, err
 	}
+	// A disabled repo is the operator's "stop working here" switch; new runs,
+	// /fix and /resume already honour it, so review and CI fix rounds must
+	// too — they spawn claude and push to origin exactly like those paths.
+	if !repo.Enabled {
+		return nil, prFixStageRepo, fmt.Errorf(
+			"the repo for project %s is disabled — re-enable it with `PATCH /admin/repos/%s {\"enabled\":true}` before retrying",
+			repo.ProjectID, repo.ProjectID)
+	}
 
 	client, err := o.prClientFor(ctx, repo)
 	if err != nil {

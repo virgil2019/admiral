@@ -354,9 +354,9 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 		// Give GitHub a moment to register the new head's check runs before
 		// the re-poll: a poll landing too early resolves the previous
 		// head's completed failing checks and burns a round on stale data.
-		// The settle sleep plus the justPushed re-observation above narrow
-		// the stale-head race; between them it cannot misattribute a stale
-		// failure to the new head. (As in pollUntilFinal, the Done branch
+		// The head-SHA binding in the loop above is what catches that case:
+		// an observation tied to the head we already fixed is rejected, and
+		// two consecutive rejections escalate rather than loop. (As in pollUntilFinal, the Done branch
 		// is by-construction dead here — the ctx is detached — and kept
 		// for future cancelable callers.)
 		round++

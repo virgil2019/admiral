@@ -689,3 +689,18 @@ func TestReconcile_BlockedRowIsDeferredNotParked(t *testing.T) {
 		t.Error("resumed a blocked task")
 	}
 }
+
+// TestTaskSettled_TimedOutKeepsTheAnswer: a pre-flight TIMED_OUT means claude
+// never ran, so the ask_user answer is still unconsumed. Clearing the pointer
+// there destroys the only copy of the user's instruction.
+func TestTaskSettled_TimedOutKeepsTheAnswer(t *testing.T) {
+	if taskSettled(store.JobStateTimedOut, "fetch issue: boom") {
+		t.Error("TIMED_OUT reported as settled — the pending answer would be dropped")
+	}
+	if !taskSettled(store.JobStateDone, "") {
+		t.Error("DONE should be settled")
+	}
+	if !taskSettled(store.JobStateFailed, "claude exited 1") {
+		t.Error("FAILED should be settled")
+	}
+}

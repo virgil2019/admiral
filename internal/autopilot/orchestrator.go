@@ -1116,6 +1116,11 @@ func isPreparePhaseError(err error) bool {
 // a continuation of the same attempt, not a new one.
 func (o *Orchestrator) runResume(ev linear.AgentEvent, task *store.AdmiralTask) {
 	defer o.beginRun(ev.IssueID)()
+	// Same branch lock as every other PR-fix path, taken before the slot: two
+	// resumes of one attempt (a reconciler auto-resume and a manual /resume)
+	// would otherwise run claude concurrently in one worktree.
+	unlockPRFix := o.lockPRFix(task.Branch)
+	defer unlockPRFix()
 	release := o.acquireRunSlot()
 	defer release()
 
@@ -1530,7 +1535,11 @@ func taskSettled(state, errText string) bool {
 		store.JobStateDoneMerged, store.JobStateFailed, store.JobStateCancelled:
 		return true
 	case store.JobStateTimedOut:
-		return !strings.HasPrefix(errText, store.InterruptedByShutdown)
+		// Never: a pre-flight timeout means claude never ran, so the answer is
+		// unconsumed, and a post-run timeout leaving the pointer in place only
+		// risks re-sending an answer claude already saw. Losing it is far
+		// worse than repeating it.
+		return false
 	}
 	return false
 }

@@ -124,6 +124,7 @@ be signed in and have push permission):
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
   -X POST http://127.0.0.1:8788/admin/repos \
   -d '{"team_id":"<linear-team-uuid>","team_name":"Engineering",
        "repo_dir":"/home/you/code/your-repo","base_branch":"main",
