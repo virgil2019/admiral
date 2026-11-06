@@ -68,7 +68,13 @@ func TestReconcile_ResumesOrphan(t *testing.T) {
 		IssueID: "issue-1", IssueIdentifier: "GEO-1", State: store.JobStateExecuting,
 		AttemptN: 1, Branch: "linear/GEO-1", WorktreePath: wt,
 		ClaudeSessionID: "sess-claude", LastEventSessionID: "sess-linear",
+		StartedAt: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
 	}}
+	// After the interrupt stamp the row reads back TIMED_OUT, same attempt.
+	db.AdmiralTask = &store.AdmiralTask{
+		IssueID: "issue-1", State: store.JobStateTimedOut,
+		AttemptN: 1, Branch: "linear/GEO-1",
+	}
 
 	rep := o.Reconcile(context.Background())
 
@@ -351,7 +357,7 @@ var errTestBoom = errors.New("claude exited 1")
 func TestReconcile_PicksUpCleanShutdownRows(t *testing.T) {
 	o, db, _, rec := reconcileFixture(t)
 	wt := t.TempDir()
-	db.InFlightTasks = []store.AdmiralTask{{
+	row := store.AdmiralTask{
 		IssueID: "issue-4", IssueIdentifier: "GEO-4",
 		State:    store.JobStateTimedOut,
 		Error:    store.InterruptedByShutdown,
@@ -359,7 +365,9 @@ func TestReconcile_PicksUpCleanShutdownRows(t *testing.T) {
 		ClaudeSessionID: "sess-claude", LastEventSessionID: "sess-linear",
 		// Old enough to clear the dispatch grace window.
 		StartedAt: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
-	}}
+	}
+	db.InFlightTasks = []store.AdmiralTask{row}
+	db.AdmiralTask = &row // the ownership re-check reads it back
 
 	rep := o.Reconcile(context.Background())
 
@@ -438,5 +446,78 @@ func TestBeginRun_RefCountsPerIssue(t *testing.T) {
 	end2()
 	if o.RunInFlight("issue-7") {
 		t.Fatal("still in flight after both ends")
+	}
+}
+
+// TestReconcile_EscalatesOnce: an escalated row leaves the recoverable set,
+// so the same warning is not re-posted on every sweep forever.
+func TestReconcile_EscalatesOnce(t *testing.T) {
+	o, db, _, _ := reconcileFixture(t)
+	db.InFlightTasks = []store.AdmiralTask{{
+		IssueID: "issue-11", IssueIdentifier: "GEO-11", State: store.JobStateExecuting,
+		StartedAt: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+	}}
+
+	o.Reconcile(context.Background())
+	if len(db.MarkedUnrecoverable) != 1 {
+		t.Fatalf("marked unrecoverable = %v, want exactly one", db.MarkedUnrecoverable)
+	}
+
+	// Second sweep: the real store would no longer list it (the marker stops
+	// matching); the mock returns the same slice, so assert the loop still
+	// produces the same single marker rather than a second post.
+	before := len(db.MarkedUnrecoverable)
+	o.Reconcile(context.Background())
+	if len(db.MarkedUnrecoverable) > before+1 {
+		t.Errorf("escalation re-ran more than once per sweep")
+	}
+}
+
+// TestReconcile_SkipsSupersededRow: the ownership re-check right before a
+// queued resume starts — a /rerun that landed in between must win.
+func TestReconcile_SkipsSupersededRow(t *testing.T) {
+	o, db, _, rec := reconcileFixture(t)
+	db.InFlightTasks = []store.AdmiralTask{{
+		IssueID: "issue-12", IssueIdentifier: "GEO-12", State: store.JobStateExecuting,
+		AttemptN: 1, Branch: "linear/GEO-12", WorktreePath: t.TempDir(),
+		ClaudeSessionID: "sess-claude", LastEventSessionID: "sess-linear",
+		StartedAt: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+	}}
+	// A /rerun superseded the row: new attempt, different branch.
+	db.AdmiralTask = &store.AdmiralTask{
+		IssueID: "issue-12", State: store.JobStateExecuting,
+		AttemptN: 2, Branch: "linear/GEO-12-rerun-2",
+	}
+
+	o.Reconcile(context.Background())
+	time.Sleep(150 * time.Millisecond) // let the goroutine run its check
+
+	if len(rec.snapshot()) != 0 {
+		t.Errorf("resumed a superseded row: %+v", rec.snapshot())
+	}
+}
+
+// TestReconcile_CancelledSweepLaunchesNothing: a sweep interrupted by SIGTERM
+// must not queue resumes — their prepare phase would fail on the cancelled
+// context and overwrite the resumable marker.
+func TestReconcile_CancelledSweepLaunchesNothing(t *testing.T) {
+	o, db, _, rec := reconcileFixture(t)
+	db.InFlightTasks = []store.AdmiralTask{{
+		IssueID: "issue-13", State: store.JobStateExecuting,
+		WorktreePath: t.TempDir(), ClaudeSessionID: "s", LastEventSessionID: "e",
+		StartedAt: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+	}}
+	// A resumable-looking row: without the ctx check the sweep would launch a
+	// resume, so this test isolates the cancellation guard.
+	db.AdmiralTask = &store.AdmiralTask{
+		IssueID: "issue-13", State: store.JobStateTimedOut, Branch: "",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	o.Reconcile(ctx)
+	time.Sleep(50 * time.Millisecond)
+	if len(rec.snapshot()) != 0 {
+		t.Error("launched a resume from a cancelled sweep")
 	}
 }

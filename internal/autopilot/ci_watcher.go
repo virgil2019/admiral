@@ -3,6 +3,7 @@ package autopilot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -330,6 +331,16 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 			failure, round+1, w.maxFixRounds)))
 
 		if err := w.fixRound(ctx, task, failure); err != nil {
+			if errors.Is(err, errFixRoundInterrupted) {
+				// The daemon is going down mid-round: leave the task DONE and
+				// say so. Stamping FAILED here would strand a healthy task
+				// (FAILED is terminal for /resume and the reconciler).
+				w.logger.Info("ci_fix_round_interrupted", "pr_url", prURL, "round", round+1)
+				w.postResult(ctx, sessionID, linear.Response(fmt.Sprintf(
+					"⏸ admiral is restarting — the automatic CI fix round was stopped and will continue after the restart. PR: %s",
+					prURL)))
+				return
+			}
 			w.logger.Warn("ci_fix_round_failed", "pr_url", prURL, "round", round+1, "err", err)
 			w.escalateCI(ctx, fmt.Sprintf(
 				"❌ CI failed on PR %s:\n%s\n\nFix round %d failed: %v. Manual intervention needed — use `/rerun` on the issue.",

@@ -1274,6 +1274,12 @@ func (s *Store) ClaimAdmiralTask(issueID, identifier, lastEventSessionID string)
 // resumes them (the resume path already accepts TIMED_OUT rows).
 const InterruptedByShutdown = "interrupted_by_shutdown"
 
+// UnrecoverablePrefix marks an interrupted row the reconciler already
+// escalated. It deliberately does NOT match ListRecoverableTasks, so a
+// single escalation is not repeated on every sweep; /resume and /rerun still
+// work on the row.
+const UnrecoverablePrefix = "interrupted_unrecoverable"
+
 // MarkInterruptedTasks moves every in-flight admiral_tasks row to TIMED_OUT
 // with the given reason and returns how many rows changed.
 //
@@ -1320,6 +1326,26 @@ func (s *Store) MarkTaskInterrupted(issueID, reason string) (bool, error) {
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// ResetAutoResumeCount clears the row's auto-resume counter; a task that
+// reached DONE is healthy, so a later interruption should get a fresh budget.
+func (s *Store) ResetAutoResumeCount(issueID string) {
+	if _, err := s.DB.Exec(`
+		UPDATE admiral_tasks SET auto_resume_count = 0 WHERE issue_id=?`, issueID); err != nil {
+		// Best effort: a stale counter only makes the cap slightly stricter.
+		_ = err
+	}
+}
+
+// MarkTaskUnrecoverable records that the reconciler already told a human
+// about this interrupted row. The distinct error prefix keeps it out of
+// ListRecoverableTasks, so the same escalation is not re-posted every sweep.
+func (s *Store) MarkTaskUnrecoverable(issueID, reason string) error {
+	_, err := s.DB.Exec(`
+		UPDATE admiral_tasks SET error=? WHERE issue_id=? AND state=?`,
+		UnrecoverablePrefix+": "+reason, issueID, JobStateTimedOut)
+	return err
 }
 
 // IncrementAutoResumeCount bumps and returns the row's auto-resume counter.

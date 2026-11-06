@@ -71,6 +71,8 @@ type storeInterface interface {
 	MarkTaskInterrupted(issueID, reason string) (bool, error)
 	ListRecoverableTasks() ([]store.AdmiralTask, error)
 	IncrementAutoResumeCount(issueID string) (int, error)
+	ResetAutoResumeCount(issueID string)
+	MarkTaskUnrecoverable(issueID, reason string) error
 	GetAdmiralTaskByPRURL(prURL string) (*store.AdmiralTask, error)
 	ClaimAdmiralTask(issueID, identifier, lastEventSessionID string) (bool, error)
 	UpdateAdmiralTask(issueID string, fn func(*store.AdmiralTask)) error
@@ -347,13 +349,6 @@ func (o *Orchestrator) ghEnvForProject(ctx context.Context, projectID string) ([
 	return o.accounts.EnvFor(ctx, ghUser)
 }
 
-// acquireRunSlot blocks until a slot is available in the runSlots
-// semaphore. Returns a release func the caller must invoke (typically
-// via defer) when the run finishes — even on error or panic.
-//
-// A nil runSlots (e.g. tests that construct Orchestrator directly
-// instead of via New) skips the bound and returns a no-op release.
-// Production always has a bounded chan.
 // SetRootContext makes ctx the parent of every run this orchestrator
 // starts. main passes its signal context, so a SIGTERM cancels in-flight
 // runs — killing their claude children via exec.CommandContext — instead of
@@ -385,6 +380,7 @@ func (o *Orchestrator) baseCtx() context.Context {
 // product-verify runs have no admiral_tasks row).
 func (o *Orchestrator) beginRun(issueID string) func() {
 	o.runsMu.Lock()
+	cond := o.runCond() // built under runsMu; see its doc
 	o.runsActive++
 	o.runsMu.Unlock()
 
@@ -411,8 +407,8 @@ func (o *Orchestrator) beginRun(issueID string) func() {
 		}
 		o.runsMu.Lock()
 		o.runsActive--
+		cond.Broadcast()
 		o.runsMu.Unlock()
-		o.runCond().Broadcast()
 	}
 }
 
@@ -446,8 +442,9 @@ func (o *Orchestrator) Shutdown(timeout time.Duration) {
 	done := make(chan struct{})
 	go func() {
 		o.runsMu.Lock()
+		cond := o.runCond()
 		for o.runsActive > 0 {
-			o.runCond().Wait()
+			cond.Wait()
 		}
 		o.runsMu.Unlock()
 		close(done)
@@ -469,6 +466,13 @@ func (o *Orchestrator) Shutdown(timeout time.Duration) {
 	}
 }
 
+// acquireRunSlot blocks until a slot is available in the runSlots
+// semaphore. Returns a release func the caller must invoke (typically
+// via defer) when the run finishes — even on error or panic.
+//
+// A nil runSlots (e.g. tests that construct Orchestrator directly
+// instead of via New) skips the bound and returns a no-op release.
+// Production always has a bounded chan.
 func (o *Orchestrator) acquireRunSlot() func() {
 	if o.runSlots == nil {
 		return func() {}
@@ -1470,11 +1474,49 @@ func newResumeFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent, j
 // source of truth for dispatch but flow.execute can still complete its
 // autopilot_jobs path even if the admiral_tasks write transiently
 // fails (next event will reconcile by reading whatever sticks).
+// resumeUserMessage is what a resumed run continues with. Normally the
+// generic "continue" instruction is enough — claude resumes its own session.
+// But when the interruption hit while the run was waiting on an ask_user
+// answer, THAT ANSWER is the instruction that must reach claude: the generic
+// prompt would silently drop what the user asked for, and the question is
+// already marked answered so nothing else would ever deliver it.
+func (f *flow) resumeUserMessage() string {
+	const generic = "Continue from where the previous run was interrupted by timeout."
+	if f.ev.IssueID == "" {
+		return generic
+	}
+	task, err := f.o.db.GetAdmiralTaskByIssue(f.ev.IssueID)
+	if err != nil || task == nil || task.PendingQuestionID == "" {
+		return generic
+	}
+	pq, err := f.o.db.GetPendingQuestionByID(task.PendingQuestionID)
+	if err != nil || pq == nil || pq.AnsweredAt == "" {
+		return generic
+	}
+	return fmt.Sprintf(
+		"The user has answered the pending question.\n\nQuestion: %s\nAnswer: %s\n\nContinue from where you left off.",
+		pq.Question, pq.Answer)
+}
+
 func (f *flow) persistAdmiralTask(fn func(*store.AdmiralTask)) {
 	if f.ev.IssueID == "" {
 		return
 	}
-	if err := f.o.db.UpdateAdmiralTask(f.ev.IssueID, fn); err != nil {
+	// Never call the store from inside the update callback: it runs inside
+	// the row's transaction (and under the mock's lock), so a nested write
+	// either deadlocks or lands outside the transaction.
+	reachedDone := false
+	err := f.o.db.UpdateAdmiralTask(f.ev.IssueID, func(t *store.AdmiralTask) {
+		fn(t)
+		reachedDone = t.State == store.JobStateDone
+	})
+	if err == nil && reachedDone {
+		// Reaching DONE proves the task is healthy, which resets the
+		// automatic-resume budget: the cap exists to stop a crash loop, not
+		// to count every interruption a long-lived row ever suffered.
+		f.o.db.ResetAutoResumeCount(f.ev.IssueID)
+	}
+	if err != nil {
 		f.o.logger.Warn("update_admiral_task_failed",
 			"err", err, "issue", f.ev.IssueID)
 	}
@@ -1988,7 +2030,7 @@ func (f *flow) executeResumeFromTimeout() error {
 
 	// A non-empty prompt cues claude to continue rather than wait for input.
 	// The actual continuation context lives in the resumed session itself.
-	if err := f.runClaudeResume("Continue from where the previous run was interrupted by timeout."); err != nil {
+	if err := f.runClaudeResume(f.resumeUserMessage()); err != nil {
 		return fmt.Errorf("claude resume: %w", err)
 	}
 
@@ -2433,10 +2475,12 @@ func (o *Orchestrator) shuttingDown() bool {
 // the process is winding down — there the task is resumable, and FAILED is
 // terminal for /resume and the reconciler.
 func (o *Orchestrator) failTaskUnlessShuttingDown(issueID string, runErr error) {
+	now := time.Now().UTC().Format(time.RFC3339)
 	_ = o.db.UpdateAdmiralTask(issueID, func(t *store.AdmiralTask) {
 		if o.shuttingDown() {
 			t.State = store.JobStateTimedOut
 			t.Error = store.InterruptedByShutdown
+			t.FinishedAt = now
 			return
 		}
 		t.State = store.JobStateFailed

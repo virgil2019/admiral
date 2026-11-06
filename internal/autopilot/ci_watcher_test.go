@@ -1125,3 +1125,31 @@ func TestWatchPR_DeletedRowStillReports(t *testing.T) {
 
 	ciWatchTaskFailure(t, lc, "no admiral task row")
 }
+
+// TestWatchPR_InterruptedFixRoundDoesNotFailTask: a CI fix round cancelled by
+// shutdown is not a CI failure. Marking the (DONE) task FAILED/ci_failed would
+// be terminal for /resume and the reconciler — stranding a healthy task at
+// exactly the restart the reconciler is meant to recover from.
+func TestWatchPR_InterruptedFixRoundDoesNotFailTask(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		"if [ \"$2\" = \"view\" ]; then echo '{\"headRefOid\":\"sha-a\"}'; exit 0; fi\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, _ := ciWatchFixFixture(ghBin, 2)
+	w.fixRound = func(_ context.Context, _ *store.AdmiralTask, _ string) error {
+		return errFixRoundInterrupted
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "will continue after the restart")
+	if state, errMsg := taskStateSnapshot(db); state != store.JobStateDone || errMsg != "" {
+		t.Errorf("task = %q/%q, want it left DONE for the next boot", state, errMsg)
+	}
+}

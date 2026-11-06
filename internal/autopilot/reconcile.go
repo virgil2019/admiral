@@ -70,6 +70,12 @@ func (o *Orchestrator) Reconcile(ctx context.Context) ReconcileReport {
 	}
 
 	for i := range rows {
+		if ctx.Err() != nil {
+			// Shutting down: launching a resume now would fail in its
+			// prepare phase and overwrite the interrupted marker with an
+			// error the next sweep does not recognise.
+			return rep
+		}
 		row := rows[i]
 		if o.RunInFlight(row.IssueID) {
 			continue // a live run owns it; leave it alone
@@ -170,7 +176,14 @@ func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTa
 			o.postToTaskThread(row, linear.Response(fmt.Sprintf(
 				"admiral restarted mid-run and is resuming this task (attempt %d, automatic resume %d/%d).",
 				row.AttemptN, n, maxAutoResumes)))
-			go o.resumeOrphanRun(ev, row)
+			go func() {
+				if !o.stillResumable(*row) {
+					o.logger.Info("reconcile_resume_superseded",
+						"issue", row.IssueIdentifier, "attempt_n", row.AttemptN)
+					return
+				}
+				o.resumeOrphanRun(ev, row)
+			}()
 			return orphanResumed
 		}
 	}
@@ -189,10 +202,31 @@ func (o *Orchestrator) tryResumeOrphan(ctx context.Context, row *store.AdmiralTa
 		reason = fmt.Sprintf("the run was interrupted and automatic resume was already used %d times", maxAutoResumes)
 	}
 	o.logger.Warn("reconcile_escalate", "issue", row.IssueIdentifier, "reason", reason)
+	// Leave the recoverable set so this sweep does not re-post the same
+	// warning every ReconcileInterval; /rerun and /resume still work.
+	if err := o.db.MarkTaskUnrecoverable(row.IssueID, reason); err != nil {
+		o.logger.Warn("reconcile_mark_unrecoverable_failed",
+			"issue", row.IssueIdentifier, "err", err)
+	}
 	o.postToTaskThread(row, linear.Response(fmt.Sprintf(
 		"⚠️ admiral stopped this task mid-run (%s).\n\nWorktree: `%s`\nBranch: `%s`\nPR: %s\n\nReply `/rerun` on the issue to start a fresh attempt.",
 		reason, row.WorktreePath, row.Branch, row.PRURL)))
 	return orphanEscalated
+}
+
+// stillResumable re-checks the row right before a queued resume starts. The
+// sweep reads rows, then launches a goroutine that blocks on the run slot —
+// and a /rerun drained in that window supersedes the row (new attempt, no
+// auto_resume row). Resuming then would run the OLD branch/worktree while
+// writing EXECUTING/DONE onto the NEW attempt's row.
+func (o *Orchestrator) stillResumable(row store.AdmiralTask) bool {
+	cur, err := o.db.GetAdmiralTaskByIssue(row.IssueID)
+	if err != nil || cur == nil {
+		return false
+	}
+	return cur.AttemptN == row.AttemptN &&
+		cur.State == store.JobStateTimedOut &&
+		cur.Branch == row.Branch
 }
 
 // postToTaskThread posts an activity on the task's Linear agent session

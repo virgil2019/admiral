@@ -9,6 +9,11 @@ import (
 	"github.com/georgehuang/admiral/internal/store"
 )
 
+// errFixRoundInterrupted marks a fix round the process stopped for shutdown.
+// The round did not fail — the watcher must leave the task DONE so the next
+// boot continues it, instead of escalating a healthy task to FAILED/ci_failed.
+var errFixRoundInterrupted = errors.New("fix round interrupted by shutdown")
+
 // runCIFixRound is the CI watcher's fixRound: one claude fix round on the
 // task's PR branch addressing a CI failure, build-gated and pushed exactly
 // like a review round (runPRFix). Progress lands on the PR as the repo's
@@ -40,12 +45,18 @@ func (o *Orchestrator) runCIFixRound(ctx context.Context, task *store.AdmiralTas
 
 	deps, stage, err := o.resolvePRFixDeps(ctx, task)
 	if err != nil {
+		if o.shuttingDown() || errors.Is(err, context.Canceled) {
+			return errFixRoundInterrupted
+		}
 		return fmt.Errorf("prepare fix round (%s): %w", stage, err)
 	}
 
 	prompt := buildCIFixPrompt(o.cfg.ReviewSkill, task.PRURL, task.Branch, deps.baseBranch, failure)
 	out, err := o.runPRFix(ctx, task, deps, prompt)
 	if err != nil {
+		if o.shuttingDown() || errors.Is(err, context.Canceled) {
+			return errFixRoundInterrupted
+		}
 		var gateFail *gateFailureError
 		if errors.As(err, &gateFail) {
 			_ = deps.replier.Fail(ctx, gateFail.message())
