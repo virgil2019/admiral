@@ -757,7 +757,7 @@ func TestFetchTimeout_KillsHungGh(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	start := time.Now()
-	if _, err := w.fetchCheckRuns(ctx, dir, 7, defaultTestGhUser); err == nil {
+	if _, _, err := w.fetchCheckRuns(ctx, dir, 7, defaultTestGhUser); err == nil {
 		t.Fatal("fetchCheckRuns succeeded against a hung gh, want deadline error")
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
@@ -1124,4 +1124,61 @@ func TestWatchPR_DeletedRowStillReports(t *testing.T) {
 	w.WatchPR(ctx, "https://github.com/acme/repo/pull/7", t.TempDir(), "sess-1", "issue-1", defaultTestGhUser)
 
 	ciWatchTaskFailure(t, lc, "no admiral task row")
+}
+
+// TestWatchPR_InterruptedFixRoundDoesNotFailTask: a CI fix round cancelled by
+// shutdown is not a CI failure. Marking the (DONE) task FAILED/ci_failed would
+// be terminal for /resume and the reconciler — stranding a healthy task at
+// exactly the restart the reconciler is meant to recover from.
+func TestWatchPR_InterruptedFixRoundDoesNotFailTask(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"pr\" ]; then echo fake-token; exit 0; fi\n" +
+		"if [ \"$2\" = \"view\" ]; then echo '{\"headRefOid\":\"sha-a\"}'; exit 0; fi\n" +
+		`echo '[{"name":"test","status":"completed","conclusion":"failure","url":"https://ci.example.com/run/1"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	w, lc, db, _ := ciWatchFixFixture(ghBin, 2)
+	w.fixRound = func(_ context.Context, _ *store.AdmiralTask, _ string) error {
+		return errFixRoundInterrupted
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.WatchPR(ctx, db.AdmiralTask.PRURL, t.TempDir(), "sess-1", db.AdmiralTask.IssueID, defaultTestGhUser)
+
+	ciWatchTaskFailure(t, lc, "was NOT resumed")
+	if state, errMsg := taskStateSnapshot(db); state != store.JobStateDone || errMsg != "" {
+		t.Errorf("task = %q/%q, want it left DONE for the next boot", state, errMsg)
+	}
+}
+
+// TestFetchCheckRuns_EmptyHeadIsNotFallback: right after a push GitHub has no
+// check runs for the new head yet. Falling back to the head-agnostic view
+// there re-introduces the stale-head verdict — the previous head's failures
+// read as the new head's.
+func TestFetchCheckRuns_EmptyHeadIsNotFallback(t *testing.T) {
+	ghBin := filepath.Join(t.TempDir(), "fake-gh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"auth\" ]; then echo fake-token; exit 0; fi\n" +
+		"if [ \"$1\" = \"api\" ]; then exit 0; fi\n" + // empty body: no runs yet
+		"if [ \"$2\" = \"view\" ]; then echo '{\"headRefOid\":\"sha-b\"}'; exit 0; fi\n" +
+		`echo '[{"name":"old-head","status":"completed","conclusion":"failure","url":"u"}]'` + "\n"
+	if err := os.WriteFile(ghBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w := newCIWatcher(&mockLinearClient{}, &mockStore{}, logger, ghBin, time.Second, time.Minute, 2)
+
+	runs, head, err := w.fetchCheckRuns(context.Background(), t.TempDir(), 7, defaultTestGhUser)
+	if err != nil {
+		t.Fatalf("fetchCheckRuns: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Errorf("runs = %+v, want none (the old head's failures must not be served as this head's)", runs)
+	}
+	if head != "sha-b" {
+		t.Errorf("head = %q, want sha-b", head)
+	}
 }

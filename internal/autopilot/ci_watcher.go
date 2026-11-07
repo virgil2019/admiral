@@ -3,6 +3,7 @@ package autopilot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -330,6 +331,19 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 			failure, round+1, w.maxFixRounds)))
 
 		if err := w.fixRound(ctx, task, failure); err != nil {
+			if errors.Is(err, errFixRoundInterrupted) {
+				// The daemon is going down mid-round: leave the task DONE and
+				// say so. Stamping FAILED here would strand a healthy task
+				// (FAILED is terminal for /resume and the reconciler).
+				w.logger.Info("ci_fix_round_interrupted", "pr_url", prURL, "round", round+1)
+				// Do NOT promise continuation: CI watches are in-process
+				// only, so nothing re-attaches after a restart (persisting
+				// them is the follow-up). Say what actually happened.
+				w.postResult(ctx, sessionID, linear.Response(fmt.Sprintf(
+					"⏸ admiral is restarting — the automatic CI fix round was stopped and was NOT resumed. The task stays DONE; check the PR's CI and comment `/fix` if it still fails. PR: %s",
+					prURL)))
+				return
+			}
 			w.logger.Warn("ci_fix_round_failed", "pr_url", prURL, "round", round+1, "err", err)
 			w.escalateCI(ctx, fmt.Sprintf(
 				"❌ CI failed on PR %s:\n%s\n\nFix round %d failed: %v. Manual intervention needed — use `/rerun` on the issue.",
@@ -340,9 +354,9 @@ func (w *CIWatcher) watch(ctx context.Context, prURL, repoDir, sessionID, issueI
 		// Give GitHub a moment to register the new head's check runs before
 		// the re-poll: a poll landing too early resolves the previous
 		// head's completed failing checks and burns a round on stale data.
-		// The settle sleep plus the justPushed re-observation above narrow
-		// the stale-head race; between them it cannot misattribute a stale
-		// failure to the new head. (As in pollUntilFinal, the Done branch
+		// The head-SHA binding in the loop above is what catches that case:
+		// an observation tied to the head we already fixed is rejected, and
+		// two consecutive rejections escalate rather than loop. (As in pollUntilFinal, the Done branch
 		// is by-construction dead here — the ctx is detached — and kept
 		// for future cancelable callers.)
 		round++
@@ -373,7 +387,7 @@ func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber
 			w.logger.Info("ci_watch_cancelled", "pr_url", prURL)
 			return nil, "", false
 		case <-ticker.C:
-			runs, err := w.fetchCheckRuns(ctx, repoDir, prNumber, ghUser)
+			runs, head, err := w.fetchCheckRuns(ctx, repoDir, prNumber, ghUser)
 			if err != nil {
 				w.logger.Warn("ci_fetch_runs_failed", "pr_url", prURL, "err", err)
 				// The deadline check must also cover this path: the watcher
@@ -388,17 +402,20 @@ func (w *CIWatcher) pollUntilFinal(ctx context.Context, repoDir string, prNumber
 			}
 
 			if len(runs) == 0 {
-				// No checks yet, keep polling
+				// No checks registered for this head yet, keep polling.
 			} else if allFinal(runs) {
-				// Bind the verdict to the head it belongs to. A read failure
-				// degrades to "" (trust the observation) rather than
-				// suppressing a real failure.
-				sha, shaErr := w.fetchHeadSHA(ctx, repoDir, prNumber, ghUser)
-				if shaErr != nil {
-					w.logger.Warn("ci_watch_head_sha_failed", "pr_url", prURL, "err", shaErr)
-					sha = ""
+				// The verdict is already bound to `head`: fetchCheckRuns
+				// queried that commit's checks specifically. Only the
+				// head-agnostic fallback leaves it empty, in which case it is
+				// resolved here.
+				if head == "" {
+					sha, shaErr := w.fetchHeadSHA(ctx, repoDir, prNumber, ghUser)
+					if shaErr != nil {
+						w.logger.Warn("ci_watch_head_sha_failed", "pr_url", prURL, "err", shaErr)
+					}
+					head = sha
 				}
-				return runs, sha, true
+				return runs, head, true
 			}
 
 			if time.Now().After(deadline) {
@@ -465,6 +482,13 @@ func (w *CIWatcher) fetchHeadSHA(ctx context.Context, repoDir string, prNumber i
 	if err != nil {
 		return "", fmt.Errorf("resolve gh account %q: %w", ghUser, err)
 	}
+	return w.fetchHeadSHAEnv(ctx, dir, prNumber, env)
+}
+
+// fetchHeadSHAEnv resolves the head with an already-resolved environment:
+// EnvFor shells out to `gh auth token`, and a poll makes several gh calls —
+// resolving the account once per poll instead of once per call halves that.
+func (w *CIWatcher) fetchHeadSHAEnv(ctx context.Context, dir string, prNumber int, env []string) (string, error) {
 	out, err := captureCmdEnv(ctx, dir, env, w.ghBin,
 		"pr", "view", fmt.Sprintf("%d", prNumber), "--json", "headRefOid")
 	if err != nil {
@@ -487,7 +511,7 @@ func shortSHA(sha string) string {
 	return sha
 }
 
-func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber int, ghUser string) ([]checkRun, error) {
+func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber int, ghUser string) ([]checkRun, string, error) {
 	// Bound each gh invocation: exec only kills the child on ctx
 	// cancellation, and the watcher goroutine is detached from the run ctx
 	// (no cancel will arrive) — a hung gh must not block the watcher, and
@@ -503,8 +527,65 @@ func (w *CIWatcher) fetchCheckRuns(ctx context.Context, repoDir string, prNumber
 	// private repo's checks are visible to admiral at all.
 	env, err := w.accounts.EnvFor(ctx, ghUser)
 	if err != nil {
-		return nil, fmt.Errorf("resolve gh account %q: %w", ghUser, err)
+		return nil, "", fmt.Errorf("resolve gh account %q: %w", ghUser, err)
 	}
+	// Resolve the head FIRST and ask for that commit's check runs
+	// specifically. `gh pr checks` serves whatever GitHub has finished
+	// reporting for the PR, which after a push can still be the PREVIOUS
+	// head's completed failures — reading that as the new head's verdict
+	// spends a fix round on code that is already fixed, and with the round
+	// cap reached it escalates a PR that is actually green.
+	head, err := w.fetchHeadSHAEnv(ctx, dir, prNumber, env)
+	if err != nil || head == "" {
+		// Without a head we cannot bind the verdict; fall back to the PR
+		// view and let the stale-head guard in watch() judge it.
+		runs, ferr := w.fetchPRChecks(ctx, dir, prNumber, env)
+		return runs, "", ferr
+	}
+	out, err := captureCmdEnv(ctx, dir, env, w.ghBin,
+		"api", "--paginate",
+		fmt.Sprintf("repos/{owner}/{repo}/commits/%s/check-runs", head),
+		// One object per line (NDJSON): --paginate concatenates pages, so a
+		// single JSON array per page would not parse.
+		"--jq", `.check_runs[] | {name: .name, status: .status, conclusion: (.conclusion // ""), url: (.html_url // "")}`,
+	)
+	if err != nil {
+		// An older gh or an enterprise host without the endpoint.
+		runs, ferr := w.fetchPRChecks(ctx, dir, prNumber, env)
+		return runs, "", ferr
+	}
+	runs, perr := parseCheckRunLines(out)
+	if perr != nil {
+		runs, ferr := w.fetchPRChecks(ctx, dir, prNumber, env)
+		return runs, "", ferr
+	}
+	// Zero runs is a legitimate answer — GitHub has not registered this
+	// head's checks yet. Returning it (rather than falling back to the
+	// head-agnostic view) is what stops the previous head's failures from
+	// being read as this head's verdict.
+	return runs, head, nil
+}
+
+// parseCheckRunLines decodes one checkRun per line, skipping blanks.
+func parseCheckRunLines(out string) ([]checkRun, error) {
+	var runs []checkRun
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var r checkRun
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			return nil, err
+		}
+		runs = append(runs, r)
+	}
+	return runs, nil
+}
+
+// fetchPRChecks is the head-agnostic fallback: whatever GitHub reports for
+// the PR. Used only when the head SHA could not be resolved.
+func (w *CIWatcher) fetchPRChecks(ctx context.Context, dir string, prNumber int, env []string) ([]checkRun, error) {
 	out, err := captureCmdEnv(ctx, dir, env, w.ghBin,
 		"pr", "checks", fmt.Sprintf("%d", prNumber),
 		"--json", "name,status,conclusion,url",

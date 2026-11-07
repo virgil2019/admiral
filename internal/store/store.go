@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -447,6 +448,13 @@ const migration0024 = `
 ALTER TABLE repos ADD COLUMN gh_user TEXT NOT NULL DEFAULT '';
 `
 
+// migration0025 counts how many times the boot reconciler has resumed this
+// task. Caps automatic recovery so a task that crashes the daemon on every
+// attempt escalates to a human instead of looping.
+const migration0025 = `
+ALTER TABLE admiral_tasks ADD COLUMN auto_resume_count INTEGER NOT NULL DEFAULT 0;
+`
+
 type migration struct {
 	Version int
 	SQL     string
@@ -477,6 +485,7 @@ var migrations = []migration{
 	{22, migration0022},
 	{23, migration0023},
 	{24, migration0024},
+	{25, migration0025},
 }
 
 func tableExists(db *sql.DB, name string) bool {
@@ -1229,9 +1238,14 @@ func (s *Store) GetBlockedAdmiralTasks() ([]BlockedTask, error) {
 // (i.e. it was still BLOCKED), false when another goroutine already
 // changed the state.
 func (s *Store) TransitionBlockedToReceived(issueID string) (bool, error) {
+	// started_at is refreshed because this is the moment the runnable window
+	// restarts: the reconciler uses it as the "too fresh to judge" marker,
+	// and a row blocked for days would otherwise look orphaned during the
+	// dispatcher's pre-run Linear calls. It also matches what the field
+	// means everywhere else — when the current run began.
 	res, err := s.DB.Exec(`
-		UPDATE admiral_tasks SET state=?, blocker_ids=NULL WHERE issue_id=? AND state=?
-	`, JobStateReceived, issueID, JobStateBlocked)
+		UPDATE admiral_tasks SET state=?, blocker_ids=NULL, started_at=? WHERE issue_id=? AND state=?
+	`, JobStateReceived, time.Now().UTC().Format(time.RFC3339), issueID, JobStateBlocked)
 	if err != nil {
 		return false, err
 	}
@@ -1259,6 +1273,167 @@ func (s *Store) ClaimAdmiralTask(issueID, identifier, lastEventSessionID string)
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// InterruptedByShutdown is the admiral_tasks error stamped on rows that were
+// still in flight when the daemon went down. The next boot's reconciler
+// resumes them (the resume path already accepts TIMED_OUT rows).
+const InterruptedByShutdown = "interrupted_by_shutdown"
+
+// UnrecoverablePrefix marks an interrupted row the reconciler already
+// escalated. It deliberately does NOT match ListRecoverableTasks, so a
+// single escalation is not repeated on every sweep; /resume and /rerun still
+// work on the row.
+const UnrecoverablePrefix = "interrupted_unrecoverable"
+
+// MarkInterruptedTasks moves every in-flight admiral_tasks row to TIMED_OUT
+// with the given reason and returns how many rows changed.
+//
+// TIMED_OUT (not a new state) on purpose: /resume already accepts it and
+// continues the SAME attempt on the SAME branch with claude --resume, which
+// is exactly the semantics of "the process stopped mid-run". A distinct
+// state would have to be taught to every dispatch gate and to the
+// discoverer for no additional safety.
+//
+// Called on shutdown after the runs were cancelled, and by the boot
+// reconciler for rows orphaned by a crash (SIGKILL leaves them EXECUTING).
+func (s *Store) MarkInterruptedTasks(reason string) (int, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.DB.Exec(`
+		UPDATE admiral_tasks
+		   SET state=?, error=?, finished_at=?
+		 WHERE state IN (?, ?)`,
+		JobStateTimedOut, reason, now, JobStateReceived, JobStateExecuting)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+// MarkTaskInterrupted moves ONE row to TIMED_OUT if it is still in flight,
+// reporting whether it changed. Guarded so a row a live run just finished is
+// left alone.
+func (s *Store) MarkTaskInterrupted(issueID string, attemptN int, reason string) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	// Scoped by attempt: a /rerun can move the row to history and insert a
+	// fresh attempt between the reconciler's read and this write, and the
+	// live attempt must not be stamped interrupted. attemptN <= 0 skips the
+	// scope (shutdown's blanket stamp).
+	query := `
+		UPDATE admiral_tasks
+		   SET state=?, error=?, finished_at=?
+		 WHERE issue_id=? AND state IN (?, ?)`
+	args := []any{JobStateTimedOut, reason, now, issueID, JobStateReceived, JobStateExecuting}
+	if attemptN > 0 {
+		query += ` AND attempt_n=?`
+		args = append(args, attemptN)
+	}
+	res, err := s.DB.Exec(query, args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// ErrNoSuchAttempt is returned when a task's attempt is gone (superseded by
+// a /rerun), so callers can distinguish "not ours anymore" from "over cap".
+var ErrNoSuchAttempt = errors.New("admiral task attempt no longer exists")
+
+// RefundAutoResumeCount gives back one credit. Used when a resume was
+// interrupted before it could start: charging for a retry that never happened
+// would let three restarts exhaust a two-attempt budget.
+func (s *Store) RefundAutoResumeCount(issueID string) {
+	_, _ = s.DB.Exec(`
+		UPDATE admiral_tasks SET auto_resume_count = auto_resume_count - 1
+		 WHERE issue_id=? AND auto_resume_count > 0`, issueID)
+}
+
+// ResetAutoResumeCount clears the row's auto-resume counter; a task that
+// reached DONE is healthy, so a later interruption should get a fresh budget.
+func (s *Store) ResetAutoResumeCount(issueID string) {
+	// Best effort: a stale counter only makes the cap slightly stricter, so a
+	// failure is not worth failing the caller's write over.
+	_, _ = s.DB.Exec(`
+		UPDATE admiral_tasks SET auto_resume_count = 0 WHERE issue_id=?`, issueID)
+}
+
+// MarkTaskUnrecoverable records that the reconciler already told a human
+// about this interrupted row. The distinct error prefix keeps it out of
+// ListRecoverableTasks, so the same escalation is not re-posted every sweep.
+func (s *Store) MarkTaskUnrecoverable(issueID, reason string) error {
+	_, err := s.DB.Exec(`
+		UPDATE admiral_tasks SET error=? WHERE issue_id=? AND state=?`,
+		UnrecoverablePrefix+": "+reason, issueID, JobStateTimedOut)
+	return err
+}
+
+// IncrementAutoResumeCount bumps and returns the row's auto-resume counter.
+func (s *Store) IncrementAutoResumeCount(issueID string, attemptN int) (int, error) {
+	// Scoped by attempt: a /rerun can supersede the row between the sweep's
+	// read and this write, and the new attempt must not be charged a resume
+	// credit for the old one's interruption.
+	res, err := s.DB.Exec(`
+		UPDATE admiral_tasks SET auto_resume_count = auto_resume_count + 1
+		 WHERE issue_id=? AND attempt_n=?`, issueID, attemptN)
+	if err != nil {
+		return 0, err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return 0, err
+	} else if n == 0 {
+		// The row was superseded (a /rerun moved it to history). Returning
+		// another attempt's counter here would read as "under the cap".
+		return 0, ErrNoSuchAttempt
+	}
+	var n int
+	err = s.DB.QueryRow(`
+		SELECT auto_resume_count FROM admiral_tasks
+		 WHERE issue_id=? AND attempt_n=?`, issueID, attemptN).Scan(&n)
+	return n, err
+}
+
+// ListRecoverableTasks returns the rows a restart must look at: everything
+// still marked in flight (a crash leaves them RECEIVED/EXECUTING) plus rows
+// a clean shutdown stamped interrupted (TIMED_OUT with that reason) — those
+// are invisible to an in-flight-only query, which is exactly the case a
+// graceful restart produces.
+func (s *Store) ListRecoverableTasks() ([]AdmiralTask, error) {
+	rows, err := s.DB.Query(`
+		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,
+		       COALESCE(branch,''), COALESCE(worktree_path,''),
+		       COALESCE(pr_url,''), COALESCE(claude_session_id,''),
+		       COALESCE(last_event_session_id,''),
+		       started_at, COALESCE(finished_at,''),
+		       COALESCE(error,''), COALESCE(stream_log_path,'')
+		  FROM admiral_tasks
+		 WHERE state IN (?, ?)
+		    OR (state = ? AND error GLOB ?)`,
+		JobStateReceived, JobStateExecuting,
+		JobStateTimedOut, InterruptedByShutdown+"*")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AdmiralTask
+	for rows.Next() {
+		var t AdmiralTask
+		if err := rows.Scan(&t.IssueID, &t.IssueIdentifier, &t.State, &t.AttemptN,
+			&t.Branch, &t.WorktreePath, &t.PRURL, &t.ClaudeSessionID,
+			&t.LastEventSessionID, &t.StartedAt, &t.FinishedAt,
+			&t.Error, &t.StreamLogPath); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // UpdateAdmiralTask loads the task row for issueID, applies fn, writes
@@ -2151,15 +2326,32 @@ func (s *Store) SetAdmiralTaskAwaitingInput(issueID, pendingQuestionID string) e
 	return err
 }
 
+// ClearPendingQuestion drops the task's pending-question pointer once the
+// resumed run has consumed the answer (DONE or any terminal write). Kept
+// separate from the AWAITING_INPUT transition on purpose: a restart between
+// "answer recorded" and "claude consumed it" must still be able to find the
+// answer, which is the only place that instruction exists.
+func (s *Store) ClearPendingQuestion(issueID string) {
+	if _, err := s.DB.Exec(`
+		UPDATE admiral_tasks SET pending_question_id=NULL
+		 WHERE issue_id=? AND pending_question_id IS NOT NULL`, issueID); err != nil {
+		_ = err // best effort: a stale pointer only risks re-sending an answer
+	}
+}
+
 // TransitionAwaitingInputToExecuting atomically moves an AWAITING_INPUT task
 // back to EXECUTING. Returns true when the row was updated (i.e. this caller
 // won the race), false when another goroutine already changed the state.
 func (s *Store) TransitionAwaitingInputToExecuting(issueID string) (bool, error) {
+	// started_at is refreshed because the runnable window restarts here: the
+	// reconciler uses it as its "too fresh to judge" marker, and without the
+	// bump the gap between this write and beginRun() would look like an
+	// orphaned EXECUTING row (see TransitionBlockedToReceived).
 	res, err := s.DB.Exec(`
 		UPDATE admiral_tasks
-		SET state=?, pending_question_id=NULL
+		SET state=?, started_at=?
 		WHERE issue_id=? AND state=?
-	`, JobStateExecuting, issueID, JobStateAwaitingInput)
+	`, JobStateExecuting, time.Now().UTC().Format(time.RFC3339), issueID, JobStateAwaitingInput)
 	if err != nil {
 		return false, err
 	}

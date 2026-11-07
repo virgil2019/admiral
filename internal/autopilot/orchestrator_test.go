@@ -581,9 +581,26 @@ type mockStore struct {
 	HasAnyJobForIssueErr    error
 
 	// admiral_tasks (PR-B-v2)
-	AdmiralTask             *store.AdmiralTask
-	AdmiralTaskErr          error
-	AdmiralTaskErrOnce      bool
+	AdmiralTask        *store.AdmiralTask
+	AdmiralTaskErr     error
+	AdmiralTaskErrOnce bool
+
+	// shutdown / reconcile recorders
+	InterruptedReason       string
+	InterruptedCount        int
+	MarkInterruptedErr      error
+	MarkedInterruptedIDs    []string
+	AutoResumeCount         int
+	AutoResumeErr           error
+	AutoResumeResets        int
+	ClearedPendingQuestion  string
+	AutoResumeRefunds       int
+	TaskVerifyResets        []string
+	ProductVerifyResets     []string
+	MarkedUnrecoverable     []string
+	MarkUnrecoverableErr    error
+	InFlightTasks           []store.AdmiralTask
+	ListInFlightErr         error
 	AdmiralTaskByPRURL      *store.AdmiralTask
 	AdmiralTaskByPRURLErr   error
 	LiveAdmiralTask         *store.AdmiralTask // mutated by UpdateAdmiralTask via fn
@@ -731,6 +748,107 @@ func (m *mockStore) HasAnyAutopilotJobForIssue(issueID string) (bool, error) {
 }
 
 // --- admiral_tasks (PR-B-v2) ---
+
+// MarkInterruptedTasks / ListInFlightTasks back the shutdown + reconcile path.
+func (m *mockStore) MarkInterruptedTasks(reason string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.InterruptedReason = reason
+	if m.LiveAdmiralTask != nil && !isTerminalTaskState(m.LiveAdmiralTask.State) &&
+		m.LiveAdmiralTask.State != store.JobStateBlocked &&
+		m.LiveAdmiralTask.State != store.JobStateAwaitingInput {
+		m.LiveAdmiralTask.State = store.JobStateTimedOut
+		m.LiveAdmiralTask.Error = reason
+		m.StateTransitions = append(m.StateTransitions, store.JobStateTimedOut)
+		return 1, nil
+	}
+	return m.InterruptedCount, m.MarkInterruptedErr
+}
+
+func (m *mockStore) MarkTaskInterrupted(issueID string, attemptN int, reason string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.InterruptedReason = reason
+	m.MarkedInterruptedIDs = append(m.MarkedInterruptedIDs, issueID)
+	if m.MarkInterruptedErr != nil {
+		return false, m.MarkInterruptedErr
+	}
+	return true, nil
+}
+
+func (m *mockStore) ResetTaskVerificationRound(parentIssueID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.TaskVerifyResets = append(m.TaskVerifyResets, parentIssueID)
+	return nil
+}
+
+func (m *mockStore) ResetProductVerificationRound(projectID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ProductVerifyResets = append(m.ProductVerifyResets, projectID)
+	return nil
+}
+
+func (m *mockStore) RefundAutoResumeCount(issueID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.AutoResumeRefunds++
+}
+
+func (m *mockStore) ClearPendingQuestion(issueID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ClearedPendingQuestion = issueID
+	if m.AdmiralTask != nil {
+		m.AdmiralTask.PendingQuestionID = ""
+	}
+}
+
+func (m *mockStore) ResetAutoResumeCount(issueID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.AutoResumeCount = 0
+	m.AutoResumeResets++
+}
+
+func (m *mockStore) MarkTaskUnrecoverable(issueID, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.MarkedUnrecoverable = append(m.MarkedUnrecoverable, issueID)
+	return m.MarkUnrecoverableErr
+}
+
+func (m *mockStore) IncrementAutoResumeCount(issueID string, attemptN int) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.AutoResumeCount++
+	return m.AutoResumeCount, m.AutoResumeErr
+}
+
+func (m *mockStore) ListRecoverableTasks() ([]store.AdmiralTask, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.InFlightTasks != nil || m.ListInFlightErr != nil {
+		// Mirror the real query: a row whose escalation was delivered no
+		// longer matches, which is what stops the sweep re-posting it.
+		skip := make(map[string]bool, len(m.MarkedUnrecoverable))
+		for _, id := range m.MarkedUnrecoverable {
+			skip[id] = true
+		}
+		var out []store.AdmiralTask
+		for _, t := range m.InFlightTasks {
+			if !skip[t.IssueID] {
+				out = append(out, t)
+			}
+		}
+		return out, m.ListInFlightErr
+	}
+	if m.LiveAdmiralTask != nil {
+		return []store.AdmiralTask{*m.LiveAdmiralTask}, nil
+	}
+	return nil, nil
+}
 
 func (m *mockStore) GetAdmiralTaskByIssue(issueID string) (*store.AdmiralTask, error) {
 	// AdmiralTaskErrOnce simulates one transient read failure (locked

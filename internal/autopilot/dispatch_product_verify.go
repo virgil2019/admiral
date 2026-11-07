@@ -138,6 +138,21 @@ func (o *Orchestrator) HandleProductVerifyEvent(ctx context.Context, projectID s
 // L2 verify / autopilot claude runs). Every failure logs and returns, leaving
 // the verification 'active' for a later (manual) re-trigger.
 func (o *Orchestrator) runProductVerify(projectID string) {
+	defer o.beginRun("")()
+	// Same reasoning as runVerify: a restart must not consume the round.
+	verdictApplied := false
+	defer func() {
+		// A filed verdict already describes the work; refunding its round
+		// would re-run the judge AND re-file the same gap issues.
+		if !o.shuttingDown() || verdictApplied {
+			return
+		}
+		if err := o.db.ResetProductVerificationRound(projectID); err != nil {
+			o.logger.Warn("product_verify_round_reset_failed", "project", projectID, "err", err)
+		} else {
+			o.logger.Info("product_verify_interrupted_by_shutdown", "project", projectID)
+		}
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			o.logger.Error("product_verify_run_panic", "project", projectID, "panic", r)
@@ -147,7 +162,7 @@ func (o *Orchestrator) runProductVerify(projectID string) {
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
+	ctx, cancel := context.WithTimeout(o.baseCtx(),
 		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
 	defer cancel()
 
@@ -186,6 +201,7 @@ func (o *Orchestrator) runProductVerify(projectID string) {
 		return
 	}
 
+	verdictApplied = true
 	o.applyProductVerifyVerdict(ctx, projectID, teamID, verdict)
 }
 
