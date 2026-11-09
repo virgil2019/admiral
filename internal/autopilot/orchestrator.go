@@ -1076,6 +1076,16 @@ func (o *Orchestrator) dispatchResume(ev linear.AgentEvent, task *store.AdmiralT
 			task.AttemptN))
 		return
 	case store.JobStateTimedOut:
+		if isGateExpiryTimeout(task.Error) {
+			// The gate never finished on this run — resuming pushes and PRs
+			// without re-running the verify gate, exactly what the timeout
+			// message on the thread steers away from.
+			o.logger.Info("dispatch_reject_resume_gate_expired",
+				"session", ev.SessionID, "issue", ev.IssueIdentifier)
+			o.postRejection(ev.SessionID,
+				"This run ended because the build gate did not finish within the run budget — /resume would push and open the PR without re-running the verify gate. Use /rerun to start over with a fresh gate.")
+			return
+		}
 		// proceed
 	default:
 		o.replyRejection(ev.SessionID, task.State, fmt.Sprintf(
@@ -1569,6 +1579,10 @@ type flow struct {
 	// gate-killed code past the gate).
 	gateFailed bool
 
+	// remoteBranchCleaned dedupes the best-effort origin-branch cleanup:
+	// the expiry path and the shutdown settle can both reach it.
+	remoteBranchCleaned bool
+
 	// gateExpired records that the run budget expired while the build gate
 	// was mid-verification (set by handleGateFailure, which leaves the
 	// TIMED_OUT classification to runWithAttempt). timedOutMessage uses it
@@ -1719,7 +1733,13 @@ func (f *flow) postActivityWithRetryCtx(ctx context.Context, a linear.AgentActiv
 		}
 		lastErr = err
 		if attempt < len(delays) {
-			time.Sleep(delays[attempt])
+			// Respect the caller's ctx: a dead ctx must not burn the full
+			// backoff sleeping toward attempts that can only fail.
+			select {
+			case <-time.After(delays[attempt]):
+			case <-ctx.Done():
+				return lastErr
+			}
 		}
 	}
 	return lastErr
@@ -2812,7 +2832,10 @@ func (f *flow) markFailed(runErr error) {
 		if j, err := f.o.db.GetAutopilotJob(f.ev.SessionID); err == nil && j.StreamLogPath != "" {
 			body += "\n\nStream log: " + j.StreamLogPath
 		}
-		err := f.postActivityWithRetry(linear.ErrorActivity(body))
+		// Post on the fresh ctx, not flow.ctx: the failing error may have
+		// raced budget expiry without wrapping it, and the budget ctx can be
+		// dead while Linear is perfectly reachable.
+		err := f.postActivityWithRetryCtx(ctx, linear.ErrorActivity(body))
 		if err != nil {
 			f.o.logger.Error("final_activity_push_failed",
 				"session", f.ev.SessionID, "err", err)
@@ -2887,12 +2910,28 @@ func (f *flow) timedOutMessage() string {
 // dead (budget expiry, shutdown) pass a fresh short one; this cleanup must
 // outlive the budget that expired.
 func (f *flow) deleteRemoteBranchBestEffort(ctx context.Context) {
+	if f.remoteBranchCleaned {
+		return
+	}
+	f.remoteBranchCleaned = true
 	if delErr := runCmd(ctx, f.worktreePath, "git", "push", "origin", "--delete", f.branch); delErr != nil {
 		f.o.logger.Debug("first_run_gate_fail_no_remote_branch_to_delete",
 			"branch", f.branch, "err", delErr)
 	} else {
 		f.o.logger.Info("first_run_gate_fail_cleaned_remote_branch", "branch", f.branch)
 	}
+}
+
+// gateExpiryErrPrefix marks a TIMED_OUT row whose run budget expired while
+// the build gate was mid-verification (written by handleGateFailure).
+// dispatchResume refuses these rows: resuming skips the verify gate. The
+// writer and the check must change together.
+const gateExpiryErrPrefix = "run budget expired during build gate"
+
+// isGateExpiryTimeout reports whether a persisted task error describes a
+// budget expiry that landed mid-gate.
+func isGateExpiryTimeout(taskErr string) bool {
+	return strings.HasPrefix(taskErr, gateExpiryErrPrefix)
 }
 
 // persistGateFailed writes the FAILED settlement shared by both gate-failure
@@ -2975,11 +3014,11 @@ func (f *flow) handleGateFailure(identifier string, gate VerifyRetryResult) erro
 			// interrupt-resumable and the reconciler would auto-resume a
 			// run whose build never passed.
 			f.settleGateFailedByShutdown()
-			return fmt.Errorf("run budget expired during build gate (attempts=%d), interrupted by shutdown: %w",
-				gate.Attempts, f.ctx.Err())
+			return fmt.Errorf("%s (attempts=%d), interrupted by shutdown: %w",
+				gateExpiryErrPrefix, gate.Attempts, f.ctx.Err())
 		}
-		return fmt.Errorf("run budget expired during build gate (attempts=%d): %w",
-			gate.Attempts, f.ctx.Err())
+		return fmt.Errorf("%s (attempts=%d): %w",
+			gateExpiryErrPrefix, gate.Attempts, f.ctx.Err())
 	}
 	f.o.logger.Warn("first_run_build_gate_failed",
 		"issue", identifier, "branch", f.branch,
@@ -2992,7 +3031,14 @@ func (f *flow) handleGateFailure(identifier string, gate VerifyRetryResult) erro
 	if gate.LaunchErr != "" {
 		body += fmt.Sprintf("\n\nadmiral launch error: %s", gate.LaunchErr)
 	}
-	f.postActivity(linear.ErrorActivity(body))
+	// The detailed build report is this failure's only thread message
+	// (markFailed skips already-terminal rows) — post it retried on a fresh
+	// ctx so one transient blip cannot silence the failure entirely.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if perr := f.postActivityWithRetryCtx(ctx, linear.ErrorActivity(body)); perr != nil {
+		f.o.logger.Warn("gate_fail_activity_push_failed", "issue", identifier, "err", perr)
+	}
 	gateErrMsg := fmt.Sprintf("build gate failed after %d attempt(s)", gate.Attempts)
 	f.persistGateFailed(gateErrMsg)
 	return fmt.Errorf("%s", gateErrMsg)

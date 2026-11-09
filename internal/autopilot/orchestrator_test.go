@@ -4414,6 +4414,97 @@ func TestMarkTimedOut_GateExpiryMessageRetriesThroughBlip(t *testing.T) {
 	}
 }
 
+// Retry backoff must respect the caller's ctx: a dead ctx burns no sleep
+// time toward attempts that can only fail.
+func TestPostActivityWithRetryCtx_DeadCtxReturnsFast(t *testing.T) {
+	mlc := &mockLinearClient{PostErr: errors.New("nope")}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60},
+		db:     &mockStore{},
+		lc:     mlc,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	f := newFlow(o, context.Background(), linear.AgentEvent{IssueID: "iss-1", SessionID: "sess-1"})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	err := f.postActivityWithRetryCtx(ctx, linear.Response("x"))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("postActivityWithRetryCtx err = nil, want the last post error")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("dead-ctx retry took %s, want it to skip the backoff", elapsed)
+	}
+}
+
+// The detailed build report is a genuine gate failure's ONLY thread message
+// (markFailed skips already-terminal rows), so it must survive a transient
+// Linear blip.
+func TestHandleGateFailure_GenuineFailReportRetriesThroughBlip(t *testing.T) {
+	ms := &mockStore{LiveAdmiralTask: &store.AdmiralTask{IssueID: "iss-1", State: store.JobStateExecuting}}
+	mlc := &mockLinearClient{}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60, VerifyMaxRetries: 2},
+		db:     ms,
+		lc:     &flakyPoster{ctxAwarePoster: &ctxAwarePoster{mockLinearClient: mlc}},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	f := newFlow(o, context.Background(), linear.AgentEvent{IssueID: "iss-1", SessionID: "sess-1"})
+	f.worktreePath = t.TempDir()
+	f.branch = "linear/geo-428"
+	f.verifyCmd = "make check"
+
+	if err := f.handleGateFailure("GEO-428", VerifyRetryResult{Attempts: 2, LastBuildOutput: "boom"}); err == nil {
+		t.Fatal("handleGateFailure err = nil, want gate-failure error")
+	}
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "could not get the build to pass") {
+		t.Fatalf("posted body = %q, want the build report delivered through the blip", body)
+	}
+}
+
+// markFailed is the last message a non-timeout failure gets — it must post
+// even when the run budget ctx is already dead (the error that landed here
+// raced the expiry without wrapping it).
+func TestMarkFailed_PostsThroughDeadBudgetCtx(t *testing.T) {
+	_, _, mlc, f := gateFailFixture(t)
+	var cancel context.CancelFunc
+	f.ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	f.markFailed(errors.New("ensure PR: gh exited 1"))
+
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "admiral failed") {
+		t.Fatalf("posted body = %q, want the failure delivered despite the dead budget ctx", body)
+	}
+}
+
+// /resume on a gate-expiry TIMED_OUT row must be refused: resuming pushes
+// and PRs without re-running the verify gate — exactly the funnel the
+// timeout message steers away from.
+func TestDispatchResume_RefusesGateExpiryRow(t *testing.T) {
+	mlc := &mockLinearClient{}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60},
+		db:     &mockStore{},
+		lc:     mlc,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	task := &store.AdmiralTask{
+		State:           store.JobStateTimedOut,
+		ClaudeSessionID: "sess-123",
+		WorktreePath:    t.TempDir(),
+		Error:           gateExpiryErrPrefix + " (attempts=2): context deadline exceeded",
+	}
+	o.dispatchResume(linear.AgentEvent{IssueID: "iss-1", SessionID: "sess-1", IssueIdentifier: "GEO-428"}, task)
+
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "verify gate") {
+		t.Fatalf("posted body = %q, want a refusal naming the verify gate", body)
+	}
+}
+
 // The budget that would have run the remote-branch cleanup died with the
 // gate — a branch claude pushed against the prompt during fix-forward must
 // still be removed, so the gate-expiry path cleans up under a fresh ctx.
@@ -4500,6 +4591,15 @@ func TestHandleGateFailure_ShutdownDuringExpiryCleanupLandsFailed(t *testing.T) 
 	}
 	if body := mlc.GetPostedBody(); !strings.Contains(body, "/rerun") {
 		t.Fatalf("posted body = %q, want rerun guidance", body)
+	}
+	// The expiry branch already ran the remote-branch cleanup; the shutdown
+	// settle must not repeat it (a duplicate git push burns shutdown time).
+	recorded, err := os.ReadFile(gitLog)
+	if err != nil {
+		t.Fatalf("fake git never ran: %v", err)
+	}
+	if got := strings.Count(string(recorded), "push origin --delete"); got != 1 {
+		t.Fatalf("remote-branch cleanup ran %d times, want exactly once", got)
 	}
 }
 

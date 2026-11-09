@@ -336,7 +336,9 @@ func (o *Orchestrator) resolvePRFixDeps(ctx context.Context, task *store.Admiral
 		client:     client,
 		replier:    NewGitHubReplier(client, task.PRURL),
 		baseBranch: repo.BaseBranch,
-		verifyCmd:  repo.VerifyCmd,
+		// Trim once, matching bindRepoFields: gating decisions and the gate
+		// itself must agree on what counts as configured.
+		verifyCmd: strings.TrimSpace(repo.VerifyCmd),
 	}
 
 	// The claude subprocess below reads and pushes GitHub state too, so it
