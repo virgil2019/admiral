@@ -2901,8 +2901,11 @@ func (f *flow) timedOutMessage() string {
 		// clock that actually fired, not the per-phase cap.
 		budget = f.outerBudget
 	}
-	if f.verifyCmd != "" {
-		// Gated repo: steer to /rerun whichever clock fired.
+	if f.verifyCmd != "" && f.outerBudget > 0 {
+		// First run on a gated repo: steer to /rerun whichever clock fired.
+		// (outerBudget is bindRepo's marker — resume-shaped flows know
+		// verifyCmd too, but /rerun would abandon the PR a /fix is patching,
+		// so they keep the historic wording.)
 		return fmt.Sprintf(
 			"Task timed out after %ds. The worktree is preserved — prefer /rerun over /resume: %s. (claude session: %s...)",
 			int(budget.Seconds()), rerunSteerNote(), truncatedSession)
@@ -2924,18 +2927,22 @@ func rerunSteerNote() string {
 // defied the prompt and pushed. Best-effort: most calls no-op (branch never
 // pushed) — a benign Debug log, not a warn. Callers whose run ctx is already
 // dead (budget expiry, shutdown) pass a fresh short one; this cleanup must
-// outlive the budget that expired.
+// outlive the budget that expired. Latches only on SUCCESS: a transient
+// push failure leaves the door open for a later caller with a healthy ctx;
+// a successful push makes later calls no-ops (a deleted branch deletes
+// twice without harm, but the tight shutdown window need not pay for it).
 func (f *flow) deleteRemoteBranchBestEffort(ctx context.Context) {
 	if f.remoteBranchCleaned {
 		return
 	}
-	f.remoteBranchCleaned = true
-	if delErr := runCmd(ctx, f.worktreePath, "git", "push", "origin", "--delete", f.branch); delErr != nil {
-		f.o.logger.Debug("first_run_gate_fail_no_remote_branch_to_delete",
-			"branch", f.branch, "err", delErr)
-	} else {
+	delErr := runCmd(ctx, f.worktreePath, "git", "push", "origin", "--delete", f.branch)
+	if delErr == nil {
+		f.remoteBranchCleaned = true
 		f.o.logger.Info("first_run_gate_fail_cleaned_remote_branch", "branch", f.branch)
+		return
 	}
+	f.o.logger.Debug("first_run_gate_fail_no_remote_branch_to_delete",
+		"branch", f.branch, "err", delErr)
 }
 
 // gateExpiryErrPrefix marks a TIMED_OUT row whose run budget expired while
@@ -3044,6 +3051,11 @@ func (f *flow) handleGateFailure(identifier string, gate VerifyRetryResult) erro
 		"issue", identifier, "branch", f.branch,
 		"attempts", gate.Attempts, "launch_err", gate.LaunchErr)
 	f.deleteRemoteBranchBestEffort(f.ctx)
+	gateErrMsg := fmt.Sprintf("build gate failed after %d attempt(s)", gate.Attempts)
+	// Persist before posting: a crash during the retried post (~7s ceiling)
+	// must not leave the gate-killed run EXECUTING for the boot reconciler
+	// to auto-resume past the verify gate.
+	f.persistGateFailed(gateErrMsg)
 	body := fmt.Sprintf(
 		"admiral could not get the build to pass after %d attempt(s). No PR opened.\n\n"+
 			"Verify command: `%s`\nLast build output tail:\n```\n%s\n```",
@@ -3059,8 +3071,6 @@ func (f *flow) handleGateFailure(identifier string, gate VerifyRetryResult) erro
 	if perr := f.postActivityWithRetryCtx(ctx, linear.ErrorActivity(body)); perr != nil {
 		f.o.logger.Warn("gate_fail_activity_push_failed", "issue", identifier, "err", perr)
 	}
-	gateErrMsg := fmt.Sprintf("build gate failed after %d attempt(s)", gate.Attempts)
-	f.persistGateFailed(gateErrMsg)
 	return fmt.Errorf("%s", gateErrMsg)
 }
 

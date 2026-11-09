@@ -4386,8 +4386,11 @@ func TestMarkInterrupted_GateFailedLandsFailedNotResumable(t *testing.T) {
 // gate, so resuming gate-killed code past the gate is the same funnel.
 func TestTimedOutMessage_GatedRepoSteersToRerun(t *testing.T) {
 	o := &Orchestrator{cfg: &config.Autopilot{MaxRunSeconds: 1800}}
+	// First-run gated flow (bindRepo applied the run budget): any timeout
+	// steers to /rerun — resume would push code the gate never saw.
 	gated := newFlow(o, context.Background(), linear.AgentEvent{})
 	gated.verifyCmd = "make check"
+	gated.outerBudget = runBudget(1800, 2, true)
 	gated.claudeSessionID = "sess-12345678"
 
 	s := gated.timedOutMessage()
@@ -4455,6 +4458,38 @@ type countingPoster struct {
 func (p *countingPoster) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {
 	atomic.AddInt32(&p.posts, 1)
 	return p.ctxAwarePoster.PostAgentActivity(ctx, sessionID, a)
+}
+
+// A transient failure (network blip on the git push) must not permanently
+// suppress the cleanup — a later caller with a healthy ctx retries it.
+func TestDeleteRemoteBranchBestEffort_RetriesAfterTransientFailure(t *testing.T) {
+	dir := t.TempDir()
+	attempted := filepath.Join(dir, "attempted")
+	gitLog := filepath.Join(dir, "git.log")
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + gitLog + "\n" +
+		"if [ -f " + attempted + " ]; then exit 0; fi\n" +
+		"touch " + attempted + "\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, _, _, f := gateFailFixture(t)
+	f.worktreePath = dir
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	f.deleteRemoteBranchBestEffort(ctx) // first attempt: transient failure
+	f.deleteRemoteBranchBestEffort(ctx) // later caller: healthy retry
+
+	recorded, err := os.ReadFile(gitLog)
+	if err != nil {
+		t.Fatalf("fake git never ran: %v", err)
+	}
+	if got := strings.Count(string(recorded), "push origin --delete"); got != 2 {
+		t.Fatalf("cleanup attempted %d times, want 2 (retry after the transient failure)", got)
+	}
 }
 
 // A /rerun superseding the row suppresses the FAILED write (attempt guard)
@@ -4718,6 +4753,17 @@ func TestTimedOutMessageNamesAppliedBudget(t *testing.T) {
 	noSession.worktreePath = "/wt/linear-gxo-428"
 	if s := noSession.timedOutMessage(); strings.Contains(s, "(claude session:") {
 		t.Fatalf("gate-expired timedOutMessage = %q, want no session suffix when claudeSessionID is empty", s)
+	}
+
+	// Resume-shaped flows on a gated repo (/fix, /resume: verifyCmd known
+	// via bindIdentity, but no run budget applied) keep the historic
+	// wording — "/rerun over /resume" is first-run guidance; for a /fix
+	// patching an existing PR, /rerun would abandon the PR entirely.
+	fixShaped := newFlow(o, context.Background(), linear.AgentEvent{})
+	fixShaped.verifyCmd = "make check"
+	fixShaped.claudeSessionID = "sess-12345678"
+	if s := fixShaped.timedOutMessage(); !strings.Contains(s, "resume from where I left off") || strings.Contains(s, "prefer /rerun") {
+		t.Fatalf("fix-shaped timedOutMessage = %q, want historic resume wording (the steer is first-run guidance)", s)
 	}
 
 	// Resume-shaped flow (no bindRepo) where claude ran: historic
