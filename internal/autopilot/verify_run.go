@@ -212,6 +212,15 @@ func runVerifyWithRetry(
 			return result
 		}
 
+		// A dead run ctx (shutdown SIGTERM mid-build folds into a non-zero
+		// exit; budget expiry cancels outright) is not a build verdict — the
+		// caller settles the run as interrupted/expired. Retry here would
+		// only burn a claude spawn that fails at exec.Start.
+		if ctx.Err() != nil {
+			result.LaunchErr = fmt.Sprintf("verify build interrupted: %v", ctx.Err())
+			return result
+		}
+
 		// Distinguish "build couldn't run at all" (LaunchErr) from "build ran
 		// and reported failure" (drop into retry). A launch error is a runtime
 		// problem the caller must surface differently — retry won't help when

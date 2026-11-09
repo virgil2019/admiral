@@ -1462,10 +1462,10 @@ func (o *Orchestrator) runWithAttempt(ev linear.AgentEvent, attemptN int) {
 	// No deadline here: the run budget is applied by flow.bindRepo once the
 	// repo is resolved and verifyCmd is known — a gated repo needs the build
 	// gate's fix-forward retries inside the budget (see runBudget). Shutdown
-	// still propagates through baseCtx. The pre-bindRepo window (Linear
-	// reads, repo lookup) is deliberately bounded only by the Linear
-	// client's per-request timeout — any future blocking call added before
-	// bindRepo must be bounded the same way.
+	// still propagates through baseCtx. The pre-bindRepo window (initial
+	// activity, issue fetch) is bounded by execute()'s preBindWindow, not by
+	// this ctx — keep any future blocking call before bindRepo inside that
+	// window.
 	ctx, cancel := context.WithCancel(o.baseCtx())
 	defer cancel()
 
@@ -2884,7 +2884,10 @@ func (f *flow) timedOutMessage() string {
 		if f.gateExpiredBuildTail != "" {
 			body += "\n\nLast build output tail:\n```\n" + f.gateExpiredBuildTail + "\n```"
 		}
-		return body + "\n\n(claude session: " + truncatedSession + "...)"
+		if truncatedSession != "" {
+			body += "\n\n(claude session: " + truncatedSession + "...)"
+		}
+		return body
 	}
 	if f.claudeSessionID == "" {
 		// The run died before claude started (e.g. the pre-bindRepo window's

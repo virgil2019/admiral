@@ -4329,6 +4329,12 @@ func TestHandleGateFailure_BudgetExpiredDefersClassification(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("handleGateFailure err = %v, want wrapped context.DeadlineExceeded", err)
 	}
+	// The persisted error text is what dispatchResume keys on — the writer's
+	// output must keep matching the reader's prefix, or /resume silently
+	// re-opens the gate-expiry funnel.
+	if !isGateExpiryTimeout(err.Error()) {
+		t.Fatalf("handleGateFailure err = %q, want it to match gateExpiryErrPrefix", err)
+	}
 	if !f.gateExpired {
 		t.Fatal("gateExpired not set — timedOutMessage would advertise unsafe /resume")
 	}
@@ -4703,6 +4709,15 @@ func TestTimedOutMessageNamesAppliedBudget(t *testing.T) {
 	}
 	if strings.Contains(s, "Task timed out after") || strings.Contains(s, "resume from where I left off") {
 		t.Fatalf("gate-expired timedOutMessage = %q, want no resume affordance", s)
+	}
+
+	// Gate expiry with no recorded session must not render a dangling
+	// "(claude session: ...)" suffix.
+	noSession := newFlow(o, context.Background(), linear.AgentEvent{})
+	noSession.gateExpired = true
+	noSession.worktreePath = "/wt/linear-gxo-428"
+	if s := noSession.timedOutMessage(); strings.Contains(s, "(claude session:") {
+		t.Fatalf("gate-expired timedOutMessage = %q, want no session suffix when claudeSessionID is empty", s)
 	}
 
 	// Resume-shaped flow (no bindRepo) where claude ran: historic
