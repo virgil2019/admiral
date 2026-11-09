@@ -361,4 +361,10 @@ func TestRunVerifyWithRetry_CanceledCtxSkipsRetry(t *testing.T) {
 	if r.LaunchErr == "" {
 		t.Errorf("LaunchErr empty, want the interruption recorded")
 	}
+	// The cancellation itself must not be misattributed as a launch failure
+	// (exec failing at Start on a dead ctx surfaces ctx.Err() through the
+	// launch-error branch).
+	if !strings.Contains(r.LaunchErr, "verify build interrupted") {
+		t.Errorf("LaunchErr = %q, want the interruption wording", r.LaunchErr)
+	}
 }

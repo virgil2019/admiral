@@ -1888,10 +1888,15 @@ func (f *flow) execute() error {
 	preCtx, preCancel := context.WithTimeout(f.ctx, preBindWindow)
 	f.postActivityCtx(preCtx, linear.Thought("Reading issue context...", true))
 	issue, err := f.o.lc.GetIssue(preCtx, f.ev.IssueID)
-	preCancel()
 	if err != nil {
+		preCancel()
 		return fmt.Errorf("fetch issue: %w", err)
 	}
+	// preCancel waits until bindRepo has applied the run budget: everything
+	// between here and bindRepo (the repo lookup is ctx-less by API, but any
+	// future ctx-taking blocking call added to this segment) stays inside
+	// the preBindWindow instead of outliving every bound.
+	defer preCancel()
 
 	f.teamID = issue.TeamID
 
@@ -3058,12 +3063,13 @@ func (f *flow) handleGateFailure(identifier string, gate VerifyRetryResult) erro
 	f.o.logger.Warn("first_run_build_gate_failed",
 		"issue", identifier, "branch", f.branch,
 		"attempts", gate.Attempts, "launch_err", gate.LaunchErr)
-	f.deleteRemoteBranchBestEffort(f.ctx)
 	gateErrMsg := fmt.Sprintf("build gate failed after %d attempt(s)", gate.Attempts)
-	// Persist before posting: a crash during the retried post (~7s ceiling)
-	// must not leave the gate-killed run EXECUTING for the boot reconciler
-	// to auto-resume past the verify gate.
+	// Persist before ANY side work — the retried post (~7s ceiling) and the
+	// remote-branch cleanup (a network call, up to the remaining budget) —
+	// so a crash in either window cannot leave the gate-killed run
+	// EXECUTING for the boot reconciler to auto-resume past the verify gate.
 	f.persistGateFailed(gateErrMsg)
+	f.deleteRemoteBranchBestEffort(f.ctx)
 	body := fmt.Sprintf(
 		"admiral could not get the build to pass after %d attempt(s). No PR opened.\n\n"+
 			"Verify command: `%s`\nLast build output tail:\n```\n%s\n```",
@@ -3078,6 +3084,11 @@ func (f *flow) handleGateFailure(identifier string, gate VerifyRetryResult) erro
 	defer cancel()
 	if perr := f.postActivityWithRetryCtx(ctx, linear.ErrorActivity(body)); perr != nil {
 		f.o.logger.Warn("gate_fail_activity_push_failed", "issue", identifier, "err", perr)
+		// FAILED rows have no thread-inconsistent stamp (that state is a
+		// DONE variant) — record the delivery gap on the row's error text
+		// instead, so the audit trail shows why no message arrived.
+		f.persistGateFailed(gateErrMsg +
+			fmt.Sprintf(" (thread report undelivered after retries: %v)", perr))
 	}
 	return fmt.Errorf("%s", gateErrMsg)
 }

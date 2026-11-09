@@ -212,6 +212,25 @@ func runVerifyWithRetry(
 			return result
 		}
 
+		// A dead run ctx (shutdown SIGTERM mid-build folds into a non-zero
+		// exit, not TimedOut; budget expiry cancels outright) is not a build
+		// verdict — the caller settles the run as interrupted/expired.
+		// Retry here would only burn a claude spawn that fails at
+		// exec.Start. A genuine launch error racing the cancellation keeps
+		// its real cause; the cancellation itself is not misattributed as a
+		// launch failure (exec failing at Start on a dead ctx returns
+		// ctx.Err() through the same branch).
+		if ctx.Err() != nil {
+			switch {
+			case br.Err != nil && !br.TimedOut &&
+				!errors.Is(br.Err, context.Canceled) && !errors.Is(br.Err, context.DeadlineExceeded):
+				result.LaunchErr = br.Err.Error()
+			default:
+				result.LaunchErr = fmt.Sprintf("verify build interrupted: %v", ctx.Err())
+			}
+			return result
+		}
+
 		// Distinguish "build couldn't run at all" (LaunchErr) from "build ran
 		// and reported failure" (drop into retry). A launch error is a runtime
 		// problem the caller must surface differently — retry won't help when
@@ -220,17 +239,6 @@ func runVerifyWithRetry(
 			// Real launch failure (vs ExitError, which runRepoVerify already
 			// folds into ExitCode). Bail.
 			result.LaunchErr = br.Err.Error()
-			return result
-		}
-
-		// A dead run ctx (shutdown SIGTERM mid-build folds into a non-zero
-		// exit, not TimedOut; budget expiry cancels outright) is not a build
-		// verdict — the caller settles the run as interrupted/expired. Retry
-		// here would only burn a claude spawn that fails at exec.Start.
-		// Checked after the launch-failure branch so a genuine launch error
-		// racing the cancellation keeps its real cause in LaunchErr.
-		if ctx.Err() != nil {
-			result.LaunchErr = fmt.Sprintf("verify build interrupted: %v", ctx.Err())
 			return result
 		}
 
