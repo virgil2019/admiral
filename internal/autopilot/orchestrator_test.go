@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -4240,6 +4241,9 @@ func TestFlowBindRepoRunBudget(t *testing.T) {
 			if err != nil {
 				t.Fatalf("bindRepo: %v", err)
 			}
+			if f.runBudget != tt.want {
+				t.Fatalf("flow runBudget = %s, want %s", f.runBudget, tt.want)
+			}
 			dl, ok := f.ctx.Deadline()
 			if !ok {
 				t.Fatal("no deadline on flow ctx after bindRepo — run budget not applied")
@@ -4270,5 +4274,121 @@ func TestFlowBindRepoGhUserUnsetNoBudget(t *testing.T) {
 	}
 	if f.cancelBudget != nil {
 		t.Fatal("cancelBudget set despite bindRepo failure")
+	}
+}
+
+// gateFailFixture builds a flow wired to recording mocks, ready for a
+// handleGateFailure call. worktreePath is a non-git temp dir so the
+// best-effort remote-branch cleanup fails fast locally instead of touching
+// any real repo.
+func gateFailFixture(t *testing.T) (*Orchestrator, *mockStore, *mockLinearClient, *flow) {
+	t.Helper()
+	ms := &mockStore{LiveAdmiralTask: &store.AdmiralTask{
+		IssueID: "iss-1", State: store.JobStateExecuting,
+	}}
+	mlc := &mockLinearClient{}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60, VerifyMaxRetries: 2},
+		db:     ms,
+		lc:     mlc,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	f := newFlow(o, context.Background(), linear.AgentEvent{IssueID: "iss-1", SessionID: "sess-1"})
+	f.worktreePath = t.TempDir()
+	f.branch = "linear/geo-428"
+	f.verifyCmd = "make check"
+	return o, ms, mlc, f
+}
+
+// The run budget expiring mid-gate is a timeout, not a build failure: the
+// verify command or a fix-forward claude run was killed by the clock.
+// Reporting "could not get the build to pass" would misdiagnose the run and
+// land it FAILED (terminal, /rerun only) instead of TIMED_OUT (/resume).
+func TestHandleGateFailure_BudgetExpiredIsTimeoutNotBuildFail(t *testing.T) {
+	o, ms, mlc, f := gateFailFixture(t)
+	_ = o
+	var cancel context.CancelFunc
+	f.ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	err := f.handleGateFailure("GEO-428", VerifyRetryResult{Attempts: 2, LastBuildOutput: "boom"})
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("handleGateFailure err = %v, want wrapped context.DeadlineExceeded", err)
+	}
+	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateTimedOut {
+		t.Fatalf("admiral task state = %s, want TIMED_OUT", got)
+	}
+	if got := ms.LiveAdmiralSnapshot().Error; !strings.Contains(got, "run budget expired") {
+		t.Fatalf("admiral task error = %q, want budget-expiry wording", got)
+	}
+	if body := mlc.GetPostedBody(); strings.Contains(body, "could not get the build to pass") {
+		t.Fatalf("posted body misreports budget expiry as build failure: %q", body)
+	}
+}
+
+// A genuine build failure (budget still alive) keeps the existing FAILED
+// outcome: build-fail message on the thread, FAILED persisted, plain
+// gateErrMsg returned.
+func TestHandleGateFailure_BuildFailureStaysFailed(t *testing.T) {
+	_, ms, mlc, f := gateFailFixture(t)
+
+	err := f.handleGateFailure("GEO-428", VerifyRetryResult{Attempts: 2, LastBuildOutput: "boom"})
+
+	if err == nil || !strings.Contains(err.Error(), "build gate failed after 2 attempt(s)") {
+		t.Fatalf("handleGateFailure err = %v, want gate-failure wording", err)
+	}
+	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateFailed {
+		t.Fatalf("admiral task state = %s, want FAILED", got)
+	}
+	body := mlc.GetPostedBody()
+	if !strings.Contains(body, "could not get the build to pass") ||
+		!strings.Contains(body, "Verify command: `make check`") {
+		t.Fatalf("posted body = %q, want build-failure report with verify command", body)
+	}
+}
+
+// The timeout message names the budget the run actually had: gated repos
+// get the scaled run budget, resume-shaped flows (no bindRepo) keep the
+// historic MaxRunSeconds wording.
+func TestTimedOutMessageNamesAppliedBudget(t *testing.T) {
+	o := &Orchestrator{cfg: &config.Autopilot{MaxRunSeconds: 1800}}
+
+	gated := newFlow(o, context.Background(), linear.AgentEvent{})
+	gated.runBudget = runBudget(1800, 2, true)
+	want := int(runBudget(1800, 2, true).Seconds())
+	if s := gated.timedOutMessage(); !strings.Contains(s, fmt.Sprintf("after %ds", want)) {
+		t.Fatalf("gated timedOutMessage = %q, want it to name the applied %ds budget", s, want)
+	}
+
+	resume := newFlow(o, context.Background(), linear.AgentEvent{})
+	if s := resume.timedOutMessage(); !strings.Contains(s, "after 1800s") {
+		t.Fatalf("resume-shaped timedOutMessage = %q, want historic MaxRunSeconds wording", s)
+	}
+}
+
+// A shutdown that lands mid-gate persists nothing here — the error returns
+// to runWithAttempt, whose shutdown check records the run as interrupted
+// (resumable), never as a build failure.
+func TestHandleGateFailure_ShutdownPersistsNothing(t *testing.T) {
+	o, ms, mlc, f := gateFailFixture(t)
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	o.rootCtx = rootCtx
+	defer rootCancel()
+	rootCancel() // shutdown before the gate outcome is decided
+	var cancel context.CancelFunc
+	f.ctx, cancel = context.WithCancel(rootCtx)
+	defer cancel()
+
+	err := f.handleGateFailure("GEO-428", VerifyRetryResult{Attempts: 1, LastBuildOutput: "boom"})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("handleGateFailure err = %v, want wrapped context.Canceled", err)
+	}
+	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateExecuting {
+		t.Fatalf("admiral task state = %s, want untouched EXECUTING", got)
+	}
+	if body := mlc.GetPostedBody(); body != "" {
+		t.Fatalf("posted body = %q, want nothing posted during shutdown", body)
 	}
 }

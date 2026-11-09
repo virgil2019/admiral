@@ -1451,7 +1451,10 @@ func (o *Orchestrator) runWithAttempt(ev linear.AgentEvent, attemptN int) {
 	// No deadline here: the run budget is applied by flow.bindRepo once the
 	// repo is resolved and verifyCmd is known — a gated repo needs the build
 	// gate's fix-forward retries inside the budget (see runBudget). Shutdown
-	// still propagates through baseCtx.
+	// still propagates through baseCtx. The pre-bindRepo window (Linear
+	// reads, repo lookup) is deliberately bounded only by the Linear
+	// client's per-request timeout — any future blocking call added before
+	// bindRepo must be bounded the same way.
 	ctx, cancel := context.WithCancel(o.baseCtx())
 	defer cancel()
 
@@ -1545,6 +1548,12 @@ type flow struct {
 	// cancelBudget cancels the run deadline bindRepo applied to ctx (set
 	// only after bindRepo succeeds; execute defers it).
 	cancelBudget context.CancelFunc
+
+	// runBudget is the wall-clock budget bindRepo applied to ctx (0 when no
+	// budget was applied — resume-shaped flows). markTimedOut reports it so
+	// the thread message names the time actually available to the run, not
+	// cfg.MaxRunSeconds.
+	runBudget time.Duration
 }
 
 func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
@@ -1733,6 +1742,17 @@ func (f *flow) bindIdentity(projectID string) error {
 		// GitHub, so they must respect the switch that stops first runs.
 		return fmt.Errorf("the repo for project %s is disabled — re-enable it with `PATCH /admin/repos/%s {\"enabled\":true}` before retrying", projectID, projectID)
 	}
+	return f.bindRepoFields(repo, projectID)
+}
+
+// bindRepoFields records the repo-scoped fields of a flow and enforces the
+// gh identity gate. admiral acts on GitHub as the account the repo
+// registered; without one it would fall back to whatever account happens to
+// be active on the host, which is how a run ends up pushing a branch it
+// cannot open a PR for. Refuse before any work happens, and say in the
+// Linear thread exactly how to fix it. Shared by bindRepo (first-run path)
+// and bindIdentity (/fix and /resume).
+func (f *flow) bindRepoFields(repo *store.Repo, projectID string) error {
 	f.repoDir = repo.RepoDir
 	f.baseBranch = repo.BaseBranch
 	f.verifyCmd = repo.VerifyCmd
@@ -1747,24 +1767,21 @@ func (f *flow) bindIdentity(projectID string) error {
 // bindRepo records the repo-scoped fields of the first-run flow (execute)
 // and applies the run budget. Only here is verifyCmd known — i.e. whether
 // the build gate will run and the budget must cover its fix-forward retries
-// (see runBudget). The /fix and /resume paths use bindIdentity instead;
-// their budgets come from runFix / runResume and they run no gate.
+// (see runBudget).
+//
+// The /fix and /resume paths use bindIdentity instead, keep their plain
+// runFix/runResume budgets, and run no gate: a resume-shaped run (runResume,
+// runAwaitingResume, runFix) can push and open the PR with code verify_cmd
+// never passed. That bypass is a known accepted gap — closing it means
+// gating the push/PR boundary of those paths, a follow-up of GEO-428, not a
+// property of this budget.
 func (f *flow) bindRepo(repo *store.Repo, projectID string) error {
-	f.repoDir = repo.RepoDir
-	f.baseBranch = repo.BaseBranch
-	f.verifyCmd = repo.VerifyCmd
-	f.projectID = projectID
-	// Identity gate. admiral acts on GitHub as the account the repo
-	// registered; without one it would fall back to whatever account is
-	// active on the host, which is how a run ends up pushing a branch it
-	// cannot open a PR for. Refuse before any work happens, and say in the
-	// Linear thread exactly how to fix it.
-	f.ghUser = strings.TrimSpace(repo.GhUser)
-	if f.ghUser == "" {
-		return errGhUserUnset(projectID)
+	if err := f.bindRepoFields(repo, projectID); err != nil {
+		return err
 	}
-	f.ctx, f.cancelBudget = context.WithTimeout(f.ctx,
-		runBudget(f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, f.verifyCmd != ""))
+	budget := runBudget(f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, f.verifyCmd != "")
+	f.runBudget = budget
+	f.ctx, f.cancelBudget = context.WithTimeout(f.ctx, budget)
 	return nil
 }
 
@@ -1973,42 +1990,7 @@ func (f *flow) execute() error {
 		gate := runVerifyWithRetry(f.ctx, f.worktreePath, f.verifyCmd, f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, gateEnv, claudeRunner)
 		gateAttempts = gate.Attempts
 		if !gate.Passed {
-			f.o.logger.Warn("first_run_build_gate_failed",
-				"issue", issue.Identifier, "branch", f.branch,
-				"attempts", gate.Attempts, "launch_err", gate.LaunchErr)
-			// Best-effort: if claude defied the prompt and pushed, remove the
-			// remote branch so no broken state sits on origin. Most calls will
-			// no-op (branch never pushed) — that's a benign Debug log, not a
-			// warn.
-			if delErr := runCmd(f.ctx, f.worktreePath, "git", "push", "origin", "--delete", f.branch); delErr != nil {
-				f.o.logger.Debug("first_run_gate_fail_no_remote_branch_to_delete",
-					"branch", f.branch, "err", delErr)
-			} else {
-				f.o.logger.Info("first_run_gate_fail_cleaned_remote_branch", "branch", f.branch)
-			}
-			body := fmt.Sprintf(
-				"admiral could not get the build to pass after %d attempt(s). No PR opened.\n\n"+
-					"Verify command: `%s`\nLast build output tail:\n```\n%s\n```",
-				gate.Attempts, f.verifyCmd, strings.TrimSpace(gate.LastBuildOutput))
-			if gate.LaunchErr != "" {
-				body += fmt.Sprintf("\n\nadmiral launch error: %s", gate.LaunchErr)
-			}
-			f.postActivity(linear.ErrorActivity(body))
-			now := time.Now().UTC().Format(time.RFC3339)
-			gateErrMsg := fmt.Sprintf("build gate failed after %d attempt(s)", gate.Attempts)
-			f.persistAdmiralTask(func(t *store.AdmiralTask) {
-				t.State = store.JobStateFailed
-				t.FinishedAt = now
-				t.Error = gateErrMsg
-			})
-			if jerr := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
-				j.State = store.JobStateFailed
-				j.FinishedAt = now
-				j.Error = gateErrMsg
-			}); jerr != nil {
-				f.o.logger.Warn("update_job_state_on_gate_fail", "err", jerr)
-			}
-			return fmt.Errorf("%s", gateErrMsg)
+			return f.handleGateFailure(issue.Identifier, gate)
 		}
 		f.o.logger.Info("first_run_build_gate_passed",
 			"issue", issue.Identifier, "branch", f.branch, "attempts", gate.Attempts)
@@ -2778,13 +2760,83 @@ func (f *flow) markFailed(runErr error) {
 }
 
 func (f *flow) markTimedOut(runErr error) {
+	f.markTimedOutWithMessage(runErr, f.timedOutMessage())
+}
+
+// timedOutMessage renders the /resume affordance message for a run-length
+// timeout, naming the budget the run actually had (see runBudget) so a
+// gated repo's longer run doesn't read as a MaxRunSeconds timeout.
+func (f *flow) timedOutMessage() string {
+	budget := f.runBudget
+	if budget == 0 {
+		// Resume-shaped flows (no bindRepo) keep the historic wording.
+		budget = time.Duration(f.o.cfg.MaxRunSeconds) * time.Second
+	}
 	truncatedSession := f.claudeSessionID
 	if len(truncatedSession) > 8 {
 		truncatedSession = truncatedSession[:8]
 	}
-	f.markTimedOutWithMessage(runErr, fmt.Sprintf(
+	return fmt.Sprintf(
 		"Task timed out after %ds. State preserved — re-mention me on this issue to resume from where I left off. (claude session: %s...)",
-		f.o.cfg.MaxRunSeconds, truncatedSession))
+		int(budget.Seconds()), truncatedSession)
+}
+
+// handleGateFailure settles a run whose build hard gate did not pass.
+// Shutdown (ctx canceled) returns without persisting anything, leaving the
+// classification to runWithAttempt's shutdown check. A run budget that
+// expired mid-gate is a timeout, not a build failure — the verify command
+// or a fix-forward claude run was killed by the clock — so it reports
+// TIMED_OUT (resumable) instead of "could not get the build to pass"
+// (FAILED, terminal). Otherwise the gate genuinely failed: clean up any
+// remote branch, surface the build tail on the thread, and persist FAILED.
+func (f *flow) handleGateFailure(identifier string, gate VerifyRetryResult) error {
+	if f.o.shuttingDown() {
+		return fmt.Errorf("build gate interrupted by shutdown: %w", f.ctx.Err())
+	}
+	if errors.Is(f.ctx.Err(), context.DeadlineExceeded) {
+		f.o.logger.Warn("run_budget_expired_during_build_gate",
+			"issue", identifier, "branch", f.branch, "attempts", gate.Attempts)
+		err := fmt.Errorf("run budget expired during build gate (attempts=%d): %w",
+			gate.Attempts, f.ctx.Err())
+		f.markTimedOut(err)
+		return err
+	}
+	f.o.logger.Warn("first_run_build_gate_failed",
+		"issue", identifier, "branch", f.branch,
+		"attempts", gate.Attempts, "launch_err", gate.LaunchErr)
+	// Best-effort: if claude defied the prompt and pushed, remove the
+	// remote branch so no broken state sits on origin. Most calls will
+	// no-op (branch never pushed) — that's a benign Debug log, not a
+	// warn.
+	if delErr := runCmd(f.ctx, f.worktreePath, "git", "push", "origin", "--delete", f.branch); delErr != nil {
+		f.o.logger.Debug("first_run_gate_fail_no_remote_branch_to_delete",
+			"branch", f.branch, "err", delErr)
+	} else {
+		f.o.logger.Info("first_run_gate_fail_cleaned_remote_branch", "branch", f.branch)
+	}
+	body := fmt.Sprintf(
+		"admiral could not get the build to pass after %d attempt(s). No PR opened.\n\n"+
+			"Verify command: `%s`\nLast build output tail:\n```\n%s\n```",
+		gate.Attempts, f.verifyCmd, strings.TrimSpace(gate.LastBuildOutput))
+	if gate.LaunchErr != "" {
+		body += fmt.Sprintf("\n\nadmiral launch error: %s", gate.LaunchErr)
+	}
+	f.postActivity(linear.ErrorActivity(body))
+	now := time.Now().UTC().Format(time.RFC3339)
+	gateErrMsg := fmt.Sprintf("build gate failed after %d attempt(s)", gate.Attempts)
+	f.persistAdmiralTask(func(t *store.AdmiralTask) {
+		t.State = store.JobStateFailed
+		t.FinishedAt = now
+		t.Error = gateErrMsg
+	})
+	if jerr := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+		j.State = store.JobStateFailed
+		j.FinishedAt = now
+		j.Error = gateErrMsg
+	}); jerr != nil {
+		f.o.logger.Warn("update_job_state_on_gate_fail", "err", jerr)
+	}
+	return fmt.Errorf("%s", gateErrMsg)
 }
 
 // markTimedOutBeforeStart records a /resume that failed its pre-flight, i.e.
