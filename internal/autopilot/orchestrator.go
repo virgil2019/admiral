@@ -1448,8 +1448,11 @@ func (o *Orchestrator) runWithAttempt(ev linear.AgentEvent, attemptN int) {
 	release := o.acquireRunSlot()
 	defer release()
 
-	ctx, cancel := context.WithTimeout(o.baseCtx(),
-		time.Duration(o.cfg.MaxRunSeconds+120)*time.Second)
+	// No deadline here: the run budget is applied by flow.bindRepo once the
+	// repo is resolved and verifyCmd is known — a gated repo needs the build
+	// gate's fix-forward retries inside the budget (see runBudget). Shutdown
+	// still propagates through baseCtx.
+	ctx, cancel := context.WithCancel(o.baseCtx())
 	defer cancel()
 
 	// autopilot_jobs claim is best-effort under the new model — admiral_tasks
@@ -1538,6 +1541,10 @@ type flow struct {
 	// means the run called ask_user and parked itself; execute() will
 	// transition the task to AWAITING_INPUT instead of opening a PR.
 	awaitPendingID string
+
+	// cancelBudget cancels the run deadline bindRepo applied to ctx (set
+	// only after bindRepo succeeds; execute defers it).
+	cancelBudget context.CancelFunc
 }
 
 func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
@@ -1737,6 +1744,45 @@ func (f *flow) bindIdentity(projectID string) error {
 	return nil
 }
 
+// bindRepo records the repo-scoped fields of the first-run flow (execute)
+// and applies the run budget. Only here is verifyCmd known — i.e. whether
+// the build gate will run and the budget must cover its fix-forward retries
+// (see runBudget). The /fix and /resume paths use bindIdentity instead;
+// their budgets come from runFix / runResume and they run no gate.
+func (f *flow) bindRepo(repo *store.Repo, projectID string) error {
+	f.repoDir = repo.RepoDir
+	f.baseBranch = repo.BaseBranch
+	f.verifyCmd = repo.VerifyCmd
+	f.projectID = projectID
+	// Identity gate. admiral acts on GitHub as the account the repo
+	// registered; without one it would fall back to whatever account is
+	// active on the host, which is how a run ends up pushing a branch it
+	// cannot open a PR for. Refuse before any work happens, and say in the
+	// Linear thread exactly how to fix it.
+	f.ghUser = strings.TrimSpace(repo.GhUser)
+	if f.ghUser == "" {
+		return errGhUserUnset(projectID)
+	}
+	f.ctx, f.cancelBudget = context.WithTimeout(f.ctx,
+		runBudget(f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, f.verifyCmd != ""))
+	return nil
+}
+
+// runBudget returns the wall-clock budget for one attempt run (first run or
+// /rerun). With verify_cmd configured the run is claude plus the build hard
+// gate — one verify pass plus, per retry, a claude fix-forward pass and a
+// verify pass, each individually budgeted maxRunSeconds — so the budget must
+// scale with the retries (prFixBudget; same arithmetic the PR-fix paths
+// use). A single MaxRunSeconds+120 budget is consumed by the initial claude
+// run and kills the gate mid-build, leaving verify_max_retries unreachable.
+// Gate-less repos keep the plain budget: claude plus the PR-overhead slack.
+func runBudget(maxRunSeconds, verifyMaxRetries int, gated bool) time.Duration {
+	if gated {
+		return prFixBudget(maxRunSeconds, verifyMaxRetries)
+	}
+	return time.Duration(maxRunSeconds+120) * time.Second
+}
+
 func (f *flow) execute() error {
 	f.postActivity(linear.Thought("Reading issue context...", true))
 
@@ -1762,19 +1808,10 @@ func (f *flow) execute() error {
 	if repo == nil || !repo.Enabled {
 		return fmt.Errorf("no enabled repo configured for project %s", issue.ProjectID)
 	}
-	f.repoDir = repo.RepoDir
-	f.baseBranch = repo.BaseBranch
-	f.verifyCmd = repo.VerifyCmd
-	f.projectID = issue.ProjectID
-	// Identity gate. admiral acts on GitHub as the account the repo
-	// registered; without one it would fall back to whatever account is
-	// active on the host, which is how a run ends up pushing a branch it
-	// cannot open a PR for. Refuse before any work happens, and say in the
-	// Linear thread exactly how to fix it.
-	f.ghUser = strings.TrimSpace(repo.GhUser)
-	if f.ghUser == "" {
-		return errGhUserUnset(issue.ProjectID)
+	if err := f.bindRepo(repo, issue.ProjectID); err != nil {
+		return err
 	}
+	defer f.cancelBudget()
 	worktreeName := "linear-" + sanitizeForPath(issue.Identifier)
 	f.branch = branchName(issue)
 	// /rerun: append `-rerun-<N>` to both branch and worktree so a new
