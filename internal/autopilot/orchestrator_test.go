@@ -4278,6 +4278,19 @@ func TestFlowBindRepoGhUserUnsetNoBudget(t *testing.T) {
 	}
 }
 
+// ctxAwarePoster fails posts that run on a dead context — the real client
+// honors request ctx, so a post attempted on a canceled ctx never lands.
+// Wrapping the recording mock keeps the assertions honest about WHERE the
+// message is posted from.
+type ctxAwarePoster struct{ *mockLinearClient }
+
+func (p *ctxAwarePoster) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return p.mockLinearClient.PostAgentActivity(ctx, sessionID, a)
+}
+
 // gateFailFixture builds a flow wired to recording mocks, ready for a
 // handleGateFailure call. worktreePath is a non-git temp dir so the
 // best-effort remote-branch cleanup fails fast locally instead of touching
@@ -4291,7 +4304,7 @@ func gateFailFixture(t *testing.T) (*Orchestrator, *mockStore, *mockLinearClient
 	o := &Orchestrator{
 		cfg:    &config.Autopilot{MaxRunSeconds: 60, VerifyMaxRetries: 2},
 		db:     ms,
-		lc:     mlc,
+		lc:     &ctxAwarePoster{mockLinearClient: mlc},
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	f := newFlow(o, context.Background(), linear.AgentEvent{IssueID: "iss-1", SessionID: "sess-1"})
@@ -4361,6 +4374,64 @@ func TestHandleGateFailure_BudgetExpiredCleansRemoteBranch(t *testing.T) {
 	}
 }
 
+// Shutdown landing WHILE the gate-expiry path cleans up (before
+// classification) must not leave the run interrupt-resumable: nothing is
+// persisted yet, so runWithAttempt would mark it TIMED_OUT with the
+// InterruptedByShutdown marker and the reconciler would auto-resume past
+// the verify gate. The race branch settles FAILED instead.
+func TestHandleGateFailure_ShutdownDuringExpiryCleanupLandsFailed(t *testing.T) {
+	dir := t.TempDir()
+	started := filepath.Join(dir, "started")
+	release := filepath.Join(dir, "release")
+	gitLog := filepath.Join(dir, "git.log")
+	script := "#!/bin/sh\ntouch " + started + "\n" +
+		"while [ ! -f " + release + " ]; do sleep 0.02; done\n" +
+		"echo \"$@\" >> " + gitLog + "\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	o, ms, mlc, f := gateFailFixture(t)
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	o.rootCtx = rootCtx
+	defer rootCancel()
+	var cancel context.CancelFunc
+	f.ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- f.handleGateFailure("GEO-428", VerifyRetryResult{Attempts: 2, LastBuildOutput: "boom"})
+	}()
+
+	// Wait until the cleanup's git push is running, then land the shutdown
+	// inside the gate-expiry branch's cleanup window.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fake git never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	rootCancel()
+	if err := os.WriteFile(release, []byte("go"), 0o644); err != nil {
+		t.Fatalf("release fake git: %v", err)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("handleGateFailure err = nil, want non-nil")
+	}
+	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateFailed {
+		t.Fatalf("admiral task state = %s, want FAILED (not interrupt-resumable past the gate)", got)
+	}
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "/rerun") {
+		t.Fatalf("posted body = %q, want rerun guidance", body)
+	}
+}
+
 // A genuine build failure (budget still alive) keeps the existing FAILED
 // outcome: build-fail message on the thread, FAILED persisted, plain
 // gateErrMsg returned.
@@ -4391,16 +4462,20 @@ func TestTimedOutMessageNamesAppliedBudget(t *testing.T) {
 	o := &Orchestrator{cfg: &config.Autopilot{MaxRunSeconds: 1800}}
 	budget := runBudget(1800, 2, true) // 6 × 1920s
 
-	// Claude-phase kill: outer budget still alive → per-phase cap.
+	// Claude-phase kill: outer budget still alive → per-phase cap. Claude
+	// ran, so the session is recorded and the resume affordance applies.
 	claudeKill := newFlow(o, context.Background(), linear.AgentEvent{})
 	claudeKill.outerBudget = budget
+	claudeKill.claudeSessionID = "sess-12345678"
 	if s := claudeKill.timedOutMessage(); !strings.Contains(s, "after 1800s") {
 		t.Fatalf("claude-phase timedOutMessage = %q, want MaxRunSeconds wording", s)
 	}
 
-	// Post-gate expiry: the outer deadline fired → the run budget.
+	// Post-gate expiry: the outer deadline fired → the run budget. Claude
+	// ran (session recorded) — the pre-claude wording must not hijack this.
 	outerKill := newFlow(o, context.Background(), linear.AgentEvent{})
 	outerKill.outerBudget = budget
+	outerKill.claudeSessionID = "sess-12345678"
 	var cancel context.CancelFunc
 	outerKill.ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
@@ -4421,9 +4496,21 @@ func TestTimedOutMessageNamesAppliedBudget(t *testing.T) {
 		t.Fatalf("gate-expired timedOutMessage = %q, want no resume affordance", s)
 	}
 
-	// Plain flow (no bindRepo): historic MaxRunSeconds wording.
-	if s := newFlow(o, context.Background(), linear.AgentEvent{}).timedOutMessage(); !strings.Contains(s, "after 1800s") {
+	// Resume-shaped flow (no bindRepo) where claude ran: historic
+	// MaxRunSeconds wording.
+	plain := newFlow(o, context.Background(), linear.AgentEvent{})
+	plain.claudeSessionID = "sess-12345678"
+	if s := plain.timedOutMessage(); !strings.Contains(s, "after 1800s") {
 		t.Fatalf("plain timedOutMessage = %q, want MaxRunSeconds wording", s)
+	}
+
+	// Claude never started (pre-run window deadline): no session to resume,
+	// so no resume affordance — rerun guidance instead.
+	pre := newFlow(o, context.Background(), linear.AgentEvent{})
+	pre.outerBudget = 0
+	if s := pre.timedOutMessage(); !strings.Contains(s, "/rerun") ||
+		strings.Contains(s, "resume from where I left off") {
+		t.Fatalf("pre-claude timedOutMessage = %q, want rerun guidance without resume affordance", s)
 	}
 }
 
