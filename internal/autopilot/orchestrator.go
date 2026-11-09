@@ -1556,6 +1556,17 @@ type flow struct {
 	// verify gate, so advertising /resume here would funnel gate-killed
 	// code past the gate that was mid-verification.
 	gateExpired bool
+
+	// gateExpiredBuildTail carries the gate's last build output for the
+	// gateExpired thread message (the budget that died mid-gate never
+	// reaches the genuine-failure report path).
+	gateExpiredBuildTail string
+
+	// outerBudget is the run budget bindRepo applied to ctx (0 on
+	// resume-shaped flows). timedOutMessage names it when the outer
+	// deadline is the one that fired; the claude phase's own MaxRunSeconds
+	// cap is reported as MaxRunSeconds.
+	outerBudget time.Duration
 }
 
 func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
@@ -1761,7 +1772,10 @@ func (f *flow) bindIdentity(projectID string) error {
 func (f *flow) bindRepoFields(repo *store.Repo, projectID string) error {
 	f.repoDir = repo.RepoDir
 	f.baseBranch = repo.BaseBranch
-	f.verifyCmd = repo.VerifyCmd
+	// Trim once, here: the gate (runVerifyWithRetry) trims before running,
+	// so gating decisions (runBudget) and the gate itself must agree on
+	// what counts as configured — a whitespace-only verify_cmd is ungated.
+	f.verifyCmd = strings.TrimSpace(repo.VerifyCmd)
 	f.projectID = projectID
 	f.ghUser = strings.TrimSpace(repo.GhUser)
 	if f.ghUser == "" {
@@ -1786,6 +1800,7 @@ func (f *flow) bindRepo(repo *store.Repo, projectID string) error {
 		return err
 	}
 	budget := runBudget(f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, f.verifyCmd != "")
+	f.outerBudget = budget
 	f.ctx, f.cancelBudget = context.WithTimeout(f.ctx, budget)
 	return nil
 }
@@ -2730,39 +2745,46 @@ func (f *flow) markFailed(runErr error) {
 		return
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
-	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
-		j.State = store.JobStateFailed
-		j.Error = runErr.Error()
-		j.FinishedAt = now
-	})
-	f.persistAdmiralTask(func(t *store.AdmiralTask) {
-		t.State = store.JobStateFailed
-		t.Error = runErr.Error()
-		t.FinishedAt = now
-	})
-	// Use a fresh short ctx in case the parent is already done.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	mention := f.creatorMention()
-	body := mention + "admiral failed: " + truncate(runErr.Error(), 1500)
-	if f.worktreePath != "" {
-		body += "\n\nWorktree: `" + f.worktreePath + "`"
-	}
-	if f.branch != "" {
-		body += "\nBranch: `" + f.branch + "`"
-	}
-	if j, err := f.o.db.GetAutopilotJob(f.ev.SessionID); err == nil && j.StreamLogPath != "" {
-		body += "\n\nStream log: " + j.StreamLogPath
-	}
-	err := f.postActivityWithRetry(linear.ErrorActivity(body))
-	if err != nil {
-		f.o.logger.Error("final_activity_push_failed",
-			"session", f.ev.SessionID, "err", err)
+	// A row that already reached a terminal state describes the work (the
+	// build gate wrote FAILED with its own detailed thread message, say).
+	// Re-stamping it and posting the generic "admiral failed" body would
+	// duplicate the message and blur the specific diagnosis. The worktree
+	// cleanup below still runs.
+	if !f.alreadyTerminal() {
+		now := time.Now().UTC().Format(time.RFC3339)
 		_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
-			j.State = store.JobStateDoneThreadInconsistent
+			j.State = store.JobStateFailed
+			j.Error = runErr.Error()
+			j.FinishedAt = now
 		})
-		_ = f.addInconsistencyFooter(ctx)
+		f.persistAdmiralTask(func(t *store.AdmiralTask) {
+			t.State = store.JobStateFailed
+			t.Error = runErr.Error()
+			t.FinishedAt = now
+		})
+		// Use a fresh short ctx in case the parent is already done.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		mention := f.creatorMention()
+		body := mention + "admiral failed: " + truncate(runErr.Error(), 1500)
+		if f.worktreePath != "" {
+			body += "\n\nWorktree: `" + f.worktreePath + "`"
+		}
+		if f.branch != "" {
+			body += "\nBranch: `" + f.branch + "`"
+		}
+		if j, err := f.o.db.GetAutopilotJob(f.ev.SessionID); err == nil && j.StreamLogPath != "" {
+			body += "\n\nStream log: " + j.StreamLogPath
+		}
+		err := f.postActivityWithRetry(linear.ErrorActivity(body))
+		if err != nil {
+			f.o.logger.Error("final_activity_push_failed",
+				"session", f.ev.SessionID, "err", err)
+			_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+				j.State = store.JobStateDoneThreadInconsistent
+			})
+			_ = f.addInconsistencyFooter(ctx)
+		}
 	}
 	// On branch divergence the error message instructs the user to rebase
 	// inside the worktree and push manually — keep it on disk so that
@@ -2790,26 +2812,76 @@ func (f *flow) timedOutMessage() string {
 		truncatedSession = truncatedSession[:8]
 	}
 	if f.gateExpired {
-		return "Run budget expired during the build gate. The worktree is preserved — " +
-			"prefer /rerun over /resume: resuming continues without re-running the verify gate. " +
-			"(claude session: " + truncatedSession + "...)"
+		body := "Run budget expired during the build gate. The worktree is preserved — " +
+			"prefer /rerun over /resume: resuming continues without re-running the verify gate.\n\n" +
+			"Worktree (fix-forward commits there are discarded by /rerun): `" + f.worktreePath + "`"
+		if f.gateExpiredBuildTail != "" {
+			body += "\n\nLast build output tail:\n```\n" + f.gateExpiredBuildTail + "\n```"
+		}
+		return body + "\n\n(claude session: " + truncatedSession + "...)"
+	}
+	budget := time.Duration(f.o.cfg.MaxRunSeconds) * time.Second
+	if f.outerBudget > 0 && errors.Is(f.ctx.Err(), context.DeadlineExceeded) {
+		// The run budget itself expired — post-gate phases (ensurePR) run
+		// under it, and the gate-expiry case is handled above. Name the
+		// clock that actually fired, not the per-phase cap.
+		budget = f.outerBudget
 	}
 	return fmt.Sprintf(
 		"Task timed out after %ds. State preserved — re-mention me on this issue to resume from where I left off. (claude session: %s...)",
-		f.o.cfg.MaxRunSeconds, truncatedSession)
+		int(budget.Seconds()), truncatedSession)
+}
+
+// deleteRemoteBranchBestEffort removes the branch from origin if claude
+// defied the prompt and pushed. Best-effort: most calls no-op (branch never
+// pushed) — a benign Debug log, not a warn. Callers whose run ctx is already
+// dead (budget expiry, shutdown) pass a fresh short one; this cleanup must
+// outlive the budget that expired.
+func (f *flow) deleteRemoteBranchBestEffort(ctx context.Context) {
+	if delErr := runCmd(ctx, f.worktreePath, "git", "push", "origin", "--delete", f.branch); delErr != nil {
+		f.o.logger.Debug("first_run_gate_fail_no_remote_branch_to_delete",
+			"branch", f.branch, "err", delErr)
+	} else {
+		f.o.logger.Info("first_run_gate_fail_cleaned_remote_branch", "branch", f.branch)
+	}
 }
 
 // handleGateFailure settles a run whose build hard gate did not pass.
-// Shutdown (ctx canceled) returns without persisting anything, leaving the
-// classification to runWithAttempt's shutdown check. A run budget that
-// expired mid-gate is a timeout, not a build failure — the verify command
-// or a fix-forward claude run was killed by the clock — so it reports
-// TIMED_OUT (resumable) instead of "could not get the build to pass"
-// (FAILED, terminal). Otherwise the gate genuinely failed: clean up any
-// remote branch, surface the build tail on the thread, and persist FAILED.
+// Shutdown mid-gate persists FAILED with rerun guidance — the build never
+// passed, so the run must not be left auto-resumable (the resume path skips
+// the verify gate; markInterrupted no-ops on the terminal row). A run budget
+// that expired mid-gate is a timeout, not a build failure — it flags the
+// flow and returns the classified error for runWithAttempt to settle once.
+// Otherwise the gate genuinely failed: clean up any remote branch, surface
+// the build tail on the thread, and persist FAILED.
 func (f *flow) handleGateFailure(identifier string, gate VerifyRetryResult) error {
 	if f.o.shuttingDown() {
-		return fmt.Errorf("build gate interrupted by shutdown: %w", f.ctx.Err())
+		now := time.Now().UTC().Format(time.RFC3339)
+		errMsg := "build gate interrupted by shutdown — verify gate did not pass"
+		f.persistAdmiralTask(func(t *store.AdmiralTask) {
+			t.State = store.JobStateFailed
+			t.FinishedAt = now
+			t.Error = errMsg
+		})
+		if jerr := f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
+			j.State = store.JobStateFailed
+			j.FinishedAt = now
+			j.Error = errMsg
+		}); jerr != nil {
+			f.o.logger.Warn("update_job_state_on_gate_shutdown", "err", jerr)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		f.deleteRemoteBranchBestEffort(ctx)
+		body := f.creatorMention() +
+			"The run was stopped by a restart while the build gate was mid-verification — " +
+			"the verify gate did NOT pass, so this run will not auto-resume. " +
+			"Reply `/rerun` to start over. Worktree: `" + f.worktreePath + "`"
+		if perr := f.postActivityWithRetry(linear.ErrorActivity(body)); perr != nil {
+			f.o.logger.Warn("gate_shutdown_activity_push_failed",
+				"session", f.ev.SessionID, "err", perr)
+		}
+		return fmt.Errorf("%s: %w", errMsg, f.ctx.Err())
 	}
 	if errors.Is(f.ctx.Err(), context.DeadlineExceeded) {
 		// The run budget expired mid-gate. Classification stays with
@@ -2818,23 +2890,18 @@ func (f *flow) handleGateFailure(identifier string, gate VerifyRetryResult) erro
 		// steers timedOutMessage to /rerun guidance (resume skips the gate).
 		f.o.logger.Warn("run_budget_expired_during_build_gate",
 			"issue", identifier, "branch", f.branch, "attempts", gate.Attempts)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		f.deleteRemoteBranchBestEffort(ctx)
 		f.gateExpired = true
+		f.gateExpiredBuildTail = strings.TrimSpace(gate.LastBuildOutput)
 		return fmt.Errorf("run budget expired during build gate (attempts=%d): %w",
 			gate.Attempts, f.ctx.Err())
 	}
 	f.o.logger.Warn("first_run_build_gate_failed",
 		"issue", identifier, "branch", f.branch,
 		"attempts", gate.Attempts, "launch_err", gate.LaunchErr)
-	// Best-effort: if claude defied the prompt and pushed, remove the
-	// remote branch so no broken state sits on origin. Most calls will
-	// no-op (branch never pushed) — that's a benign Debug log, not a
-	// warn.
-	if delErr := runCmd(f.ctx, f.worktreePath, "git", "push", "origin", "--delete", f.branch); delErr != nil {
-		f.o.logger.Debug("first_run_gate_fail_no_remote_branch_to_delete",
-			"branch", f.branch, "err", delErr)
-	} else {
-		f.o.logger.Info("first_run_gate_fail_cleaned_remote_branch", "branch", f.branch)
-	}
+	f.deleteRemoteBranchBestEffort(f.ctx)
 	body := fmt.Sprintf(
 		"admiral could not get the build to pass after %d attempt(s). No PR opened.\n\n"+
 			"Verify command: `%s`\nLast build output tail:\n```\n%s\n```",

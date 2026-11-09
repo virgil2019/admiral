@@ -4227,6 +4227,10 @@ func TestFlowBindRepoRunBudget(t *testing.T) {
 		// mid-build and verify_max_retries is unreachable (GEO-428).
 		{"gated scales with gate retries", "make check", prFixBudget(60, 2)},
 		{"ungated keeps plain budget", "", 180 * time.Second},
+		// The gate trims before deciding whether to run; gating decisions
+		// must agree, or a whitespace-only verify_cmd buys the scaled budget
+		// but runs a gate that can only fail.
+		{"whitespace-only verify_cmd is ungated", "   ", 180 * time.Second},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -4315,11 +4319,45 @@ func TestHandleGateFailure_BudgetExpiredDefersClassification(t *testing.T) {
 	if !f.gateExpired {
 		t.Fatal("gateExpired not set — timedOutMessage would advertise unsafe /resume")
 	}
+	if f.gateExpiredBuildTail != "boom" {
+		t.Fatalf("gateExpiredBuildTail = %q, want the gate's last build output", f.gateExpiredBuildTail)
+	}
 	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateExecuting {
 		t.Fatalf("admiral task state = %s, want untouched EXECUTING (runWithAttempt settles)", got)
 	}
 	if body := mlc.GetPostedBody(); body != "" {
 		t.Fatalf("posted body = %q, want nothing posted (single markTimedOut upstream)", body)
+	}
+}
+
+// The budget that would have run the remote-branch cleanup died with the
+// gate — a branch claude pushed against the prompt during fix-forward must
+// still be removed, so the gate-expiry path cleans up under a fresh ctx.
+func TestHandleGateFailure_BudgetExpiredCleansRemoteBranch(t *testing.T) {
+	binDir := t.TempDir()
+	gitLog := filepath.Join(binDir, "git.log")
+	script := "#!/bin/sh\necho \"$@\" >> " + gitLog + "\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, _, _, f := gateFailFixture(t)
+	f.branch = "linear/geo-428"
+	var cancel context.CancelFunc
+	f.ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	if err := f.handleGateFailure("GEO-428", VerifyRetryResult{Attempts: 2}); err == nil ||
+		!errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("handleGateFailure err = %v, want wrapped DeadlineExceeded", err)
+	}
+	recorded, err := os.ReadFile(gitLog)
+	if err != nil {
+		t.Fatalf("fake git never ran: %v", err)
+	}
+	if !strings.Contains(string(recorded), "push origin --delete linear/geo-428") {
+		t.Fatalf("fake git recorded %q, want the remote-branch cleanup", recorded)
 	}
 }
 
@@ -4344,31 +4382,84 @@ func TestHandleGateFailure_BuildFailureStaysFailed(t *testing.T) {
 	}
 }
 
-// The default timeout message names the per-phase work cap (MaxRunSeconds —
-// the deadline that actually fires for a long claude phase). A gate-expiry
-// timeout instead steers to /rerun: resuming skips the verify gate.
+// The default timeout message names the clock that fired: the claude
+// phase's own MaxRunSeconds cap for a mid-claude kill (outer ctx alive),
+// the run budget for a post-gate expiry (outer ctx dead). A gate-expiry
+// timeout instead steers to /rerun with diagnostics: resuming skips the
+// verify gate.
 func TestTimedOutMessageNamesAppliedBudget(t *testing.T) {
 	o := &Orchestrator{cfg: &config.Autopilot{MaxRunSeconds: 1800}}
+	budget := runBudget(1800, 2, true) // 6 × 1920s
 
-	if s := newFlow(o, context.Background(), linear.AgentEvent{}).timedOutMessage(); !strings.Contains(s, "after 1800s") {
-		t.Fatalf("plain timedOutMessage = %q, want MaxRunSeconds wording", s)
+	// Claude-phase kill: outer budget still alive → per-phase cap.
+	claudeKill := newFlow(o, context.Background(), linear.AgentEvent{})
+	claudeKill.outerBudget = budget
+	if s := claudeKill.timedOutMessage(); !strings.Contains(s, "after 1800s") {
+		t.Fatalf("claude-phase timedOutMessage = %q, want MaxRunSeconds wording", s)
 	}
 
+	// Post-gate expiry: the outer deadline fired → the run budget.
+	outerKill := newFlow(o, context.Background(), linear.AgentEvent{})
+	outerKill.outerBudget = budget
+	var cancel context.CancelFunc
+	outerKill.ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if s := outerKill.timedOutMessage(); !strings.Contains(s, fmt.Sprintf("after %ds", int(budget.Seconds()))) {
+		t.Fatalf("post-gate timedOutMessage = %q, want the applied run budget", s)
+	}
+
+	// Gate expiry: rerun guidance + diagnostics, no resume affordance.
 	gated := newFlow(o, context.Background(), linear.AgentEvent{})
 	gated.gateExpired = true
+	gated.worktreePath = "/wt/linear-gxo-428"
+	gated.gateExpiredBuildTail = "boom"
 	s := gated.timedOutMessage()
-	if !strings.Contains(s, "prefer /rerun") {
-		t.Fatalf("gate-expired timedOutMessage = %q, want /rerun guidance", s)
+	if !strings.Contains(s, "prefer /rerun") || !strings.Contains(s, "/wt/linear-gxo-428") || !strings.Contains(s, "boom") {
+		t.Fatalf("gate-expired timedOutMessage = %q, want rerun guidance with worktree and build tail", s)
 	}
 	if strings.Contains(s, "Task timed out after") || strings.Contains(s, "resume from where I left off") {
 		t.Fatalf("gate-expired timedOutMessage = %q, want no resume affordance", s)
 	}
+
+	// Plain flow (no bindRepo): historic MaxRunSeconds wording.
+	if s := newFlow(o, context.Background(), linear.AgentEvent{}).timedOutMessage(); !strings.Contains(s, "after 1800s") {
+		t.Fatalf("plain timedOutMessage = %q, want MaxRunSeconds wording", s)
+	}
 }
 
-// A shutdown that lands mid-gate persists nothing here — the error returns
-// to runWithAttempt, whose shutdown check records the run as interrupted
-// (resumable), never as a build failure.
-func TestHandleGateFailure_ShutdownPersistsNothing(t *testing.T) {
+// A row that already settled terminal (the gate's own FAILED write) must not
+// be re-stamped and re-posted by markFailed — one diagnosis, one message.
+// The worktree cleanup still runs.
+func TestMarkFailed_SkipsAlreadyTerminalRow(t *testing.T) {
+	ms := &mockStore{
+		AdmiralTask:     &store.AdmiralTask{IssueID: "iss-1", State: store.JobStateFailed},
+		LiveAdmiralTask: &store.AdmiralTask{IssueID: "iss-1", State: store.JobStateFailed},
+	}
+	mlc := &mockLinearClient{}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60},
+		db:     ms,
+		lc:     mlc,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	f := newFlow(o, context.Background(), linear.AgentEvent{IssueID: "iss-1", SessionID: "sess-1"})
+	f.worktreePath = "" // cleanupWorktree no-ops; not under test here
+
+	f.markFailed(errors.New("build gate failed after 2 attempt(s)"))
+
+	if body := mlc.GetPostedBody(); body != "" {
+		t.Fatalf("markFailed posted %q on an already-terminal row, want silence", body)
+	}
+	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateFailed {
+		t.Fatalf("admiral task state = %s, want FAILED untouched", got)
+	}
+}
+
+// A shutdown that lands mid-gate must NOT leave the run auto-resumable: the
+// resume path skips the verify gate, so an interrupted row would be resumed
+// by the reconciler straight past the gate. It persists FAILED with rerun
+// guidance instead (markInterrupted no-ops on the terminal row).
+func TestHandleGateFailure_ShutdownMidGatePersistsFailedNoAutoResume(t *testing.T) {
 	o, ms, mlc, f := gateFailFixture(t)
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	o.rootCtx = rootCtx
@@ -4383,10 +4474,10 @@ func TestHandleGateFailure_ShutdownPersistsNothing(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("handleGateFailure err = %v, want wrapped context.Canceled", err)
 	}
-	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateExecuting {
-		t.Fatalf("admiral task state = %s, want untouched EXECUTING", got)
+	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateFailed {
+		t.Fatalf("admiral task state = %s, want FAILED (not interrupt-resumable past the gate)", got)
 	}
-	if body := mlc.GetPostedBody(); body != "" {
-		t.Fatalf("posted body = %q, want nothing posted during shutdown", body)
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "/rerun") {
+		t.Fatalf("posted body = %q, want rerun guidance", body)
 	}
 }
