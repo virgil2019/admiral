@@ -602,7 +602,9 @@ func (o *Orchestrator) gatherVerifyMaterial(ctx context.Context, parentID string
 		}
 		mat.Subs = append(mat.Subs, sm)
 	}
-	return mat, repo.RepoDir, parent.TeamID, parent.ProjectID, repo.VerifyCmd, nil
+	// Trim once, matching bindRepoFields / resolvePRFixDeps: the gating
+	// decision and the gate itself must agree on what counts as configured.
+	return mat, repo.RepoDir, parent.TeamID, parent.ProjectID, strings.TrimSpace(repo.VerifyCmd), nil
 }
 
 // applyVerifyVerdict acts on the judge's verdict. complete → flip the parent

@@ -4341,8 +4341,8 @@ func TestHandleGateFailure_BudgetExpiredDefersClassification(t *testing.T) {
 	if f.gateExpiredBuildTail != "boom" {
 		t.Fatalf("gateExpiredBuildTail = %q, want the gate's last build output", f.gateExpiredBuildTail)
 	}
-	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateExecuting {
-		t.Fatalf("admiral task state = %s, want untouched EXECUTING (runWithAttempt settles)", got)
+	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateTimedOut {
+		t.Fatalf("admiral task state = %s, want TIMED_OUT persisted before return (crash-safe; classification still posts once upstream)", got)
 	}
 	if body := mlc.GetPostedBody(); body != "" {
 		t.Fatalf("posted body = %q, want nothing posted (single markTimedOut upstream)", body)
@@ -4390,7 +4390,7 @@ func TestTimedOutMessage_GatedRepoSteersToRerun(t *testing.T) {
 	// steers to /rerun — resume would push code the gate never saw.
 	gated := newFlow(o, context.Background(), linear.AgentEvent{})
 	gated.verifyCmd = "make check"
-	gated.outerBudget = runBudget(1800, 2, true)
+	gated.outerBudget = runBudget(1800, 2, "make check")
 	gated.claudeSessionID = "sess-12345678"
 
 	s := gated.timedOutMessage()
@@ -4489,6 +4489,61 @@ func TestDeleteRemoteBranchBestEffort_RetriesAfterTransientFailure(t *testing.T)
 	}
 	if got := strings.Count(string(recorded), "push origin --delete"); got != 2 {
 		t.Fatalf("cleanup attempted %d times, want 2 (retry after the transient failure)", got)
+	}
+}
+
+// The gate-expiry branch must persist the TIMED_OUT row BEFORE its (up to
+// 30s) remote-branch cleanup: a crash mid-cleanup must not leave the row
+// EXECUTING for the boot reconciler to auto-resume past the verify gate.
+func TestHandleGateFailure_ExpiryPersistsBeforeCleanup(t *testing.T) {
+	dir := t.TempDir()
+	started := filepath.Join(dir, "started")
+	release := filepath.Join(dir, "release")
+	script := "#!/bin/sh\ntouch " + started + "\n" +
+		"while [ ! -f " + release + " ]; do sleep 0.02; done\n" +
+		"exit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, ms, _, f := gateFailFixture(t)
+	var cancel context.CancelFunc
+	f.ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- f.handleGateFailure("GEO-428", VerifyRetryResult{Attempts: 1, LastBuildOutput: "boom"})
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fake git never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Cleanup is now blocked mid-flight; the row must already be TIMED_OUT.
+	seen := false
+	for time.Now().Before(deadline) {
+		if ms.LiveAdmiralSnapshot().State == store.JobStateTimedOut {
+			seen = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !seen {
+		t.Fatalf("row still %s while cleanup runs, want TIMED_OUT persisted before the cleanup", ms.LiveAdmiralSnapshot().State)
+	}
+	if err := os.WriteFile(release, []byte("go"), 0o644); err != nil {
+		t.Fatalf("release fake git: %v", err)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("handleGateFailure err = nil, want non-nil")
 	}
 }
 
@@ -4710,7 +4765,7 @@ func TestHandleGateFailure_BuildFailureStaysFailed(t *testing.T) {
 // verify gate.
 func TestTimedOutMessageNamesAppliedBudget(t *testing.T) {
 	o := &Orchestrator{cfg: &config.Autopilot{MaxRunSeconds: 1800}}
-	budget := runBudget(1800, 2, true) // 6 × 1920s
+	budget := runBudget(1800, 2, "make check") // 6 × 1920s
 
 	// Claude-phase kill: outer budget still alive → per-phase cap. Claude
 	// ran, so the session is recorded and the resume affordance applies.

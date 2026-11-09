@@ -1850,7 +1850,7 @@ func (f *flow) bindRepo(repo *store.Repo, projectID string) error {
 	if err := f.bindRepoFields(repo, projectID); err != nil {
 		return err
 	}
-	budget := runBudget(f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, f.verifyCmd != "")
+	budget := runBudget(f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, f.verifyCmd)
 	f.outerBudget = budget
 	f.ctx, f.cancelBudget = context.WithTimeout(f.ctx, budget)
 	return nil
@@ -1864,15 +1864,17 @@ func (f *flow) bindRepo(repo *store.Repo, projectID string) error {
 const preBindWindow = 10 * time.Minute
 
 // runBudget returns the wall-clock budget for one attempt run (first run or
-// /rerun). With verify_cmd configured the run is claude plus the build hard
-// gate — one verify pass plus, per retry, a claude fix-forward pass and a
-// verify pass, each individually budgeted maxRunSeconds — so the budget must
-// scale with the retries (prFixBudget; same arithmetic the PR-fix paths
+// /rerun). With a configured verify_cmd the run is claude plus the build
+// hard gate — one verify pass plus, per retry, a claude fix-forward pass and
+// a verify pass, each individually budgeted maxRunSeconds — so the budget
+// must scale with the retries (prFixBudget; same arithmetic the PR-fix paths
 // use). A single MaxRunSeconds+120 budget is consumed by the initial claude
 // run and kills the gate mid-build, leaving verify_max_retries unreachable.
 // Gate-less repos keep the plain budget: claude plus the PR-overhead slack.
-func runBudget(maxRunSeconds, verifyMaxRetries int, gated bool) time.Duration {
-	if gated {
+// verifyCmd is taken raw and trimmed here so the budget decision cannot
+// drift from the gate decision it exists to match.
+func runBudget(maxRunSeconds, verifyMaxRetries int, verifyCmd string) time.Duration {
+	if strings.TrimSpace(verifyCmd) != "" {
 		return prFixBudget(maxRunSeconds, verifyMaxRetries)
 	}
 	return time.Duration(maxRunSeconds+120) * time.Second
@@ -3030,11 +3032,17 @@ func (f *flow) handleGateFailure(identifier string, gate VerifyRetryResult) erro
 		// steers timedOutMessage to /rerun guidance (resume skips the gate).
 		f.o.logger.Warn("run_budget_expired_during_build_gate",
 			"issue", identifier, "branch", f.branch, "attempts", gate.Attempts)
+		f.gateExpired = true
+		f.gateExpiredBuildTail = strings.TrimSpace(gate.LastBuildOutput)
+		// Persist the timeout BEFORE the cleanup: a crash mid-cleanup must
+		// not leave the row EXECUTING for the boot reconciler to auto-resume
+		// past the verify gate. Classification upstream re-writes the same
+		// TIMED_OUT row (benign) and posts once; a shutdown landing mid-
+		// cleanup upgrades the row to FAILED via markInterrupted.
+		f.persistTimedOut(fmt.Errorf("%s (attempts=%d)", gateExpiryErrPrefix, gate.Attempts))
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		f.deleteRemoteBranchBestEffort(ctx)
-		f.gateExpired = true
-		f.gateExpiredBuildTail = strings.TrimSpace(gate.LastBuildOutput)
 		if f.o.shuttingDown() {
 			// Shutdown landed while the cleanup ran — nothing is persisted
 			// yet, so letting runWithAttempt classify would mark the row
@@ -3086,14 +3094,12 @@ func (f *flow) markTimedOutBeforeStart(runErr error) {
 // markTimedOutWithMessage persists a TIMED_OUT run and reports body on the
 // thread. Shared by the run-length timeout and the pre-flight failure above,
 // which differ only in what they tell the user.
-func (f *flow) markTimedOutWithMessage(runErr error, body string) {
-	// A run cut short by shutdown is resumable, and the reconciler only
-	// recognises the interrupted marker: recording "fetch issue: context
-	// canceled" here would drop the row out of automatic recovery.
-	if f.o.shuttingDown() {
-		f.markInterrupted(runErr)
-		return
-	}
+// persistTimedOut writes the TIMED_OUT dual-row settlement without posting.
+// markTimedOutWithMessage uses it before its thread post; the gate-expiry
+// branch of handleGateFailure uses it BEFORE its cleanup, so a crash
+// mid-cleanup cannot leave the row EXECUTING for the boot reconciler to
+// auto-resume past the verify gate.
+func (f *flow) persistTimedOut(runErr error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_ = f.o.db.UpdateAutopilotJob(f.ev.SessionID, func(j *store.AutopilotJob) {
 		j.State = store.JobStateTimedOut
@@ -3105,6 +3111,17 @@ func (f *flow) markTimedOutWithMessage(runErr error, body string) {
 		t.Error = runErr.Error()
 		t.FinishedAt = now
 	})
+}
+
+func (f *flow) markTimedOutWithMessage(runErr error, body string) {
+	// A run cut short by shutdown is resumable, and the reconciler only
+	// recognises the interrupted marker: recording "fetch issue: context
+	// canceled" here would drop the row out of automatic recovery.
+	if f.o.shuttingDown() {
+		f.markInterrupted(runErr)
+		return
+	}
+	f.persistTimedOut(runErr)
 	// Use a fresh short ctx in case the parent is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
