@@ -4343,6 +4343,77 @@ func TestHandleGateFailure_BudgetExpiredDefersClassification(t *testing.T) {
 	}
 }
 
+// flakyPoster wraps ctxAwarePoster, failing the first post before letting
+// one through — a transient Linear blip.
+type flakyPoster struct {
+	*ctxAwarePoster
+	failures int32
+}
+
+func (p *flakyPoster) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {
+	if atomic.AddInt32(&p.failures, 1) <= 1 {
+		return errors.New("transient linear blip")
+	}
+	return p.ctxAwarePoster.PostAgentActivity(ctx, sessionID, a)
+}
+
+// A gate-killed run must never be left interrupt-resumable, even when the
+// shutdown lands after handleGateFailure returned — classification (via
+// markInterrupted) is the last line of defense against the reconciler
+// resuming past the verify gate.
+func TestMarkInterrupted_GateFailedLandsFailedNotResumable(t *testing.T) {
+	_, ms, mlc, f := gateFailFixture(t)
+	f.gateFailed = true
+
+	f.markInterrupted(errors.New("run budget expired during build gate: context deadline exceeded"))
+
+	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateFailed {
+		t.Fatalf("admiral task state = %s, want FAILED (the interrupt marker would auto-resume past the gate)", got)
+	}
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "/rerun") {
+		t.Fatalf("posted body = %q, want rerun guidance", body)
+	}
+}
+
+// On a gated repo ANY timeout — not just gate expiry — must steer away from
+// /resume: the resume path pushes and PRs without re-running the verify
+// gate, so resuming gate-killed code past the gate is the same funnel.
+func TestTimedOutMessage_GatedRepoSteersToRerun(t *testing.T) {
+	o := &Orchestrator{cfg: &config.Autopilot{MaxRunSeconds: 1800}}
+	gated := newFlow(o, context.Background(), linear.AgentEvent{})
+	gated.verifyCmd = "make check"
+	gated.claudeSessionID = "sess-12345678"
+
+	s := gated.timedOutMessage()
+	if !strings.Contains(s, "prefer /rerun") {
+		t.Fatalf("gated timedOutMessage = %q, want rerun steer", s)
+	}
+	if strings.Contains(s, "resume from where I left off") {
+		t.Fatalf("gated timedOutMessage = %q, want no resume affordance", s)
+	}
+}
+
+// The gate-expiry thread message is the only steer away from /resume — a
+// transient Linear failure must not silently drop it.
+func TestMarkTimedOut_GateExpiryMessageRetriesThroughBlip(t *testing.T) {
+	mlc := &mockLinearClient{}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60},
+		db:     &mockStore{LiveAdmiralTask: &store.AdmiralTask{IssueID: "iss-1"}},
+		lc:     &flakyPoster{ctxAwarePoster: &ctxAwarePoster{mockLinearClient: mlc}},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	f := newFlow(o, context.Background(), linear.AgentEvent{IssueID: "iss-1", SessionID: "sess-1"})
+	f.gateExpired = true
+	f.claudeSessionID = "sess-12345678"
+
+	f.markTimedOut(errors.New("run budget expired during build gate: context deadline exceeded"))
+
+	if body := mlc.GetPostedBody(); !strings.Contains(body, "prefer /rerun") {
+		t.Fatalf("posted body = %q, want the gate-expiry steer delivered through the blip", body)
+	}
+}
+
 // The budget that would have run the remote-branch cleanup died with the
 // gate — a branch claude pushed against the prompt during fix-forward must
 // still be removed, so the gate-expiry path cleans up under a fresh ctx.
