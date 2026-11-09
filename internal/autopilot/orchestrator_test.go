@@ -4213,3 +4213,62 @@ func TestIsPreparePhaseError(t *testing.T) {
 		})
 	}
 }
+
+func TestFlowBindRepoRunBudget(t *testing.T) {
+	tests := []struct {
+		name      string
+		verifyCmd string
+		want      time.Duration
+	}{
+		// A gated repo's budget must cover claude plus every gate
+		// fix-forward retry (prFixBudget arithmetic), not a single
+		// MaxRunSeconds+120 window — otherwise the outer ctx kills the gate
+		// mid-build and verify_max_retries is unreachable (GEO-428).
+		{"gated scales with gate retries", "make check", prFixBudget(60, 2)},
+		{"ungated keeps plain budget", "", 180 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o := &Orchestrator{cfg: &config.Autopilot{MaxRunSeconds: 60, VerifyMaxRetries: 2}}
+			f := newFlow(o, context.Background(), linear.AgentEvent{})
+			err := f.bindRepo(&store.Repo{
+				RepoDir:    "/tmp/repo",
+				BaseBranch: "main",
+				VerifyCmd:  tt.verifyCmd,
+				GhUser:     "someone",
+			}, "proj-1")
+			if err != nil {
+				t.Fatalf("bindRepo: %v", err)
+			}
+			dl, ok := f.ctx.Deadline()
+			if !ok {
+				t.Fatal("no deadline on flow ctx after bindRepo — run budget not applied")
+			}
+			remaining := time.Until(dl)
+			// Small tolerance for the clock between WithTimeout and Until.
+			if remaining > tt.want+2*time.Second || remaining < tt.want-2*time.Second {
+				t.Fatalf("run budget = %s, want ≈ %s", remaining, tt.want)
+			}
+			if f.cancelBudget != nil {
+				f.cancelBudget()
+			}
+		})
+	}
+}
+
+// bindRepo must refuse before applying the budget: an unidentifiable run is
+// dead anyway, and the deadline must not have moved.
+func TestFlowBindRepoGhUserUnsetNoBudget(t *testing.T) {
+	o := &Orchestrator{cfg: &config.Autopilot{MaxRunSeconds: 60, VerifyMaxRetries: 2}}
+	f := newFlow(o, context.Background(), linear.AgentEvent{})
+	err := f.bindRepo(&store.Repo{RepoDir: "/tmp/repo", BaseBranch: "main"}, "proj-1")
+	if !isGhUserUnset(err) {
+		t.Fatalf("bindRepo err = %v, want ghUserUnset", err)
+	}
+	if _, ok := f.ctx.Deadline(); ok {
+		t.Fatal("budget applied despite bindRepo failure")
+	}
+	if f.cancelBudget != nil {
+		t.Fatal("cancelBudget set despite bindRepo failure")
+	}
+}
