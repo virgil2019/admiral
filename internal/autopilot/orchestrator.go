@@ -1083,7 +1083,8 @@ func (o *Orchestrator) dispatchResume(ev linear.AgentEvent, task *store.AdmiralT
 			o.logger.Info("dispatch_reject_resume_gate_expired",
 				"session", ev.SessionID, "issue", ev.IssueIdentifier)
 			o.postRejection(ev.SessionID,
-				"This run ended because the build gate did not finish within the run budget — /resume would push and open the PR without re-running the verify gate. Use /rerun to start over with a fresh gate.")
+				"This run ended because the build gate did not finish within the run budget — "+rerunSteerNote()+
+					", so /resume would ship code the gate never saw. Use /rerun to start over with a fresh gate.")
 			return
 		}
 		// proceed
@@ -1485,12 +1486,13 @@ func (o *Orchestrator) runWithAttempt(ev linear.AgentEvent, attemptN int) {
 	flow := newFlow(o, ctx, ev)
 	flow.attemptN = attemptN
 	flow.expectAttemptN = attemptN
-	// cancelBudget is owned HERE, not by execute's defer. Two consumers need
-	// the budget ctx alive after execute returns: markFailed's final post
-	// (postActivityWithRetryCtx runs on flow.ctx), and timedOutMessage's
-	// clock detection — f.ctx.Err() tells which clock fired, and a
-	// canceled-at-return ctx would report Canceled, silently falling back to
-	// the per-phase wording. These defers run after classification.
+	// cancelBudget is owned HERE, not by execute's defer, for one consumer
+	// that needs the budget ctx alive after execute returns:
+	// timedOutMessage's clock detection — f.ctx.Err() tells which clock
+	// fired, and a canceled-at-return ctx would report Canceled, silently
+	// falling back to the per-phase wording. (markFailed's final post runs
+	// on a fresh context.Background ctx and does not need this.) These
+	// defers run after classification.
 	defer func() {
 		if flow.cancelBudget != nil {
 			flow.cancelBudget()
@@ -1582,6 +1584,11 @@ type flow struct {
 	// remoteBranchCleaned dedupes the best-effort origin-branch cleanup:
 	// the expiry path and the shutdown settle can both reach it.
 	remoteBranchCleaned bool
+
+	// gateSettled dedupes the shutdown landing: a /rerun-superseded row
+	// suppresses the FAILED write, so alreadyTerminal stays false and
+	// classification would otherwise settle — and post — a second time.
+	gateSettled bool
 
 	// gateExpired records that the run budget expired while the build gate
 	// was mid-verification (set by handleGateFailure, which leaves the
@@ -2872,7 +2879,7 @@ func (f *flow) timedOutMessage() string {
 	}
 	if f.gateExpired {
 		body := "Run budget expired during the build gate. The worktree is preserved — " +
-			"prefer /rerun over /resume: resuming continues without re-running the verify gate.\n\n" +
+			"prefer /rerun over /resume: " + rerunSteerNote() + ".\n\n" +
 			"Worktree (fix-forward commits there are discarded by /rerun): `" + f.worktreePath + "`"
 		if f.gateExpiredBuildTail != "" {
 			body += "\n\nLast build output tail:\n```\n" + f.gateExpiredBuildTail + "\n```"
@@ -2892,16 +2899,22 @@ func (f *flow) timedOutMessage() string {
 		budget = f.outerBudget
 	}
 	if f.verifyCmd != "" {
-		// Gated repo: the resume path never re-runs the verify gate, so
-		// resuming would push and PR code the gate never saw — steer to
-		// /rerun whichever clock fired.
+		// Gated repo: steer to /rerun whichever clock fired.
 		return fmt.Sprintf(
-			"Task timed out after %ds. The worktree is preserved — prefer /rerun over /resume: resuming continues without re-running the verify gate. (claude session: %s...)",
-			int(budget.Seconds()), truncatedSession)
+			"Task timed out after %ds. The worktree is preserved — prefer /rerun over /resume: %s. (claude session: %s...)",
+			int(budget.Seconds()), rerunSteerNote(), truncatedSession)
 	}
 	return fmt.Sprintf(
 		"Task timed out after %ds. State preserved — re-mention me on this issue to resume from where I left off. (claude session: %s...)",
 		int(budget.Seconds()), truncatedSession)
+}
+
+// rerunSteerNote renders the shared rationale for steering away from
+// /resume when the verify gate has not passed. Used by the timeout
+// messages, the /resume refusal, and the shutdown landing so the policy
+// lives in one place and cannot drift between message and enforcement.
+func rerunSteerNote() string {
+	return "resuming continues without re-running the verify gate"
 }
 
 // deleteRemoteBranchBestEffort removes the branch from origin if claude
@@ -2961,13 +2974,17 @@ func (f *flow) persistGateFailed(errMsg string) {
 // the reconciler away. All side work runs on a fresh short ctx — the run's
 // own ctx is dead under shutdown (budget child of the canceled root).
 func (f *flow) settleGateFailedByShutdown() {
+	if f.gateSettled {
+		return
+	}
+	f.gateSettled = true
 	f.persistGateFailed("build gate interrupted by shutdown — verify gate did not pass")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	f.deleteRemoteBranchBestEffort(ctx)
 	body := f.creatorMention() +
 		"The run was stopped by a restart while the build gate was mid-verification — " +
-		"the verify gate did NOT pass, so this run will not auto-resume. " +
+		"the verify gate did NOT pass, so this run will not auto-resume (" + rerunSteerNote() + "). " +
 		"Reply `/rerun` to start over. Worktree: `" + f.worktreePath + "`"
 	// One best-effort attempt on the fresh ctx: postActivityWithRetry would
 	// retry against the dead run ctx and burn the shutdown window sleeping.

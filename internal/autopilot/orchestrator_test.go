@@ -4440,6 +4440,44 @@ func TestPostActivityWithRetryCtx_DeadCtxReturnsFast(t *testing.T) {
 	}
 }
 
+// countingPoster records how many posts actually went out.
+type countingPoster struct {
+	*ctxAwarePoster
+	posts int32
+}
+
+func (p *countingPoster) PostAgentActivity(ctx context.Context, sessionID string, a linear.AgentActivity) error {
+	atomic.AddInt32(&p.posts, 1)
+	return p.ctxAwarePoster.PostAgentActivity(ctx, sessionID, a)
+}
+
+// A /rerun superseding the row suppresses the FAILED write (attempt guard)
+// but not the rerun-guidance post — classification (markInterrupted) must
+// not settle and post a second time when the flow already did.
+func TestSettleGateFailedByShutdown_SupersededRowPostsOnce(t *testing.T) {
+	ms := &mockStore{LiveAdmiralTask: &store.AdmiralTask{IssueID: "iss-1", AttemptN: 1, State: store.JobStateExecuting}}
+	mlc := &mockLinearClient{}
+	o := &Orchestrator{
+		cfg:    &config.Autopilot{MaxRunSeconds: 60},
+		db:     ms,
+		lc:     &countingPoster{ctxAwarePoster: &ctxAwarePoster{mockLinearClient: mlc}},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	f := newFlow(o, context.Background(), linear.AgentEvent{IssueID: "iss-1", SessionID: "sess-1"})
+	f.worktreePath = t.TempDir()
+	f.branch = "linear/geo-428"
+	f.expectAttemptN = 2 // the row was superseded by a /rerun
+	f.gateFailed = true
+
+	// Race branch settle, then classification — the exact round-7 sequence.
+	f.settleGateFailedByShutdown()
+	f.markInterrupted(errors.New("run budget expired during build gate: context deadline exceeded"))
+
+	if got := atomic.LoadInt32(&o.lc.(*countingPoster).posts); got != 1 {
+		t.Fatalf("rerun guidance posted %d times, want exactly once", got)
+	}
+}
+
 // The detailed build report is a genuine gate failure's ONLY thread message
 // (markFailed skips already-terminal rows), so it must survive a transient
 // Linear blip.
