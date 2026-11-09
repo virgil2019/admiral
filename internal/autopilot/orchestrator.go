@@ -1549,11 +1549,13 @@ type flow struct {
 	// only after bindRepo succeeds; execute defers it).
 	cancelBudget context.CancelFunc
 
-	// runBudget is the wall-clock budget bindRepo applied to ctx (0 when no
-	// budget was applied — resume-shaped flows). markTimedOut reports it so
-	// the thread message names the time actually available to the run, not
-	// cfg.MaxRunSeconds.
-	runBudget time.Duration
+	// gateExpired records that the run budget expired while the build gate
+	// was mid-verification (set by handleGateFailure, which leaves the
+	// TIMED_OUT classification to runWithAttempt). timedOutMessage uses it
+	// to steer the user to /rerun: the resume path does not re-run the
+	// verify gate, so advertising /resume here would funnel gate-killed
+	// code past the gate that was mid-verification.
+	gateExpired bool
 }
 
 func newFlow(o *Orchestrator, ctx context.Context, ev linear.AgentEvent) *flow {
@@ -1660,7 +1662,11 @@ func taskSettled(state string) bool {
 }
 
 func (f *flow) postActivity(a linear.AgentActivity) {
-	if err := f.o.lc.PostAgentActivity(f.ctx, f.ev.SessionID, a); err != nil {
+	f.postActivityCtx(f.ctx, a)
+}
+
+func (f *flow) postActivityCtx(ctx context.Context, a linear.AgentActivity) {
+	if err := f.o.lc.PostAgentActivity(ctx, f.ev.SessionID, a); err != nil {
 		f.o.logger.Warn("post_activity_failed",
 			"session", f.ev.SessionID, "type", a.Type, "err", err)
 	}
@@ -1780,10 +1786,16 @@ func (f *flow) bindRepo(repo *store.Repo, projectID string) error {
 		return err
 	}
 	budget := runBudget(f.o.cfg.MaxRunSeconds, f.o.cfg.VerifyMaxRetries, f.verifyCmd != "")
-	f.runBudget = budget
 	f.ctx, f.cancelBudget = context.WithTimeout(f.ctx, budget)
 	return nil
 }
+
+// preBindWindow bounds execute's pre-bindRepo section (initial activity,
+// issue fetch): those run before any run budget exists, so without this
+// ceiling a hang would hold the run slot forever. Generous versus the
+// Linear client's per-request 30s timeout and postActivityWithRetry's
+// backoff, tight enough to free the slot.
+const preBindWindow = 10 * time.Minute
 
 // runBudget returns the wall-clock budget for one attempt run (first run or
 // /rerun). With verify_cmd configured the run is claude plus the build hard
@@ -1801,9 +1813,14 @@ func runBudget(maxRunSeconds, verifyMaxRetries int, gated bool) time.Duration {
 }
 
 func (f *flow) execute() error {
-	f.postActivity(linear.Thought("Reading issue context...", true))
-
-	issue, err := f.o.lc.GetIssue(f.ctx, f.ev.IssueID)
+	// The run budget does not exist until bindRepo applies it, so the
+	// pre-bind Linear calls get their own ceiling: a hang here would
+	// otherwise hold the run slot indefinitely (each Linear request is
+	// 30s-capped by the client, but retries multiply).
+	preCtx, preCancel := context.WithTimeout(f.ctx, preBindWindow)
+	f.postActivityCtx(preCtx, linear.Thought("Reading issue context...", true))
+	issue, err := f.o.lc.GetIssue(preCtx, f.ev.IssueID)
+	preCancel()
 	if err != nil {
 		return fmt.Errorf("fetch issue: %w", err)
 	}
@@ -2764,21 +2781,22 @@ func (f *flow) markTimedOut(runErr error) {
 }
 
 // timedOutMessage renders the /resume affordance message for a run-length
-// timeout, naming the budget the run actually had (see runBudget) so a
-// gated repo's longer run doesn't read as a MaxRunSeconds timeout.
+// timeout. A gate-expiry timeout is different: the build never passed, and
+// the resume path does not re-run the verify gate, so the message steers to
+// /rerun instead of advertising resume.
 func (f *flow) timedOutMessage() string {
-	budget := f.runBudget
-	if budget == 0 {
-		// Resume-shaped flows (no bindRepo) keep the historic wording.
-		budget = time.Duration(f.o.cfg.MaxRunSeconds) * time.Second
-	}
 	truncatedSession := f.claudeSessionID
 	if len(truncatedSession) > 8 {
 		truncatedSession = truncatedSession[:8]
 	}
+	if f.gateExpired {
+		return "Run budget expired during the build gate. The worktree is preserved — " +
+			"prefer /rerun over /resume: resuming continues without re-running the verify gate. " +
+			"(claude session: " + truncatedSession + "...)"
+	}
 	return fmt.Sprintf(
 		"Task timed out after %ds. State preserved — re-mention me on this issue to resume from where I left off. (claude session: %s...)",
-		int(budget.Seconds()), truncatedSession)
+		f.o.cfg.MaxRunSeconds, truncatedSession)
 }
 
 // handleGateFailure settles a run whose build hard gate did not pass.
@@ -2794,12 +2812,15 @@ func (f *flow) handleGateFailure(identifier string, gate VerifyRetryResult) erro
 		return fmt.Errorf("build gate interrupted by shutdown: %w", f.ctx.Err())
 	}
 	if errors.Is(f.ctx.Err(), context.DeadlineExceeded) {
+		// The run budget expired mid-gate. Classification stays with
+		// runWithAttempt — marking here AND returning a DeadlineExceeded
+		// error would settle the row and post the message twice. The flag
+		// steers timedOutMessage to /rerun guidance (resume skips the gate).
 		f.o.logger.Warn("run_budget_expired_during_build_gate",
 			"issue", identifier, "branch", f.branch, "attempts", gate.Attempts)
-		err := fmt.Errorf("run budget expired during build gate (attempts=%d): %w",
+		f.gateExpired = true
+		return fmt.Errorf("run budget expired during build gate (attempts=%d): %w",
 			gate.Attempts, f.ctx.Err())
-		f.markTimedOut(err)
-		return err
 	}
 	f.o.logger.Warn("first_run_build_gate_failed",
 		"issue", identifier, "branch", f.branch,

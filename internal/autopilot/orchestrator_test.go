@@ -4241,9 +4241,6 @@ func TestFlowBindRepoRunBudget(t *testing.T) {
 			if err != nil {
 				t.Fatalf("bindRepo: %v", err)
 			}
-			if f.runBudget != tt.want {
-				t.Fatalf("flow runBudget = %s, want %s", f.runBudget, tt.want)
-			}
 			dl, ok := f.ctx.Deadline()
 			if !ok {
 				t.Fatal("no deadline on flow ctx after bindRepo — run budget not applied")
@@ -4300,13 +4297,12 @@ func gateFailFixture(t *testing.T) (*Orchestrator, *mockStore, *mockLinearClient
 	return o, ms, mlc, f
 }
 
-// The run budget expiring mid-gate is a timeout, not a build failure: the
-// verify command or a fix-forward claude run was killed by the clock.
-// Reporting "could not get the build to pass" would misdiagnose the run and
-// land it FAILED (terminal, /rerun only) instead of TIMED_OUT (/resume).
-func TestHandleGateFailure_BudgetExpiredIsTimeoutNotBuildFail(t *testing.T) {
-	o, ms, mlc, f := gateFailFixture(t)
-	_ = o
+// The run budget expiring mid-gate is a timeout, not a build failure — but
+// the classification belongs to runWithAttempt (marking here too would
+// settle the row and post the message twice). handleGateFailure only flags
+// the flow and returns the classified error.
+func TestHandleGateFailure_BudgetExpiredDefersClassification(t *testing.T) {
+	_, ms, mlc, f := gateFailFixture(t)
 	var cancel context.CancelFunc
 	f.ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
@@ -4316,14 +4312,14 @@ func TestHandleGateFailure_BudgetExpiredIsTimeoutNotBuildFail(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("handleGateFailure err = %v, want wrapped context.DeadlineExceeded", err)
 	}
-	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateTimedOut {
-		t.Fatalf("admiral task state = %s, want TIMED_OUT", got)
+	if !f.gateExpired {
+		t.Fatal("gateExpired not set — timedOutMessage would advertise unsafe /resume")
 	}
-	if got := ms.LiveAdmiralSnapshot().Error; !strings.Contains(got, "run budget expired") {
-		t.Fatalf("admiral task error = %q, want budget-expiry wording", got)
+	if got := ms.LiveAdmiralSnapshot().State; got != store.JobStateExecuting {
+		t.Fatalf("admiral task state = %s, want untouched EXECUTING (runWithAttempt settles)", got)
 	}
-	if body := mlc.GetPostedBody(); strings.Contains(body, "could not get the build to pass") {
-		t.Fatalf("posted body misreports budget expiry as build failure: %q", body)
+	if body := mlc.GetPostedBody(); body != "" {
+		t.Fatalf("posted body = %q, want nothing posted (single markTimedOut upstream)", body)
 	}
 }
 
@@ -4348,22 +4344,24 @@ func TestHandleGateFailure_BuildFailureStaysFailed(t *testing.T) {
 	}
 }
 
-// The timeout message names the budget the run actually had: gated repos
-// get the scaled run budget, resume-shaped flows (no bindRepo) keep the
-// historic MaxRunSeconds wording.
+// The default timeout message names the per-phase work cap (MaxRunSeconds —
+// the deadline that actually fires for a long claude phase). A gate-expiry
+// timeout instead steers to /rerun: resuming skips the verify gate.
 func TestTimedOutMessageNamesAppliedBudget(t *testing.T) {
 	o := &Orchestrator{cfg: &config.Autopilot{MaxRunSeconds: 1800}}
 
-	gated := newFlow(o, context.Background(), linear.AgentEvent{})
-	gated.runBudget = runBudget(1800, 2, true)
-	want := int(runBudget(1800, 2, true).Seconds())
-	if s := gated.timedOutMessage(); !strings.Contains(s, fmt.Sprintf("after %ds", want)) {
-		t.Fatalf("gated timedOutMessage = %q, want it to name the applied %ds budget", s, want)
+	if s := newFlow(o, context.Background(), linear.AgentEvent{}).timedOutMessage(); !strings.Contains(s, "after 1800s") {
+		t.Fatalf("plain timedOutMessage = %q, want MaxRunSeconds wording", s)
 	}
 
-	resume := newFlow(o, context.Background(), linear.AgentEvent{})
-	if s := resume.timedOutMessage(); !strings.Contains(s, "after 1800s") {
-		t.Fatalf("resume-shaped timedOutMessage = %q, want historic MaxRunSeconds wording", s)
+	gated := newFlow(o, context.Background(), linear.AgentEvent{})
+	gated.gateExpired = true
+	s := gated.timedOutMessage()
+	if !strings.Contains(s, "prefer /rerun") {
+		t.Fatalf("gate-expired timedOutMessage = %q, want /rerun guidance", s)
+	}
+	if strings.Contains(s, "Task timed out after") || strings.Contains(s, "resume from where I left off") {
+		t.Fatalf("gate-expired timedOutMessage = %q, want no resume affordance", s)
 	}
 }
 
