@@ -1022,6 +1022,10 @@ type SearchFilter struct {
 	StateTypes     []string
 	RequireLabel   string
 	UnassignedOnly bool
+	// AssigneeID restricts the search to issues assigned to this Linear
+	// user (exact id match). Mutually exclusive with UnassignedOnly in
+	// practice — the discoverer issues two searches, one per shape.
+	AssigneeID string
 	// TopLevelOnly restricts the search to issues with no parent (i.e.
 	// top-level "feature" issues directly under a project, not sub-issues).
 	// Used by product-level verify to enumerate a project's features.
@@ -1066,6 +1070,9 @@ func (c *Client) SearchAssignableIssues(ctx context.Context, f SearchFilter) ([]
 	}
 	if f.UnassignedOnly {
 		filter["assignee"] = map[string]any{"null": true}
+	}
+	if f.AssigneeID != "" {
+		filter["assignee"] = map[string]any{"id": map[string]any{"eq": f.AssigneeID}}
 	}
 	if f.TopLevelOnly {
 		filter["parent"] = map[string]any{"null": true}

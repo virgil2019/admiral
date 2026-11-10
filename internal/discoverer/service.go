@@ -289,6 +289,23 @@ func (s *Service) scanAndPick(ctx context.Context) {
 		)
 		return
 	}
+	// Teammate semantics: admiral works unclaimed issues AND issues
+	// explicitly assigned to it — same label/state/project gates, assignee
+	// exact-matched to AdmiralUserID. The two result sets are disjoint by
+	// construction (assignee null vs assignee = id), no dedupe needed.
+	assignedFilter := filter
+	assignedFilter.UnassignedOnly = false
+	assignedFilter.AssigneeID = s.cfg.AdmiralUserID
+	assigned, err := s.linear.SearchAssignableIssues(ctx, assignedFilter)
+	if err != nil {
+		s.logger.Warn("scan_assigned_failed",
+			"err", err,
+			"projects", projectIDs,
+			"assignee", s.cfg.AdmiralUserID,
+		)
+		return
+	}
+	issues = append(issues, assigned...)
 	s.logger.Info("scan_complete", "candidates", len(issues), "projects", len(projectIDs))
 
 	picked := 0
@@ -379,9 +396,14 @@ func (s *Service) consider(ctx context.Context, iss linear.Issue) bool {
 		return false
 	}
 
-	if err := s.linear.AssignIssue(ctx, iss.ID, s.cfg.AdmiralUserID); err != nil {
-		s.logger.Error("assign_failed", "issue", iss.Identifier, "err", err)
-		return false
+	// Already assigned to admiral (the assigned-to-me search path): a
+	// re-assign would be a Linear-side no-op, but skipping it saves the API
+	// call and keeps the "explicitly assigned to me" intent visible.
+	if iss.AssigneeID != s.cfg.AdmiralUserID {
+		if err := s.linear.AssignIssue(ctx, iss.ID, s.cfg.AdmiralUserID); err != nil {
+			s.logger.Error("assign_failed", "issue", iss.Identifier, "err", err)
+			return false
+		}
 	}
 	s.logger.Info("assigned", "issue", iss.Identifier, "title", iss.Title, "url", iss.URL)
 
