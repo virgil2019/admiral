@@ -312,3 +312,59 @@ func TestRunRepoVerify_UsesGivenEnv(t *testing.T) {
 		t.Errorf("verify_cmd ran with the wrong env: ADMIRAL_TEST_ACCOUNT=%q", got)
 	}
 }
+
+// A canceled run ctx (shutdown SIGTERM or budget expiry) is not a build
+// verdict — bailing must not burn a doomed claude retry spawn on the dead
+// ctx before the run settles as interrupted/expired. The verify build is
+// killed MID-RUN (SIGTERM folds into a non-zero exit, not TimedOut), which
+// is exactly the shape runVerifyWithRetry would otherwise treat as a real
+// failing build worth a fix-forward retry.
+func TestRunVerifyWithRetry_CanceledCtxSkipsRetry(t *testing.T) {
+	dir := t.TempDir()
+	started := dir + "/.started"
+	release := dir + "/.release"
+	cmd := writeFakeBuild(t, dir, "touch "+started+"\nwhile [ ! -f "+release+" ]; do sleep 0.02; done\necho fail 1>&2\nexit 1\n")
+	claudeCalled := 0
+	runner := func(ctx context.Context, wt, prompt string) (string, error) {
+		claudeCalled++
+		return "", errors.New("should not spawn")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan VerifyRetryResult, 1)
+	go func() {
+		done <- runVerifyWithRetry(ctx, dir, cmd, 30, 2, os.Environ(), runner)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fake build never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := os.WriteFile(release, []byte("go"), 0o644); err != nil {
+		t.Fatalf("release fake build: %v", err)
+	}
+	r := <-done
+
+	if r.Passed {
+		t.Fatalf("expected Passed=false on a canceled ctx, got %#v", r)
+	}
+	if claudeCalled != 0 {
+		t.Errorf("claudeRunner called %d times on a canceled ctx; expected 0 (no doomed spawn)", claudeCalled)
+	}
+	if r.LaunchErr == "" {
+		t.Errorf("LaunchErr empty, want the interruption recorded")
+	}
+	// The cancellation itself must not be misattributed as a launch failure
+	// (exec failing at Start on a dead ctx surfaces ctx.Err() through the
+	// launch-error branch).
+	if !strings.Contains(r.LaunchErr, "verify build interrupted") {
+		t.Errorf("LaunchErr = %q, want the interruption wording", r.LaunchErr)
+	}
+}
