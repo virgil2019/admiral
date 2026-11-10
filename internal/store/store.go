@@ -1405,6 +1405,37 @@ func (s *Store) IncrementAutoResumeCount(issueID string, attemptN int) (int, err
 // a clean shutdown stamped interrupted (TIMED_OUT with that reason) — those
 // are invisible to an in-flight-only query, which is exactly the case a
 // graceful restart produces.
+// ListWatchableCITasks returns admiral_tasks rows whose PR should have a
+// live CI watcher: DONE (PR open, awaiting review/merge) and
+// DONE_THREAD_INCONSISTENT (same PR, thread report undelivered). The CI-watch
+// reconciler mounts watchers for these on boot and on a ticker — daemon
+// restarts and crash windows otherwise leave the PR unwatched, and CI
+// failures during those gaps were silently lost. DONE_MERGED is excluded:
+// a merged PR has no CI to watch.
+func (s *Store) ListWatchableCITasks() ([]AdmiralTask, error) {
+	rows, err := s.DB.Query(`
+		SELECT issue_id, COALESCE(issue_identifier,''), state,
+		       COALESCE(pr_url,''), COALESCE(last_event_session_id,'')
+		  FROM admiral_tasks
+		 WHERE COALESCE(pr_url,'') != ''
+		   AND state IN (?, ?)`,
+		JobStateDone, JobStateDoneThreadInconsistent)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AdmiralTask
+	for rows.Next() {
+		var t AdmiralTask
+		if err := rows.Scan(&t.IssueID, &t.IssueIdentifier, &t.State,
+			&t.PRURL, &t.LastEventSessionID); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListRecoverableTasks() ([]AdmiralTask, error) {
 	rows, err := s.DB.Query(`
 		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,

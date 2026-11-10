@@ -942,3 +942,49 @@ func TestRepoGhUserRoundTrip(t *testing.T) {
 		t.Fatalf("ListRepos = (%+v, %v), want one row with gh_user=chababa9", list, err)
 	}
 }
+
+// Only DONE / DONE_THREAD_INCONSISTENT rows with a PR are watchable —
+// DONE_MERGED has no CI left to watch, PR-less rows have nothing to mount.
+func TestListWatchableCITasks(t *testing.T) {
+	s := newTestStore(t)
+	rows := []struct {
+		issue, state, pr string
+	}{
+		{"issue-done", JobStateDone, "https://github.com/x/y/pull/1"},
+		{"issue-incons", JobStateDoneThreadInconsistent, "https://github.com/x/y/pull/2"},
+		{"issue-merged", JobStateDoneMerged, "https://github.com/x/y/pull/3"},
+		{"issue-nopr", JobStateDone, ""},
+	}
+	for _, r := range rows {
+		if _, err := s.ClaimAdmiralTask(r.issue, "GEO-"+r.issue, "s-"+r.issue); err != nil {
+			t.Fatalf("claim %s: %v", r.issue, err)
+		}
+		if err := s.UpdateAdmiralTask(r.issue, func(t *AdmiralTask) {
+			t.State = r.state
+			t.PRURL = r.pr
+			t.LastEventSessionID = "sess-" + r.issue
+		}); err != nil {
+			t.Fatalf("update %s: %v", r.issue, err)
+		}
+	}
+	got, err := s.ListWatchableCITasks()
+	if err != nil {
+		t.Fatalf("ListWatchableCITasks: %v", err)
+	}
+	ids := map[string]string{}
+	for _, r := range got {
+		ids[r.IssueID] = r.PRURL
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d rows (%v), want exactly the two PR-bearing non-merged rows", len(got), ids)
+	}
+	if ids["issue-done"] == "" || ids["issue-incons"] == "" {
+		t.Fatalf("missing expected rows: %v", ids)
+	}
+	if _, ok := ids["issue-merged"]; ok {
+		t.Errorf("DONE_MERGED row must be excluded (no CI left to watch)")
+	}
+	if _, ok := ids["issue-nopr"]; ok {
+		t.Errorf("PR-less row must be excluded (nothing to mount)")
+	}
+}

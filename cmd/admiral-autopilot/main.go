@@ -164,6 +164,7 @@ func main() {
 	// leaves them EXECUTING and every later /rerun is rejected as "currently
 	// processing"), and keeps sweeping so a stuck row self-heals.
 	go orch.StartReconciler(ctx)
+	go orch.StartCIWatchReconciler(ctx)
 
 	// worker pool: N workers consume from events_inbox and dispatch to orchestrator
 	for i := 0; i < n; i++ {
