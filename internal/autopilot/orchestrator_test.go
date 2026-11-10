@@ -2,6 +2,7 @@ package autopilot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -4993,5 +4994,116 @@ func TestReconcileCIWatchers_SkipsUnresolvableRepo(t *testing.T) {
 
 	if got := len(mcw.mounted); got != 0 {
 		t.Fatalf("mounted %d watchers for an unresolvable repo, want 0", got)
+	}
+}
+
+// The compensator must reproduce the webhook enqueue contract exactly:
+// source=github, PR URL in the session field, extractReviewBody-compatible
+// payloads, deterministic gh-recon webhook IDs, and the bot loop guard —
+// admiral's own reviews and comments must never be re-enqueued.
+func TestProcessFeedback_EnqueueShapeAndLoopGuard(t *testing.T) {
+	ms := &mockStore{}
+	o := &Orchestrator{db: ms, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	row := store.AdmiralTask{IssueID: "iss-1", IssueIdentifier: "GEO-1",
+		State: store.JobStateDone, PRURL: "https://github.com/x/y/pull/7"}
+
+	reviews := []ghReview{
+		{ID: 101, State: "CHANGES_REQUESTED", Body: "fix the loop", User: struct {
+			Login string `json:"login"`
+		}{Login: "reviewer1"}},
+		{ID: 102, State: "PENDING", Body: "draft", User: struct {
+			Login string `json:"login"`
+		}{Login: "reviewer2"}},
+		{ID: 103, State: "APPROVED", Body: "nice", User: struct {
+			Login string `json:"login"`
+		}{Login: "someone"}}, // ghUser set below to "SOMEONE" (case-insensitive guard)
+	}
+	comments := []ghComment{
+		{ID: 201, Body: "this line is broken", User: struct {
+			Login string `json:"login"`
+		}{Login: "reviewer1"}},
+		{ID: 202, Body: "self note", User: struct {
+			Login string `json:"login"`
+		}{Login: "someone"}},
+	}
+	o.processFeedback(row, "someone", reviews, comments)
+
+	if len(ms.Enqueued) != 2 {
+		t.Fatalf("enqueued %d events (%+v), want exactly 2 (self and PENDING filtered)", len(ms.Enqueued), ms.Enqueued)
+	}
+	var rev, com struct {
+		WebhookID, Action, SessionID, Payload string
+	}
+	for _, e := range ms.Enqueued {
+		if e.Source != "github" {
+			t.Errorf("source = %q, want github", e.Source)
+		}
+		if e.SessionID != row.PRURL {
+			t.Errorf("session = %q, want the PR URL (HandleReviewEvent reads it from there)", e.SessionID)
+		}
+		if strings.HasPrefix(e.Action, "pull_request_review_comment.") {
+			com.WebhookID, com.Action, com.Payload = e.WebhookID, e.Action, e.Payload
+		} else {
+			rev.WebhookID, rev.Action, rev.Payload = e.WebhookID, e.Action, e.Payload
+		}
+	}
+	if rev.WebhookID != "gh-recon-review-101" || rev.Action != "submitted" {
+		t.Errorf("review event = %s/%s, want gh-recon-review-101/submitted", rev.WebhookID, rev.Action)
+	}
+	var rp struct {
+		Review struct {
+			Body  string `json:"body"`
+			State string `json:"state"`
+		} `json:"review"`
+	}
+	if err := json.Unmarshal([]byte(rev.Payload), &rp); err != nil {
+		t.Fatalf("review payload unmarshal: %v", err)
+	}
+	if rp.Review.Body != "fix the loop" || rp.Review.State != "changes_requested" {
+		t.Errorf("review payload = %+v, want body + lowercased state", rp.Review)
+	}
+	if com.WebhookID != "gh-recon-comment-201" || !strings.HasPrefix(com.Action, "pull_request_review_comment.") {
+		t.Errorf("comment event = %s/%s, want gh-recon-comment-201 + comment action", com.WebhookID, com.Action)
+	}
+	var cp struct {
+		Comment struct {
+			Body string `json:"body"`
+		} `json:"comment"`
+	}
+	if err := json.Unmarshal([]byte(com.Payload), &cp); err != nil {
+		t.Fatalf("comment payload unmarshal: %v", err)
+	}
+	if cp.Comment.Body != "this line is broken" {
+		t.Errorf("comment body = %q, want the review comment body", cp.Comment.Body)
+	}
+}
+
+// fetchRecentFeedback must parse gh api's reviews and comments arrays.
+func TestFetchRecentFeedback_ParsesGhOutput(t *testing.T) {
+	dir := t.TempDir()
+	binDir := t.TempDir()
+	// POSIX sh only — CI's /bin/sh is dash, which rejects bash's [[ ]].
+	script := `#!/bin/sh
+case "$*" in
+  *"/reviews"*) echo '[{"id":11,"state":"COMMENTED","body":"inline note","user":{"login":"rev"}}]' ;;
+  *) echo '[{"id":22,"body":"thread body","user":{"login":"rev"}}]' ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "gh"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	o := &Orchestrator{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	reviews, comments, err := o.fetchRecentFeedback(context.Background(), dir,
+		"https://github.com/x/y/pull/7", os.Environ())
+	if err != nil {
+		t.Fatalf("fetchRecentFeedback: %v", err)
+	}
+	if len(reviews) != 1 || reviews[0].ID != 11 || reviews[0].Body != "inline note" || reviews[0].User.Login != "rev" {
+		t.Fatalf("reviews = %+v, want the stubbed review", reviews)
+	}
+	if len(comments) != 1 || comments[0].ID != 22 || comments[0].Body != "thread body" {
+		t.Fatalf("comments = %+v, want the stubbed comment", comments)
 	}
 }

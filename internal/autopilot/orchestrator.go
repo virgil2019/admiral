@@ -756,16 +756,8 @@ func (o *Orchestrator) reconcileCIWatchers() {
 		if o.ciWatcher == nil || o.ciWatcher.Watching(row.PRURL) {
 			continue
 		}
-		issue, ierr := o.lc.GetIssue(o.baseCtx(), row.IssueID)
-		if ierr != nil {
-			o.logger.Warn("ci_watch_reconcile_issue_lookup_failed",
-				"issue", row.IssueIdentifier, "err", ierr)
-			continue
-		}
-		repo, rerr := o.db.GetRepoByProjectID(issue.ProjectID)
-		if rerr != nil || repo == nil || !repo.Enabled {
-			o.logger.Warn("ci_watch_reconcile_repo_unresolved",
-				"issue", row.IssueIdentifier, "err", rerr)
+		repo, ok := o.resolveRepoForRow(row)
+		if !ok {
 			continue
 		}
 		o.logger.Info("ci_watch_remount",
@@ -773,6 +765,25 @@ func (o *Orchestrator) reconcileCIWatchers() {
 		o.ciWatcher.WatchPR(o.baseCtx(), row.PRURL, repo.RepoDir,
 			row.LastEventSessionID, row.IssueID, strings.TrimSpace(repo.GhUser))
 	}
+}
+
+// resolveRepoForRow resolves a watchable row's repo through its Linear
+// issue's project. Shared by the CI-watch reconciler and the review
+// compensator. ok=false skips the row (the warning is already logged).
+func (o *Orchestrator) resolveRepoForRow(row store.AdmiralTask) (*store.Repo, bool) {
+	issue, err := o.lc.GetIssue(o.baseCtx(), row.IssueID)
+	if err != nil {
+		o.logger.Warn("watch_reconcile_issue_lookup_failed",
+			"issue", row.IssueIdentifier, "err", err)
+		return nil, false
+	}
+	repo, err := o.db.GetRepoByProjectID(issue.ProjectID)
+	if err != nil || repo == nil || !repo.Enabled {
+		o.logger.Warn("watch_reconcile_repo_unresolved",
+			"issue", row.IssueIdentifier, "err", err)
+		return nil, false
+	}
+	return repo, true
 }
 
 // dispatchFreshAssign claims a fresh admiral_tasks row for the issue,
