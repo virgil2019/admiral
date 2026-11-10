@@ -628,6 +628,10 @@ type mockStore struct {
 	ListJobsByIssueAndStatesResult []store.AutopilotJob
 	ListJobsByIssueAndStatesErr    error
 
+	// CI-watch reconciler override
+	WatchableCITasks    []store.AdmiralTask
+	WatchableCITasksErr error
+
 	// ClaimAutopilotJob recorder. Each call appends the session id; tests
 	// inspect this to verify dispatch decisions that spawn goroutines
 	// (runFollowup / runFollowupResume) actually claim a row.
@@ -825,6 +829,12 @@ func (m *mockStore) IncrementAutoResumeCount(issueID string, attemptN int) (int,
 	defer m.mu.Unlock()
 	m.AutoResumeCount++
 	return m.AutoResumeCount, m.AutoResumeErr
+}
+
+func (m *mockStore) ListWatchableCITasks() ([]store.AdmiralTask, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.WatchableCITasks, m.WatchableCITasksErr
 }
 
 func (m *mockStore) ListRecoverableTasks() ([]store.AdmiralTask, error) {
@@ -4891,5 +4901,97 @@ func TestHandleGateFailure_ShutdownMidGatePersistsFailedNoAutoResume(t *testing.
 	}
 	if body := mlc.GetPostedBody(); !strings.Contains(body, "/rerun") {
 		t.Fatalf("posted body = %q, want rerun guidance", body)
+	}
+}
+
+// mockCIWatcher records mounts; Watching mirrors the live slot map so the
+// reconciler's dedupe path is exercised against real lookups.
+type mockCIWatcher struct {
+	mu       sync.Mutex
+	watching map[string]bool
+	mounted  []string
+}
+
+func (m *mockCIWatcher) WatchPR(_ context.Context, prURL, _, _, _, _ string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.watching[prURL] = true
+	m.mounted = append(m.mounted, prURL)
+}
+
+func (m *mockCIWatcher) Watching(prURL string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.watching[prURL]
+}
+
+func (m *mockCIWatcher) SetFixRound(fn func(context.Context, *store.AdmiralTask, string) error) {}
+
+// The reconciler mounts watchers for watchable rows that have none, resolves
+// each row's repo via Linear project, and is idempotent — a second pass over
+// now-watched PRs mounts nothing. Wrong-thread notes are exactly why a
+// duplicate must not reach WatchPR.
+func TestReconcileCIWatchers_MountsUnwatchedIdempotently(t *testing.T) {
+	ms := &mockStore{
+		WatchableCITasks: []store.AdmiralTask{
+			{IssueID: "iss-1", IssueIdentifier: "GEO-1", State: store.JobStateDone,
+				PRURL: "https://github.com/x/y/pull/1", LastEventSessionID: "sess-1"},
+			{IssueID: "iss-2", IssueIdentifier: "GEO-2", State: "DONE_THREAD_INCONSISTENT",
+				PRURL: "https://github.com/x/y/pull/2", LastEventSessionID: "sess-2"},
+		},
+		Repo: &store.Repo{RepoDir: "/tmp/repo", BaseBranch: "main", GhUser: "someone", Enabled: true},
+	}
+	mlc := &mockLinearClient{GetIssueByID: map[string]*linear.Issue{
+		"iss-1": {ID: "iss-1", ProjectID: "proj-1"},
+		"iss-2": {ID: "iss-2", ProjectID: "proj-1"},
+	}}
+	mcw := &mockCIWatcher{watching: map[string]bool{}}
+	o := &Orchestrator{
+		cfg:       &config.Autopilot{MaxRunSeconds: 60},
+		db:        ms,
+		lc:        mlc,
+		ciWatcher: mcw,
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	o.reconcileCIWatchers()
+
+	if got := len(mcw.mounted); got != 2 {
+		t.Fatalf("mounted %d watchers (%v), want both unwatched PRs", got, mcw.mounted)
+	}
+
+	// Second pass: both PRs now have live watchers — nothing new mounts.
+	o.reconcileCIWatchers()
+	if got := len(mcw.mounted); got != 2 {
+		t.Fatalf("re-mount happened on the second pass (%v), want idempotent", mcw.mounted)
+	}
+}
+
+// A repo that cannot be resolved (missing Linear project, unregistered repo,
+// disabled repo) is skipped with a warning, not mounted and not fatal.
+func TestReconcileCIWatchers_SkipsUnresolvableRepo(t *testing.T) {
+	ms := &mockStore{
+		WatchableCITasks: []store.AdmiralTask{
+			{IssueID: "iss-bad", IssueIdentifier: "GEO-9", State: store.JobStateDone,
+				PRURL: "https://github.com/x/y/pull/9", LastEventSessionID: "sess-9"},
+		},
+		Repo: nil, // no repo registered for the project
+	}
+	mlc := &mockLinearClient{GetIssueByID: map[string]*linear.Issue{
+		"iss-bad": {ID: "iss-bad", ProjectID: "proj-none"},
+	}}
+	mcw := &mockCIWatcher{watching: map[string]bool{}}
+	o := &Orchestrator{
+		cfg:       &config.Autopilot{MaxRunSeconds: 60},
+		db:        ms,
+		lc:        mlc,
+		ciWatcher: mcw,
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	o.reconcileCIWatchers()
+
+	if got := len(mcw.mounted); got != 0 {
+		t.Fatalf("mounted %d watchers for an unresolvable repo, want 0", got)
 	}
 }
