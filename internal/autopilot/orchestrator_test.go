@@ -5082,12 +5082,12 @@ func TestProcessFeedback_EnqueueShapeAndLoopGuard(t *testing.T) {
 func TestFetchRecentFeedback_ParsesGhOutput(t *testing.T) {
 	dir := t.TempDir()
 	binDir := t.TempDir()
+	// POSIX sh only — CI's /bin/sh is dash, which rejects bash's [[ ]].
 	script := `#!/bin/sh
-if [[ "$*" == *"/reviews"* ]]; then
-  echo '[{"id":11,"state":"COMMENTED","body":"inline note","user":{"login":"rev"}}]'
-else
-  echo '[{"id":22,"body":"thread body","user":{"login":"rev"}}]'
-fi
+case "$*" in
+  *"/reviews"*) echo '[{"id":11,"state":"COMMENTED","body":"inline note","user":{"login":"rev"}}]' ;;
+  *) echo '[{"id":22,"body":"thread body","user":{"login":"rev"}}]' ;;
+esac
 `
 	if err := os.WriteFile(filepath.Join(binDir, "gh"), []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
