@@ -7,6 +7,9 @@ import (
 
 	"github.com/georgehuang/admiral/internal/linear"
 	"github.com/georgehuang/admiral/internal/store"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
 // seedTeamGEO populates a fake linear client with a single team's
@@ -636,5 +639,76 @@ func TestAdvanceSkipsWhenRepoHasNoGhAccount(t *testing.T) {
 	}
 	if len(lc.issueUpdates) != 0 {
 		t.Fatalf("expected no Linear state change without a registered account; got %+v", lc.issueUpdates)
+	}
+}
+
+// merge-time residue sweep: a merged task's worktree is archived
+// (recoverable), its local branch deleted, and its remote branch deleted.
+// Without this sweep merged-task worktrees accumulate forever.
+func TestAdvanceMergedCleansUpWorktreeAndBranches(t *testing.T) {
+	dir := t.TempDir()
+	worktree := filepath.Join(dir, "wt")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitLog := filepath.Join(dir, "git.log")
+	binDir := t.TempDir()
+	script := "#!/bin/sh\necho \"$@\" >> " + gitLog + "\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	prURL := newPRURL()
+	task := newGEOTaskDone(prURL)
+	task.Branch = "linear/geo-77"
+	task.WorktreePath = worktree
+	ts := newFakeStore()
+	ts.tasksByState[task.IssueID] = &task
+	ts.repos = map[string]*store.Repo{"proj-A": {RepoDir: dir, GhUser: defaultTestGhUser}}
+
+	lc := &fakeLinear{}
+	lc.issues = map[string]*linear.Issue{"iss-A": newGEOIssue("In Progress")}
+	seedTeamGEO(lc)
+	pr := &fakePR{statuses: map[string]PRStatus{
+		prURL: {State: "MERGED", MergedAt: "2026-05-25T06:00:00Z"},
+	}}
+
+	svc := newSvcWithPR(Config{AdmiralUserID: "u-1"}, lc, pr, ts, nil)
+	svc.advanceLinearStates(context.Background())
+
+	if ts.tasksByState[task.IssueID].State != store.JobStateDoneMerged {
+		t.Fatalf("task state = %q, want DONE_MERGED (cleanup must not block the transition)", ts.tasksByState[task.IssueID].State)
+	}
+	recorded, err := os.ReadFile(gitLog)
+	if err != nil {
+		t.Fatalf("fake git never ran: %v", err)
+	}
+	for _, want := range []string{
+		"worktree remove --force " + worktree,
+		"branch -D linear/geo-77",
+		"push origin --delete linear/geo-77",
+	} {
+		if !strings.Contains(string(recorded), want) {
+			t.Errorf("git log missing %q; recorded: %s", want, recorded)
+		}
+	}
+	// The archive copy must contain the worktree's files (recoverable).
+	archiveRoot := filepath.Join(dir, ".worktrees-archive")
+	var archived string
+	err = filepath.Walk(archiveRoot, func(p string, info os.FileInfo, err error) error {
+		if err == nil && info.IsDir() && strings.HasPrefix(info.Name(), "iss-A-") {
+			archived = p
+		}
+		return nil
+	})
+	if err != nil || archived == "" {
+		t.Fatalf("no archived copy under %s: %v", archiveRoot, err)
+	}
+	if _, err := os.Stat(filepath.Join(archived, "f.txt")); err != nil {
+		t.Errorf("archived copy missing f.txt: %v", err)
 	}
 }
