@@ -1616,3 +1616,37 @@ func TestGetIssueBlockers_ResolvedSkipped(t *testing.T) {
 		t.Fatalf("expected no blockers (all resolved), got %+v", blockers)
 	}
 }
+
+// AssigneeID must land in the GraphQL filter as an exact id match — the
+// discoverer's assigned-to-me pickup keys on it, and a dropped filter would
+// silently widen the search to every issue.
+func TestSearchAssignableIssues_AssigneeFilter(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatal(err)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"issues": map[string]any{"nodes": []map[string]any{}}},
+		})
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "test-token")
+	if _, err := c.SearchAssignableIssues(context.Background(), SearchFilter{AssigneeID: "user-7"}); err != nil {
+		t.Fatalf("SearchAssignableIssues failed: %v", err)
+	}
+
+	vars := receivedBody["variables"].(map[string]any)
+	filter := vars["filter"].(map[string]any)
+	assignee, ok := filter["assignee"].(map[string]any)
+	if !ok {
+		t.Fatalf("assignee filter missing: %v", filter)
+	}
+	if eq := assignee["id"].(map[string]any)["eq"]; eq != "user-7" {
+		t.Errorf("assignee id eq = %v, want user-7", eq)
+	}
+	if _, hasNull := assignee["null"]; hasNull {
+		t.Errorf("assignee filter must not carry null when AssigneeID is set")
+	}
+}

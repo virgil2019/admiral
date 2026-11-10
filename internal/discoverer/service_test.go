@@ -13,10 +13,17 @@ import (
 	"github.com/georgehuang/admiral/internal/store"
 )
 
+type searchCall struct {
+	UnassignedOnly bool
+	AssigneeID     string
+}
+
 type fakeLinear struct {
 	mu             sync.Mutex
-	scanRet        []linear.Issue
+	scanRet        []linear.Issue // returned to the unassigned search
+	assignedRet    []linear.Issue // returned to the assigned-to-me search
 	scanErr        error
+	filters        []searchCall
 	assigns        []assignCall
 	assnErr        error
 	blockers       map[string][]linear.IssueBlocker
@@ -40,10 +47,23 @@ type issueUpdateCall struct {
 	StateID string
 }
 
-func (f *fakeLinear) SearchAssignableIssues(_ context.Context, _ linear.SearchFilter) ([]linear.Issue, error) {
+func (f *fakeLinear) SearchAssignableIssues(_ context.Context, sf linear.SearchFilter) ([]linear.Issue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.scanRet, f.scanErr
+	f.filters = append(f.filters, searchCall{UnassignedOnly: sf.UnassignedOnly, AssigneeID: sf.AssigneeID})
+	if f.scanErr != nil {
+		return nil, f.scanErr
+	}
+	if sf.AssigneeID != "" {
+		return f.assignedRet, nil
+	}
+	return f.scanRet, nil
+}
+
+func (f *fakeLinear) recordedFilters() []searchCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]searchCall(nil), f.filters...)
 }
 
 func (f *fakeLinear) AssignIssue(_ context.Context, issueID, userID string) error {
@@ -604,5 +624,35 @@ func TestRunRejectsMissingUserID(t *testing.T) {
 	svc := newSvc(Config{PollInterval: time.Second}, &fakeLinear{}, newFakeStore(), nil)
 	if err := svc.Run(context.Background()); err == nil {
 		t.Fatal("expected Run to error on missing AdmiralUserID")
+	}
+}
+
+// Teammate semantics: the scan issues two searches — unclaimed issues
+// (historic behavior) and issues explicitly assigned to admiral (exact
+// assignee match, same label/state/project gates). An assigned issue is
+// picked WITHOUT a redundant AssignIssue — it is already admiral's.
+func TestScanPicksAssignedToAdmiral(t *testing.T) {
+	lc := &fakeLinear{
+		scanRet:     []linear.Issue{{ID: "a", Identifier: "GEO-A"}},
+		assignedRet: []linear.Issue{{ID: "m", Identifier: "GEO-M", AssigneeID: "u-1"}},
+	}
+	ts := newFakeStore()
+	svc := newSvc(Config{AdmiralUserID: "u-1"}, lc, ts, nil)
+
+	svc.tick(context.Background())
+
+	filters := lc.recordedFilters()
+	if len(filters) != 2 {
+		t.Fatalf("got %d searches (%+v), want two: unassigned + assigned-to-me", len(filters), filters)
+	}
+	if !filters[0].UnassignedOnly || filters[0].AssigneeID != "" {
+		t.Errorf("first search = %+v, want the unassigned pickup", filters[0])
+	}
+	if filters[1].UnassignedOnly || filters[1].AssigneeID != "u-1" {
+		t.Errorf("second search = %+v, want assignee exact match u-1", filters[1])
+	}
+	got := lc.assignedIDs()
+	if len(got) != 1 || got[0] != "a" {
+		t.Fatalf("assigns = %v, want only unassigned issue a (m is already admiral's)", got)
 	}
 }
