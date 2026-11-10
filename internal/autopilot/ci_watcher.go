@@ -124,6 +124,23 @@ func (w *CIWatcher) WatchPR(ctx context.Context, prURL, repoDir, sessionID, issu
 	}()
 }
 
+// Watching reports whether a watcher is currently active for prURL. The
+// watch reconciler uses it to skip re-mounting: a duplicate WatchPR would
+// post an "already being watched" note on the caller's (possibly wrong)
+// session thread.
+func (w *CIWatcher) Watching(prURL string) bool {
+	w.activeMu.Lock()
+	defer w.activeMu.Unlock()
+	_, active := w.activePR[prURL]
+	return active
+}
+
+// SetFixRound wires the automatic fix round (the review path's fix
+// machinery). A nil fn keeps the watcher report-only.
+func (w *CIWatcher) SetFixRound(fn func(ctx context.Context, task *store.AdmiralTask, failure string) error) {
+	w.fixRound = fn
+}
+
 // ciClaimWait bounds how long a new watcher waits for a same-PR watcher
 // that is finishing up (its final post retries + DB write can take seconds).
 // A watcher still held after this is a genuine long-lived duplicate. Var for

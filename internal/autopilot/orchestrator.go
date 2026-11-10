@@ -70,6 +70,7 @@ type storeInterface interface {
 	MarkInterruptedTasks(reason string) (int, error)
 	MarkTaskInterrupted(issueID string, attemptN int, reason string) (bool, error)
 	ListRecoverableTasks() ([]store.AdmiralTask, error)
+	ListWatchableCITasks() ([]store.AdmiralTask, error)
 	IncrementAutoResumeCount(issueID string, attemptN int) (int, error)
 	ResetAutoResumeCount(issueID string)
 	ClearPendingQuestion(issueID string)
@@ -207,8 +208,9 @@ type Orchestrator struct {
 	workflowStatesMu     sync.Mutex
 
 	// ciWatcher polls GitHub check runs after a PR is opened and reports
-	// results back into the Linear thread (GEO-54).
-	ciWatcher *CIWatcher
+	// results back into the Linear thread (GEO-54). Interface so the watch
+	// reconciler's tests can fake watch state.
+	ciWatcher ciWatcherInterface
 
 	// blockerWatcher polls BLOCKED tasks and re-queues them once all their
 	// Linear blocked_by relations are resolved.
@@ -289,7 +291,7 @@ func New(cfg *config.Autopilot, lc *linear.Client, db *store.Store, logger *slog
 	o.prClientFor = o.githubClientFor
 	// The CI watcher's automatic fix rounds reuse the review path's fix
 	// machinery (claude + build gate + push on the PR's branch).
-	o.ciWatcher.fixRound = o.runCIFixRound
+	o.ciWatcher.SetFixRound(o.runCIFixRound)
 	o.verifyRunner = func(ctx context.Context, repoDir, prompt string, env []string) (string, error) {
 		return runClaudeForVerify(ctx, o.cfg.ClaudeBin, o.cfg.MaxRunSeconds, repoDir, prompt, env, o.logger)
 	}
@@ -704,6 +706,73 @@ func (o *Orchestrator) replyRejection(sessionID, taskState, body string) {
 // once their Linear blocked_by relations are resolved. Call once from main.
 func (o *Orchestrator) StartBlockerWatcher(ctx context.Context) {
 	o.blockerWatcher.Run(ctx)
+}
+
+// ciWatcherInterface is the slice of CIWatcher the orchestrator drives. An
+// interface so the watch reconciler's tests can fake watch state without
+// GitHub or claude.
+type ciWatcherInterface interface {
+	WatchPR(ctx context.Context, prURL, repoDir, sessionID, issueID, ghUser string)
+	Watching(prURL string) bool
+	SetFixRound(fn func(ctx context.Context, task *store.AdmiralTask, failure string) error)
+}
+
+// ciWatchReconcileInterval bounds how long an unwatched PR can sit without
+// a watcher after a daemon restart or a missed mount.
+var ciWatchReconcileInterval = 5 * time.Minute
+
+// StartCIWatchReconciler re-mounts CI watchers for admiral-owned,
+// unmerged PRs that have no live watcher. Watchers mount when a PR opens;
+// daemon restarts and crash windows leave their rows unwatched, and CI
+// failures during those gaps were silently lost.
+func (o *Orchestrator) StartCIWatchReconciler(ctx context.Context) {
+	t := time.NewTicker(ciWatchReconcileInterval)
+	defer t.Stop()
+	o.reconcileCIWatchers() // boot: rows whose watcher died with the old process
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			o.reconcileCIWatchers()
+		}
+	}
+}
+
+// reconcileCIWatchers mounts watchers for tasks with an open PR and no live
+// watcher. WatchPR's per-PR slot dedupes against any watcher that started
+// meanwhile; rows whose issue or repo can no longer be resolved are skipped
+// with a warning (stale rows from decommissioned projects). Skipped here —
+// NOT left to WatchPR's duplicate handling — because a duplicate call posts
+// an "already being watched" note on the caller's session thread, which for
+// a stale row is the wrong thread.
+func (o *Orchestrator) reconcileCIWatchers() {
+	rows, err := o.db.ListWatchableCITasks()
+	if err != nil {
+		o.logger.Error("ci_watch_reconcile_list_failed", "err", err)
+		return
+	}
+	for _, row := range rows {
+		if o.ciWatcher == nil || o.ciWatcher.Watching(row.PRURL) {
+			continue
+		}
+		issue, ierr := o.lc.GetIssue(o.baseCtx(), row.IssueID)
+		if ierr != nil {
+			o.logger.Warn("ci_watch_reconcile_issue_lookup_failed",
+				"issue", row.IssueIdentifier, "err", ierr)
+			continue
+		}
+		repo, rerr := o.db.GetRepoByProjectID(issue.ProjectID)
+		if rerr != nil || repo == nil || !repo.Enabled {
+			o.logger.Warn("ci_watch_reconcile_repo_unresolved",
+				"issue", row.IssueIdentifier, "err", rerr)
+			continue
+		}
+		o.logger.Info("ci_watch_remount",
+			"issue", row.IssueIdentifier, "pr", row.PRURL, "state", row.State)
+		o.ciWatcher.WatchPR(o.baseCtx(), row.PRURL, repo.RepoDir,
+			row.LastEventSessionID, row.IssueID, strings.TrimSpace(repo.GhUser))
+	}
 }
 
 // dispatchFreshAssign claims a fresh admiral_tasks row for the issue,
