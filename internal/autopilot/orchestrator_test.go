@@ -633,6 +633,10 @@ type mockStore struct {
 	WatchableCITasks    []store.AdmiralTask
 	WatchableCITasksErr error
 
+	// Daily report override
+	ReportStats    *store.DailyReportStats
+	ReportStatsErr error
+
 	// ClaimAutopilotJob recorder. Each call appends the session id; tests
 	// inspect this to verify dispatch decisions that spawn goroutines
 	// (runFollowup / runFollowupResume) actually claim a row.
@@ -830,6 +834,13 @@ func (m *mockStore) IncrementAutoResumeCount(issueID string, attemptN int) (int,
 	defer m.mu.Unlock()
 	m.AutoResumeCount++
 	return m.AutoResumeCount, m.AutoResumeErr
+}
+
+func (m *mockStore) DailyReportStats(since time.Time) (*store.DailyReportStats, error) {
+	if m.ReportStatsErr != nil {
+		return nil, m.ReportStatsErr
+	}
+	return m.ReportStats, nil
 }
 
 func (m *mockStore) ListWatchableCITasks() ([]store.AdmiralTask, error) {
@@ -5106,4 +5117,68 @@ esac
 	if len(comments) != 1 || comments[0].ID != 22 || comments[0].Body != "thread body" {
 		t.Fatalf("comments = %+v, want the stubbed comment", comments)
 	}
+}
+
+// The daily report renders one scannable line per metric with the real
+// numbers — a Telegram message whose numbers drifted is worse than none.
+func TestRenderDailyReport(t *testing.T) {
+	stats := &store.DailyReportStats{
+		StartedRuns: 3, MergedTasks: 2, FixEvents: 5, OpenPRs: 4, FailedTasks: 1,
+	}
+	text := renderDailyReport(stats)
+	for _, want := range []string{
+		"started 3 run(s)", "merged 2 PR(s)", "fix rounds: 5",
+		"awaiting review: 4", "escalated to human: 1",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("report %q missing %q", text, want)
+		}
+	}
+}
+
+// StartDailyReport sends through the wired sender on its ticker — a nil
+// sender stays dormant, and a send failure is logged, not panicking.
+func TestStartDailyReport_SendsOnTick(t *testing.T) {
+	old := dailyReportInterval
+	dailyReportInterval = 20 * time.Millisecond
+	defer func() { dailyReportInterval = old }()
+
+	sent := make(chan string, 4)
+	ms := &mockStore{ReportStats: &store.DailyReportStats{StartedRuns: 1}}
+	o := &Orchestrator{db: ms, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	// StartDailyReport is synchronous (production calls it with `go`) —
+	// invoking it inline here would deadlock: its send blocks on the very
+	// channel this test reads after the call returns.
+	go o.StartDailyReport(ctx, func(text string) error {
+		sent <- text
+		return nil
+	})
+
+	select {
+	case text := <-sent:
+		if !strings.Contains(text, "started 1 run(s)") {
+			t.Fatalf("sent %q, want the rendered stats", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no report sent within 2s of ticker start")
+	}
+}
+
+// A nil sender disables the component entirely — nothing reads the store,
+// nothing sends.
+func TestStartDailyReport_NilSenderDormant(t *testing.T) {
+	old := dailyReportInterval
+	dailyReportInterval = 20 * time.Millisecond
+	defer func() { dailyReportInterval = old }()
+
+	ms := &mockStore{ReportStatsErr: errors.New("store must not be touched")}
+	o := &Orchestrator{db: ms, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	o.StartDailyReport(ctx, nil) // must return immediately, no store reads
+	<-ctx.Done()
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+	"strings"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -986,5 +987,80 @@ func TestListWatchableCITasks(t *testing.T) {
 	}
 	if _, ok := ids["issue-nopr"]; ok {
 		t.Errorf("PR-less row must be excluded (nothing to mount)")
+	}
+}
+
+// The daily report aggregates exactly the teammate's last-24h activity:
+// runs started, PRs merged, GitHub fix events processed, currently-open
+// PRs, and tasks escalated to human (FAILED).
+func TestDailyReportStats(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	recent := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	old := now.Add(-48 * time.Hour).Format(time.RFC3339)
+
+	seed := []struct {
+		issue, state, started, finished string
+	}{
+		{"issue-started", JobStateDone, recent, recent},
+		{"issue-started2", JobStateDoneThreadInconsistent, recent, recent},
+		{"issue-old", JobStateDone, old, old},
+		{"issue-old2", JobStateDoneThreadInconsistent, old, old},
+		{"issue-merged", JobStateDoneMerged, recent, recent},
+		{"issue-merged-old", JobStateDoneMerged, old, old},
+		{"issue-failed", JobStateFailed, recent, recent},
+	}
+	for _, r := range seed {
+		if _, err := s.ClaimAdmiralTask(r.issue, "GEO-"+r.issue, "s-"+r.issue); err != nil {
+			t.Fatalf("claim %s: %v", r.issue, err)
+		}
+		if err := s.UpdateAdmiralTask(r.issue, func(t *AdmiralTask) {
+			t.State = r.state
+			t.StartedAt = r.started
+			t.FinishedAt = r.finished
+			t.PRURL = "https://github.com/x/y/pull/1"
+		}); err != nil {
+			t.Fatalf("update %s: %v", r.issue, err)
+		}
+	}
+	if _, err := s.DB.Exec(`INSERT INTO events_inbox (webhook_id, action, session_id, payload_json, status, attempts, received_at, source)
+		VALUES ('wh-1','submitted','pr','','done',1,?,'github'), ('wh-2','submitted','pr','','done',1,?,'github'), ('wh-3','created','pr','','done',1,?,'linear')`,
+		now.Add(-time.Hour).Unix(), now.Add(-48*time.Hour).Unix(), now.Add(-time.Hour).Unix()); err != nil {
+		t.Fatalf("seed inbox: %v", err)
+	}
+
+	// UpdateAdmiralTask does not write started_at (fixed at claim time), so
+	// the started window is driven by a direct write here.
+	for _, r := range seed {
+		st := recent
+		if strings.HasPrefix(r.issue, "issue-old") {
+			st = old
+		}
+		if _, err := s.DB.Exec(`UPDATE admiral_tasks SET started_at = ? WHERE issue_id = ?`, st, r.issue); err != nil {
+			t.Fatalf("backdate %s: %v", r.issue, err)
+		}
+	}
+
+	stats, err := s.DailyReportStats(now.Add(-24 * time.Hour))
+	if err != nil {
+		t.Fatalf("DailyReportStats: %v", err)
+	}
+	// Started window: every row EXCEPT the two issue-old* rows.
+	if stats.StartedRuns != 5 {
+		t.Errorf("StartedRuns = %d, want 5", stats.StartedRuns)
+	}
+	if stats.MergedTasks != 1 {
+		t.Errorf("MergedTasks = %d, want 1 (recent merge only)", stats.MergedTasks)
+	}
+	if stats.FixEvents != 1 {
+		t.Errorf("FixEvents = %d, want 1 (recent github done only)", stats.FixEvents)
+	}
+	// Watchable = DONE / DONE_THREAD_INCONSISTENT rows with a PR: the four
+	// started/old DONE-family rows qualify; DONE_MERGED and FAILED excluded.
+	if stats.OpenPRs != 4 {
+		t.Errorf("OpenPRs = %d, want 4", stats.OpenPRs)
+	}
+	if stats.FailedTasks != 1 {
+		t.Errorf("FailedTasks = %d, want 1", stats.FailedTasks)
 	}
 }

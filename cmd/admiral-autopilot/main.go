@@ -166,6 +166,7 @@ func main() {
 	go orch.StartReconciler(ctx)
 	go orch.StartCIWatchReconciler(ctx)
 	go orch.StartReviewCompensation(ctx)
+	go orch.StartDailyReport(ctx, newDailyReportSender(cfg, logger))
 
 	// worker pool: N workers consume from events_inbox and dispatch to orchestrator
 	for i := 0; i < n; i++ {
@@ -417,4 +418,25 @@ func warnBotIdentityUnset(cfg *config.Autopilot, logger *slog.Logger) {
 	}
 	logger.Warn("bot_identity_unconfigured",
 		"hint", "admiral commits will inherit the runtime user's git config (likely the operator's identity). Set autopilot.bot_identity.{name,email} to attribute commits to a dedicated bot.")
+}
+
+// newDailyReportSender returns the function the daily report component
+// calls with its Telegram summary. The config gate is here (not in the
+// component): report_daily_enabled off, or no Telegram credentials, means
+// a nil sender and the component stays dormant.
+func newDailyReportSender(cfg *config.Config, logger *slog.Logger) func(string) error {
+	if !cfg.Autopilot.DailyReportEnabled || strings.TrimSpace(cfg.BotToken) == "" || len(cfg.AllowedTGUserIDs) == 0 {
+		logger.Info("daily_report_disabled",
+			"reason", "report_daily_enabled off, or telegram bot_token / allowed_tg_user_ids unset")
+		return nil
+	}
+	chatID := cfg.AllowedTGUserIDs[0]
+	bot, err := tg.New(cfg.BotToken, chatID, 0)
+	if err != nil {
+		logger.Warn("daily_report_tg_init_failed", "err", err)
+		return nil
+	}
+	return func(text string) error {
+		return bot.SendWithRetry(context.Background(), chatID, text)
+	}
 }
