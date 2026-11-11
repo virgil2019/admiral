@@ -174,6 +174,15 @@ func (s *Service) advanceMerged(ctx context.Context, t *store.AdmiralTask, issue
 	// point used by autopilot when an intermediate parent's own verify
 	// passes — see internal/cascade.
 	cascade.MaybeEnqueueVerify(ctx, s.linear, s.store, s.logger, t.IssueID, t.IssueIdentifier)
+
+	// Teammate cleanup: archive the worktree and delete the merged task's
+	// branches — local residue otherwise accumulates forever. Best-effort;
+	// the state transitions above have already succeeded.
+	if repo, err := s.store.GetRepoByProjectID(issue.ProjectID); err != nil {
+		s.logger.Warn("merge_cleanup_repo_unresolved", "issue", t.IssueIdentifier, "err", err)
+	} else if repo != nil {
+		s.cleanupMergedTask(ctx, t, repo.RepoDir)
+	}
 }
 
 func (s *Service) advanceCancelled(ctx context.Context, t *store.AdmiralTask, issue *linear.Issue) {

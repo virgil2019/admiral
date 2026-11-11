@@ -71,6 +71,7 @@ type storeInterface interface {
 	MarkTaskInterrupted(issueID string, attemptN int, reason string) (bool, error)
 	ListRecoverableTasks() ([]store.AdmiralTask, error)
 	ListWatchableCITasks() ([]store.AdmiralTask, error)
+	DailyReportStats(since time.Time) (*store.DailyReportStats, error)
 	IncrementAutoResumeCount(issueID string, attemptN int) (int, error)
 	ResetAutoResumeCount(issueID string)
 	ClearPendingQuestion(issueID string)

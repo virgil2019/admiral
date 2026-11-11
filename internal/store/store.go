@@ -1436,6 +1436,56 @@ func (s *Store) ListWatchableCITasks() ([]AdmiralTask, error) {
 	return out, rows.Err()
 }
 
+// DailyReportStats aggregates the teammate's last-24h activity for the
+// daily Telegram report. StartedRuns counts runs whose start is in the
+// window (finished state is irrelevant — a run that started and then
+// escalated still counts as started); MergedTasks/FixEvents are windowed
+// the same way; OpenPRs/FailedTasks are current-state snapshots, not
+// windowed.
+type DailyReportStats struct {
+	StartedRuns int
+	MergedTasks int
+	FixEvents   int
+	OpenPRs     int
+	FailedTasks int
+}
+
+// DailyReportStats computes the report aggregates for window [since, now].
+func (s *Store) DailyReportStats(since time.Time) (*DailyReportStats, error) {
+	sinceStr := since.Format(time.RFC3339)
+	stats := &DailyReportStats{}
+	if err := s.DB.QueryRow(
+		`SELECT COUNT(*) FROM admiral_tasks WHERE started_at >= ?`,
+		sinceStr,
+	).Scan(&stats.StartedRuns); err != nil {
+		return nil, err
+	}
+	if err := s.DB.QueryRow(
+		`SELECT COUNT(*) FROM admiral_tasks WHERE state = ? AND COALESCE(finished_at,'') >= ?`,
+		JobStateDoneMerged, sinceStr,
+	).Scan(&stats.MergedTasks); err != nil {
+		return nil, err
+	}
+	if err := s.DB.QueryRow(
+		`SELECT COUNT(*) FROM admiral_tasks WHERE state = ?`,
+		JobStateFailed,
+	).Scan(&stats.FailedTasks); err != nil {
+		return nil, err
+	}
+	if err := s.DB.QueryRow(
+		`SELECT COUNT(*) FROM events_inbox WHERE source = 'github' AND status = 'done' AND received_at >= ?`,
+		since.Unix(),
+	).Scan(&stats.FixEvents); err != nil {
+		return nil, err
+	}
+	watchable, err := s.ListWatchableCITasks()
+	if err != nil {
+		return nil, err
+	}
+	stats.OpenPRs = len(watchable)
+	return stats, nil
+}
+
 func (s *Store) ListRecoverableTasks() ([]AdmiralTask, error) {
 	rows, err := s.DB.Query(`
 		SELECT issue_id, COALESCE(issue_identifier,''), state, attempt_n,

@@ -186,6 +186,10 @@ type Autopilot struct {
 	// first-run hard gate. Defaults to 2 when unset / zero — set explicitly
 	// (e.g. 0 to disable) if you want different behavior.
 	VerifyMaxRetries int `yaml:"verify_max_retries"`
+	// DailyReportEnabled turns on the teammate's once-a-day Telegram
+	// summary (started runs, merged PRs, fix rounds, open PRs, escalations).
+	// Requires telegram bot_token + allowed_tg_user_ids; off by default.
+	DailyReportEnabled bool `yaml:"daily_report_enabled"`
 	// GhBin is the absolute path to the `gh` CLI used for the PR fallback.
 	// Default: "gh" (PATH).
 	GhBin string `yaml:"gh_bin"`
